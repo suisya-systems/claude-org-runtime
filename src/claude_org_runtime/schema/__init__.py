@@ -15,6 +15,7 @@ Public surface:
 
 from .enums import AnomalyKind, JournalEventType, WorkerStatus
 from .journal_event import JournalEvent
+from .json_schema import journal_event_schema, worker_dir_entry_schema
 from .org_state import WorkerDirEntry, parse_worker_directory_registry
 
 __all__ = [
@@ -23,5 +24,7 @@ __all__ = [
     "JournalEventType",
     "WorkerDirEntry",
     "WorkerStatus",
+    "journal_event_schema",
     "parse_worker_directory_registry",
+    "worker_dir_entry_schema",
 ]

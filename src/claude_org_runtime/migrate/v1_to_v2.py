@@ -243,11 +243,13 @@ def _detect_kind(path: Path, override: str | None) -> str:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="claude_org_runtime.migrate.v1_to_v2",
-        description="Migrate .state/ artefacts from claude-org-ja v1 to v2 schema.",
-    )
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach the v1->v2 migrate flags to an existing parser.
+
+    Used by both the standalone module CLI (``python -m
+    claude_org_runtime.migrate.v1_to_v2``) and the unified
+    ``claude-org-runtime migrate v1-to-v2`` entry point.
+    """
     parser.add_argument("--in", dest="src", required=True, help="input file")
     parser.add_argument("--out", dest="dst", required=True, help="output file")
     parser.add_argument(
@@ -256,8 +258,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="explicit kind; inferred from suffix when omitted",
     )
-    args = parser.parse_args(argv)
 
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="claude_org_runtime.migrate.v1_to_v2",
+        description="Migrate .state/ artefacts from claude-org-ja v1 to v2 schema.",
+    )
+    add_arguments(parser)
+    return parser
+
+
+def run(args: argparse.Namespace) -> int:
     src = Path(args.src)
     dst = Path(args.dst)
     kind = _detect_kind(src, args.kind)
@@ -274,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(migrate_org_state_markdown(text), encoding="utf-8")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run(args)
 
 
 if __name__ == "__main__":
