@@ -10,6 +10,7 @@ import pytest
 from claude_org_runtime.dispatcher import runner
 from claude_org_runtime.dispatcher.runner import (
     ActionPlan,
+    LocaleConfig,
     Pane,
     build_plan,
     choose_split,
@@ -18,6 +19,7 @@ from claude_org_runtime.dispatcher.runner import (
     validate_cwd,
     validate_instruction_vars,
     validate_task_id,
+    write_instruction,
 )
 
 
@@ -407,6 +409,221 @@ def test_unified_cli_dispatcher_subcommand_help() -> None:
     with pytest.raises(SystemExit) as info:
         parser.parse_args(["dispatcher", "delegate-plan", "--help"])
     assert info.value.code == 0
+
+
+def test_locale_config_english_is_default() -> None:
+    en = LocaleConfig.english()
+    assert en.constraints_default == "(none)"
+    assert en.report_target_default == "secretary"
+    assert en.claude_md_filename_default == "CLAUDE.md"
+    assert "Worker instruction expanded" in en.instruction_template
+
+
+def test_validate_instruction_vars_locale_overrides_constraints_default() -> None:
+    raw = {
+        "task_description": "x", "dir_setup": "x",
+        "branch_strategy": "x", "verification_depth": "full",
+    }
+    ja = LocaleConfig(constraints_default="(なし)")  # "(なし)"
+    norm, err = validate_instruction_vars(raw, locale=ja)
+    assert err is None and norm is not None
+    assert norm["constraints"] == "(なし)"
+
+
+def test_write_instruction_uses_locale_template(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".state"
+    ja = LocaleConfig(
+        instruction_template=(
+            "# タスク: {task_id}\n"
+            "Dir: {worker_dir}\n"
+            "----\n{instruction}\n"
+        ),
+    )
+    task = {
+        "task_id": "demo", "worker_dir": str(tmp_path),
+        "instruction": "do the thing",
+    }
+    out = write_instruction(state_dir, task, "demo", locale=ja)
+    body = out.read_text(encoding="utf-8")
+    assert body.startswith("# タスク: demo")
+    assert "do the thing" in body
+    assert "Worker instruction expanded" not in body
+
+
+def test_cli_locale_json_overrides_constraints(tmp_path: Path) -> None:
+    locale_path = tmp_path / "locale.json"
+    locale_path.write_text(
+        json.dumps({
+            "constraints_default": "(なし)",
+            "instruction_template": (
+                "# T:{task_id}\nD:{worker_dir}\n--\n{instruction}\n"
+            ),
+        }),
+        encoding="utf-8",
+    )
+    task = {
+        "task_id": "loc",
+        "worker_dir": str(tmp_path),
+        "instruction_vars": {
+            "task_description": "x",
+            "dir_setup": "x",
+            "branch_strategy": "x",
+            "verification_depth": "full",
+        },
+    }
+    panes = [
+        {"id": 1, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": 2, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path = tmp_path / "task.json"
+    panes_path = tmp_path / "panes.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+
+    state_dir = tmp_path / ".state"
+    rc = main([
+        "delegate-plan",
+        "--task-json", str(task_path),
+        "--panes-json", str(panes_path),
+        "--state-dir", str(state_dir),
+        "--locale-json", str(locale_path),
+        # No real instruction-template available; the task has explicit
+        # instruction_vars, so we'd hit load_instruction_template -- avoid
+        # that by also providing --template-repo to a stub repo.
+        "--template-repo", str(tmp_path / "stub-repo-no-template"),
+    ])
+    # Missing template -> input_invalid (rc 1) but the locale still
+    # parsed cleanly, which is the assertion that matters: a malformed
+    # --locale-json would have raised SystemExit before this point.
+    assert rc == 1
+
+
+def test_cli_locale_json_rejects_unknown_field(tmp_path: Path) -> None:
+    locale_path = tmp_path / "locale.json"
+    locale_path.write_text(json.dumps({"bogus": 1}), encoding="utf-8")
+    task = {"task_id": "x", "worker_dir": str(tmp_path), "instruction": "x"}
+    panes = [
+        {"id": 1, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": 2, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path = tmp_path / "t.json"
+    panes_path = tmp_path / "p.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        main([
+            "delegate-plan",
+            "--task-json", str(task_path),
+            "--panes-json", str(panes_path),
+            "--state-dir", str(tmp_path / ".state"),
+            "--locale-json", str(locale_path),
+        ])
+
+
+def test_cli_locale_json_rejects_non_string_value(tmp_path: Path) -> None:
+    locale_path = tmp_path / "locale.json"
+    locale_path.write_text(
+        json.dumps({"instruction_template": 123}), encoding="utf-8"
+    )
+    task = {"task_id": "x", "worker_dir": str(tmp_path), "instruction": "x"}
+    panes = [
+        {"id": 1, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": 2, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path = tmp_path / "t.json"
+    panes_path = tmp_path / "p.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+    with pytest.raises(SystemExit) as info:
+        main([
+            "delegate-plan",
+            "--task-json", str(task_path),
+            "--panes-json", str(panes_path),
+            "--state-dir", str(tmp_path / ".state"),
+            "--locale-json", str(locale_path),
+        ])
+    assert "must be a string" in str(info.value)
+    # Crucially, no side-effect files should have been written.
+    assert not (tmp_path / ".state").exists()
+
+
+def test_cli_locale_json_rejects_template_missing_placeholders(
+    tmp_path: Path,
+) -> None:
+    locale_path = tmp_path / "locale.json"
+    locale_path.write_text(
+        json.dumps({"instruction_template": "no placeholders"}),
+        encoding="utf-8",
+    )
+    task = {"task_id": "x", "worker_dir": str(tmp_path), "instruction": "x"}
+    panes = [
+        {"id": 1, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": 2, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path = tmp_path / "t.json"
+    panes_path = tmp_path / "p.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+    with pytest.raises(SystemExit) as info:
+        main([
+            "delegate-plan",
+            "--task-json", str(task_path),
+            "--panes-json", str(panes_path),
+            "--state-dir", str(tmp_path / ".state"),
+            "--locale-json", str(locale_path),
+        ])
+    assert "missing required placeholders" in str(info.value)
+
+
+@pytest.mark.parametrize("template,expected_msg", [
+    # Unknown placeholder
+    ("{task_id} {worker_dir} {instruction} {bogus}", "format() failed"),
+    # Unbalanced trailing brace
+    ("{task_id}{worker_dir}{instruction}{", "format() failed"),
+    # Missing required placeholder (only worker_dir + instruction; no task_id)
+    ("{worker_dir} -- {instruction}", "missing required placeholders"),
+    # Attribute access on a string sentinel: AttributeError surface.
+    ("{task_id.bogus_attr} {worker_dir} {instruction}", "format() failed"),
+    # Item access with a non-int key: TypeError surface.
+    ("{task_id[bogus]} {worker_dir} {instruction}", "format() failed"),
+])
+def test_cli_locale_json_rejects_malformed_template(
+    tmp_path: Path, template: str, expected_msg: str,
+) -> None:
+    locale_path = tmp_path / "locale.json"
+    locale_path.write_text(
+        json.dumps({"instruction_template": template}), encoding="utf-8",
+    )
+    task = {"task_id": "x", "worker_dir": str(tmp_path), "instruction": "x"}
+    panes = [
+        {"id": 1, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": 2, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path = tmp_path / "t.json"
+    panes_path = tmp_path / "p.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+    with pytest.raises(SystemExit) as info:
+        main([
+            "delegate-plan",
+            "--task-json", str(task_path),
+            "--panes-json", str(panes_path),
+            "--state-dir", str(tmp_path / ".state"),
+            "--locale-json", str(locale_path),
+        ])
+    assert expected_msg in str(info.value)
+    # Reject before any worker-state file is written.
+    assert not (tmp_path / ".state").exists()
 
 
 def test_action_plan_dataclass_default() -> None:

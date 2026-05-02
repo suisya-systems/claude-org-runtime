@@ -41,8 +41,42 @@ python -m claude_org_runtime.dispatcher.runner delegate-plan \
 | `--task-stdin` | Read the task JSON from stdin. |
 | `--panes-json PATH` | Path to a JSON file containing renga `list_panes` output (a list of pane dicts, or `{panes: [...]}`). |
 | `--state-dir PATH` | State directory root. Default: `.state`. |
-| `--template-repo PATH` | Repo root that hosts `.claude/skills/org-delegate/references/instruction-template.md`. Default: current working directory. |
+| `--template-repo PATH` | Repo root that hosts `.claude/skills/org-delegate/references/instruction-template.md`. Default: try the runtime package's ancestors first, then walk up from CWD. |
+| `--locale-json PATH` | Override the English defaults for non-English consumers (e.g. claude-org-ja). The JSON file maps to `LocaleConfig` fields: `constraints_default`, `report_target_default`, `claude_md_filename_default`, `instruction_template`. |
 | `--dry-run` | Compute and print the plan without writing the worker seed / outbox files. |
+
+### LocaleConfig
+
+The runtime ships English-only worker instruction copy
+(`LocaleConfig.english()`). Consumers whose workers run in another
+language can override the locale either programmatically:
+
+```python
+from claude_org_runtime.dispatcher import LocaleConfig
+from claude_org_runtime.dispatcher.runner import build_plan
+
+ja = LocaleConfig(
+    constraints_default="(なし)",
+    instruction_template=(
+        "# タスク: {task_id}\n"
+        "作業ディレクトリ: `{worker_dir}`\n\n"
+        "## 指示\n{instruction}\n"
+    ),
+)
+plan = build_plan(task, panes, state_dir, locale=ja)
+```
+
+or from the CLI via `--locale-json`:
+
+```sh
+claude-org-runtime dispatcher delegate-plan \
+    --task-json ... --panes-json ... \
+    --locale-json /path/to/locale.ja.json
+```
+
+`locale.ja.json` is a flat JSON object whose keys match the
+`LocaleConfig` field names; unknown keys are rejected with a clear
+error.
 
 ### Exit codes
 

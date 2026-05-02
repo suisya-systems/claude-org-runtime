@@ -27,10 +27,7 @@ def _run_settings_generate(args: argparse.Namespace) -> int:
 
 
 def _run_migrate_v1_to_v2(args: argparse.Namespace) -> int:
-    forwarded: list[str] = ["--in", args.src, "--out", args.dst]
-    if args.kind is not None:
-        forwarded += ["--kind", args.kind]
-    return migrate_v1_to_v2.main(forwarded)
+    return migrate_v1_to_v2.run(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,12 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
             "to the v2 polymorphic schema."
         ),
     )
-    v1v2_p.add_argument("--in", dest="src", required=True, help="input file")
-    v1v2_p.add_argument("--out", dest="dst", required=True, help="output file")
-    v1v2_p.add_argument(
-        "--kind", choices=("journal", "org_state"), default=None,
-        help="explicit kind; inferred from suffix when omitted",
-    )
+    migrate_v1_to_v2.add_arguments(v1v2_p)
     v1v2_p.set_defaults(func=_run_migrate_v1_to_v2)
 
     return parser

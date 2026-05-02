@@ -44,7 +44,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 # Re-export for documentation / downstream importers (Step B + C symbols).
 from claude_org_runtime import prompts as _prompts  # noqa: F401
@@ -79,13 +79,77 @@ _TEMPLATE_END_MARKER = "<!-- AUTO-EXPAND-TEMPLATE-END -->"
 _REQUIRED_VARS = (
     "task_description", "dir_setup", "branch_strategy", "verification_depth",
 )
-_OPTIONAL_VARS = {
-    "constraints": "(none)",
-    "report_target": "secretary",
-    "claude_md_filename": "CLAUDE.md",
-}
-_ALLOWED_VARS = set(_REQUIRED_VARS) | set(_OPTIONAL_VARS)
+# Optional-var keys understood by the template. The default for each key
+# is supplied by :class:`LocaleConfig` so consumers can override locale-
+# sensitive copy without forking the runner. ``constraints`` is the only
+# entry whose default is locale-sensitive in practice; ``report_target``
+# and ``claude_md_filename`` are structural identifiers shared by every
+# locale, but they live on :class:`LocaleConfig` for symmetry so a
+# consumer can shift them too if the convention is different.
+_OPTIONAL_VAR_KEYS = ("constraints", "report_target", "claude_md_filename")
+_ALLOWED_VARS = set(_REQUIRED_VARS) | set(_OPTIONAL_VAR_KEYS)
 _VERIFICATION_DEPTHS = ("full", "minimal")
+
+
+# ----------------------------------------------------------------------------
+# Locale configuration
+# ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LocaleConfig:
+    """Locale-sensitive copy used when rendering worker instructions.
+
+    The runtime ships an English default (``LocaleConfig.english()``) per
+    the Layer 2 extraction policy. ``claude-org-ja`` -- whose workers run
+    in Japanese -- is expected to construct a Japanese
+    :class:`LocaleConfig` and pass it through ``build_plan`` /
+    ``write_instruction`` from its adoption layer.
+
+    Fields
+    ------
+    constraints_default
+        Filler for ``instruction_vars.constraints`` when the caller omits
+        it. Surfaces in the rendered worker instruction.
+    report_target_default
+        Default value for ``instruction_vars.report_target``.
+    claude_md_filename_default
+        Default value for ``instruction_vars.claude_md_filename``.
+    instruction_template
+        Format string used by :func:`write_instruction` to compose the
+        ``<task_id>-instruction.md`` file body. Receives three named
+        placeholders: ``{task_id}``, ``{worker_dir}``, ``{instruction}``.
+    """
+
+    constraints_default: str = "(none)"
+    report_target_default: str = "secretary"
+    claude_md_filename_default: str = "CLAUDE.md"
+    instruction_template: str = (
+        "# Task: {task_id}\n"
+        "\n"
+        "Worker instruction expanded by the dispatcher runner from a "
+        "secretary delegation.\n"
+        "Working directory: `{worker_dir}`\n"
+        "\n"
+        "## Instruction\n"
+        "{instruction}\n"
+    )
+
+    @classmethod
+    def english(cls) -> "LocaleConfig":
+        """Return the English default (matches the runtime ship config)."""
+        return cls()
+
+    def optional_var_defaults(self) -> dict[str, str]:
+        """Return the ``{key: default}`` map for ``_OPTIONAL_VAR_KEYS``."""
+        return {
+            "constraints": self.constraints_default,
+            "report_target": self.report_target_default,
+            "claude_md_filename": self.claude_md_filename_default,
+        }
+
+
+_DEFAULT_LOCALE = LocaleConfig.english()
 
 
 # ----------------------------------------------------------------------------
@@ -203,25 +267,44 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
 # ----------------------------------------------------------------------------
 
 
-def _default_template_repo() -> Path:
-    """Default template repo root.
+def _candidate_template_repos() -> Iterable[Path]:
+    """Yield template-repo candidates in priority order.
 
-    Prefers the nearest ancestor of the current working directory that
-    contains the auto-expand template; falls back to CWD itself when no
-    such ancestor exists. The original in-tree helper anchored to
-    ``__file__.parent.parent`` because it shipped inside the consumer
-    repo at ``<repo>/tools/dispatcher_runner.py``. After the move into
-    the runtime package that anchor is no longer available, so we walk
-    up from CWD instead -- this matches the canonical Dispatcher
-    invocation pattern (run from the consumer repo root or anywhere
-    inside it) without forcing the caller to set ``--template-repo``
-    explicitly.
+    Priority:
+    1. ``__file__``-relative ancestors (``parents[2..4]``). The original
+       in-tree helper at ``<repo>/tools/dispatcher_runner.py`` anchored
+       to ``__file__.parent.parent``; after the move into the runtime
+       package the equivalent anchor lives a few levels up. In editable
+       dev installs this resolves to the worktree root, which keeps the
+       behaviour close to the in-tree script when the runtime is checked
+       out next to the consumer repo for development.
+    2. ``Path.cwd()`` and every ancestor. This is the production
+       invocation pattern: Dispatcher runs ``python -m
+       claude_org_runtime.dispatcher.runner ...`` from somewhere inside
+       the consumer repo (typically the repo root), so walking up from
+       CWD finds the template without requiring ``--template-repo``.
     """
+    here = Path(__file__).resolve()
+    for n in (2, 3, 4):
+        if n < len(here.parents):
+            yield here.parents[n]
     cwd = Path.cwd()
-    for candidate in (cwd, *cwd.parents):
+    yield cwd
+    yield from cwd.parents
+
+
+def _default_template_repo() -> Path:
+    """Pick the first :func:`_candidate_template_repos` that has the template.
+
+    Falls back to CWD when no candidate contains the template; callers
+    of :func:`load_instruction_template` then surface a clear
+    ``ValueError`` with the ``--template-repo`` hint instead of a
+    cryptic ``FileNotFoundError``.
+    """
+    for candidate in _candidate_template_repos():
         if (candidate / INSTRUCTION_TEMPLATE_PATH).is_file():
             return candidate
-    return cwd
+    return Path.cwd()
 
 
 def load_instruction_template(repo_root: Optional[Path] = None) -> str:
@@ -255,8 +338,13 @@ def load_instruction_template(repo_root: Optional[Path] = None) -> str:
 
 def validate_instruction_vars(
     raw: Any,
+    locale: Optional[LocaleConfig] = None,
 ) -> tuple[Optional[dict[str, str]], Optional[str]]:
-    """Normalize and validate ``instruction_vars``. Returns (vars, error)."""
+    """Normalize and validate ``instruction_vars``. Returns (vars, error).
+
+    ``locale`` overrides the optional-var defaults (notably
+    ``constraints``); ``None`` keeps the runtime's English defaults.
+    """
     if not isinstance(raw, dict):
         return None, "instruction_vars must be a JSON object"
     norm: dict[str, str] = {}
@@ -286,7 +374,8 @@ def validate_instruction_vars(
         )
     norm["verification_depth"] = depth
 
-    for k, default in _OPTIONAL_VARS.items():
+    locale = locale or _DEFAULT_LOCALE
+    for k, default in locale.optional_var_defaults().items():
         if not norm.get(k, "").strip():
             norm[k] = default
     return norm, None
@@ -350,6 +439,7 @@ def build_plan(
     panes: list[Pane],
     state_dir: Path,
     template_repo: Optional[Path] = None,
+    locale: Optional[LocaleConfig] = None,
 ) -> ActionPlan:
     task_id = task.get("task_id", "")
     plan = ActionPlan(status="ready_to_spawn", task_id=task_id)
@@ -363,7 +453,9 @@ def build_plan(
     has_explicit = bool(str(task.get("instruction") or "").strip())
     has_vars = "instruction_vars" in task
     if not has_explicit and has_vars:
-        norm_vars, vars_err = validate_instruction_vars(task["instruction_vars"])
+        norm_vars, vars_err = validate_instruction_vars(
+            task["instruction_vars"], locale=locale,
+        )
         if vars_err:
             plan.status = "input_invalid"
             plan.errors.append(vars_err)
@@ -517,6 +609,7 @@ def write_worker_seed(
 
 def write_instruction(
     state_dir: Path, task: dict[str, Any], task_id: str,
+    locale: Optional[LocaleConfig] = None,
 ) -> Path:
     target = state_dir / "dispatcher" / "outbox" / f"{task_id}-instruction.md"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -528,15 +621,11 @@ def write_instruction(
             or ""
         )
     )
-    body = (
-        f"# Task: {task_id}\n"
-        "\n"
-        "Worker instruction expanded by the dispatcher runner from a "
-        "secretary delegation.\n"
-        f"Working directory: `{task.get('worker_dir') or task.get('cwd')}`\n"
-        "\n"
-        "## Instruction\n"
-        f"{instruction}\n"
+    locale = locale or _DEFAULT_LOCALE
+    body = locale.instruction_template.format(
+        task_id=task_id,
+        worker_dir=task.get("worker_dir") or task.get("cwd") or "",
+        instruction=instruction,
     )
     target.write_text(body, encoding="utf-8")
     return target
@@ -565,6 +654,70 @@ def _parse_panes(panes_data: Any) -> list[Pane]:
     return [Pane.from_dict(d) for d in panes_list]
 
 
+def _load_locale(path: Optional[str]) -> Optional[LocaleConfig]:
+    if not path:
+        return None
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f"--locale-json {path!r} must be a JSON object whose keys "
+            "match LocaleConfig field names"
+        )
+    allowed = {
+        "constraints_default",
+        "report_target_default",
+        "claude_md_filename_default",
+        "instruction_template",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise SystemExit(
+            f"--locale-json contains unknown LocaleConfig fields: {unknown}; "
+            f"allowed: {sorted(allowed)}"
+        )
+    # All LocaleConfig fields are strings. Reject non-string values up front
+    # so a typo like `{"instruction_template": 123}` becomes a clean input
+    # error instead of a partial-write crash later when ``str.format`` is
+    # called on the bad value.
+    for k, v in raw.items():
+        if not isinstance(v, str):
+            raise SystemExit(
+                f"--locale-json field {k!r} must be a string, got "
+                f"{type(v).__name__}"
+            )
+    if "instruction_template" in raw:
+        tmpl = raw["instruction_template"]
+        # Dry-run the format with sentinel values to surface any defect
+        # (unbalanced braces, unknown placeholders, etc.) here, before
+        # any worker-state files get written. Sentinel values let us
+        # also confirm every required placeholder is referenced.
+        sentinels = {
+            "task_id": "\x00TID\x00",
+            "worker_dir": "\x00WD\x00",
+            "instruction": "\x00INS\x00",
+        }
+        try:
+            rendered = tmpl.format(**sentinels)
+        except (
+            KeyError, IndexError, ValueError, AttributeError, TypeError,
+        ) as exc:
+            raise SystemExit(
+                f"--locale-json instruction_template is invalid "
+                f"(format() failed: {exc}); the template must use only "
+                f"{sorted(sentinels)} placeholders and well-formed braces"
+            ) from None
+        missing_ph = [
+            f"{{{k}}}" for k, v in sentinels.items() if v not in rendered
+        ]
+        if missing_ph:
+            raise SystemExit(
+                f"--locale-json instruction_template is missing required "
+                f"placeholders: {missing_ph}; the template must reference "
+                f"{[f'{{{k}}}' for k in sentinels]}"
+            )
+    return LocaleConfig(**raw)
+
+
 def cmd_delegate_plan(args: argparse.Namespace) -> int:
     task = _load_json(args.task_json, stdin=args.task_stdin)
     if not isinstance(task, dict):
@@ -578,12 +731,16 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
     template_repo = (
         Path(args.template_repo).resolve() if args.template_repo else None
     )
+    locale = _load_locale(args.locale_json)
 
-    plan = build_plan(task, panes, state_dir, template_repo=template_repo)
+    plan = build_plan(
+        task, panes, state_dir,
+        template_repo=template_repo, locale=locale,
+    )
 
     if plan.status == "ready_to_spawn" and not args.dry_run:
         write_worker_seed(state_dir, task, plan.task_id, plan.spawn or {})
-        write_instruction(state_dir, task, plan.task_id)
+        write_instruction(state_dir, task, plan.task_id, locale=locale)
 
     json.dump(dataclasses.asdict(plan), sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -635,9 +792,22 @@ def add_subparsers(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -
     )
     dp.add_argument(
         "--template-repo", default=None,
-        help=("repo root that hosts "
-              ".claude/skills/org-delegate/references/instruction-template.md "
-              "(default: current working directory)"),
+        help=(
+            "repo root that hosts "
+            ".claude/skills/org-delegate/references/instruction-template.md "
+            "(default: tries runtime package ancestors first, then walks "
+            "up from the current working directory)"
+        ),
+    )
+    dp.add_argument(
+        "--locale-json", default=None,
+        help=(
+            "JSON file with LocaleConfig fields "
+            "(constraints_default / report_target_default / "
+            "claude_md_filename_default / instruction_template); used to "
+            "override the runtime's English defaults for non-English "
+            "consumers (e.g. claude-org-ja)"
+        ),
     )
     dp.add_argument(
         "--dry-run", action="store_true",

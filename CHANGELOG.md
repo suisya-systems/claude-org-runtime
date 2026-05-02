@@ -20,12 +20,18 @@ behavioural regression.
 
 - `claude_org_runtime.dispatcher.runner` (Step D-1): port of
   `tools/dispatcher_runner.py`. Public API: `Pane`, `SplitChoice`,
-  `ActionPlan`, `choose_split`, `build_plan`, `validate_task_id`,
-  `validate_cwd`, `validate_instruction_vars`, `render_instruction`.
-  CLI: `python -m claude_org_runtime.dispatcher.runner delegate-plan`.
-  New `--template-repo` flag lets callers point the helper at the repo
-  hosting `.claude/skills/org-delegate/references/instruction-template.md`
-  (default: CWD).
+  `ActionPlan`, `LocaleConfig`, `choose_split`, `build_plan`,
+  `validate_task_id`, `validate_cwd`, `validate_instruction_vars`,
+  `render_instruction`, `write_instruction`. CLI: `python -m
+  claude_org_runtime.dispatcher.runner delegate-plan`. New
+  `--template-repo` flag lets callers point the helper at the repo
+  hosting `.claude/skills/org-delegate/references/instruction-template.md`;
+  default resolution tries the runtime package's ancestors first, then
+  walks up from CWD. New `--locale-json PATH` flag lets non-English
+  consumers (notably `claude-org-ja`) override the runtime's English
+  defaults via a `LocaleConfig` JSON file (`constraints_default`,
+  `report_target_default`, `claude_md_filename_default`,
+  `instruction_template`).
 - `claude_org_runtime.settings.generator` (Step D-1): port of
   `tools/generate_worker_settings.py`. Public API: `load_schema`,
   `render_role`. CLI:
