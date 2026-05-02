@@ -1,0 +1,448 @@
+{
+  "$comment": "Source of truth for per-role settings.local.json shape. Both tools/check_role_configs.py and docs/skills/org-setup/references/permissions.md project from this schema. See Issue #85.",
+  "version": 1,
+  "global": {
+    "forbidden_allow_exact": [
+      "Bash(git *)",
+      "Bash(git push *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)",
+      "Bash(gh:*)",
+      "Bash(gh *)"
+    ],
+    "forbidden_allow_regex": [
+      "^mcp__claude-peers__"
+    ]
+  },
+  "required_hook_scripts": [
+    "block-no-verify.sh",
+    "block-dangerous-git.sh",
+    "block-git-push.sh",
+    "block-workers-delete.sh",
+    "block-org-structure.sh",
+    "check-worker-boundary.sh",
+    "block-dispatcher-out-of-scope.sh"
+  ],
+  "roles": {
+    "repo_shared": {
+      "description": "Repo-shared settings (.claude/settings.json) — tracked in git; hosts repo-wide safety hooks (block-no-verify, block-dangerous-git).",
+      "docs_section": null,
+      "settings_paths": [".claude/settings.json"],
+      "closed_world": false,
+      "required_allow": [],
+      "allowed_allow_regex": [],
+      "required_deny": [],
+      "required_hooks": [
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-no-verify.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-dangerous-git.sh"
+        }
+      ],
+      "disallow_allow_regex": []
+    },
+    "user_common": {
+      "description": "User-level (~/.claude/settings.json) — shared across all roles.",
+      "docs_section": "ユーザー共通",
+      "settings_paths": [],
+      "closed_world": true,
+      "required_allow": [
+        "Bash(renga --version)",
+        "Bash(renga --help)",
+        "Bash(renga --layout:*)",
+        "Bash(renga mcp install:*)",
+        "Bash(renga mcp uninstall:*)",
+        "Bash(renga mcp status:*)",
+        "Bash(renga mcp --help)",
+        "mcp__renga-peers__set_summary",
+        "mcp__renga-peers__list_peers",
+        "mcp__renga-peers__send_message",
+        "mcp__renga-peers__check_messages",
+        "mcp__renga-peers__list_panes",
+        "mcp__renga-peers__spawn_pane",
+        "mcp__renga-peers__close_pane",
+        "mcp__renga-peers__focus_pane",
+        "mcp__renga-peers__new_tab",
+        "mcp__renga-peers__inspect_pane",
+        "mcp__renga-peers__poll_events",
+        "mcp__renga-peers__send_keys",
+        "mcp__renga-peers__spawn_claude_pane",
+        "mcp__renga-peers__set_pane_identity"
+      ],
+      "allowed_allow_regex": [],
+      "required_deny": [],
+      "required_hooks": [],
+      "disallow_allow_regex": []
+    },
+    "secretary": {
+      "description": "Secretary (窓口) — repo .claude/settings.local.json.",
+      "docs_section": "窓口",
+      "settings_paths": [".claude/settings.local.json"],
+      "closed_world": true,
+      "required_allow": [
+        "mcp__renga-peers__set_summary",
+        "mcp__renga-peers__list_peers",
+        "mcp__renga-peers__send_message",
+        "mcp__renga-peers__check_messages",
+        "mcp__renga-peers__list_panes",
+        "mcp__renga-peers__spawn_pane",
+        "mcp__renga-peers__spawn_claude_pane",
+        "mcp__renga-peers__close_pane",
+        "mcp__renga-peers__inspect_pane",
+        "mcp__renga-peers__poll_events",
+        "mcp__renga-peers__send_keys",
+        "mcp__renga-peers__set_pane_identity",
+        "Bash(git add:*)",
+        "Bash(git commit:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git log:*)",
+        "Bash(git branch:*)",
+        "Bash(git checkout:*)",
+        "Bash(git switch:*)",
+        "Bash(git push:*)",
+        "Bash(git worktree:*)",
+        "Bash(git fetch:*)",
+        "Bash(git pull:*)",
+        "Bash(git stash:*)",
+        "Bash(git -C ../workers/claude-org status)",
+        "Bash(git -C ../workers/claude-org remote -v)",
+        "Bash(gh issue:*)",
+        "Bash(gh pr:*)",
+        "Bash(gh label:*)",
+        "Bash(gh api:*)",
+        "Bash(gh gist:*)",
+        "Bash(gh run:*)",
+        "Bash(gh auth status)",
+        "Bash(gh auth login:*)",
+        "Bash(python:*)",
+        "Bash(python3:*)",
+        "Bash(py -3 dashboard/:*)",
+        "Bash(py -3 tools/:*)",
+        "Bash(py dashboard/:*)",
+        "Bash(renga --version)",
+        "Bash(renga --help)",
+        "Bash(renga --layout:*)",
+        "Bash(renga mcp install:*)",
+        "Bash(renga mcp uninstall:*)",
+        "Bash(renga mcp status:*)",
+        "Bash(renga mcp --help)",
+        "Bash(sleep:*)",
+        "Bash(codex exec:*)",
+        "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8099/:*)",
+        "Bash(curl -s http://localhost:8099/ -o /dev/null -w \"%{http_code}\\\\n\")",
+        "PowerShell(Out-File *)"
+      ],
+      "allowed_allow_regex": [],
+      "required_deny": [
+        "Write(*/workers/*/.claude/settings.local.json)",
+        "Edit(*/workers/*/.claude/settings.local.json)",
+        "Write(*/workers/*/.worktrees/*/.claude/settings.local.json)",
+        "Edit(*/workers/*/.worktrees/*/.claude/settings.local.json)"
+      ],
+      "required_hooks": [
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-workers-delete.sh"
+        }
+      ],
+      "disallow_allow_regex": [
+        "^Bash\\(\\*\\)$",
+        "^Bash$"
+      ]
+    },
+    "dispatcher": {
+      "description": "Dispatcher — .dispatcher/.claude/settings.local.json. Runs in bypassPermissions mode (Sonnet constraint), so permissions.allow / deny are no-ops; PreToolUse hooks are the only enforcement layer.",
+      "docs_section": "ディスパッチャー",
+      "settings_paths": [".dispatcher/.claude/settings.local.json"],
+      "closed_world": true,
+      "required_allow": [
+        "Bash(claude :*)",
+        "Bash(sleep:*)"
+      ],
+      "allowed_allow_regex": [],
+      "required_deny": [],
+      "required_hooks": [
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Edit|Write",
+          "command_contains": "block-dispatcher-out-of-scope.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-git-push.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-dangerous-git.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-workers-delete.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-no-verify.sh"
+        }
+      ],
+      "disallow_allow_regex": [
+        "^Bash\\(\\*\\)$",
+        "^Bash$",
+        "^Bash\\(git \\*\\)$"
+      ]
+    },
+    "curator": {
+      "description": "Curator — .curator/.claude/settings.local.json (narrow / empty by design).",
+      "docs_section": "キュレーター",
+      "settings_paths": [".curator/.claude/settings.local.json"],
+      "closed_world": true,
+      "required_allow": [],
+      "allowed_allow_regex": [],
+      "required_deny": [],
+      "required_hooks": [],
+      "disallow_allow_regex": [
+        "^Bash\\(\\*\\)$",
+        "^Bash$",
+        "^Bash\\(git .*\\)$",
+        "^Bash\\(git:\\*\\)$"
+      ]
+    },
+    "worker": {
+      "description": "Worker (dynamic template, audit constraints) — <worker_dir>/.claude/settings.local.json. See also top-level worker_roles section for the concrete templates that generate_worker_settings.py emits.",
+      "docs_section": "ワーカー",
+      "settings_paths": [],
+      "closed_world": true,
+      "required_allow": [
+        "Bash(git add:*)",
+        "Bash(git commit:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git log:*)",
+        "Bash(git branch:*)",
+        "Bash(git checkout:*)",
+        "Bash(git switch:*)",
+        "Bash(git worktree:*)",
+        "Bash(git stash:*)",
+        "Bash(sleep:*)"
+      ],
+      "allowed_allow_regex": [],
+      "required_deny": [
+        "Bash(git push *)",
+        "Bash(git push)",
+        "Bash(rm -rf *)",
+        "Bash(rm -r *)"
+      ],
+      "required_hooks": [
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Edit",
+          "command_contains": "check-worker-boundary.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Edit",
+          "command_contains": "block-org-structure.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-git-push.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "Bash",
+          "command_contains": "block-org-structure.sh"
+        }
+      ],
+      "disallow_allow_regex": [
+        "^Bash\\(\\*\\)$",
+        "^Bash$",
+        "^Bash\\(git push.*\\)$"
+      ]
+    }
+  },
+  "worker_roles": {
+    "$comment": "Concrete templates emitted by tools/generate_worker_settings.py. Each entry shapes a worker's <worker_dir>/.claude/settings.local.json. Placeholders {worker_dir} and {claude_org_path} are substituted at generation time. The audit constraints in roles.worker still apply — drift tooling validates emitted files against them.",
+    "default": {
+      "description": "Standard worker template — git read/write within the worktree, no push, no recursive delete. Mirrors the historical org-delegate Step 3 inline JSON.",
+      "permissions": {
+        "allow": [
+          "Bash(git add:*)",
+          "Bash(git commit:*)",
+          "Bash(git status:*)",
+          "Bash(git diff:*)",
+          "Bash(git log:*)",
+          "Bash(git branch:*)",
+          "Bash(git checkout:*)",
+          "Bash(git switch:*)",
+          "Bash(git worktree:*)",
+          "Bash(git stash:*)",
+          "Bash(sleep:*)"
+        ],
+        "deny": [
+          "Bash(git push *)",
+          "Bash(git push)",
+          "Bash(rm -rf *)",
+          "Bash(rm -r *)"
+        ]
+      },
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Edit|Write",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/check-worker-boundary.sh\""
+              },
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-git-push.sh\""
+              },
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          }
+        ]
+      },
+      "env": {
+        "WORKER_DIR": "{worker_dir}",
+        "CLAUDE_ORG_PATH": "{claude_org_path}"
+      }
+    },
+    "claude-org-self-edit": {
+      "description": "Worker that edits the claude-org repo itself (e.g. tools/, .claude/skills/). Drops block-org-structure.sh hooks because by definition this role must touch org structure paths. check-worker-boundary.sh remains the boundary check.",
+      "permissions": {
+        "allow": [
+          "Bash(git add:*)",
+          "Bash(git commit:*)",
+          "Bash(git status:*)",
+          "Bash(git diff:*)",
+          "Bash(git log:*)",
+          "Bash(git branch:*)",
+          "Bash(git checkout:*)",
+          "Bash(git switch:*)",
+          "Bash(git worktree:*)",
+          "Bash(git stash:*)",
+          "Bash(sleep:*)"
+        ],
+        "deny": [
+          "Bash(git push *)",
+          "Bash(git push)",
+          "Bash(rm -rf *)",
+          "Bash(rm -r *)"
+        ]
+      },
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Edit|Write",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/check-worker-boundary.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-git-push.sh\""
+              }
+            ]
+          }
+        ]
+      },
+      "env": {
+        "WORKER_DIR": "{worker_dir}",
+        "CLAUDE_ORG_PATH": "{claude_org_path}"
+      }
+    },
+    "doc-audit": {
+      "description": "Read-only investigation worker — no Write/Edit allow, no commit/branch mutation. Suitable for survey / audit / reporting tasks where the worker should not modify the worktree.",
+      "permissions": {
+        "allow": [
+          "Bash(git status:*)",
+          "Bash(git diff:*)",
+          "Bash(git log:*)",
+          "Bash(sleep:*)"
+        ],
+        "deny": [
+          "Bash(git push *)",
+          "Bash(git push)",
+          "Bash(git commit *)",
+          "Bash(git commit)",
+          "Bash(git branch *)",
+          "Bash(git branch)",
+          "Bash(git checkout *)",
+          "Bash(git switch *)",
+          "Bash(rm -rf *)",
+          "Bash(rm -r *)",
+          "Edit",
+          "Write",
+          "MultiEdit",
+          "NotebookEdit"
+        ]
+      },
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Edit|Write",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/check-worker-boundary.sh\""
+              },
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "Bash",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-git-push.sh\""
+              },
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          }
+        ]
+      },
+      "env": {
+        "WORKER_DIR": "{worker_dir}",
+        "CLAUDE_ORG_PATH": "{claude_org_path}"
+      }
+    }
+  }
+}

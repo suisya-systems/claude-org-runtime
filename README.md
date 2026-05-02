@@ -11,16 +11,19 @@ orchestrator workflows, not an autonomous-agent toolkit.
 
 ## Status
 
-Pre-0.1.0: schema + migrate. The `0.0.1` release established the repository
-structure, packaging metadata, and CI scaffolding. The current `Unreleased`
-work adds the `.state/` schema (Python Enums + Draft 2020-12 JSON Schema)
-and the `v1->v2` polymorphic migrate (`python -m
-claude_org_runtime.migrate.v1_to_v2`). The dispatcher and prompt-template
-bundle land in subsequent releases.
+**0.1.0**: dispatcher runner + settings generator + reference role
+prompts + state schema + `v1->v2` polymorphic migrate. This is the first
+release that consumers (notably `claude-org-ja`) can `pip install` to
+replace their in-tree `tools/dispatcher_runner.py` /
+`tools/generate_worker_settings.py` / `tools/role_configs_schema.json`.
 
 ## Install
 
-Not yet on PyPI. To experiment locally:
+```sh
+pip install claude-org-runtime==0.1.0
+```
+
+For local development:
 
 ```sh
 git clone https://github.com/suisya-systems/claude-org-runtime
@@ -28,9 +31,25 @@ cd claude-org-runtime
 python -m pip install -e .[dev]
 ```
 
-PyPI publish (under the `claude-org-runtime` name) is **deferred until the
-repo gating signal**; the first publish will go through the Trusted Publisher
-workflow already wired up in `.github/workflows/release.yml`.
+## Quick start
+
+```sh
+# Render a per-role settings.local.json:
+claude-org-runtime settings generate \
+    --role default \
+    --worker-dir /path/to/worker \
+    --claude-org-path /path/to/claude-org \
+    --out /path/to/worker/.claude/settings.local.json
+
+# Compute a Dispatcher delegation action plan:
+claude-org-runtime dispatcher delegate-plan \
+    --task-json .state/dispatcher/inbox/<task_id>.json \
+    --panes-json panes.json \
+    --state-dir .state
+```
+
+See [`docs/cli.md`](docs/cli.md) for the full CLI reference and the
+migration recipe for `claude-org-ja` consumers.
 
 ## Reference role prompts
 

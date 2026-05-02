@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-02
+
+First release with a public CLI surface. Marks the completion of
+Phase 4's Layer 2 extraction from `claude-org-ja` (refs
+`claude-org-ja#129`): the in-tree `tools/dispatcher_runner.py`,
+`tools/generate_worker_settings.py`, and `tools/role_configs_schema.json`
+can now be replaced by `pip install claude-org-runtime` without
+behavioural regression.
+
 ### Added
 
+- `claude_org_runtime.dispatcher.runner` (Step D-1): port of
+  `tools/dispatcher_runner.py`. Public API: `Pane`, `SplitChoice`,
+  `ActionPlan`, `choose_split`, `build_plan`, `validate_task_id`,
+  `validate_cwd`, `validate_instruction_vars`, `render_instruction`.
+  CLI: `python -m claude_org_runtime.dispatcher.runner delegate-plan`.
+  New `--template-repo` flag lets callers point the helper at the repo
+  hosting `.claude/skills/org-delegate/references/instruction-template.md`
+  (default: CWD).
+- `claude_org_runtime.settings.generator` (Step D-1): port of
+  `tools/generate_worker_settings.py`. Public API: `load_schema`,
+  `render_role`. CLI:
+  `python -m claude_org_runtime.settings.generator`. The bundled
+  schema is the new SoT.
+- `claude_org_runtime.settings.role_configs_schema.json` (Step D-1):
+  bundled copy of `tools/role_configs_schema.json` (SoT moved into the
+  runtime package).
+- `claude-org-runtime` console entry point with `dispatcher` /
+  `settings` subcommand groups (e.g.
+  `claude-org-runtime dispatcher delegate-plan ...`).
+- `docs/cli.md`: CLI usage reference and migration recipe for
+  `claude-org-ja` consumers replacing the in-tree `tools/` scripts.
 - `claude_org_runtime.prompts` package: bundled English reference prompts
   for the `secretary`, `dispatcher`, and `curator` roles, plus
   `load(role)` / `load_meta(role)` / `available_roles()` (stdlib-only
@@ -42,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Added `jsonschema>=4.18` as a runtime dependency (sole non-stdlib dep).
+- Bumped package classifier from `Development Status :: 1 - Planning` to
+  `Development Status :: 4 - Beta`.
 
 ## [0.0.1] - 2026-05-02
 
