@@ -1,0 +1,8 @@
+{"ts":"2026-04-19T21:00:30Z","event":"worker_spawned","worker":"sample-worker-001","dir":"C:/tmp/wt/sample","task":"demo-task"}
+{"ts":"2026-04-22T00:00:00Z","event":"worker_spawned","task_id":"demo-task","pane_id":5,"pane_name":"worker-demo"}
+{"ts":"2026-04-22T00:10:00Z","event":"pane_closed","worker":"sample-worker-001","pane":5,"note":"normal exit"}
+{"ts":"2026-04-22T00:11:00Z","event":"pane_closed","task_id":"demo-task","pane":"worker-demo","note":"named pane"}
+{"ts":"2026-04-22T00:15:00Z","event":"suspend","reason":"user_requested","active_workers":[],"pending_items":[]}
+{"ts":"2026-04-22T00:20:00Z","event":"phase_d_force_push","note":"one-off catch-all"}
+{"ts":"2026-04-22T00:21:00Z","event":"totally_unseen_event_xyz","note":"forces misc fallback"}
+{"ts":"2026-04-22T00:25:00Z","event":"notify_sent","source":"dispatcher","worker":"sample-worker-001","kind":"pane_silent","confidence":0.9}

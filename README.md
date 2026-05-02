@@ -11,10 +11,12 @@ orchestrator workflows, not an autonomous-agent toolkit.
 
 ## Status
 
-Pre-0.1.0 skeleton. There is **no public API yet**: this `0.0.1` release
-establishes the repository structure, packaging metadata, and CI scaffolding.
-The dispatcher, state schema, and prompt-template bundle land in subsequent
-releases.
+Pre-0.1.0: schema + migrate. The `0.0.1` release established the repository
+structure, packaging metadata, and CI scaffolding. The current `Unreleased`
+work adds the `.state/` schema (Python Enums + Draft 2020-12 JSON Schema)
+and the `v1->v2` polymorphic migrate (`python -m
+claude_org_runtime.migrate.v1_to_v2`). The dispatcher and prompt-template
+bundle land in subsequent releases.
 
 ## Install
 
