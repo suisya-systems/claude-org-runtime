@@ -1,0 +1,33 @@
+[project]
+name = "claude-org-runtime"
+dynamic = ["version"]
+description = "Python runtime for claude-org-ja: dispatcher, state schema, and reference role prompts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "suisya-systems", email = "iwama.ryo.0731@gmail.com" }]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/suisya-systems/claude-org-runtime"
+Issues = "https://github.com/suisya-systems/claude-org-runtime/issues"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "claude_org_runtime.__about__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
