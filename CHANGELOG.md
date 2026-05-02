@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-03
+
+### Changed
+
+- Maintenance release: trigger first PyPI publish via Trusted Publisher
+  (registered post-0.1.0). No code changes from 0.1.0.
+
 ## [0.1.0] - 2026-05-02
 
 First release with a public CLI surface. Marks the completion of
