@@ -1,0 +1,5 @@
+{"event": "task_created", "note": "kickoff", "pane_id": "pane-1", "pane_name": "worker-a", "status": "ACTIVE", "task_id": "T-001", "ts": "2026-05-02T09:00:00Z"}
+{"event": "worker_note", "note": "see https://example.com/REDACTED ping redacted@example.com", "pane_id": "pane-1", "pane_name": "worker-a", "task_id": "T-001", "ts": "2026-05-02T09:05:00Z"}
+{"event": "worker_note", "note": "[NOTE REDACTED]", "pane_id": "pane-1", "pane_name": "worker-a", "task_id": "T-001", "ts": "2026-05-02T09:10:00Z"}
+{"event": "secret_leak_attempt", "note": "leaked [REDACTED_KEY]", "pane_id": "pane-1", "pane_name": "worker-a", "task_id": "T-001", "ts": "2026-05-02T09:15:00Z"}
+{"event": "task_completed", "note": "done", "pane_id": "pane-1", "pane_name": "worker-a", "status": "COMPLETED", "task_id": "T-001", "ts": "2026-05-02T09:20:00Z"}
