@@ -37,3 +37,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "claude_org_runtime.schema.json_schema" = ["*.json"]
+"claude_org_runtime.prompts.templates" = ["*.md"]
