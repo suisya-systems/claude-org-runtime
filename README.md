@@ -32,6 +32,26 @@ PyPI publish (under the `claude-org-runtime` name) is **deferred until the
 repo gating signal**; the first publish will go through the Trusted Publisher
 workflow already wired up in `.github/workflows/release.yml`.
 
+## Reference role prompts
+
+The runtime ships English reference prompts for the three roles used in
+the `claude-org-ja` reference organization (`secretary`, `dispatcher`,
+`curator`):
+
+```python
+from claude_org_runtime.prompts import load, load_meta
+
+prompt = load("dispatcher")          # raw markdown, frontmatter included
+meta = load_meta("dispatcher")       # {'role': 'dispatcher', 'source': ..., 'status': ...}
+```
+
+These are **reference**, not prescriptive. They capture one working
+configuration from `claude-org-ja`, not an "agent framework" opinion.
+Consumers are expected to load them as a starting point and then override
+or rewrite sections from their own project-root `CLAUDE.md` (or skill
+files) to match their organization's conventions, terminology, and slash
+commands.
+
 ## Related
 
 - [core-harness](https://github.com/suisya-systems/core-harness) — sibling

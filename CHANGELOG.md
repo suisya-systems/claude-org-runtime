@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `claude_org_runtime.prompts` package: bundled English reference prompts
+  for the `secretary`, `dispatcher`, and `curator` roles, plus
+  `load(role)` / `load_meta(role)` / `available_roles()` (stdlib-only
+  frontmatter parser). The templates are reference, not prescriptive —
+  consumers override or adapt them from their own `CLAUDE.md`. Refs
+  `claude-org-ja#129`.
 - `tests/scrub/scrub_fixture.py`: deterministic scrubber for `.state/`
   snapshots (URLs, emails, API keys, session-narrative H2 blocks,
   long worker `note` fields). Preserves structural identifiers
