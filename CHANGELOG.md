@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/fixtures/synthetic/{scrub_input_sample,expected_output}.jsonl`:
   synthetic round-trip fixture exercising every scrubber class.
 - Refs `claude-org-ja#208`.
+- `claude_org_runtime.schema` package: `WorkerStatus`, `JournalEventType`,
+  `AnomalyKind` (string-mixin Enums), frozen `JournalEvent` dataclass with
+  `from_dict`/`to_dict` and an `extra` forward-compatibility bucket, and a
+  `parse_worker_directory_registry` parser for `org-state.md` rows.
+- Bundled JSON Schema (Draft 2020-12) files for `JournalEvent` and
+  `WorkerDirEntry` under `claude_org_runtime.schema.json_schema`.
+- `claude_org_runtime.migrate.v1_to_v2` polymorphic migrate (CLI:
+  `python -m claude_org_runtime.migrate.v1_to_v2 --in IN --out OUT`):
+  legacy keys (`worker`, `pane`, `dir`) are kept alongside canonical keys
+  (`task_id`, `pane_id`/`pane_name`, `worker_dir`); unknown event names
+  fall back to `event=misc` with `original_event` preserved.
+- Synthetic fixtures and tests covering schema validation and the v1->v2
+  migrate round-trip.
+- Refs `claude-org-ja#129`.
+
+### Changed
+
+- Added `jsonschema>=4.18` as a runtime dependency (sole non-stdlib dep).
 
 ## [0.0.1] - 2026-05-02
 

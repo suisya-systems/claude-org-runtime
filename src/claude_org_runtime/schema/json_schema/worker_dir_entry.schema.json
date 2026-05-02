@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/suisya-systems/claude-org-runtime/schema/worker_dir_entry.schema.json",
+  "title": "WorkerDirEntry",
+  "description": "One row of the org-state.md Worker Directory Registry. Polymorphic posture: legacy keys worker/pane/dir kept alongside canonical task_id/pane_id/pane_name/worker_dir during the v1->v2 transition.",
+  "type": "object",
+  "properties": {
+    "task_id": { "type": ["string", "null"] },
+    "pane_id": { "type": ["integer", "null"] },
+    "pane_name": { "type": ["string", "null"] },
+    "worker_dir": { "type": ["string", "null"] },
+    "status": {
+      "type": ["string", "null"],
+      "enum": [
+        "in_use",
+        "available",
+        "completed",
+        "suspended",
+        "merged",
+        "review",
+        "blocked",
+        null
+      ]
+    },
+    "note": { "type": ["string", "null"] },
+    "worker": {
+      "type": ["string", "null"],
+      "description": "Legacy alias for task_id; preserved under polymorphic posture."
+    },
+    "pane": {
+      "type": ["string", "null"],
+      "description": "Legacy alias absorbed into pane_id (numeric) or pane_name (text)."
+    },
+    "dir": {
+      "type": ["string", "null"],
+      "description": "Legacy alias for worker_dir; preserved under polymorphic posture."
+    }
+  },
+  "anyOf": [
+    { "required": ["task_id"] },
+    { "required": ["worker"] }
+  ],
+  "additionalProperties": true
+}

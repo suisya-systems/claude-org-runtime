@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/suisya-systems/claude-org-runtime/schema/journal_event.schema.json",
+  "title": "JournalEvent",
+  "description": "One line of .state/journal.jsonl. Required: ts (ISO8601) + event. Polymorphic identifiers: legacy keys worker/pane/dir kept alongside canonical task_id/pane_id/pane_name/worker_dir for the v1->v2 transition.",
+  "type": "object",
+  "required": ["ts", "event"],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "description": "ISO 8601 timestamp; not strictly format-validated to keep legacy events accepted."
+    },
+    "event": {
+      "type": "string",
+      "enum": [
+        "worker_spawned",
+        "pane_closed",
+        "worker_closed",
+        "suspend",
+        "notify_sent",
+        "worker_pane_closed",
+        "worker_completed",
+        "anomaly_observed",
+        "foreman_shutdown",
+        "approval_applied",
+        "pr_merged",
+        "worker_review",
+        "delegate_sent",
+        "plan_approved",
+        "task_completed",
+        "resume",
+        "issue_closed",
+        "pr_opened",
+        "issue_filed",
+        "issues_filed",
+        "worker_report_forwarded",
+        "worktree_removed",
+        "pre_history_reset_snapshot",
+        "design_approved",
+        "prs_opened",
+        "prs_merged",
+        "delegate_resume",
+        "plan_delivered",
+        "prs_pushed",
+        "delegate_resume_r2",
+        "plan_approved_and_prep_dispatched",
+        "fix_pushed",
+        "prep_delivered",
+        "worker_reported",
+        "issues_swept",
+        "drift_reaudit",
+        "phase_d_snapshot",
+        "phase_d_force_push",
+        "phase_d_complete",
+        "misc"
+      ]
+    },
+    "original_event": {
+      "type": "string",
+      "description": "Original event string preserved when event=misc (catch-all migration)."
+    },
+    "task_id": { "type": ["string", "null"] },
+    "pane_id": { "type": ["integer", "null"] },
+    "pane_name": { "type": ["string", "null"] },
+    "worker_dir": { "type": ["string", "null"] },
+    "worker": {
+      "type": ["string", "null"],
+      "description": "Legacy alias for task_id; preserved under polymorphic posture."
+    },
+    "pane": {
+      "type": ["integer", "string", "null"],
+      "description": "Legacy polymorphic key; must be int or string. Migrate copies it into pane_id or pane_name based on type."
+    },
+    "dir": {
+      "type": ["string", "null"],
+      "description": "Legacy alias for worker_dir; preserved under polymorphic posture."
+    },
+    "task": { "type": ["string", "null"] },
+    "status": { "type": ["string", "null"] },
+    "reason": { "type": ["string", "null"] },
+    "note": { "type": ["string", "null"] },
+    "kind": { "type": ["string", "null"] },
+    "confidence": { "type": ["number", "null"] },
+    "matched": { "type": ["string", "null"] },
+    "cursor": { "type": ["string", "null"] },
+    "source": { "type": ["string", "null"] },
+    "model": { "type": ["string", "null"] },
+    "pattern": { "type": ["string", "null"] },
+    "permission_mode": { "type": ["string", "null"] },
+    "peer": { "type": ["string", "null"] },
+    "commit": { "type": ["string", "null"] },
+    "commits": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "result": { "type": ["string", "null"] },
+    "pr": { "type": ["integer", "null"] },
+    "repo": { "type": ["string", "null"] },
+    "duration_sec": { "type": ["integer", "null"] },
+    "active_workers": { "type": ["array", "null"] },
+    "pending_items": { "type": ["array", "null"] },
+    "pane_closed": { "type": ["boolean", "null"] },
+    "worktree_removed": { "type": ["boolean", "null"] }
+  },
+  "additionalProperties": true
+}
