@@ -1,0 +1,5 @@
+{"ts": "2026-05-02T09:00:00Z", "event": "task_created", "task_id": "T-001", "pane_id": "pane-1", "pane_name": "worker-a", "status": "ACTIVE", "note": "kickoff"}
+{"ts": "2026-05-02T09:05:00Z", "event": "worker_note", "task_id": "T-001", "pane_id": "pane-1", "pane_name": "worker-a", "note": "see https://x.io ping a@b.io"}
+{"ts": "2026-05-02T09:10:00Z", "event": "worker_note", "task_id": "T-001", "pane_id": "pane-1", "pane_name": "worker-a", "note": "Spent the morning untangling the dispatcher race condition; reproduction takes about ten minutes on a clean checkout, and the only reliable fix so far requires reordering the suspend hand-off."}
+{"ts": "2026-05-02T09:15:00Z", "event": "secret_leak_attempt", "task_id": "T-001", "pane_id": "pane-1", "pane_name": "worker-a", "note": "leaked ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+{"ts": "2026-05-02T09:20:00Z", "event": "task_completed", "task_id": "T-001", "pane_id": "pane-1", "pane_name": "worker-a", "status": "COMPLETED", "note": "done"}
