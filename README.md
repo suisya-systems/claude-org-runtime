@@ -76,7 +76,7 @@ commands.
 - [core-harness](https://github.com/suisya-systems/core-harness) — sibling
   repo with reusable safety primitives for Claude Code harnesses.
 - [claude-org-ja#129](https://github.com/suisya-systems/claude-org-ja/issues/129)
-  — Phase 4 epic that motivated extracting this runtime.
+  — tracking issue for the extraction effort that produced this runtime.
 - [Issues](https://github.com/suisya-systems/claude-org-runtime/issues) for
   this repo.
 

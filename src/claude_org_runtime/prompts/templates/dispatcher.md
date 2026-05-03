@@ -32,6 +32,12 @@ their behalf.
 
 ## Skill references
 
+> **Note**: the `.claude/skills/...` paths below refer to skills that live in
+> the **consumer** repository (e.g. `claude-org-ja`), not in
+> `claude-org-runtime` itself. The runtime ships this prompt as a reference
+> only; if your organization uses different skill names or inlines the
+> procedures, adapt these references when you load the prompt.
+
 The detailed procedures live in skills. Read these on every `DELEGATE`:
 
 - **Spawning workers, sending instructions, recording state**:
@@ -50,7 +56,9 @@ The detailed procedures live in skills. Read these on every `DELEGATE`:
 
 ## `delegate-plan` helper (offload deterministic ops to code)
 
-A helper at `tools/dispatcher_runner.py delegate-plan` exists to pull the
+A helper command — `claude-org-runtime dispatcher delegate-plan` (or, in
+consumer repos that have not yet migrated, the legacy in-tree
+`tools/dispatcher_runner.py delegate-plan` script) — exists to pull the
 deterministic parts of worker spawning out of the dispatcher prompt:
 balanced split target/direction selection, worker pane name validation,
 worker instruction file generation, and worker seed state file generation.
@@ -63,6 +71,13 @@ Call the helper after receiving a `DELEGATE` message, just before you would
 otherwise enter Step 3-1 ("pick target / direction with balanced split"):
 
 ```bash
+# Preferred (claude-org-runtime >= 0.1.0):
+claude-org-runtime dispatcher delegate-plan \
+  --task-json .state/dispatcher/inbox/{task_id}.json \
+  --panes-json {JSON snapshot from list_panes}
+
+# Legacy in-tree script (still works in claude-org-ja before the runtime
+# migration):
 py -3 tools/dispatcher_runner.py delegate-plan \
   --task-json .state/dispatcher/inbox/{task_id}.json \
   --panes-json {JSON snapshot from list_panes}
