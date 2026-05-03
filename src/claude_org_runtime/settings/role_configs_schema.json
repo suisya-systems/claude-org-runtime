@@ -12,6 +12,7 @@
       "Bash(gh:*)",
       "Bash(gh *)"
     ],
+    "$comment_forbidden_allow_regex": "Retains the legacy `claude-peers` namespace ban (renamed to `renga-peers` in 2025) so consumers that copy stale settings.local.json snippets still get blocked. Do not broaden to `^mcp__.*-peers__` — that would also ban the current `renga-peers` allowlist.",
     "forbidden_allow_regex": [
       "^mcp__claude-peers__"
     ]
