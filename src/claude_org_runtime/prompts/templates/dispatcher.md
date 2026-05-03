@@ -56,7 +56,9 @@ The detailed procedures live in skills. Read these on every `DELEGATE`:
 
 ## `delegate-plan` helper (offload deterministic ops to code)
 
-A helper at `tools/dispatcher_runner.py delegate-plan` exists to pull the
+A helper command — `claude-org-runtime dispatcher delegate-plan` (or, in
+consumer repos that have not yet migrated, the legacy in-tree
+`tools/dispatcher_runner.py delegate-plan` script) — exists to pull the
 deterministic parts of worker spawning out of the dispatcher prompt:
 balanced split target/direction selection, worker pane name validation,
 worker instruction file generation, and worker seed state file generation.
