@@ -58,8 +58,22 @@ _ALL_DIGITS = re.compile(r"^\d+$")
 # claude-org-ja `.claude/skills/org-delegate/references/pane-layout.md`.
 MIN_PANE_WIDTH = 20
 MIN_PANE_HEIGHT = 5
-SECRETARY_MIN_WIDTH = 125
-SECRETARY_MIN_HEIGHT = 45
+SECRETARY_MIN_WIDTH = 140
+SECRETARY_MIN_HEIGHT = 30
+
+# Role priority for balanced-split target selection. Higher wins.
+# Mirrors claude-org-ja's pane-layout.md sort regime: priority is the
+# primary key (so a higher-priority pane always beats a lower-priority
+# one regardless of metric), with metric desc and id asc as tie
+# breakers. The ordering keeps the most-load-bearing panes
+# (secretary > curator > worker > dispatcher) splittable first so the
+# tab fills out evenly under repeated delegations.
+_ROLE_PRIORITY = {
+    "secretary": 4,
+    "curator": 3,
+    "worker": 2,
+    "dispatcher": 1,
+}
 
 # Default Claude model for worker panes. The auto-mode safety classifier
 # is unstable on sonnet -- opus-only per the claude-org-ja worker-model
@@ -206,6 +220,7 @@ class SplitChoice:
     new_w: int
     new_h: int
     metric: int
+    role: str = ""
 
 
 def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
@@ -217,7 +232,7 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
 
     candidates: list[SplitChoice] = []
     for p in panes:
-        if p.role not in ("secretary", "dispatcher", "worker"):
+        if p.role not in ("secretary", "dispatcher", "worker", "curator"):
             continue
 
         if p.role == "dispatcher":
@@ -253,12 +268,15 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
             new_w=new_w,
             new_h=new_h,
             metric=metric,
+            role=p.role or "",
         ))
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda c: (-c.metric, c.target_id))
+    candidates.sort(
+        key=lambda c: (-_ROLE_PRIORITY.get(c.role, 0), -c.metric, c.target_id)
+    )
     return candidates[0]
 
 

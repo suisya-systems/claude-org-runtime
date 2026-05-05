@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-06
+
+### Changed
+
+- `dispatcher.runner.choose_split`: align balanced-split target selection
+  with claude-org-ja PR #310 (`org-delegate` Step 3-1b /
+  `references/pane-layout.md`).
+  - `SECRETARY_MIN_WIDTH` 125 → 140.
+  - `SECRETARY_MIN_HEIGHT` 45 → 30.
+  - `curator` is now a valid split target (previously skipped).
+  - Sort regime changed from `(metric desc, id asc)` to
+    `(role priority desc, metric desc, id asc)` with priority
+    `secretary=4 > curator=3 > worker=2 > dispatcher=1`.
+  - Dispatcher's curator-rect adjacency requirement is unchanged.
+  - `SplitChoice` gains a `role` field (defaulted to `""`) so the new
+    sort key can read it; existing positional construction is not
+    affected.
+- Regression scenario covered: 280×86 terminal with secretary 280×43
+  now correctly selects secretary for the next split (previously the
+  secretary was never splittable under the old thresholds).
+
 ## [0.1.1] - 2026-05-03
 
 ### Changed
