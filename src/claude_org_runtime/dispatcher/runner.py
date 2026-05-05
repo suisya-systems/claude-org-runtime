@@ -62,9 +62,12 @@ SECRETARY_MIN_WIDTH = 140
 SECRETARY_MIN_HEIGHT = 30
 
 # Role priority for balanced-split target selection. Higher wins.
-# Mirrors claude-org-ja's pane-layout.md sort regime: keep
-# secretary/curator visible (high priority) and split worker/dispatcher
-# preferentially when their metrics tie.
+# Mirrors claude-org-ja's pane-layout.md sort regime: priority is the
+# primary key (so a higher-priority pane always beats a lower-priority
+# one regardless of metric), with metric desc and id asc as tie
+# breakers. The ordering keeps the most-load-bearing panes
+# (secretary > curator > worker > dispatcher) splittable first so the
+# tab fills out evenly under repeated delegations.
 _ROLE_PRIORITY = {
     "secretary": 4,
     "curator": 3,
