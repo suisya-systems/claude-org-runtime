@@ -74,10 +74,13 @@ def test_rect_adjacent_no_overlap() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_choose_split_prefers_dispatcher_when_only_candidate() -> None:
+def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:
+    # Curator too small to split (would fall under MIN_PANE_HEIGHT after
+    # halving), so dispatcher is the only viable candidate even though
+    # it has the lowest role priority.
     panes = [
-        _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=50),
-        _pane(2, name="dispatcher", role="dispatcher", x=100, y=0, w=200, h=50),
+        _pane(1, name="curator", role="curator", x=0, y=0, w=18, h=8),
+        _pane(2, name="dispatcher", role="dispatcher", x=18, y=0, w=200, h=50),
     ]
     choice = choose_split(panes)
     assert choice is not None
@@ -86,8 +89,10 @@ def test_choose_split_prefers_dispatcher_when_only_candidate() -> None:
 
 
 def test_choose_split_picks_largest_metric() -> None:
-    # Secretary 300x100 -> vertical split -> 150x100, metric=150.
-    # Dispatcher 200x50 -> vertical split -> 100x50, metric=100.
+    # New sort regime: (role priority desc, metric desc, id asc).
+    # secretary priority=4 outranks dispatcher priority=1, so secretary
+    # wins regardless of metric — verified separately in
+    # test_choose_split_role_priority_outranks_metric.
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=50),
         _pane(2, name="dispatcher", role="dispatcher", x=100, y=0, w=200, h=50),
@@ -104,12 +109,97 @@ def test_choose_split_returns_none_when_no_candidate() -> None:
 
 
 def test_choose_split_dispatcher_requires_curator_adjacency() -> None:
+    # Curator deliberately too small to split (so it doesn't itself
+    # become the chosen candidate) -- the assertion is specifically
+    # that the non-adjacent dispatcher is rejected.
     panes = [
-        _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=50),
+        _pane(1, name="curator", role="curator", x=0, y=0, w=18, h=8),
         # dispatcher not adjacent to curator (gap)
         _pane(2, name="dispatcher", role="dispatcher", x=200, y=0, w=200, h=50),
     ]
     assert choose_split(panes) is None
+
+
+def test_choose_split_role_priority_outranks_metric() -> None:
+    # Worker has the larger metric (vertical split -> 200x60, metric=200)
+    # but secretary (priority 4) outranks worker (priority 2) in the new
+    # sort regime, so secretary is picked despite its smaller metric
+    # (vertical split -> 75x60, metric=75... but that's < SECRETARY_MIN
+    # -- use a secretary big enough to clear the threshold).
+    panes = [
+        _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=60),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=100, y=0, w=100, h=60),
+        _pane(3, name="secretary", role="secretary",
+              x=0, y=60, w=300, h=60),
+        _pane(4, name="worker-a", role="worker",
+              x=0, y=120, w=400, h=60),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.role == "secretary"
+
+
+def test_choose_split_includes_curator_as_candidate() -> None:
+    # Pre-fix curator was not a candidate. With curator added at
+    # priority 3 (above worker=2, below secretary=4), it should now be
+    # selected when no secretary is splittable.
+    panes = [
+        _pane(1, name="curator", role="curator", x=0, y=0, w=200, h=60),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=200, y=0, w=200, h=60),
+        _pane(3, name="worker-a", role="worker",
+              x=0, y=60, w=200, h=60),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "curator"
+    assert choice.role == "curator"
+
+
+def test_choose_split_secretary_280x43_picks_secretary() -> None:
+    # Regression scenario for the threshold tweak (issue #310):
+    # 280x86 terminal with secretary 280x43, dispatcher 140x43
+    # adjacent to a 140x43 curator. Under the old thresholds
+    # (SECRETARY_MIN_WIDTH=125, SECRETARY_MIN_HEIGHT=45) the secretary
+    # was excluded because horizontal split gave new_h=21 < 45 and
+    # vertical split gave new_w=140 >= 125 but new_h=43 < 45 either
+    # way -- *the secretary was never splittable in this layout*.
+    # New thresholds (140 / 30) make the vertical split (140x43)
+    # exactly meet both, so secretary should be picked.
+    panes = [
+        _pane(1, name="curator", role="curator",
+              x=0, y=0, w=140, h=43),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=140, y=0, w=140, h=43),
+        _pane(3, name="secretary", role="secretary",
+              x=0, y=43, w=280, h=43),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 140
+    assert choice.new_h == 43
+
+
+def test_choose_split_tie_break_by_id_within_same_role() -> None:
+    # Two workers with identical metrics -> id asc breaks the tie.
+    # Curator deliberately tiny so it doesn't outrank the workers.
+    panes = [
+        _pane(1, name="curator", role="curator", x=0, y=0, w=18, h=8),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=18, y=0, w=100, h=60),
+        _pane(7, name="worker-b", role="worker",
+              x=0, y=60, w=200, h=60),
+        _pane(5, name="worker-a", role="worker",
+              x=0, y=120, w=200, h=60),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "worker-a"
+    assert choice.target_id == 5
 
 
 # ---------------------------------------------------------------------------
