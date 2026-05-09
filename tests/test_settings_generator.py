@@ -713,3 +713,439 @@ def test_render_role_dict_api_still_returns_dict() -> None:
     )
     assert isinstance(out, dict)
     assert "sandbox" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (Refs `claude-org-ja#378`): structured anchor + role_kind + Pattern B
+# ---------------------------------------------------------------------------
+
+
+def _structured(
+    anchor: str,
+    path: str,
+    *,
+    suppress: bool = True,
+) -> dict:
+    return {
+        "anchor": anchor,
+        "path": path,
+        "suppressOnSymlinkEscape": suppress,
+    }
+
+
+def test_structured_entry_round_trip_preserved_in_kept_output(tmp_path: Path) -> None:
+    """Structured entries that survive suppression round-trip unchanged."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    entry = _structured("worker_dir", "secrets.env")
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=[entry]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [entry]
+
+
+def test_legacy_string_and_structured_entry_coexist(tmp_path: Path) -> None:
+    """Mixed legacy + structured entries both render correctly."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[
+                    "secrets.env",
+                    _structured("worker_dir", "private.key"),
+                ],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    kept = result.settings["sandbox"]["filesystem"]["denyRead"]
+    assert kept[0] == "secrets.env"
+    assert kept[1]["anchor"] == "worker_dir"
+    assert kept[1]["path"] == "private.key"
+
+
+def test_home_anchor_realpath_evaluated_against_home() -> None:
+    """anchor=home resolves the entry against /home/<user>, not worker_dir."""
+    worker_dir = "/home/u/work/wd"
+    home = os.path.expanduser("~")
+
+    captured: list[str] = []
+
+    def fake_realpath(p: str) -> str:
+        captured.append(p)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("home", ".aws/credentials")],
+                additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    # /home/u (or whatever home is) is not in read_roots -> suppressed.
+    assert len(result.sandbox.suppressions) == 1
+    suppression = result.sandbox.suppressions[0]
+    expected_target = os.path.join(home, ".aws/credentials")
+    assert expected_target in captured
+    assert suppression.realpath == expected_target
+    # Layer 2 untouched.
+    assert "Read(.env)" in result.settings["permissions"]["deny"]
+
+
+def test_home_anchor_kept_when_home_is_in_additional_directories() -> None:
+    """anchor=home is reachable when /home/<user> is a sandbox read root."""
+    worker_dir = "/home/u/work/wd"
+    home = os.path.expanduser("~")
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("home", ".aws/credentials")],
+                additional=[home],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+
+
+def test_absolute_anchor_literal_path_round_trip() -> None:
+    """anchor=absolute treats the path literally, no anchor base join."""
+    worker_dir = "/home/u/wd"
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("absolute", "/etc/shadow")],
+                additional=["/etc"],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    # /etc/shadow is inside additionalDirectories=/etc -> kept.
+    assert result.sandbox.suppressions == []
+    assert (
+        result.settings["sandbox"]["filesystem"]["denyRead"][0]["path"]
+        == "/etc/shadow"
+    )
+
+
+def test_claude_org_path_anchor_resolves_against_claude_org_path() -> None:
+    """anchor=claude_org_path uses ctx.claude_org_path as the base."""
+    worker_dir = "/home/u/wd"
+    co = "/home/u/claude-org"
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("claude_org_path", "secrets/api.key")],
+                additional=[co],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=co,
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    # claude_org_path is in additionalDirectories -> kept.
+    assert result.sandbox.suppressions == []
+
+
+def test_suppress_on_symlink_escape_false_keeps_entry() -> None:
+    """suppressOnSymlinkEscape=false keeps the entry even when realpath escapes."""
+    worker_dir = "/home/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/mnt/c/Users/u/work/wd", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[
+                    _structured("worker_dir", "secrets.env", suppress=False),
+                ],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    assert result.sandbox.suppressions == []
+    kept = result.settings["sandbox"]["filesystem"]["denyRead"][0]
+    assert kept["suppressOnSymlinkEscape"] is False
+
+
+def test_pattern_b_substitution_in_entry_path_and_additional_directories() -> None:
+    """Pattern B placeholders are substituted in entry paths + additionalDirectories."""
+    worker_dir = "/home/u/work/wd"
+    base_clone = "/home/u/base"
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[
+                    _structured("absolute", "{base_clone}/.git/config"),
+                ],
+                additional=["{base_clone}/.git"],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        base_clone=base_clone,
+        task_id="demo-task",
+        branch_ref="feat/x",
+        pattern="B",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    fs = result.settings["sandbox"]["filesystem"]
+    # additionalDirectories were substituted.
+    assert fs["additionalDirectories"] == [f"{base_clone}/.git"]
+    # The rendered entry carries the substituted path -- the bwrap
+    # launcher consumes the rendered settings.local.json directly so
+    # concrete paths (not templates) must appear in the output.
+    assert fs["denyRead"][0]["path"] == f"{base_clone}/.git/config"
+    # Reachability evaluation used the substituted path, so the entry
+    # is kept (it is inside the substituted additionalDirectory).
+    assert result.sandbox.suppressions == []
+
+
+def test_pattern_b_placeholders_in_legacy_string_entries() -> None:
+    """Legacy string entries also see Pattern B substitution before realpath."""
+    worker_dir = "/home/u/work/wd"
+    base_clone = "/home/u/base"
+
+    def fake_realpath(p: str) -> str:
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=["{base_clone}/.git/HEAD"],
+                additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        base_clone=base_clone,
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: False,
+    )
+    # `{base_clone}/...` resolves outside worker_dir read root -> suppressed.
+    assert len(result.sandbox.suppressions) == 1
+    s = result.sandbox.suppressions[0]
+    assert s.realpath == f"{base_clone}/.git/HEAD"
+
+
+def test_render_org_role_with_role_kind_org() -> None:
+    """role_kind='org' looks up the role under schema['roles']."""
+    schema = {
+        "roles": {
+            "secretary": {
+                "description": "Secretary",
+                "settings_paths": [".claude/settings.local.json"],
+                "sandbox": {
+                    "enabled": True,
+                    "filesystem": {
+                        "denyRead": [_structured("home", ".ssh/id_rsa")],
+                        "denyWrite": [],
+                        "additionalDirectories": [],
+                    },
+                    "failIfUnavailable": False,
+                },
+            },
+            "$comment_irrelevant": "ignored",
+        },
+        "worker_roles": {},
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="secretary",
+        role_kind="org",
+        worker_dir="/home/u/wd",
+        claude_org_path="/home/u/co",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    # description is dropped (metadata).
+    assert "description" not in result.settings
+    # settings_paths is preserved (the renderer doesn't filter org-role
+    # specific fields).
+    assert result.settings["settings_paths"] == [
+        ".claude/settings.local.json"
+    ]
+    # Sandbox suppression ran: home anchor is outside worker_dir.
+    assert len(result.sandbox.suppressions) == 1
+    assert result.sandbox.suppressions[0].layer == "sandbox.filesystem.denyRead"
+
+
+def test_render_org_role_unknown_role_raises() -> None:
+    """role_kind='org' for an unknown role surfaces an org-role-flavored error."""
+    schema = {"roles": {"secretary": {}}, "worker_roles": {}}
+    with pytest.raises(KeyError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="nope",
+            role_kind="org",
+            worker_dir="/wd",
+            claude_org_path="/co",
+        )
+    assert "unknown org role" in info.value.args[0]
+
+
+def test_render_role_kind_invalid_raises_valueerror() -> None:
+    """An unknown role_kind is rejected up-front."""
+    schema = {"worker_roles": {"demo": {}}}
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            role_kind="bogus",
+            worker_dir="/wd",
+            claude_org_path="/co",
+        )
+    assert "unknown role_kind" in str(info.value)
+
+
+def test_unknown_anchor_in_structured_entry_passes_through(tmp_path: Path) -> None:
+    """A structured entry with an invalid anchor is kept untouched."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    weird = {"anchor": "moon", "path": "x", "suppressOnSymlinkEscape": True}
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=[weird]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [weird]
+
+
+def test_normalize_sandbox_entry_legacy_absolute_string() -> None:
+    """Legacy absolute string -> anchor=absolute, suppress=True."""
+    norm = generator._normalize_sandbox_entry("/etc/shadow")
+    assert norm is not None
+    assert norm.anchor == "absolute"
+    assert norm.path == "/etc/shadow"
+    assert norm.suppress_on_symlink_escape is True
+
+
+def test_normalize_sandbox_entry_legacy_relative_string() -> None:
+    """Legacy relative string -> anchor=worker_dir, suppress=True."""
+    norm = generator._normalize_sandbox_entry("secrets.env")
+    assert norm is not None
+    assert norm.anchor == "worker_dir"
+    assert norm.path == "secrets.env"
+    assert norm.suppress_on_symlink_escape is True
+
+
+def test_normalize_sandbox_entry_structured_defaults_suppress_true() -> None:
+    """Structured entry without suppressOnSymlinkEscape defaults to True."""
+    norm = generator._normalize_sandbox_entry(
+        {"anchor": "home", "path": ".aws/credentials"}
+    )
+    assert norm is not None
+    assert norm.anchor == "home"
+    assert norm.suppress_on_symlink_escape is True
+
+
+def test_format_show_output_text_handles_structured_entry() -> None:
+    """Text rendering of a structured entry produces a readable line."""
+    settings = {
+        "permissions": {"deny": []},
+        "sandbox": {
+            "enabled": True,
+            "filesystem": {
+                "denyRead": [_structured("home", ".aws/credentials")],
+                "denyWrite": [],
+                "additionalDirectories": [],
+            },
+            "failIfUnavailable": False,
+        },
+    }
+    result = generator.RenderResult(
+        settings=settings, sandbox=generator.SandboxMetadata(),
+    )
+    text = generator._format_show_output(
+        result, "demo", explain=False, as_json=False,
+    )
+    assert "sandbox.filesystem.denyRead (1):" in text
+    # The structured entry is rendered via its repr / dict form.
+    assert "anchor" in text
+    assert ".aws/credentials" in text
+
+
+def test_render_role_legacy_signature_unchanged(tmp_path: Path) -> None:
+    """The pre-Phase-1 positional signature still works."""
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"]),
+        },
+    }
+    out = generator.render_role(
+        schema, "demo", str(tmp_path / "wd"), str(tmp_path / "co"),
+    )
+    assert isinstance(out, dict)
