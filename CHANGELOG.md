@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-10
+
+### Added
+
+- `claude_org_runtime.settings.generator`: Phase 1 sandbox schema +
+  generator extension (Refs `claude-org-ja#378`, `claude-org-ja#376`).
+  - Structured anchor entry shape on
+    `sandbox.filesystem.denyRead` / `denyWrite`. Each entry may now be
+    either a legacy raw string (anchored at `worker_dir` for relative
+    paths, treated literally for absolute paths) or a structured object
+    `{anchor: 'home'|'worker_dir'|'claude_org_path'|'absolute', path:
+    string, suppressOnSymlinkEscape: bool, default true}`. The
+    structured form fixes the prior ambiguity where home-anchor
+    entries (`~/.aws/**`) were misjudged as `worker_dir`-relative.
+    Existing string entries continue to parse via the legacy adapter
+    (`_normalize_sandbox_entry`) so no consumer migration is required.
+  - `render_role_with_metadata(..., role_kind='org'|'worker')`: callers
+    can now render the org-side roles (`schema['roles'][...]`) in
+    addition to the worker-side templates (`schema['worker_roles'][...]`).
+    Default is `'worker'` for backward compatibility.
+  - Pattern B context parameters (`base_clone`, `task_id`, `branch_ref`,
+    `pattern`) on both `render_role` and `render_role_with_metadata`.
+    Their `{...}` placeholders are substituted alongside `{worker_dir}`
+    / `{claude_org_path}` in entry paths and `additionalDirectories`
+    before realpath evaluation.
+  - Per-entry `suppressOnSymlinkEscape: false` opt-out: a structured
+    entry with this flag is preserved in the rendered output even when
+    its realpath escapes the sandbox read roots (e.g. for entries the
+    operator wants surfaced for the launcher regardless of
+    reachability).
+  - `GeneratorContext` dataclass and `_VALID_ANCHORS` constant exported
+    as the canonical generator inputs.
+  - CLI: `claude-org-runtime settings generate` and `settings show`
+    now expose `--role-kind {worker,org}`, `--base-clone`, `--task-id`,
+    `--branch-ref`, and `--pattern` so the new generator surface is
+    reachable from the public command-line entry point as well.
+    `settings generate --role-kind org` is rejected (org
+    `settings.local.json` files are hand-maintained); use `settings
+    show --role-kind org` for inspection.
+- `docs/cli.md`: documented the new `--role-kind` / `--base-clone` /
+  `--task-id` / `--branch-ref` / `--pattern` flags on both `settings
+  generate` and `settings show`, plus the org-rejection behavior.
+- `claude_org_runtime.settings.role_configs_schema.json`: documented
+  the new structured anchor form via
+  `worker_roles.$comment_sandbox_anchor` and added
+  `roles.$comment_roles_sandbox` permitting the same `sandbox` shape on
+  org-side roles (secretary / dispatcher / curator).
+
+### Notes
+
+- The matching `claude-org-ja`-side schema surface, drift CI extension,
+  and pin bump are tracked separately as a follow-up after this
+  runtime release lands.
+- Concrete sandbox bodies for `roles.secretary` / `roles.dispatcher` /
+  `roles.curator` are deliberately NOT populated in this PR. Phase 0
+  contract (`docs/contracts/role-pattern-sandbox-contract.md` on the
+  `claude-org-ja` side) is the SoT for which entries each org role
+  declares; this PR is limited to the structural extension (schema +
+  generator + CLI). The matching ja-side follow-up PR populates the
+  bodies driven by that contract.
+
 ## [0.1.5] - 2026-05-10
 
 ### Changed

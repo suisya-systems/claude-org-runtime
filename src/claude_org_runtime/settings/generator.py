@@ -15,6 +15,19 @@ Phase 3 case E (Issue #392) adds an optional ``sandbox`` object on
 ``role_configs_schema.json`` ``worker_roles.$comment_sandbox`` for the
 shape; rendered output and suppression metadata are surfaced via
 ``claude-org-runtime settings show --explain``.
+
+Phase 1 (Refs `claude-org-ja#378`) extends the renderer with:
+
+- ``role_kind='org'|'worker'`` so the same ``render_role_with_metadata``
+  call site can render org roles (``schema['roles'][...]``) in
+  addition to worker roles (``schema['worker_roles'][...]``).
+- A structured anchor entry shape on ``sandbox.filesystem.deny{Read,Write}``
+  (``{anchor, path, suppressOnSymlinkEscape}``) plus a backward-compat
+  legacy adapter for raw strings; see
+  ``role_configs_schema.json`` ``worker_roles.$comment_sandbox_anchor``.
+- A Pattern B context (``base_clone`` / ``task_id`` / ``branch_ref``)
+  whose placeholders are substituted alongside ``{worker_dir}`` /
+  ``{claude_org_path}`` in entry paths and ``additionalDirectories``.
 """
 
 from __future__ import annotations
@@ -158,12 +171,147 @@ def _is_inside_root(target: str, roots: list[str]) -> bool:
     return False
 
 
+_VALID_ANCHORS = ("home", "worker_dir", "claude_org_path", "absolute")
+
+
+@dataclass(frozen=True)
+class GeneratorContext:
+    """Context passed to the renderer / suppression evaluator.
+
+    ``worker_dir`` and ``claude_org_path`` keep the legacy substitution
+    semantics. The Phase 1 (Refs `claude-org-ja#378`) additions
+    ``base_clone`` / ``task_id`` / ``branch_ref`` are optional Pattern B
+    context placeholders -- when set, ``{base_clone}`` etc. are
+    substituted in entry paths and ``additionalDirectories`` alongside
+    the legacy placeholders. ``pattern`` is informational metadata for
+    consumers that want to branch on the dispatch pattern; the renderer
+    itself does not gate behavior on it.
+    """
+
+    worker_dir: str
+    claude_org_path: str
+    base_clone: str | None = None
+    task_id: str | None = None
+    branch_ref: str | None = None
+    pattern: str | None = None  # "A" | "B" | None
+
+
+def _build_substitution_mapping(ctx: GeneratorContext) -> dict[str, str]:
+    """Substitution mapping fed to :func:`_substitute`.
+
+    Optional Pattern B placeholders are only added to the mapping when
+    set. Unknown placeholders therefore pass through untouched, which
+    keeps backward compatibility with templates that never reference
+    Pattern B context.
+    """
+    mapping: dict[str, str] = {
+        "worker_dir": ctx.worker_dir,
+        "claude_org_path": ctx.claude_org_path,
+    }
+    if ctx.base_clone is not None:
+        mapping["base_clone"] = ctx.base_clone
+    if ctx.task_id is not None:
+        mapping["task_id"] = ctx.task_id
+    if ctx.branch_ref is not None:
+        mapping["branch_ref"] = ctx.branch_ref
+    return mapping
+
+
+def _anchor_base_path(anchor: str, ctx: GeneratorContext) -> str:
+    """Resolve an anchor name to its absolute base path.
+
+    ``home`` expands to the current user's home directory (via
+    ``os.path.expanduser('~')`` so the value is consistent with the
+    process's resolved ``HOME``). ``worker_dir`` / ``claude_org_path``
+    pull from the generator context. ``absolute`` returns ``""`` so the
+    caller treats the entry path itself as fully-qualified.
+    """
+    if anchor == "home":
+        return os.path.expanduser("~")
+    if anchor == "worker_dir":
+        return ctx.worker_dir
+    if anchor == "claude_org_path":
+        return ctx.claude_org_path
+    if anchor == "absolute":
+        return ""
+    raise ValueError(
+        f"unknown sandbox entry anchor: {anchor!r}. "
+        f"valid: {list(_VALID_ANCHORS)}"
+    )
+
+
+@dataclass(frozen=True)
+class _NormalizedSandboxEntry:
+    """Internal normalized form of a sandbox.filesystem deny entry.
+
+    The legacy raw-string form and the new structured form converge
+    here so the suppression evaluator has a single shape to reason
+    about. ``raw`` preserves the operator's original entry value so it
+    can be surfaced back in the rendered output and suppression report
+    untouched.
+    """
+
+    anchor: str
+    path: str
+    suppress_on_symlink_escape: bool
+    raw: Any
+
+
+def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
+    """Convert a raw-string or structured deny entry into the unified form.
+
+    Legacy strings keep their historical anchoring: absolute paths are
+    treated as ``anchor='absolute'``, everything else is anchored at
+    ``worker_dir``. ``suppressOnSymlinkEscape`` defaults to ``True`` to
+    match the prior unconditional suppression behavior.
+
+    Returns ``None`` when the entry shape is unrecognized so the caller
+    can pass it through to the rendered output untouched (the launcher
+    will surface any malformed entries directly).
+    """
+    if isinstance(entry, str):
+        if entry.startswith("/"):
+            return _NormalizedSandboxEntry(
+                anchor="absolute",
+                path=entry,
+                suppress_on_symlink_escape=True,
+                raw=entry,
+            )
+        return _NormalizedSandboxEntry(
+            anchor="worker_dir",
+            path=entry,
+            suppress_on_symlink_escape=True,
+            raw=entry,
+        )
+    if isinstance(entry, dict):
+        anchor = entry.get("anchor", "worker_dir")
+        if anchor not in _VALID_ANCHORS:
+            return None
+        path = entry.get("path")
+        if not isinstance(path, str):
+            return None
+        suppress = entry.get("suppressOnSymlinkEscape", True)
+        # Strict bool check: ``bool('false') == True`` would silently
+        # flip the operator's intent, so non-bool values cause the
+        # entry to pass through to the rendered output untouched
+        # (and the launcher / drift CI surfaces the malformed entry).
+        if not isinstance(suppress, bool):
+            return None
+        return _NormalizedSandboxEntry(
+            anchor=anchor,
+            path=path,
+            suppress_on_symlink_escape=suppress,
+            raw=entry,
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class SandboxSuppression:
     """One ``sandbox.filesystem`` entry that was dropped from Layer 3."""
 
     layer: str  # e.g. "sandbox.filesystem.denyRead"
-    entry: str
+    entry: Any  # original raw-string or structured-dict entry
     reason: str
     realpath: str
     sandbox_read_roots: tuple[str, ...]
@@ -206,7 +354,7 @@ class RenderResult:
 
 def _evaluate_sandbox_suppressions(
     sandbox: dict,
-    worker_dir: str,
+    ctx: GeneratorContext,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
     wsl_detector: Callable[[], bool] = _detect_wsl,
@@ -218,6 +366,15 @@ def _evaluate_sandbox_suppressions(
     -- on WSL this typically happens when the worker_dir is a symlink
     that resolves into ``/mnt/c``, and the sandbox bind-mount tree does
     not include ``/mnt/c``. Layer 2 ``permissions.deny`` is untouched.
+
+    Phase 1 (Refs `claude-org-ja#378`) extends this with a structured
+    anchor field: a deny entry can declare ``anchor='home'`` (resolves
+    against ``/home/<current-user>``), ``'absolute'``, ``'worker_dir'``,
+    or ``'claude_org_path'``. Operators may also opt out of escape
+    suppression on a per-entry basis with
+    ``suppressOnSymlinkEscape: false``. Pattern B placeholders
+    (``{base_clone}`` etc.) are substituted before realpath evaluation
+    when supplied via the generator context.
     """
     metadata = SandboxMetadata(wsl_detected=wsl_detector())
     if not isinstance(sandbox, dict) or not sandbox.get("enabled"):
@@ -226,80 +383,114 @@ def _evaluate_sandbox_suppressions(
     fs = sandbox.get("filesystem") or {}
     if not isinstance(fs, dict):
         fs = {}
-    additional = list(fs.get("additionalDirectories") or [])
-    read_roots_raw = [worker_dir, *additional]
+    mapping = _build_substitution_mapping(ctx)
+    additional_raw = list(fs.get("additionalDirectories") or [])
+    additional = [_substitute(a, mapping) for a in additional_raw]
+    read_roots_raw = [ctx.worker_dir, *additional]
     read_roots = [_normalize_root(r) for r in read_roots_raw if r]
     metadata.sandbox_read_roots = tuple(read_roots)
 
-    # If worker_dir's realpath escapes the sandbox read roots, every
-    # entry that is anchored at worker_dir (relative literal or
-    # relative pure-glob) is unreachable in the sandbox view and must
-    # also be suppressed -- not just the literal-prefix cases. This is
-    # the WSL case where /home/<u>/work/wd resolves into /mnt/c/... .
-    worker_dir_rp = realpath_fn(worker_dir)
-    worker_dir_reachable = _is_inside_root(worker_dir_rp, read_roots)
-
     new_fs: dict = {**fs}
+    # Only emit additionalDirectories when the original sandbox had
+    # the key -- the documented contract is "forwarded as-is" except
+    # for the suppression-driven mutations on deny{Read,Write}, so an
+    # absent key should stay absent.
+    if "additionalDirectories" in fs:
+        new_fs["additionalDirectories"] = additional
     for layer_key in ("denyRead", "denyWrite"):
         entries = list(fs.get(layer_key) or [])
-        kept: list[str] = []
+        kept: list[Any] = []
         for entry in entries:
-            if not isinstance(entry, str):
+            normalized = _normalize_sandbox_entry(entry)
+            if normalized is None:
+                # Unrecognized shape: keep as-is so the launcher sees
+                # the operator's original input.
                 kept.append(entry)
                 continue
-            literal = _literal_path_prefix(entry)
-            absolute_pattern = entry.startswith("/")
-            if literal is None and not absolute_pattern:
-                # Pure-glob, relative -> anchored at worker_dir.
-                if worker_dir_reachable:
-                    kept.append(entry)
-                else:
-                    metadata.suppressions.append(
-                        SandboxSuppression(
-                            layer=f"sandbox.filesystem.{layer_key}",
-                            entry=entry,
-                            reason=(
-                                "worker_dir realpath escapes sandbox read "
-                                "roots (anchored relative pattern)"
-                            ),
-                            realpath=worker_dir_rp,
-                            sandbox_read_roots=tuple(read_roots),
-                        )
-                    )
-                continue
-            if literal is None:
+            substituted_path = _substitute(normalized.path, mapping)
+            anchor_base = _anchor_base_path(normalized.anchor, ctx)
+            literal = _literal_path_prefix(substituted_path)
+            absolute_pattern = substituted_path.startswith("/")
+
+            anchored_relative_glob = False
+            target_literal: str
+            if literal is None and absolute_pattern:
                 # Absolute pure-glob (e.g. ``/*``) -- without fnmatch'ing
                 # the actual filesystem we can't compute reachability,
                 # so keep the entry as-is.
                 kept.append(entry)
                 continue
-            # Build the joined target on top of the already-realpath'd
-            # worker_dir. realpath is idempotent on real filesystems, so
-            # this matches the prior semantics; on Windows it also keeps
-            # the path consistent with platform-native separators when
-            # ntpath.join would otherwise mix ``/`` and ``\\``.
-            target = (
-                literal
-                if os.path.isabs(literal)
-                else os.path.join(worker_dir_rp, literal)
-            )
-            target_rp = realpath_fn(target)
+            if literal is None:
+                # Pure-glob anchored at the entry's anchor (worker_dir
+                # by default for legacy strings; home / claude_org_path
+                # / absolute when explicit).
+                if normalized.anchor == "absolute":
+                    # No anchor base to fall back on; can't reason
+                    # about reachability without literal -> keep.
+                    kept.append(entry)
+                    continue
+                target_literal = anchor_base
+                anchored_relative_glob = True
+            else:
+                if os.path.isabs(literal):
+                    target_literal = literal
+                elif anchor_base:
+                    # realpath the anchor base first so target/realpath
+                    # composition matches the pre-Phase-1 worker_dir
+                    # semantics on real filesystems.
+                    target_literal = os.path.join(
+                        realpath_fn(anchor_base), literal
+                    )
+                else:
+                    # anchor=absolute with a relative path is malformed
+                    # (no anchor base to join against). Resolving it
+                    # against CWD would produce surprising suppressions,
+                    # so keep-as-is and let the launcher / drift CI
+                    # surface the issue.
+                    kept.append(entry)
+                    continue
+
+            target_rp = realpath_fn(target_literal)
             if _is_inside_root(target_rp, read_roots):
                 kept.append(entry)
-            else:
-                metadata.suppressions.append(
-                    SandboxSuppression(
-                        layer=f"sandbox.filesystem.{layer_key}",
-                        entry=entry,
-                        reason="realpath escapes sandbox read roots",
-                        realpath=target_rp,
-                        sandbox_read_roots=tuple(read_roots),
-                    )
+                continue
+            if not normalized.suppress_on_symlink_escape:
+                kept.append(entry)
+                continue
+            if anchored_relative_glob:
+                reason = (
+                    f"{normalized.anchor} realpath escapes sandbox read "
+                    f"roots (anchored relative pattern)"
                 )
+                # Preserve the legacy worker_dir wording for the common
+                # case so existing operators / dashboards keep parsing
+                # the message the same way.
+                if normalized.anchor == "worker_dir":
+                    reason = (
+                        "worker_dir realpath escapes sandbox read "
+                        "roots (anchored relative pattern)"
+                    )
+            else:
+                reason = "realpath escapes sandbox read roots"
+            metadata.suppressions.append(
+                SandboxSuppression(
+                    layer=f"sandbox.filesystem.{layer_key}",
+                    entry=entry,
+                    reason=reason,
+                    realpath=target_rp,
+                    sandbox_read_roots=tuple(read_roots),
+                )
+            )
         new_fs[layer_key] = kept
 
     new_sandbox = {**sandbox, "filesystem": new_fs}
     return new_sandbox, metadata
+
+
+_ROLE_KIND_TO_SCHEMA_KEY = {
+    "worker": "worker_roles",
+    "org": "roles",
+}
 
 
 def render_role_with_metadata(
@@ -308,6 +499,11 @@ def render_role_with_metadata(
     worker_dir: str,
     claude_org_path: str,
     *,
+    role_kind: str = "worker",
+    base_clone: str | None = None,
+    task_id: str | None = None,
+    branch_ref: str | None = None,
+    pattern: str | None = None,
     realpath_fn: Callable[[str], str] = os.path.realpath,
     wsl_detector: Callable[[], bool] = _detect_wsl,
 ) -> RenderResult:
@@ -318,8 +514,26 @@ def render_role_with_metadata(
     applied (see :func:`_evaluate_sandbox_suppressions`); the rendered
     sandbox object reflects the suppression while
     ``permissions.deny`` is preserved untouched.
+
+    ``role_kind`` selects which schema bucket to look up the role in:
+    ``'worker'`` (default, ``schema['worker_roles']``) preserves the
+    pre-Phase-1 behavior; ``'org'`` looks the role up in
+    ``schema['roles']`` so Phase 1 callers can render the org-side
+    sandbox intent for secretary / dispatcher / curator.
+
+    Pattern B context (``base_clone`` / ``task_id`` / ``branch_ref``)
+    is optional. When supplied, the matching ``{...}`` placeholders are
+    substituted alongside ``{worker_dir}`` / ``{claude_org_path}`` in
+    every string in the rendered template. ``pattern`` is informational
+    metadata; the renderer does not branch on it directly.
     """
-    roles = schema.get("worker_roles") or {}
+    schema_key = _ROLE_KIND_TO_SCHEMA_KEY.get(role_kind)
+    if schema_key is None:
+        raise ValueError(
+            f"unknown role_kind: {role_kind!r}. "
+            f"valid: {sorted(_ROLE_KIND_TO_SCHEMA_KEY)}"
+        )
+    roles = schema.get(schema_key) or {}
     available = sorted(
         k
         for k, v in roles.items()
@@ -330,21 +544,27 @@ def render_role_with_metadata(
         or role.startswith("$")
         or not isinstance(roles[role], dict)
     ):
+        kind_label = "worker role" if role_kind == "worker" else "org role"
         raise KeyError(
-            f"unknown worker role: {role!r}. available: {available}"
+            f"unknown {kind_label}: {role!r}. available: {available}"
         )
+    ctx = GeneratorContext(
+        worker_dir=worker_dir,
+        claude_org_path=claude_org_path,
+        base_clone=base_clone,
+        task_id=task_id,
+        branch_ref=branch_ref,
+        pattern=pattern,
+    )
     template = {
         k: v for k, v in roles[role].items() if k not in _META_KEYS
     }
-    rendered = _substitute(
-        template,
-        {"worker_dir": worker_dir, "claude_org_path": claude_org_path},
-    )
+    rendered = _substitute(template, _build_substitution_mapping(ctx))
     sandbox = rendered.get("sandbox")
     if isinstance(sandbox, dict):
         new_sandbox, metadata = _evaluate_sandbox_suppressions(
             sandbox,
-            worker_dir,
+            ctx,
             realpath_fn=realpath_fn,
             wsl_detector=wsl_detector,
         )
@@ -359,6 +579,12 @@ def render_role(
     role: str,
     worker_dir: str,
     claude_org_path: str,
+    *,
+    role_kind: str = "worker",
+    base_clone: str | None = None,
+    task_id: str | None = None,
+    branch_ref: str | None = None,
+    pattern: str | None = None,
 ) -> dict:
     """Render the per-role ``settings.local.json`` content.
 
@@ -366,12 +592,20 @@ def render_role(
     template, drops ``description`` / ``$comment`` metadata keys, and
     applies Phase 3 case E sandbox suppression when applicable. For the
     suppression metadata use :func:`render_role_with_metadata`.
+
+    See :func:`render_role_with_metadata` for the Phase 1 ``role_kind``
+    and Pattern B context parameters.
     """
     return render_role_with_metadata(
         schema,
         role=role,
         worker_dir=worker_dir,
         claude_org_path=claude_org_path,
+        role_kind=role_kind,
+        base_clone=base_clone,
+        task_id=task_id,
+        branch_ref=branch_ref,
+        pattern=pattern,
     ).settings
 
 
@@ -425,6 +659,46 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="schema path override (default: bundled role_configs_schema.json)",
     )
+    parser.add_argument(
+        "--role-kind",
+        choices=sorted(_ROLE_KIND_TO_SCHEMA_KEY),
+        default="worker",
+        help=(
+            "schema bucket to look up the role in: 'worker' (default, "
+            "schema['worker_roles']) or 'org' (schema['roles'], for "
+            "secretary / dispatcher / curator). NOTE: 'org' is supported "
+            "by `settings show` for inspection only -- `settings generate "
+            "--role-kind org` is rejected because org settings.local.json "
+            "files are hand-maintained."
+        ),
+    )
+    parser.add_argument(
+        "--base-clone",
+        default=None,
+        help=(
+            "Pattern B context: substituted as {base_clone} in entry "
+            "paths and additionalDirectories before realpath evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--task-id",
+        default=None,
+        help="Pattern B context: substituted as {task_id}.",
+    )
+    parser.add_argument(
+        "--branch-ref",
+        default=None,
+        help="Pattern B context: substituted as {branch_ref}.",
+    )
+    parser.add_argument(
+        "--pattern",
+        default=None,
+        help=(
+            "Informational dispatch pattern label (e.g. 'A', 'B'); "
+            "passed through to the renderer for consumers that branch on "
+            "it. The renderer itself does not gate behavior on --pattern."
+        ),
+    )
 
 
 def add_show_arguments(parser: argparse.ArgumentParser) -> None:
@@ -455,15 +729,37 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: schema is not valid JSON: {exc}", file=sys.stderr)
         return 2
 
+    role_kind = getattr(args, "role_kind", "worker")
+    if role_kind == "org":
+        # Org-side settings.local.json files (secretary / dispatcher /
+        # curator) are hand-maintained. The `roles[*]` schema entries
+        # describe audit constraints (`required_allow` / `required_deny`
+        # / `required_hooks`), not a settings.local.json template, so
+        # rendering them as JSON would produce a misleading file. Use
+        # `settings show --role-kind org` for inspection (sandbox
+        # suppression, etc.) instead.
+        print(
+            "error: settings generate does not support --role-kind org "
+            "(org settings.local.json files are hand-maintained; "
+            "use `settings show --role-kind org` for inspection).",
+            file=sys.stderr,
+        )
+        return 2
     try:
         rendered = render_role(
             schema,
             role=args.role,
             worker_dir=args.worker_dir,
             claude_org_path=args.claude_org_path,
+            role_kind=role_kind,
+            base_clone=getattr(args, "base_clone", None),
+            task_id=getattr(args, "task_id", None),
+            branch_ref=getattr(args, "branch_ref", None),
+            pattern=getattr(args, "pattern", None),
         )
-    except KeyError as exc:
-        print(f"error: {exc.args[0]}", file=sys.stderr)
+    except (KeyError, ValueError) as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        print(f"error: {msg}", file=sys.stderr)
         return 2
 
     text = json.dumps(rendered, indent=2, ensure_ascii=False) + "\n"
@@ -491,9 +787,15 @@ def run_show(args: argparse.Namespace) -> int:
             role=args.role,
             worker_dir=args.worker_dir,
             claude_org_path=args.claude_org_path,
+            role_kind=getattr(args, "role_kind", "worker"),
+            base_clone=getattr(args, "base_clone", None),
+            task_id=getattr(args, "task_id", None),
+            branch_ref=getattr(args, "branch_ref", None),
+            pattern=getattr(args, "pattern", None),
         )
-    except KeyError as exc:
-        print(f"error: {exc.args[0]}", file=sys.stderr)
+    except (KeyError, ValueError) as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        print(f"error: {msg}", file=sys.stderr)
         return 2
 
     explain = bool(getattr(args, "explain", False))
