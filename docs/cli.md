@@ -117,6 +117,44 @@ python -m claude_org_runtime.settings.generator \
 | `--out PATH` | Output file. Default: stdout. |
 | `--schema PATH` | Schema-path override. Default: bundled `role_configs_schema.json`. |
 
+## `settings show`
+
+Renders the same per-role settings as `settings generate` and, with
+`--explain`, surfaces Phase 3 case E sandbox suppression metadata
+(`worker_roles.<role>.sandbox` is described under
+`worker_roles.$comment_sandbox` in the bundled schema). The `show` and
+`generate` commands share the same renderer, so the deny set you see
+under `--explain` is exactly what would be written by `generate`.
+
+```sh
+claude-org-runtime settings show \
+    --role default \
+    --worker-dir /path/to/worker \
+    --claude-org-path /path/to/claude-org \
+    --explain --json
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--role NAME` | Same as `settings generate`. |
+| `--worker-dir PATH` | Same as `settings generate`. |
+| `--claude-org-path PATH` | Same as `settings generate`. |
+| `--out PATH` | Output file. Default: stdout. |
+| `--schema PATH` | Schema-path override. Default: bundled. |
+| `--explain` | Include sandbox suppression metadata: `wsl_detected`, the normalized user-supplied `sandbox_read_roots` (the configured `worker_dir` + `additionalDirectories`, *not* realpath-resolved — the realpath only applies to deny entries during the escape check), and the per-entry `suppressions` list (`layer`, `entry`, `reason`, `realpath`). |
+| `--json` | Emit a structured JSON payload instead of the human-readable text. |
+
+The runtime applies WSL/realpath suppression at render time: any
+`sandbox.filesystem.denyRead / denyWrite` entry whose realpath escapes
+the sandbox read roots (`worker_dir` + `additionalDirectories`) is
+dropped from the rendered sandbox object — this handles WSL
+(`/home/<u>/...` resolving into `/mnt/c/...`) and devcontainer
+(`/workspaces` symlink) cases without hard-coding any host path.
+`permissions.deny Read(...) / Write(...)` (Layer 2) is **never**
+suppressed.
+
 ## Migration from `claude-org-ja`'s `tools/`
 
 If your `claude-org-ja` checkout was previously calling either of the

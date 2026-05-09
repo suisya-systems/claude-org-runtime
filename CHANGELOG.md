@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-09
+
+### Added
+
+- `claude_org_runtime.settings.generator`: Phase 3 sandbox bootstrap
+  policy MVP (case E only, refs `claude-org-ja#392`, `claude-org-ja#376`).
+  - `worker_roles.<role>.sandbox` is a new optional object with shape
+    `{enabled: bool, filesystem: {denyRead, denyWrite,
+    additionalDirectories}, failIfUnavailable: bool}`. Documented via
+    the new `worker_roles.$comment_sandbox` schema annotation. Existing
+    roles without `sandbox` are unchanged (backward compatible — absent
+    `sandbox` is treated as sandbox-disabled).
+  - `render_role()` (and a new `render_role_with_metadata()` that
+    returns a `RenderResult` carrying the suppression report) now apply
+    Layer 3 suppression: each `sandbox.filesystem.denyRead` /
+    `denyWrite` entry whose realpath escapes the sandbox read roots
+    (`worker_dir` + `additionalDirectories`) is dropped from the
+    rendered sandbox object. This handles the WSL case (`/home/<u>/...`
+    that resolves into `/mnt/c/...`) and devcontainer case
+    (`/workspaces` symlinks) without hard-coding `/mnt/c`. Layer 2
+    `permissions.deny Read(...) / Write(...)` entries are NEVER
+    suppressed.
+  - Annotation-only WSL detection (`/proc/version`,
+    `/proc/sys/kernel/osrelease` → `microsoft-standard-WSL`) recorded
+    in suppression metadata for telemetry; the actual suppression
+    decision is keyed on realpath escape.
+- `claude-org-runtime settings show [--explain] [--json]`: new CLI
+  surface that drives the same renderer as `settings generate` (single
+  source of truth) and surfaces the rendered settings + sandbox
+  suppression metadata. With `--explain`, the output includes
+  `wsl_detected`, the resolved `sandbox_read_roots`, and the per-entry
+  suppression list (`layer`, `entry`, `reason`, `realpath`).
+
+### Deferred (per `tmp/codex-review-phase3-impl-392.md`)
+
+- Case A bootstrap fallback (`bootstrap.py`, bwrap stderr parser):
+  runtime does not control the bwrap launcher, so the helper would be
+  dead code. Tracked for a follow-up after the launcher contract
+  stabilizes.
+- `failIfUnavailable` redefinition: kept the field in the schema but
+  semantics are unchanged from prior usage.
+- `sandbox_deny_skipped` journal events: requires the
+  `claude-org-ja` `journal_append` contract, deferred to a separate PR.
+- `profile-tightened.json` `$comment` updates and
+  `docs/verification.md` reconciliation are `claude-org-ja`-side
+  follow-ups for after the runtime release lands.
+
 ## [0.1.3] - 2026-05-09
 
 ### Changed
