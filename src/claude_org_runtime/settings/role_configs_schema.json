@@ -296,7 +296,12 @@
           "Bash(git push *)",
           "Bash(git push)",
           "Bash(rm -rf *)",
-          "Bash(rm -r *)"
+          "Bash(rm -r *)",
+          "Read(.env)",
+          "Read(.env.*)",
+          "Read(**/credentials*)",
+          "Read(**/*.pem)",
+          "Read(~/.config/gh/hosts.yml)"
         ]
       },
       "hooks": {
@@ -354,7 +359,12 @@
           "Bash(git push *)",
           "Bash(git push)",
           "Bash(rm -rf *)",
-          "Bash(rm -r *)"
+          "Bash(rm -r *)",
+          "Read(.env)",
+          "Read(.env.*)",
+          "Read(**/credentials*)",
+          "Read(**/*.pem)",
+          "Read(~/.config/gh/hosts.yml)"
         ]
       },
       "hooks": {
