@@ -666,7 +666,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "schema bucket to look up the role in: 'worker' (default, "
             "schema['worker_roles']) or 'org' (schema['roles'], for "
-            "secretary / dispatcher / curator)."
+            "secretary / dispatcher / curator). NOTE: 'org' is supported "
+            "by `settings show` for inspection only -- `settings generate "
+            "--role-kind org` is rejected because org settings.local.json "
+            "files are hand-maintained."
         ),
     )
     parser.add_argument(
@@ -726,13 +729,29 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: schema is not valid JSON: {exc}", file=sys.stderr)
         return 2
 
+    role_kind = getattr(args, "role_kind", "worker")
+    if role_kind == "org":
+        # Org-side settings.local.json files (secretary / dispatcher /
+        # curator) are hand-maintained. The `roles[*]` schema entries
+        # describe audit constraints (`required_allow` / `required_deny`
+        # / `required_hooks`), not a settings.local.json template, so
+        # rendering them as JSON would produce a misleading file. Use
+        # `settings show --role-kind org` for inspection (sandbox
+        # suppression, etc.) instead.
+        print(
+            "error: settings generate does not support --role-kind org "
+            "(org settings.local.json files are hand-maintained; "
+            "use `settings show --role-kind org` for inspection).",
+            file=sys.stderr,
+        )
+        return 2
     try:
         rendered = render_role(
             schema,
             role=args.role,
             worker_dir=args.worker_dir,
             claude_org_path=args.claude_org_path,
-            role_kind=getattr(args, "role_kind", "worker"),
+            role_kind=role_kind,
             base_clone=getattr(args, "base_clone", None),
             task_id=getattr(args, "task_id", None),
             branch_ref=getattr(args, "branch_ref", None),

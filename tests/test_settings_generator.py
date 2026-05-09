@@ -1278,24 +1278,15 @@ def test_additional_directories_absent_stays_absent(tmp_path: Path) -> None:
     assert fs["denyRead"] == ["secrets.env"]
 
 
-def test_cli_role_kind_org_renders_org_role(tmp_path: Path) -> None:
-    """`settings generate --role-kind org` renders schema['roles'][...] entries."""
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text(
-        json.dumps(
-            {
-                "roles": {
-                    "secretary": {
-                        "description": "ignored",
-                        "settings_paths": [".claude/settings.local.json"],
-                    },
-                },
-                "worker_roles": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-    out = tmp_path / "out.json"
+def test_cli_generate_role_kind_org_rejected(tmp_path: Path, capsys) -> None:
+    """`settings generate --role-kind org` is rejected with a helpful message.
+
+    Org settings.local.json files (secretary / dispatcher / curator)
+    are hand-maintained; the org-side `roles[*]` schema entries are
+    audit constraints, not a renderable settings template. Use
+    `settings show --role-kind org` for inspection (sandbox
+    suppression, etc.).
+    """
     rc = generator.main(
         [
             "--role",
@@ -1306,17 +1297,13 @@ def test_cli_role_kind_org_renders_org_role(tmp_path: Path) -> None:
             str(tmp_path / "wd"),
             "--claude-org-path",
             str(tmp_path / "co"),
-            "--schema",
-            str(schema_path),
-            "--out",
-            str(out),
         ]
     )
-    assert rc == 0
-    parsed = json.loads(out.read_text(encoding="utf-8"))
-    # description is dropped (metadata).
-    assert "description" not in parsed
-    assert parsed["settings_paths"] == [".claude/settings.local.json"]
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "settings generate" in err
+    assert "--role-kind org" in err
+    assert "settings show" in err
 
 
 def test_cli_pattern_b_context_substitutes_placeholders(tmp_path: Path) -> None:
@@ -1392,15 +1379,18 @@ def test_cli_role_kind_invalid_argparse_rejects(tmp_path: Path) -> None:
     assert info.value.code != 0
 
 
-def test_cli_unknown_org_role_returns_2(tmp_path: Path) -> None:
-    """`--role-kind org` with an unknown role surfaces the org-flavored error."""
+def test_cli_show_unknown_org_role_returns_2(tmp_path: Path) -> None:
+    """`settings show --role-kind org` with an unknown role returns rc=2."""
     schema_path = tmp_path / "schema.json"
     schema_path.write_text(
         json.dumps({"roles": {"secretary": {}}, "worker_roles": {}}),
         encoding="utf-8",
     )
-    rc = generator.main(
+    parser = runtime_cli.build_parser()
+    args = parser.parse_args(
         [
+            "settings",
+            "show",
             "--role",
             "nope",
             "--role-kind",
@@ -1413,6 +1403,7 @@ def test_cli_unknown_org_role_returns_2(tmp_path: Path) -> None:
             str(schema_path),
         ]
     )
+    rc = args.func(args)
     assert rc == 2
 
 

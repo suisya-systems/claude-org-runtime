@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     now expose `--role-kind {worker,org}`, `--base-clone`, `--task-id`,
     `--branch-ref`, and `--pattern` so the new generator surface is
     reachable from the public command-line entry point as well.
+    `settings generate --role-kind org` is rejected (org
+    `settings.local.json` files are hand-maintained); use `settings
+    show --role-kind org` for inspection.
+- `docs/cli.md`: documented the new `--role-kind` / `--base-clone` /
+  `--task-id` / `--branch-ref` / `--pattern` flags on both `settings
+  generate` and `settings show`, plus the org-rejection behavior.
 - `claude_org_runtime.settings.role_configs_schema.json`: documented
   the new structured anchor form via
   `worker_roles.$comment_sandbox_anchor` and added

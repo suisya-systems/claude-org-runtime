@@ -116,6 +116,11 @@ python -m claude_org_runtime.settings.generator \
 | `--claude-org-path PATH` | Absolute path to the claude-org repo (for hook script paths). |
 | `--out PATH` | Output file. Default: stdout. |
 | `--schema PATH` | Schema-path override. Default: bundled `role_configs_schema.json`. |
+| `--role-kind {worker,org}` | Schema bucket: `worker` (default, `schema['worker_roles']`) or `org` (`schema['roles']`). NOTE: `--role-kind org` is rejected by `settings generate` because org `settings.local.json` files are hand-maintained; use `settings show --role-kind org` for inspection. |
+| `--base-clone PATH` | Pattern B context: substituted as `{base_clone}` in entry paths and `additionalDirectories` before realpath evaluation. |
+| `--task-id ID` | Pattern B context: substituted as `{task_id}`. |
+| `--branch-ref REF` | Pattern B context: substituted as `{branch_ref}`. |
+| `--pattern LABEL` | Informational dispatch pattern label (e.g. `A`, `B`); passed through to the renderer for consumers that branch on it. The renderer itself does not gate behavior on `--pattern`. |
 
 ## `settings show`
 
@@ -145,6 +150,11 @@ claude-org-runtime settings show \
 | `--schema PATH` | Schema-path override. Default: bundled. |
 | `--explain` | Include sandbox suppression metadata: `wsl_detected`, the normalized user-supplied `sandbox_read_roots` (the configured `worker_dir` + `additionalDirectories`, *not* realpath-resolved — the realpath only applies to deny entries during the escape check), and the per-entry `suppressions` list (`layer`, `entry`, `reason`, `realpath`). |
 | `--json` | Emit a structured JSON payload instead of the human-readable text. |
+| `--role-kind {worker,org}` | Schema bucket: `worker` (default) or `org` (for inspecting secretary / dispatcher / curator sandbox intent). |
+| `--base-clone PATH` | Pattern B context: substituted as `{base_clone}` before realpath evaluation. |
+| `--task-id ID` | Pattern B context: substituted as `{task_id}`. |
+| `--branch-ref REF` | Pattern B context: substituted as `{branch_ref}`. |
+| `--pattern LABEL` | Informational dispatch pattern label; passed through to the renderer. |
 
 The runtime applies WSL/realpath suppression at render time: any
 `sandbox.filesystem.denyRead / denyWrite` entry whose realpath escapes
