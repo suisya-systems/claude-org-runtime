@@ -137,6 +137,10 @@ def _is_inside_root(target: str, roots: list[str]) -> bool:
     of ``/home/<user>/work/wd``). If the roots were realpath'd too, the
     symlink would be resolved on both sides and the escape would
     silently disappear.
+
+    The boundary separator is composed from ``os.sep`` so the prefix
+    check works on both POSIX (``/``) and Windows (``\\``); ``normpath``
+    has already normalized either input to native separators.
     """
     target_norm = os.path.normpath(target)
     for r in roots:
@@ -145,7 +149,10 @@ def _is_inside_root(target: str, roots: list[str]) -> bool:
         normalized = _normalize_root(r)
         if target_norm == normalized:
             return True
-        sep = "/" if normalized == "/" else normalized + "/"
+        if normalized.endswith(("/", os.sep)):
+            sep = normalized
+        else:
+            sep = normalized + os.sep
         if target_norm.startswith(sep):
             return True
     return False
@@ -266,10 +273,15 @@ def _evaluate_sandbox_suppressions(
                 # so keep the entry as-is.
                 kept.append(entry)
                 continue
+            # Build the joined target on top of the already-realpath'd
+            # worker_dir. realpath is idempotent on real filesystems, so
+            # this matches the prior semantics; on Windows it also keeps
+            # the path consistent with platform-native separators when
+            # ntpath.join would otherwise mix ``/`` and ``\\``.
             target = (
                 literal
                 if os.path.isabs(literal)
-                else os.path.join(worker_dir, literal)
+                else os.path.join(worker_dir_rp, literal)
             )
             target_rp = realpath_fn(target)
             if _is_inside_root(target_rp, read_roots):
