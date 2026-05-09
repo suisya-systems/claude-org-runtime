@@ -26,6 +26,10 @@ def _run_settings_generate(args: argparse.Namespace) -> int:
     return settings_generator.run(args)
 
 
+def _run_settings_show(args: argparse.Namespace) -> int:
+    return settings_generator.run_show(args)
+
+
 def _run_migrate_v1_to_v2(args: argparse.Namespace) -> int:
     return migrate_v1_to_v2.run(args)
 
@@ -66,6 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     settings_generator.add_arguments(gen_p)
     gen_p.set_defaults(func=_run_settings_generate)
+    show_p = settings_sub.add_parser(
+        "show",
+        help=(
+            "Show the rendered settings for a role; with --explain also "
+            "surface Phase 3 case E sandbox suppression metadata."
+        ),
+    )
+    settings_generator.add_show_arguments(show_p)
+    show_p.set_defaults(func=_run_settings_show)
 
     # migrate
     migrate_p = sub.add_parser(
