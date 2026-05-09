@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-09
+
+### Changed
+
+- `claude_org_runtime/settings/role_configs_schema.json`: sync 5 Read deny
+  entries from claude-org-ja `feat/phase2-read-deny-gap-rows` (commit
+  `68f502e`). Both `worker_roles.default.permissions.deny` and
+  `worker_roles.claude-org-self-edit.permissions.deny` now include:
+  `Read(.env)`, `Read(.env.*)`, `Read(**/credentials*)`, `Read(**/*.pem)`,
+  `Read(~/.config/gh/hosts.yml)`. Closes the Phase 2 Read-tool gap rows
+  surfaced by the sandbox-probe iter-c §4.3 #2 audit (Layer 2 perms.deny
+  had no Read entries; Layer 3 sandbox.denyRead is Bash-tool-only).
+  Refs `claude-org-ja#376`.
+
 ## [0.1.2] - 2026-05-06
 
 ### Changed
