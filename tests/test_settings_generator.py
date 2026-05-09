@@ -1149,3 +1149,329 @@ def test_render_role_legacy_signature_unchanged(tmp_path: Path) -> None:
         schema, "demo", str(tmp_path / "wd"), str(tmp_path / "co"),
     )
     assert isinstance(out, dict)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 round-1 Codex fixes: strict bool, malformed absolute,
+# additionalDirectories preservation, CLI plumbing.
+# ---------------------------------------------------------------------------
+
+
+def test_suppress_on_symlink_escape_non_bool_passes_through(tmp_path: Path) -> None:
+    """A structured entry whose suppressOnSymlinkEscape is not a bool is kept-as-is.
+
+    ``bool('false') == True`` would silently flip the operator's
+    intent; the safer behaviour is to surface the malformed entry by
+    leaving it in the rendered output untouched.
+    """
+    worker_dir = "/home/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/mnt/c/Users/u/work/wd", 1)
+        return p
+
+    bad = {
+        "anchor": "worker_dir",
+        "path": "secrets.env",
+        "suppressOnSymlinkEscape": "false",
+    }
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=[bad]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    assert result.sandbox.suppressions == []
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [bad]
+
+
+def test_normalize_sandbox_entry_non_bool_suppress_returns_none() -> None:
+    """``_normalize_sandbox_entry`` rejects non-bool suppress flags."""
+    assert (
+        generator._normalize_sandbox_entry(
+            {
+                "anchor": "worker_dir",
+                "path": "x",
+                "suppressOnSymlinkEscape": "true",
+            }
+        )
+        is None
+    )
+    assert (
+        generator._normalize_sandbox_entry(
+            {
+                "anchor": "worker_dir",
+                "path": "x",
+                "suppressOnSymlinkEscape": 1,
+            }
+        )
+        is None
+    )
+
+
+def test_absolute_anchor_with_relative_path_kept_as_is() -> None:
+    """anchor=absolute with a relative path is malformed -> keep-as-is.
+
+    Resolving the relative path against ``CWD`` would produce
+    surprising suppressions; the launcher / drift CI is the right
+    place to surface the operator error.
+    """
+    worker_dir = "/home/u/wd"
+    bad = {
+        "anchor": "absolute",
+        "path": "etc/shadow",  # missing leading "/"
+        "suppressOnSymlinkEscape": True,
+    }
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=[bad], additional=[]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [bad]
+
+
+def test_additional_directories_absent_stays_absent(tmp_path: Path) -> None:
+    """When the original sandbox lacks additionalDirectories, render keeps it absent."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox": {
+                    "enabled": True,
+                    "filesystem": {
+                        "denyRead": ["secrets.env"],
+                        "denyWrite": [],
+                    },
+                    "failIfUnavailable": False,
+                },
+            },
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    fs = result.settings["sandbox"]["filesystem"]
+    assert "additionalDirectories" not in fs
+    assert fs["denyRead"] == ["secrets.env"]
+
+
+def test_cli_role_kind_org_renders_org_role(tmp_path: Path) -> None:
+    """`settings generate --role-kind org` renders schema['roles'][...] entries."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "secretary": {
+                        "description": "ignored",
+                        "settings_paths": [".claude/settings.local.json"],
+                    },
+                },
+                "worker_roles": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    rc = generator.main(
+        [
+            "--role",
+            "secretary",
+            "--role-kind",
+            "org",
+            "--worker-dir",
+            str(tmp_path / "wd"),
+            "--claude-org-path",
+            str(tmp_path / "co"),
+            "--schema",
+            str(schema_path),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    # description is dropped (metadata).
+    assert "description" not in parsed
+    assert parsed["settings_paths"] == [".claude/settings.local.json"]
+
+
+def test_cli_pattern_b_context_substitutes_placeholders(tmp_path: Path) -> None:
+    """`settings generate --base-clone ...` substitutes Pattern B placeholders."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps(
+            {
+                "worker_roles": {
+                    "demo": {
+                        "permissions": {
+                            "allow": ["Bash(test {base_clone})"],
+                        },
+                        "env": {
+                            "BASE": "{base_clone}",
+                            "TASK": "{task_id}",
+                            "BRANCH": "{branch_ref}",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    rc = generator.main(
+        [
+            "--role",
+            "demo",
+            "--worker-dir",
+            "/wd",
+            "--claude-org-path",
+            "/co",
+            "--base-clone",
+            "/tmp/base",
+            "--task-id",
+            "task-123",
+            "--branch-ref",
+            "feat/x",
+            "--pattern",
+            "B",
+            "--schema",
+            str(schema_path),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    assert parsed["permissions"]["allow"][0] == "Bash(test /tmp/base)"
+    assert parsed["env"] == {
+        "BASE": "/tmp/base",
+        "TASK": "task-123",
+        "BRANCH": "feat/x",
+    }
+
+
+def test_cli_role_kind_invalid_argparse_rejects(tmp_path: Path) -> None:
+    """`--role-kind bogus` is rejected by argparse (non-zero exit)."""
+    with pytest.raises(SystemExit) as info:
+        generator.main(
+            [
+                "--role",
+                "demo",
+                "--role-kind",
+                "bogus",
+                "--worker-dir",
+                "/wd",
+                "--claude-org-path",
+                "/co",
+            ]
+        )
+    assert info.value.code != 0
+
+
+def test_cli_unknown_org_role_returns_2(tmp_path: Path) -> None:
+    """`--role-kind org` with an unknown role surfaces the org-flavored error."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps({"roles": {"secretary": {}}, "worker_roles": {}}),
+        encoding="utf-8",
+    )
+    rc = generator.main(
+        [
+            "--role",
+            "nope",
+            "--role-kind",
+            "org",
+            "--worker-dir",
+            "/wd",
+            "--claude-org-path",
+            "/co",
+            "--schema",
+            str(schema_path),
+        ]
+    )
+    assert rc == 2
+
+
+def test_cli_show_role_kind_org_with_explain(tmp_path: Path) -> None:
+    """`settings show --role-kind org --explain` surfaces sandbox suppression."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "secretary": {
+                        "sandbox": {
+                            "enabled": True,
+                            "filesystem": {
+                                "denyRead": [
+                                    {
+                                        "anchor": "absolute",
+                                        "path": "/etc/shadow",
+                                        "suppressOnSymlinkEscape": True,
+                                    }
+                                ],
+                                "denyWrite": [],
+                                "additionalDirectories": [],
+                            },
+                            "failIfUnavailable": False,
+                        }
+                    }
+                },
+                "worker_roles": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    parser = runtime_cli.build_parser()
+    args = parser.parse_args(
+        [
+            "settings",
+            "show",
+            "--role",
+            "secretary",
+            "--role-kind",
+            "org",
+            "--worker-dir",
+            str(tmp_path / "wd"),
+            "--claude-org-path",
+            str(tmp_path / "co"),
+            "--schema",
+            str(schema_path),
+            "--explain",
+            "--json",
+        ]
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = args.func(args)
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["role"] == "secretary"
+    # /etc/shadow escapes the worker_dir read root -> suppressed.
+    suppressions = payload["sandbox"]["suppressions"]
+    assert len(suppressions) == 1
+    assert suppressions[0]["entry"]["path"] == "/etc/shadow"

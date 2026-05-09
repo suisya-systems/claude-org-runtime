@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reachability).
   - `GeneratorContext` dataclass and `_VALID_ANCHORS` constant exported
     as the canonical generator inputs.
+  - CLI: `claude-org-runtime settings generate` and `settings show`
+    now expose `--role-kind {worker,org}`, `--base-clone`, `--task-id`,
+    `--branch-ref`, and `--pattern` so the new generator surface is
+    reachable from the public command-line entry point as well.
 - `claude_org_runtime.settings.role_configs_schema.json`: documented
   the new structured anchor form via
   `worker_roles.$comment_sandbox_anchor` and added

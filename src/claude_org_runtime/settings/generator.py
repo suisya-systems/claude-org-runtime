@@ -39,7 +39,7 @@ import sys
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 # Keys under worker_roles[<role>] that are metadata, not part of the emitted
 # settings.local.json content.
@@ -190,10 +190,10 @@ class GeneratorContext:
 
     worker_dir: str
     claude_org_path: str
-    base_clone: Optional[str] = None
-    task_id: Optional[str] = None
-    branch_ref: Optional[str] = None
-    pattern: Optional[str] = None  # "A" | "B" | None
+    base_clone: str | None = None
+    task_id: str | None = None
+    branch_ref: str | None = None
+    pattern: str | None = None  # "A" | "B" | None
 
 
 def _build_substitution_mapping(ctx: GeneratorContext) -> dict[str, str]:
@@ -291,10 +291,16 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
         if not isinstance(path, str):
             return None
         suppress = entry.get("suppressOnSymlinkEscape", True)
+        # Strict bool check: ``bool('false') == True`` would silently
+        # flip the operator's intent, so non-bool values cause the
+        # entry to pass through to the rendered output untouched
+        # (and the launcher / drift CI surfaces the malformed entry).
+        if not isinstance(suppress, bool):
+            return None
         return _NormalizedSandboxEntry(
             anchor=anchor,
             path=path,
-            suppress_on_symlink_escape=bool(suppress),
+            suppress_on_symlink_escape=suppress,
             raw=entry,
         )
     return None
@@ -384,7 +390,13 @@ def _evaluate_sandbox_suppressions(
     read_roots = [_normalize_root(r) for r in read_roots_raw if r]
     metadata.sandbox_read_roots = tuple(read_roots)
 
-    new_fs: dict = {**fs, "additionalDirectories": additional}
+    new_fs: dict = {**fs}
+    # Only emit additionalDirectories when the original sandbox had
+    # the key -- the documented contract is "forwarded as-is" except
+    # for the suppression-driven mutations on deny{Read,Write}, so an
+    # absent key should stay absent.
+    if "additionalDirectories" in fs:
+        new_fs["additionalDirectories"] = additional
     for layer_key in ("denyRead", "denyWrite"):
         entries = list(fs.get(layer_key) or [])
         kept: list[Any] = []
@@ -430,10 +442,13 @@ def _evaluate_sandbox_suppressions(
                         realpath_fn(anchor_base), literal
                     )
                 else:
-                    # absolute anchor with a relative path is malformed;
-                    # fall back to literal as written so the launcher
-                    # surfaces the issue.
-                    target_literal = literal
+                    # anchor=absolute with a relative path is malformed
+                    # (no anchor base to join against). Resolving it
+                    # against CWD would produce surprising suppressions,
+                    # so keep-as-is and let the launcher / drift CI
+                    # surface the issue.
+                    kept.append(entry)
+                    continue
 
             target_rp = realpath_fn(target_literal)
             if _is_inside_root(target_rp, read_roots):
@@ -485,10 +500,10 @@ def render_role_with_metadata(
     claude_org_path: str,
     *,
     role_kind: str = "worker",
-    base_clone: Optional[str] = None,
-    task_id: Optional[str] = None,
-    branch_ref: Optional[str] = None,
-    pattern: Optional[str] = None,
+    base_clone: str | None = None,
+    task_id: str | None = None,
+    branch_ref: str | None = None,
+    pattern: str | None = None,
     realpath_fn: Callable[[str], str] = os.path.realpath,
     wsl_detector: Callable[[], bool] = _detect_wsl,
 ) -> RenderResult:
@@ -566,10 +581,10 @@ def render_role(
     claude_org_path: str,
     *,
     role_kind: str = "worker",
-    base_clone: Optional[str] = None,
-    task_id: Optional[str] = None,
-    branch_ref: Optional[str] = None,
-    pattern: Optional[str] = None,
+    base_clone: str | None = None,
+    task_id: str | None = None,
+    branch_ref: str | None = None,
+    pattern: str | None = None,
 ) -> dict:
     """Render the per-role ``settings.local.json`` content.
 
@@ -644,6 +659,43 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="schema path override (default: bundled role_configs_schema.json)",
     )
+    parser.add_argument(
+        "--role-kind",
+        choices=sorted(_ROLE_KIND_TO_SCHEMA_KEY),
+        default="worker",
+        help=(
+            "schema bucket to look up the role in: 'worker' (default, "
+            "schema['worker_roles']) or 'org' (schema['roles'], for "
+            "secretary / dispatcher / curator)."
+        ),
+    )
+    parser.add_argument(
+        "--base-clone",
+        default=None,
+        help=(
+            "Pattern B context: substituted as {base_clone} in entry "
+            "paths and additionalDirectories before realpath evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--task-id",
+        default=None,
+        help="Pattern B context: substituted as {task_id}.",
+    )
+    parser.add_argument(
+        "--branch-ref",
+        default=None,
+        help="Pattern B context: substituted as {branch_ref}.",
+    )
+    parser.add_argument(
+        "--pattern",
+        default=None,
+        help=(
+            "Informational dispatch pattern label (e.g. 'A', 'B'); "
+            "passed through to the renderer for consumers that branch on "
+            "it. The renderer itself does not gate behavior on --pattern."
+        ),
+    )
 
 
 def add_show_arguments(parser: argparse.ArgumentParser) -> None:
@@ -680,9 +732,15 @@ def run(args: argparse.Namespace) -> int:
             role=args.role,
             worker_dir=args.worker_dir,
             claude_org_path=args.claude_org_path,
+            role_kind=getattr(args, "role_kind", "worker"),
+            base_clone=getattr(args, "base_clone", None),
+            task_id=getattr(args, "task_id", None),
+            branch_ref=getattr(args, "branch_ref", None),
+            pattern=getattr(args, "pattern", None),
         )
-    except KeyError as exc:
-        print(f"error: {exc.args[0]}", file=sys.stderr)
+    except (KeyError, ValueError) as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        print(f"error: {msg}", file=sys.stderr)
         return 2
 
     text = json.dumps(rendered, indent=2, ensure_ascii=False) + "\n"
@@ -710,9 +768,15 @@ def run_show(args: argparse.Namespace) -> int:
             role=args.role,
             worker_dir=args.worker_dir,
             claude_org_path=args.claude_org_path,
+            role_kind=getattr(args, "role_kind", "worker"),
+            base_clone=getattr(args, "base_clone", None),
+            task_id=getattr(args, "task_id", None),
+            branch_ref=getattr(args, "branch_ref", None),
+            pattern=getattr(args, "pattern", None),
         )
-    except KeyError as exc:
-        print(f"error: {exc.args[0]}", file=sys.stderr)
+    except (KeyError, ValueError) as exc:
+        msg = exc.args[0] if exc.args else str(exc)
+        print(f"error: {msg}", file=sys.stderr)
         return 2
 
     explain = bool(getattr(args, "explain", False))
