@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The matching `claude-org-ja`-side schema surface, drift CI extension,
   and pin bump are tracked separately as a follow-up after this
   runtime release lands.
+- Concrete sandbox bodies for `roles.secretary` / `roles.dispatcher` /
+  `roles.curator` are deliberately NOT populated in this PR. Phase 0
+  contract (`docs/contracts/role-pattern-sandbox-contract.md` on the
+  `claude-org-ja` side) is the SoT for which entries each org role
+  declares; this PR is limited to the structural extension (schema +
+  generator + CLI). The matching ja-side follow-up PR populates the
+  bodies driven by that contract.
 
 ## [0.1.5] - 2026-05-10
 
