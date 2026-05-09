@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-10
+
+### Changed
+
+- `claude_org_runtime/settings/role_configs_schema.json`: add
+  `Write(*/.worktrees/*/.claude/settings.local.json)` and
+  `Edit(*/.worktrees/*/.claude/settings.local.json)` to the secretary
+  role's `required_deny`. Extends Secretary's `permissions.deny`
+  coverage to the `live_repo_worktree` (Pattern B) sub-mode where the
+  worktree lives under `{claude_org_path}/.worktrees/...` rather than
+  `{workers_dir}/{project_slug}/.worktrees/...`. The existing
+  `*/workers/*/.worktrees/*/.claude/settings.local.json` pattern only
+  covered worker-side worktrees; this adds a sibling glob (no
+  role-specific gating in the pattern itself, mirroring how the
+  existing entry is expressed) so the `claude-org-ja`-side org
+  extension schema can pin a runtime release that already carries
+  the matching deny coverage. Refs `claude-org-ja#300`,
+  `claude-org-ja#289`.
+
 ## [0.1.4] - 2026-05-09
 
 ### Added
