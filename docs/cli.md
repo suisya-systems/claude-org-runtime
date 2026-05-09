@@ -143,7 +143,7 @@ claude-org-runtime settings show \
 | `--claude-org-path PATH` | Same as `settings generate`. |
 | `--out PATH` | Output file. Default: stdout. |
 | `--schema PATH` | Schema-path override. Default: bundled. |
-| `--explain` | Include sandbox suppression metadata: `wsl_detected`, resolved `sandbox_read_roots`, and the per-entry `suppressions` list (`layer`, `entry`, `reason`, `realpath`). |
+| `--explain` | Include sandbox suppression metadata: `wsl_detected`, the normalized user-supplied `sandbox_read_roots` (the configured `worker_dir` + `additionalDirectories`, *not* realpath-resolved — the realpath only applies to deny entries during the escape check), and the per-entry `suppressions` list (`layer`, `entry`, `reason`, `realpath`). |
 | `--json` | Emit a structured JSON payload instead of the human-readable text. |
 
 The runtime applies WSL/realpath suppression at render time: any

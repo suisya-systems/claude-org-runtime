@@ -99,7 +99,9 @@ def _literal_path_prefix(pattern: str) -> str | None:
     For example, ``/etc/passwd`` -> ``/etc/passwd``; ``/etc/**`` ->
     ``/etc``; ``foo/bar`` -> ``foo/bar``; ``**/credentials*`` -> None
     (pattern's first segment is itself a glob, so there is no anchored
-    prefix that ``realpath`` could meaningfully resolve).
+    prefix that ``realpath`` could meaningfully resolve). Patterns of
+    the form ``/*…`` (absolute but the first non-empty segment is a
+    glob) also return None.
     """
     glob_chars = ("*", "?", "[")
     parts = pattern.split("/")
@@ -112,7 +114,13 @@ def _literal_path_prefix(pattern: str) -> str | None:
         if any(c in part for c in glob_chars):
             break
         out.append(part)
-    return "/".join(out)
+    if not out:
+        return None
+    result = "/".join(out)
+    if not result:
+        # Pattern was "/<glob>..."; no usable anchored prefix.
+        return None
+    return result
 
 
 def _normalize_root(root: str) -> str:
@@ -216,6 +224,14 @@ def _evaluate_sandbox_suppressions(
     read_roots = [_normalize_root(r) for r in read_roots_raw if r]
     metadata.sandbox_read_roots = tuple(read_roots)
 
+    # If worker_dir's realpath escapes the sandbox read roots, every
+    # entry that is anchored at worker_dir (relative literal or
+    # relative pure-glob) is unreachable in the sandbox view and must
+    # also be suppressed -- not just the literal-prefix cases. This is
+    # the WSL case where /home/<u>/work/wd resolves into /mnt/c/... .
+    worker_dir_rp = realpath_fn(worker_dir)
+    worker_dir_reachable = _is_inside_root(worker_dir_rp, read_roots)
+
     new_fs: dict = {**fs}
     for layer_key in ("denyRead", "denyWrite"):
         entries = list(fs.get(layer_key) or [])
@@ -225,9 +241,29 @@ def _evaluate_sandbox_suppressions(
                 kept.append(entry)
                 continue
             literal = _literal_path_prefix(entry)
+            absolute_pattern = entry.startswith("/")
+            if literal is None and not absolute_pattern:
+                # Pure-glob, relative -> anchored at worker_dir.
+                if worker_dir_reachable:
+                    kept.append(entry)
+                else:
+                    metadata.suppressions.append(
+                        SandboxSuppression(
+                            layer=f"sandbox.filesystem.{layer_key}",
+                            entry=entry,
+                            reason=(
+                                "worker_dir realpath escapes sandbox read "
+                                "roots (anchored relative pattern)"
+                            ),
+                            realpath=worker_dir_rp,
+                            sandbox_read_roots=tuple(read_roots),
+                        )
+                    )
+                continue
             if literal is None:
-                # Pure-glob (no anchored prefix) -- realpath would be
-                # meaningless here, so keep the entry unchanged.
+                # Absolute pure-glob (e.g. ``/*``) -- without fnmatch'ing
+                # the actual filesystem we can't compute reachability,
+                # so keep the entry as-is.
                 kept.append(entry)
                 continue
             target = (
@@ -464,8 +500,9 @@ def _format_show_output(
 ) -> str:
     """Render ``settings show`` output.
 
-    The same renderer drives the JSON and text variants (Codex Mn1) so
-    the final deny set + suppression reasons come from one data source.
+    Both the JSON and the human-readable text variants project from
+    the same :class:`RenderResult` so the final deny set + suppression
+    reasons come from a single source of truth.
     """
     if as_json:
         payload: dict[str, Any] = {

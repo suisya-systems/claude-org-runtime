@@ -336,8 +336,32 @@ def test_devcontainer_workspaces_symlink_suppression() -> None:
     assert "escapes sandbox read roots" in s.reason
 
 
-def test_pure_glob_entry_is_not_suppressed() -> None:
-    """Patterns whose first segment is a glob have no anchored realpath -> kept."""
+def test_relative_pure_glob_kept_when_worker_dir_reachable(tmp_path: Path) -> None:
+    """Relative pure-glob patterns survive when worker_dir is reachable."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=["**/credentials*", "*.pem"],
+                additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == ["**/credentials*", "*.pem"]
+
+
+def test_relative_pure_glob_suppressed_when_worker_dir_escapes() -> None:
+    """Relative pure-glob (anchored at worker_dir) escapes -> suppressed."""
     worker_dir = "/home/u/wd"
 
     def fake_realpath(p: str) -> str:
@@ -361,9 +385,53 @@ def test_pure_glob_entry_is_not_suppressed() -> None:
         realpath_fn=fake_realpath,
         wsl_detector=lambda: True,
     )
+    suppressed_entries = {
+        (s.layer, s.entry) for s in result.sandbox.suppressions
+    }
+    assert (
+        "sandbox.filesystem.denyRead",
+        "**/credentials*",
+    ) in suppressed_entries
+    assert (
+        "sandbox.filesystem.denyRead",
+        "*.pem",
+    ) in suppressed_entries
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == []
+    # The reason mentions worker_dir, so operators can see why a glob
+    # without an anchored prefix was dropped.
+    reasons = {s.reason for s in result.sandbox.suppressions}
+    assert any("worker_dir" in r for r in reasons)
+
+
+def test_absolute_pure_glob_kept_unchanged() -> None:
+    """Absolute pure-glob patterns (e.g. ``/*``) are kept unchanged."""
+    worker_dir = "/home/u/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/mnt/c/Users/u/wd", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=["/*"],
+                additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
     assert result.sandbox.suppressions == []
     fs = result.settings["sandbox"]["filesystem"]
-    assert fs["denyRead"] == ["**/credentials*", "*.pem"]
+    assert fs["denyRead"] == ["/*"]
 
 
 def test_wsl_marker_detected_from_proc_files(tmp_path: Path) -> None:
@@ -519,6 +587,115 @@ def test_settings_show_without_explain_omits_metadata(tmp_path: Path) -> None:
     payload = json.loads(buf.getvalue())
     assert "sandbox" not in payload
     assert payload["settings"]["sandbox"]["enabled"] is True
+
+
+def _make_render_result_with_suppressions() -> generator.RenderResult:
+    """Hand-built RenderResult exercising the suppression rendering path."""
+    settings = {
+        "permissions": {
+            "deny": [
+                "Bash(git push *)",
+                "Read(.env)",
+                "Read(**/credentials*)",
+            ],
+        },
+        "sandbox": {
+            "enabled": True,
+            "filesystem": {
+                "denyRead": [],
+                "denyWrite": [],
+                "additionalDirectories": [],
+            },
+            "failIfUnavailable": False,
+        },
+    }
+    sandbox_meta = generator.SandboxMetadata(
+        enabled=True,
+        wsl_detected=True,
+        sandbox_read_roots=("/home/u/wd",),
+        suppressions=[
+            generator.SandboxSuppression(
+                layer="sandbox.filesystem.denyRead",
+                entry="secrets.env",
+                reason="realpath escapes sandbox read roots",
+                realpath="/mnt/c/Users/u/wd/secrets.env",
+                sandbox_read_roots=("/home/u/wd",),
+            ),
+            generator.SandboxSuppression(
+                layer="sandbox.filesystem.denyWrite",
+                entry="*.pem",
+                reason=(
+                    "worker_dir realpath escapes sandbox read roots "
+                    "(anchored relative pattern)"
+                ),
+                realpath="/mnt/c/Users/u/wd",
+                sandbox_read_roots=("/home/u/wd",),
+            ),
+        ],
+    )
+    return generator.RenderResult(settings=settings, sandbox=sandbox_meta)
+
+
+def test_format_show_output_text_includes_suppression_reasons() -> None:
+    """Text --explain output renders every suppressed entry's reason."""
+    result = _make_render_result_with_suppressions()
+    text = generator._format_show_output(
+        result, "demo", explain=True, as_json=False,
+    )
+    assert "wsl_detected: True" in text
+    assert "sandbox_read_roots (1):" in text
+    assert "  - /home/u/wd" in text
+    assert "suppressions (2):" in text
+    assert "sandbox.filesystem.denyRead" in text
+    assert "secrets.env" in text
+    assert "realpath escapes sandbox read roots" in text
+    assert "sandbox.filesystem.denyWrite" in text
+    assert "*.pem" in text
+    assert "worker_dir realpath escapes" in text
+    # Layer 2 deny is preserved in the output.
+    assert "Read(.env)" in text
+    assert "Read(**/credentials*)" in text
+
+
+def test_format_show_output_json_payload_carries_suppressions() -> None:
+    """JSON --explain payload carries structured suppression entries."""
+    result = _make_render_result_with_suppressions()
+    text = generator._format_show_output(
+        result, "demo", explain=True, as_json=True,
+    )
+    payload = json.loads(text)
+    assert payload["role"] == "demo"
+    assert payload["sandbox"]["wsl_detected"] is True
+    suppressions = payload["sandbox"]["suppressions"]
+    assert len(suppressions) == 2
+    layers = {s["layer"] for s in suppressions}
+    assert layers == {
+        "sandbox.filesystem.denyRead",
+        "sandbox.filesystem.denyWrite",
+    }
+    entries = {s["entry"] for s in suppressions}
+    assert entries == {"secrets.env", "*.pem"}
+    # Each suppression carries the realpath that triggered the escape
+    # and the sandbox_read_roots context.
+    for s in suppressions:
+        assert "realpath" in s and s["realpath"]
+        assert s["sandbox_read_roots"] == ["/home/u/wd"]
+    # Layer 2 deny is preserved in the rendered settings.
+    deny = payload["settings"]["permissions"]["deny"]
+    assert "Read(.env)" in deny
+
+
+def test_format_show_output_text_without_explain_omits_metadata() -> None:
+    """Without --explain the text output skips suppression sections."""
+    result = _make_render_result_with_suppressions()
+    text = generator._format_show_output(
+        result, "demo", explain=False, as_json=False,
+    )
+    assert "wsl_detected" not in text
+    assert "suppressions" not in text
+    # Settings sections still render.
+    assert "permissions.deny" in text
+    assert "sandbox.enabled: True" in text
 
 
 def test_render_role_dict_api_still_returns_dict() -> None:
