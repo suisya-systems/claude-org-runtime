@@ -884,9 +884,15 @@ def render_role(
     """Render the per-role ``settings.local.json`` content.
 
     Substitutes ``{worker_dir}`` and ``{claude_org_path}`` in the role's
-    template, drops ``description`` / ``$comment`` metadata keys, and
-    applies Phase 3 case E sandbox suppression when applicable. For the
-    suppression metadata use :func:`render_role_with_metadata`.
+    template, drops the input ``description`` / ``$comment`` metadata
+    keys, and applies Phase 3 case E sandbox suppression when
+    applicable. NOTE: when case E suppresses at least one Layer 3
+    entry, the renderer adds back a runtime-emitted ``$comment``
+    (``platform=<linux|wsl>, layer-3 entries suppressed: [<list>]``)
+    per sandbox-launcher-contract.md §2.1; that is the suppression
+    metadata surface, not the operator-authored input ``$comment``
+    (which is always dropped). For the structured suppression report
+    use :func:`render_role_with_metadata`.
 
     See :func:`render_role_with_metadata` for the Phase 1 ``role_kind``
     and Pattern B context parameters.
