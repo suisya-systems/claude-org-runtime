@@ -235,7 +235,7 @@ class GeneratorContext:
     base_clone: str | None = None
     task_id: str | None = None
     branch_ref: str | None = None
-    pattern: str | None = None  # "A" | "B" | None
+    pattern: str | None = None  # "A" | "B" | "C" | None
 
 
 def _build_substitution_mapping(ctx: GeneratorContext) -> dict[str, str]:
@@ -547,6 +547,69 @@ _ROLE_KIND_TO_SCHEMA_KEY = {
     "org": "roles",
 }
 
+# Pattern B context placeholders. When the selected sandbox declares one
+# of these but the generator was not given the corresponding context,
+# the rendered output would silently ship a literal ``{base_clone}``
+# string into ``sandbox.filesystem.additionalDirectories`` -- the bwrap
+# launcher consumes those entries as concrete paths, so an unresolved
+# placeholder is a hard authoring error.
+_PATTERN_B_PLACEHOLDER_FLAGS: dict[str, str] = {
+    "{base_clone}": "--base-clone",
+    "{task_id}": "--task-id",
+    "{branch_ref}": "--branch-ref",
+}
+
+
+def _reject_unresolved_pattern_b_placeholders(
+    sandbox: dict, ctx: GeneratorContext
+) -> None:
+    """Fail fast when the rendered sandbox still contains Pattern B placeholders.
+
+    ``_substitute`` only replaces placeholders whose key is present in
+    the substitution mapping (``_build_substitution_mapping`` omits
+    Pattern B keys when the matching field on :class:`GeneratorContext`
+    is ``None``). That means a sandbox declaring
+    ``"{base_clone}/.git/worktrees/{task_id}"`` rendered without
+    ``--base-clone`` / ``--task-id`` would produce a
+    ``settings.local.json`` that the bwrap launcher cannot consume,
+    so the misconfiguration is rejected at render time with the flag
+    name the operator most likely missed.
+    """
+
+    def visit(value: Any) -> str | None:
+        if isinstance(value, str):
+            for placeholder in _PATTERN_B_PLACEHOLDER_FLAGS:
+                if placeholder in value:
+                    return placeholder
+            return None
+        if isinstance(value, list):
+            for v in value:
+                hit = visit(v)
+                if hit:
+                    return hit
+            return None
+        if isinstance(value, dict):
+            for v in value.values():
+                hit = visit(v)
+                if hit:
+                    return hit
+            return None
+        return None
+
+    hit = visit(sandbox)
+    if hit is None:
+        return
+    flag = _PATTERN_B_PLACEHOLDER_FLAGS[hit]
+    pattern_label = (
+        f"--pattern {ctx.pattern}" if ctx.pattern else "the selected pattern"
+    )
+    raise ValueError(
+        f"rendered sandbox still contains the unresolved {hit} "
+        f"placeholder; {pattern_label} requires {flag} so the bwrap "
+        "launcher receives a concrete path "
+        "(sandbox.filesystem entries are consumed literally)."
+    )
+
 
 def _select_sandbox_for_pattern(
     *,
@@ -727,6 +790,7 @@ def render_role_with_metadata(
     rendered = _substitute(template, _build_substitution_mapping(ctx))
     sandbox = rendered.get("sandbox")
     if isinstance(sandbox, dict):
+        _reject_unresolved_pattern_b_placeholders(sandbox, ctx)
         new_sandbox, metadata = _evaluate_sandbox_suppressions(
             sandbox,
             ctx,

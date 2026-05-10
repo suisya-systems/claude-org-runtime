@@ -1822,6 +1822,98 @@ def test_sandbox_by_pattern_null_value_alone_rejected() -> None:
     assert "must be a dict" in str(info.value)
 
 
+def test_pattern_b_placeholder_without_base_clone_rejected() -> None:
+    """Pattern B sandbox referencing {base_clone} without --base-clone errors out.
+
+    Without the matching context, ``_substitute`` would leave a literal
+    ``{base_clone}`` in the rendered sandbox; the bwrap launcher
+    consumes ``sandbox.filesystem.additionalDirectories`` as concrete
+    paths, so the misconfiguration must be caught at render time.
+    """
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="B",
+        )
+    msg = str(info.value)
+    assert "{base_clone}" in msg
+    assert "--base-clone" in msg
+    assert "--pattern B" in msg
+
+
+def test_pattern_b_placeholder_without_task_id_rejected() -> None:
+    """{task_id} without --task-id is also caught (independent of base_clone)."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            base_clone="/home/u/proj",  # task_id intentionally omitted
+            pattern="B",
+        )
+    msg = str(info.value)
+    # base_clone resolved, but task_id is left dangling.
+    assert "{task_id}" in msg
+    assert "--task-id" in msg
+
+
+def test_pattern_b_placeholder_in_deny_read_string_rejected() -> None:
+    """An unresolved {base_clone} on a legacy-string deny entry is also caught."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        deny_read=["{base_clone}/.git/HEAD"],
+                        additional=["{worker_dir}"],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="B",
+        )
+    assert "{base_clone}" in str(info.value)
+
+
 def test_org_role_sandbox_by_pattern_null_rejected() -> None:
     """``sandbox_by_pattern: null`` on an org role is also misconfiguration."""
     schema = {
