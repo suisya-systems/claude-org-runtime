@@ -28,10 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `_VALID_ANCHORS` gains `base_clone` so Pattern B sandbox entries
     can reference Git metadata via
     `<base_clone>/.git/worktrees/<task_id>`,
-    `<base_clone>/.git/objects`, etc. (Codex Blocker 3, contract:
-    `docs/contracts/role-pattern-sandbox-contract.md` §4.2.1).
-    `anchor='base_clone'` without a generator `base_clone` context
-    surfaces a usable error message pointing at `--base-clone`.
+    `<base_clone>/.git/objects`, etc. (Codex Blocker 3; contract
+    SoT: claude-org-ja's
+    `docs/contracts/role-pattern-sandbox-contract.md` §4.2.1, not
+    redistributed here). `anchor='base_clone'` without a generator
+    `base_clone` context surfaces a usable error message pointing at
+    `--base-clone`.
   - CLI: `--pattern` is now `choices=('A','B','C')` so typos like
     `--pattern b` fail fast instead of falling through silently
     (Codex Nit 1).

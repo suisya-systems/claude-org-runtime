@@ -120,7 +120,7 @@ python -m claude_org_runtime.settings.generator \
 | `--base-clone PATH` | Pattern B context: substituted as `{base_clone}` in entry paths and `additionalDirectories` before realpath evaluation. |
 | `--task-id ID` | Pattern B context: substituted as `{task_id}`. |
 | `--branch-ref REF` | Pattern B context: substituted as `{branch_ref}`. |
-| `--pattern {A,B,C}` | Dispatch pattern. Required when the selected role declares `sandbox_by_pattern`; the renderer then forwards `sandbox_by_pattern[<pattern>]` as the role's sandbox surface (see `docs/contracts/role-pattern-sandbox-contract.md`). For roles using the legacy single `sandbox` shape it stays informational and is ignored by the renderer. Free-form values like `b` are rejected by argparse to prevent silent fallthrough. |
+| `--pattern {A,B,C}` | Dispatch pattern. Required when the selected role declares `sandbox_by_pattern`; the renderer then forwards `sandbox_by_pattern[<pattern>]` as the role's sandbox surface (contract SoT: claude-org-ja's `docs/contracts/role-pattern-sandbox-contract.md`, not part of this runtime repo). For roles using the legacy single `sandbox` shape it stays informational and is ignored by the renderer. Free-form values like `b` are rejected by argparse to prevent silent fallthrough. |
 
 ## `settings show`
 

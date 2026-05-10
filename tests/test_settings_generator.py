@@ -1771,6 +1771,76 @@ def test_sandbox_by_pattern_must_be_dict() -> None:
     assert "must be a dict" in str(info.value)
 
 
+def test_sandbox_by_pattern_null_value_rejected() -> None:
+    """``sandbox_by_pattern: null`` (key present, value None) is rejected.
+
+    Key-presence (not value-truthiness) drives the routing so a worker
+    role declaring ``{ sandbox: ..., sandbox_by_pattern: null }`` does
+    not silently fall through to the legacy single-``sandbox`` path
+    (which would smuggle in the wrong Pattern A/B/C surface).
+    """
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": None,
+                "sandbox": _pattern_sandbox(deny_read=["legacy.env"]),
+            }
+        }
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    msg = str(info.value)
+    # Mutual-exclusivity catches this ahead of the dict-shape check.
+    assert "mutually exclusive" in msg
+
+
+def test_sandbox_by_pattern_null_value_alone_rejected() -> None:
+    """``sandbox_by_pattern: null`` without sandbox still fails (not a dict)."""
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": None,
+            }
+        }
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    assert "must be a dict" in str(info.value)
+
+
+def test_org_role_sandbox_by_pattern_null_rejected() -> None:
+    """``sandbox_by_pattern: null`` on an org role is also misconfiguration."""
+    schema = {
+        "roles": {
+            "secretary": {"sandbox_by_pattern": None},
+        },
+        "worker_roles": {},
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="secretary",
+            role_kind="org",
+            worker_dir="/wd",
+            claude_org_path="/co",
+        )
+    assert "reserved for worker roles" in str(info.value)
+
+
 def test_legacy_sandbox_unaffected_by_pattern_flag(tmp_path: Path) -> None:
     """Roles using the legacy single 'sandbox' ignore --pattern."""
     worker_dir = str(tmp_path / "wd")

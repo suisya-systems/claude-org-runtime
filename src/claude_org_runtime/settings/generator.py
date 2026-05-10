@@ -41,8 +41,9 @@ selection on worker roles:
 - ``anchor='base_clone'`` resolves to ``ctx.base_clone`` so Pattern B
   entries can reference Git metadata under
   ``<base_clone>/.git/worktrees/<task_id>``,
-  ``<base_clone>/.git/objects``, etc. (see
-  ``docs/contracts/role-pattern-sandbox-contract.md`` §4.2.1).
+  ``<base_clone>/.git/objects``, etc. (the SoT is claude-org-ja's
+  ``docs/contracts/role-pattern-sandbox-contract.md`` §4.2.1; this
+  runtime repo intentionally does not redistribute the contract).
 - Org roles (``roles[<role>]``: secretary / dispatcher / curator)
   keep the single ``sandbox`` shape and may not declare
   ``sandbox_by_pattern`` -- there is no role × pattern axis on the
@@ -266,8 +267,9 @@ def _anchor_base_path(anchor: str, ctx: GeneratorContext) -> str:
     process's resolved ``HOME``). ``worker_dir`` / ``claude_org_path``
     pull from the generator context. ``base_clone`` resolves to
     ``ctx.base_clone`` so Pattern B sandbox entries can reference Git
-    metadata under ``<base_clone>/.git/...`` (the contract is documented
-    in ``docs/contracts/role-pattern-sandbox-contract.md`` §4.2.1).
+    metadata under ``<base_clone>/.git/...`` (the contract lives in
+    claude-org-ja's ``docs/contracts/role-pattern-sandbox-contract.md``
+    §4.2.1, not in this runtime repo).
     ``absolute`` returns ``""`` so the caller treats the entry path
     itself as fully-qualified.
     """
@@ -580,29 +582,34 @@ def _select_sandbox_for_pattern(
     case so :func:`render_role_with_metadata` falls through to the
     pre-Phase-1 behavior.
     """
-    raw_sandbox = raw_role.get("sandbox")
-    raw_sandbox_by_pattern = raw_role.get("sandbox_by_pattern")
-    if raw_sandbox_by_pattern is None:
+    has_sandbox = "sandbox" in raw_role
+    has_sandbox_by_pattern = "sandbox_by_pattern" in raw_role
+    if not has_sandbox_by_pattern:
         # Legacy single-sandbox path; ``pattern`` stays informational.
         return None
+    raw_sandbox_by_pattern = raw_role["sandbox_by_pattern"]
     if role_kind == "org":
+        # Key presence (not value) drives the reject so that
+        # ``sandbox_by_pattern: null`` on an org role is still surfaced
+        # as misconfiguration instead of silently treated as absent.
         raise ValueError(
             f"org role {role!r} declares 'sandbox_by_pattern' which is "
             "reserved for worker roles; org roles use the single 'sandbox' "
             "shape (secretary / dispatcher / curator do not vary by "
             "Pattern A/B/C)."
         )
-    if raw_sandbox is not None:
+    if has_sandbox:
         raise ValueError(
             f"worker role {role!r} declares both 'sandbox' and "
             "'sandbox_by_pattern'; these are mutually exclusive (the "
-            "Pattern A/B/C surfaces differ per "
-            "docs/contracts/role-pattern-sandbox-contract.md)."
+            "Pattern A/B/C surfaces differ per role-pattern-sandbox-contract "
+            "in claude-org-ja docs/contracts/)."
         )
     if not isinstance(raw_sandbox_by_pattern, dict):
         raise ValueError(
             f"role {role!r}: 'sandbox_by_pattern' must be a dict keyed "
-            f"by pattern (A/B/C); got {type(raw_sandbox_by_pattern).__name__}."
+            f"by pattern (A/B/C); got "
+            f"{type(raw_sandbox_by_pattern).__name__}."
         )
     unknown = sorted(
         k for k in raw_sandbox_by_pattern if k not in _VALID_PATTERNS
@@ -856,8 +863,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
             "Dispatch pattern (A|B|C). Required when the selected role "
             "declares 'sandbox_by_pattern' -- the renderer then forwards "
             "sandbox_by_pattern[<pattern>] as the role's sandbox surface "
-            "(see docs/contracts/role-pattern-sandbox-contract.md). For "
-            "legacy roles using the single 'sandbox' shape this stays "
+            "(contract: claude-org-ja's "
+            "docs/contracts/role-pattern-sandbox-contract.md). For legacy "
+            "roles using the single 'sandbox' shape this stays "
             "informational and is ignored by the renderer."
         ),
     )
