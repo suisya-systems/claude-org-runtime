@@ -451,6 +451,40 @@ def test_wsl_marker_not_present(tmp_path: Path) -> None:
     assert generator._detect_wsl((str(proc_version), str(osrelease))) is False
 
 
+def test_wsl1_detected_from_microsoft_in_proc_version(tmp_path: Path) -> None:
+    """WSL1's /proc/version uses ``Microsoft`` (capital M) without ``WSL``."""
+    proc_version = tmp_path / "version"
+    osrelease = tmp_path / "osrelease"
+    proc_version.write_text(
+        "Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com)\n",
+        encoding="utf-8",
+    )
+    osrelease.write_text("4.4.0-19041-Microsoft\n", encoding="utf-8")
+    assert generator._detect_wsl((str(proc_version), str(osrelease))) is True
+
+
+def test_wsl_detected_from_wsl_token_in_proc_version_only(tmp_path: Path) -> None:
+    """``WSL`` token in /proc/version is sufficient even if osrelease lacks it."""
+    proc_version = tmp_path / "version"
+    osrelease = tmp_path / "osrelease"
+    proc_version.write_text(
+        "Linux version 5.15.0-microsoft-standard-WSL2 (root@host)\n",
+        encoding="utf-8",
+    )
+    osrelease.write_text("6.6.0-1-amd64\n", encoding="utf-8")
+    assert generator._detect_wsl((str(proc_version), str(osrelease))) is True
+
+
+def test_wsl_detected_when_only_proc_version_available(tmp_path: Path) -> None:
+    """A missing osrelease file does not block detection from /proc/version."""
+    proc_version = tmp_path / "version"
+    proc_version.write_text(
+        "Linux version 5.15.0-microsoft-standard-WSL2\n", encoding="utf-8"
+    )
+    missing = tmp_path / "does-not-exist"
+    assert generator._detect_wsl((str(proc_version), str(missing))) is True
+
+
 def test_settings_show_explain_text_includes_suppressions(tmp_path: Path) -> None:
     """`settings show --explain` text output surfaces suppression reasons."""
     worker_dir = str(tmp_path / "wd")
@@ -713,6 +747,283 @@ def test_render_role_dict_api_still_returns_dict() -> None:
     )
     assert isinstance(out, dict)
     assert "sandbox" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 case E §5.2(b): ``$comment`` suppression metadata emission
+# (sandbox-launcher-contract.md §2.1 conditionally-required field).
+# ---------------------------------------------------------------------------
+
+
+def test_comment_emitted_with_wsl_platform_when_suppressed() -> None:
+    """WSL escape suppression emits ``$comment`` with ``platform=wsl``.
+
+    Mirrors the typical production WSL layout per
+    ``phase3-bootstrap-policy-design.md`` §1: ``worker_dir`` lives on
+    the Linux side (``/home/<u>/work/wd``) and is NOT a host-cross
+    symlink, while only ``~/.aws`` / ``~/.ssh`` resolve into
+    ``/mnt/c/...``. Layer 3 ``denyRead`` / ``denyWrite`` entries on
+    those home-anchored paths are what need suppression. Per the
+    schema's ``worker_roles.$comment_sandbox_anchor``, home-anchored
+    entries SHOULD be authored as the structured form
+    (``{anchor: 'home', path: '.aws/.env'}``); legacy raw ``~/...``
+    strings stay worker_dir-anchored for backward compat.
+    """
+    worker_dir = "/home/u/work/wd"
+    home = "/home/u"
+
+    def fake_realpath(p: str) -> str:
+        # Only ~/.aws and ~/.ssh escape to /mnt/c/...; worker_dir is
+        # NOT a symlink (faithfully reproduces the WSL fragility).
+        if p == f"{home}/.aws" or p.startswith(f"{home}/.aws/"):
+            return p.replace(f"{home}/.aws", "/mnt/c/Users/u/.aws", 1)
+        if p == f"{home}/.ssh" or p.startswith(f"{home}/.ssh/"):
+            return p.replace(f"{home}/.ssh", "/mnt/c/Users/u/.ssh", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[
+                    {
+                        "anchor": "home",
+                        "path": ".aws/.env",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                    {
+                        "anchor": "home",
+                        "path": ".ssh/id_rsa",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                ],
+                deny_write=[
+                    {
+                        "anchor": "home",
+                        "path": ".aws/credentials",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                ],
+                additional=[],
+            ),
+        },
+    }
+    # Force HOME so _anchor_base_path("home") resolves to the same
+    # /home/u that fake_realpath is rewriting.
+    import os as _os
+
+    saved_home = _os.environ.get("HOME")
+    _os.environ["HOME"] = home
+    try:
+        result = generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir=worker_dir,
+            claude_org_path="/home/u/co",
+            realpath_fn=fake_realpath,
+            wsl_detector=lambda: True,
+        )
+    finally:
+        if saved_home is None:
+            _os.environ.pop("HOME", None)
+        else:
+            _os.environ["HOME"] = saved_home
+
+    comment = result.settings.get("$comment")
+    assert isinstance(comment, str)
+    # Fixed prefix per sandbox-launcher-contract.md §2.1 (machine-parseable
+    # anchor for the launcher's /sandbox status display).
+    assert comment.startswith(
+        "platform=wsl, layer-3 entries suppressed: ["
+    )
+    assert comment.endswith("]")
+    # Each suppressed structured entry surfaces as ``home:<path>`` so
+    # the launcher can render the operator's authored form.
+    assert "home:.aws/.env" in comment
+    assert "home:.ssh/id_rsa" in comment
+    assert "home:.aws/credentials" in comment
+    # Layer 3 was actually emptied (3 → 0 dropped entries).
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == []
+    assert fs["denyWrite"] == []
+
+
+def test_comment_uses_linux_platform_when_not_wsl() -> None:
+    """Non-WSL escape (devcontainer-style) emits ``platform=linux`` comment."""
+    worker_dir = "/home/u/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/workspaces/repo", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"], additional=[]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: False,
+    )
+    comment = result.settings.get("$comment")
+    assert isinstance(comment, str)
+    assert comment.startswith(
+        "platform=linux, layer-3 entries suppressed: ["
+    )
+    assert "secrets.env" in comment
+
+
+def test_comment_absent_when_no_suppressions(tmp_path: Path) -> None:
+    """No suppression -> no ``$comment`` field (avoids stale metadata)."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"], additional=[]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    assert "$comment" not in result.settings
+
+
+def test_comment_absent_when_sandbox_disabled() -> None:
+    """sandbox.enabled=false short-circuits before any suppression / comment."""
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                enabled=False,
+                deny_read=["/mnt/c/Users/somebody/secrets.env"],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir="/home/u/work/wd",
+        claude_org_path="/home/u/co",
+        wsl_detector=lambda: True,
+    )
+    assert "$comment" not in result.settings
+
+
+def test_comment_renders_structured_entry_with_anchor_prefix() -> None:
+    """Structured entries surface as ``<anchor>:<path>`` in the comment list."""
+    worker_dir = "/home/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        # ``home`` resolves to a /mnt/c/... escape so the structured entry
+        # gets suppressed and the comment list has to render it.
+        if p in ("/home/u", "/home/u/"):
+            return "/mnt/c/Users/u"
+        if p.startswith("/home/u/"):
+            return p.replace("/home/u", "/mnt/c/Users/u", 1)
+        return p
+
+    structured_entry = {
+        "anchor": "home",
+        "path": ".aws/.env",
+        "suppressOnSymlinkEscape": True,
+    }
+    abs_entry = {
+        "anchor": "absolute",
+        "path": "/mnt/c/Users/u/Windows/secret",
+        "suppressOnSymlinkEscape": True,
+    }
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[structured_entry, abs_entry], additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    comment = result.settings["$comment"]
+    # ``home``-anchored structured entry: rendered as ``home:<path>`` so
+    # the operator can disambiguate from a literal worker_dir-anchored
+    # entry on the launcher's status display.
+    assert "home:.aws/.env" in comment
+    # ``absolute`` anchor: the path is already self-explanatory, so the
+    # ``absolute:`` prefix is omitted.
+    assert "/mnt/c/Users/u/Windows/secret" in comment
+    assert "absolute:" not in comment
+
+
+def test_layer_2_permissions_deny_preserved_alongside_comment() -> None:
+    """``permissions.deny`` survives Layer 3 suppression -- Layer 2 invariant."""
+    worker_dir = "/home/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/mnt/c/Users/u/work/wd", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"], additional=[]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    deny = result.settings["permissions"]["deny"]
+    # Layer 2 deny rules are emitted untouched even when Layer 3 entries
+    # are suppressed -- per phase3-bootstrap-policy-design.md §5.2(b).
+    assert "Read(.env)" in deny
+    assert "Read(**/credentials*)" in deny
+    assert "$comment" in result.settings
+
+
+def test_settings_show_text_surfaces_comment(tmp_path: Path) -> None:
+    """Bare (no --explain) text show surfaces the runtime ``$comment`` line."""
+    worker_dir = "/home/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        if p == worker_dir or p.startswith(worker_dir + "/"):
+            return p.replace(worker_dir, "/mnt/c/Users/u/work/wd", 1)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"], additional=[]),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+    )
+    text = generator._format_show_output(
+        result, "demo", explain=False, as_json=False,
+    )
+    assert "$comment: platform=wsl, layer-3 entries suppressed: [" in text
+    # Without --explain we still avoid the per-entry suppression block.
+    assert "suppressions (" not in text
 
 
 # ---------------------------------------------------------------------------
