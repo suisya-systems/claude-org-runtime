@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `claude_org_runtime.settings.generator`: Pattern A/B/C-aware sandbox
+  selection on worker roles (Refs `claude-org-runtime#13`).
+  - `worker_roles[<role>].sandbox_by_pattern: {A?, B?, C?}` declares
+    one sandbox surface per dispatch pattern. The pattern keys are
+    exactly `A` / `B` / `C` (matching the resolver / delegate-payload
+    normalization in claude-org-ja). The generator picks
+    `sandbox_by_pattern[--pattern]` and treats it as the role's
+    sandbox; missing pattern keys are an authoring error rather than
+    a silent fallthrough so Pattern B's distinct
+    `additionalDirectories` / `base_clone` surface is never replaced
+    by an A/C surface (Codex Blocker 1).
+  - `sandbox` and `sandbox_by_pattern` are MUTUALLY EXCLUSIVE on
+    worker roles; declaring both surfaces a `ValueError`. Org roles
+    (`roles[<role>]`: secretary / dispatcher / curator) keep the
+    single `sandbox` shape and may NOT declare `sandbox_by_pattern`
+    (Codex Major 1).
+  - `_VALID_ANCHORS` gains `base_clone` so Pattern B sandbox entries
+    can reference Git metadata via
+    `<base_clone>/.git/worktrees/<task_id>`,
+    `<base_clone>/.git/objects`, etc. (Codex Blocker 3, contract:
+    `docs/contracts/role-pattern-sandbox-contract.md` §4.2.1).
+    `anchor='base_clone'` without a generator `base_clone` context
+    surfaces a usable error message pointing at `--base-clone`.
+  - CLI: `--pattern` is now `choices=('A','B','C')` so typos like
+    `--pattern b` fail fast instead of falling through silently
+    (Codex Nit 1).
+  - Pattern B's *command-isolation* guardrails (`Bash(git worktree *)`
+    deny + `block-dangerous-git.sh`) are intentionally NOT modeled in
+    `sandbox_by_pattern`. The runtime sandbox layer is path-isolation
+    only; command isolation lives in the per-role `permissions.deny`
+    / `.hooks` (handled by the paired claude-org-ja Phase 1 PR4 --
+    Codex Major 3).
+
+### Notes
+
+- Backward-compatible: roles using the legacy single `sandbox` shape
+  render unchanged, and `--pattern` stays informational on those
+  roles.
+- Pattern C sub-modes (ephemeral vs gitignored_repo_root) are out of
+  scope for this PR; `sandbox_by_pattern.C` captures only the
+  surface common to both sub-modes.
+- This release does not ship concrete
+  `worker_roles[*].sandbox_by_pattern` bodies. The paired
+  claude-org-ja Phase 1 PR4 lands the concrete bodies, plumbs
+  `--pattern` / `--base-clone` / `--task-id` / `--branch-ref` through
+  `tools/resolve_worker_layout.py` / `tools/gen_delegate_payload.py`,
+  and updates `tools/check_runtime_schema_drift.py` to render A/B/C
+  fixtures. Until that PR lands, the runtime CLI exposes the surface
+  but the standard dispatch path does not yet exercise it.
+
 ## [0.1.6] - 2026-05-10
 
 ### Added

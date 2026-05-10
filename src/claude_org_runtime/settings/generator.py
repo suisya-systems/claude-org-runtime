@@ -28,6 +28,37 @@ Phase 1 (Refs `claude-org-ja#378`) extends the renderer with:
 - A Pattern B context (``base_clone`` / ``task_id`` / ``branch_ref``)
   whose placeholders are substituted alongside ``{worker_dir}`` /
   ``{claude_org_path}`` in entry paths and ``additionalDirectories``.
+
+Phase 1 (Refs `claude-org-runtime#13`) adds Pattern A/B/C-aware sandbox
+selection on worker roles:
+
+- ``worker_roles[<role>].sandbox_by_pattern: {A?, B?, C?}`` declares
+  one sandbox surface per Pattern. ``sandbox`` and
+  ``sandbox_by_pattern`` are mutually exclusive on worker roles.
+- ``--pattern A|B|C`` selects which entry the renderer treats as the
+  role's sandbox; missing pattern keys are an authoring error rather
+  than a silent fallthrough.
+- ``anchor='base_clone'`` resolves to ``ctx.base_clone`` so Pattern B
+  entries can reference Git metadata under
+  ``<base_clone>/.git/worktrees/<task_id>``,
+  ``<base_clone>/.git/objects``, etc. (see
+  ``docs/contracts/role-pattern-sandbox-contract.md`` §4.2.1).
+- Org roles (``roles[<role>]``: secretary / dispatcher / curator)
+  keep the single ``sandbox`` shape and may not declare
+  ``sandbox_by_pattern`` -- there is no role × pattern axis on the
+  org side.
+
+NOTE: This runtime PR only exposes the schema + renderer surface.
+The paired claude-org-ja PR (Phase 1 PR4) updates
+``tools/resolve_worker_layout.py`` / ``tools/gen_delegate_payload.py``
+to plumb ``--pattern`` / ``--base-clone`` / ``--task-id`` /
+``--branch-ref`` through the dispatch path, lands the concrete
+``worker_roles[*].sandbox_by_pattern`` bodies, and updates
+``tools/check_runtime_schema_drift.py`` to render A/B/C fixtures.
+Pattern B's *command-isolation* guardrails (``Bash(git worktree *)``
+deny + ``block-dangerous-git.sh``) are also a ja-side concern --
+this runtime only encodes the *path-isolation* layer in
+``sandbox_by_pattern.B``.
 """
 
 from __future__ import annotations
@@ -41,9 +72,12 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable
 
-# Keys under worker_roles[<role>] that are metadata, not part of the emitted
-# settings.local.json content.
-_META_KEYS = {"description", "$comment"}
+# Keys under worker_roles[<role>] / roles[<role>] that are *not* part of the
+# emitted settings.local.json content. ``sandbox_by_pattern`` (Phase 1
+# Refs `claude-org-runtime#13`) is resolved into ``sandbox`` based on the
+# selected --pattern before the template is rendered, so the bare key
+# never appears in output.
+_META_KEYS = {"description", "$comment", "sandbox_by_pattern"}
 
 # WSL kernel marker as exposed by /proc/version + /proc/sys/kernel/osrelease.
 _WSL_MARKER = "microsoft-standard-WSL"
@@ -171,7 +205,14 @@ def _is_inside_root(target: str, roots: list[str]) -> bool:
     return False
 
 
-_VALID_ANCHORS = ("home", "worker_dir", "claude_org_path", "absolute")
+_VALID_ANCHORS = (
+    "home",
+    "worker_dir",
+    "claude_org_path",
+    "base_clone",
+    "absolute",
+)
+_VALID_PATTERNS = ("A", "B", "C")
 
 
 @dataclass(frozen=True)
@@ -223,8 +264,12 @@ def _anchor_base_path(anchor: str, ctx: GeneratorContext) -> str:
     ``home`` expands to the current user's home directory (via
     ``os.path.expanduser('~')`` so the value is consistent with the
     process's resolved ``HOME``). ``worker_dir`` / ``claude_org_path``
-    pull from the generator context. ``absolute`` returns ``""`` so the
-    caller treats the entry path itself as fully-qualified.
+    pull from the generator context. ``base_clone`` resolves to
+    ``ctx.base_clone`` so Pattern B sandbox entries can reference Git
+    metadata under ``<base_clone>/.git/...`` (the contract is documented
+    in ``docs/contracts/role-pattern-sandbox-contract.md`` §4.2.1).
+    ``absolute`` returns ``""`` so the caller treats the entry path
+    itself as fully-qualified.
     """
     if anchor == "home":
         return os.path.expanduser("~")
@@ -232,6 +277,14 @@ def _anchor_base_path(anchor: str, ctx: GeneratorContext) -> str:
         return ctx.worker_dir
     if anchor == "claude_org_path":
         return ctx.claude_org_path
+    if anchor == "base_clone":
+        if ctx.base_clone is None:
+            raise ValueError(
+                "sandbox entry uses anchor='base_clone' but the generator "
+                "context has no base_clone. Pattern B requires "
+                "--base-clone to resolve {base_clone}-anchored entries."
+            )
+        return ctx.base_clone
     if anchor == "absolute":
         return ""
     raise ValueError(
@@ -493,6 +546,93 @@ _ROLE_KIND_TO_SCHEMA_KEY = {
 }
 
 
+def _select_sandbox_for_pattern(
+    *,
+    role: str,
+    role_kind: str,
+    raw_role: dict,
+    pattern: str | None,
+) -> Any:
+    """Resolve ``sandbox_by_pattern`` to a single ``sandbox`` payload.
+
+    Phase 1 (Refs `claude-org-runtime#13`): worker roles may declare a
+    ``sandbox_by_pattern`` map keyed by Pattern A/B/C. The renderer
+    needs a single sandbox shape, so this helper picks the entry that
+    corresponds to ``pattern`` and validates the legality of the
+    role × pattern combination:
+
+    - ``sandbox`` and ``sandbox_by_pattern`` are mutually exclusive on
+      worker roles; the contract assigns each pattern its own surface
+      and the legacy single ``sandbox`` would smuggle one shape into
+      another (e.g. Pattern A's ``additionalDirectories: [worker_dir]``
+      into Pattern B, which needs ``<base_clone>/.git/...``).
+    - Org roles (``roles[*]``: secretary / dispatcher / curator) keep
+      the single ``sandbox`` shape and may not declare
+      ``sandbox_by_pattern`` -- there is no role × pattern axis on the
+      org side.
+    - When ``sandbox_by_pattern`` is present, ``--pattern`` is required
+      and must name a defined entry; missing entries are treated as
+      misconfiguration rather than silently rendering no sandbox so
+      the operator notices a Pattern B sandbox surface that was never
+      authored.
+
+    Returns ``None`` for the legacy single-``sandbox`` (or no-sandbox)
+    case so :func:`render_role_with_metadata` falls through to the
+    pre-Phase-1 behavior.
+    """
+    raw_sandbox = raw_role.get("sandbox")
+    raw_sandbox_by_pattern = raw_role.get("sandbox_by_pattern")
+    if raw_sandbox_by_pattern is None:
+        # Legacy single-sandbox path; ``pattern`` stays informational.
+        return None
+    if role_kind == "org":
+        raise ValueError(
+            f"org role {role!r} declares 'sandbox_by_pattern' which is "
+            "reserved for worker roles; org roles use the single 'sandbox' "
+            "shape (secretary / dispatcher / curator do not vary by "
+            "Pattern A/B/C)."
+        )
+    if raw_sandbox is not None:
+        raise ValueError(
+            f"worker role {role!r} declares both 'sandbox' and "
+            "'sandbox_by_pattern'; these are mutually exclusive (the "
+            "Pattern A/B/C surfaces differ per "
+            "docs/contracts/role-pattern-sandbox-contract.md)."
+        )
+    if not isinstance(raw_sandbox_by_pattern, dict):
+        raise ValueError(
+            f"role {role!r}: 'sandbox_by_pattern' must be a dict keyed "
+            f"by pattern (A/B/C); got {type(raw_sandbox_by_pattern).__name__}."
+        )
+    unknown = sorted(
+        k for k in raw_sandbox_by_pattern if k not in _VALID_PATTERNS
+    )
+    if unknown:
+        raise ValueError(
+            f"role {role!r}: 'sandbox_by_pattern' has unknown pattern "
+            f"keys: {unknown}. valid: {list(_VALID_PATTERNS)}"
+        )
+    if pattern is None:
+        raise ValueError(
+            f"role {role!r} declares 'sandbox_by_pattern'; --pattern "
+            f"(one of {list(_VALID_PATTERNS)}) is required to select "
+            "the sandbox surface."
+        )
+    if pattern not in _VALID_PATTERNS:
+        raise ValueError(
+            f"unknown pattern: {pattern!r}. "
+            f"valid: {list(_VALID_PATTERNS)}"
+        )
+    selected = raw_sandbox_by_pattern.get(pattern)
+    if selected is None:
+        defined = sorted(raw_sandbox_by_pattern)
+        raise ValueError(
+            f"role {role!r} declares 'sandbox_by_pattern' but has no "
+            f"entry for pattern {pattern!r}. defined: {defined}"
+        )
+    return selected
+
+
 def render_role_with_metadata(
     schema: dict,
     role: str,
@@ -524,8 +664,14 @@ def render_role_with_metadata(
     Pattern B context (``base_clone`` / ``task_id`` / ``branch_ref``)
     is optional. When supplied, the matching ``{...}`` placeholders are
     substituted alongside ``{worker_dir}`` / ``{claude_org_path}`` in
-    every string in the rendered template. ``pattern`` is informational
-    metadata; the renderer does not branch on it directly.
+    every string in the rendered template. ``pattern`` selects which
+    entry of ``sandbox_by_pattern`` the renderer treats as the role's
+    sandbox surface (Phase 1 Refs `claude-org-runtime#13`); on roles
+    that still use the legacy single ``sandbox`` shape it is
+    informational metadata only. ``--pattern`` is required when the
+    role declares ``sandbox_by_pattern``; mutual exclusivity vs the
+    legacy ``sandbox`` field is enforced via
+    :func:`_select_sandbox_for_pattern`.
     """
     schema_key = _ROLE_KIND_TO_SCHEMA_KEY.get(role_kind)
     if schema_key is None:
@@ -548,6 +694,13 @@ def render_role_with_metadata(
         raise KeyError(
             f"unknown {kind_label}: {role!r}. available: {available}"
         )
+    raw_role = roles[role]
+    selected_sandbox = _select_sandbox_for_pattern(
+        role=role,
+        role_kind=role_kind,
+        raw_role=raw_role,
+        pattern=pattern,
+    )
     ctx = GeneratorContext(
         worker_dir=worker_dir,
         claude_org_path=claude_org_path,
@@ -557,8 +710,13 @@ def render_role_with_metadata(
         pattern=pattern,
     )
     template = {
-        k: v for k, v in roles[role].items() if k not in _META_KEYS
+        k: v for k, v in raw_role.items() if k not in _META_KEYS
     }
+    if "sandbox_by_pattern" in raw_role:
+        # _select_sandbox_for_pattern already validated mutual exclusivity
+        # vs the legacy single ``sandbox`` field, so this assignment is
+        # the sole sandbox source the renderer sees.
+        template["sandbox"] = selected_sandbox
     rendered = _substitute(template, _build_substitution_mapping(ctx))
     sandbox = rendered.get("sandbox")
     if isinstance(sandbox, dict):
@@ -692,11 +850,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--pattern",
+        choices=_VALID_PATTERNS,
         default=None,
         help=(
-            "Informational dispatch pattern label (e.g. 'A', 'B'); "
-            "passed through to the renderer for consumers that branch on "
-            "it. The renderer itself does not gate behavior on --pattern."
+            "Dispatch pattern (A|B|C). Required when the selected role "
+            "declares 'sandbox_by_pattern' -- the renderer then forwards "
+            "sandbox_by_pattern[<pattern>] as the role's sandbox surface "
+            "(see docs/contracts/role-pattern-sandbox-contract.md). For "
+            "legacy roles using the single 'sandbox' shape this stays "
+            "informational and is ignored by the renderer."
         ),
     )
 
