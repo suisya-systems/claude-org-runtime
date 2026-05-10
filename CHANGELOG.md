@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-05-11
+
+### Changed
+
+- `claude_org_runtime/settings/role_configs_schema.json`: schema mirror
+  sync from `claude-org-ja` Phase 2 worker git guardrails
+  (Refs `claude-org-ja#379`, paired with ja PR #420
+  `feat/phase2-worker-git-guardrails-impl`). Brings the runtime-bundled
+  schema back into byte-equivalence with ja's
+  `tools/org_extension_schema.json` so
+  `tools/check_runtime_schema_drift.py` passes inside ja's pin window.
+  - `roles.worker`:
+    - `required_allow`: drop `Bash(git worktree:*)` (worktree creation
+      now denied at the worker layer).
+    - `required_deny`: add the dangerous-git family — `Bash(git worktree)`
+      / `Bash(git worktree *)`, `Bash(git fetch)` / `Bash(git fetch *)`,
+      `Bash(git pull)` / `Bash(git pull *)`, `Bash(git submodule)` /
+      `Bash(git submodule *)`, `Bash(git lfs)` / `Bash(git lfs *)`,
+      `Bash(git gc)` / `Bash(git gc *)`,
+      `Bash(git filter-branch)` / `Bash(git filter-branch *)`,
+      `Bash(git filter-repo)` / `Bash(git filter-repo *)`,
+      `Bash(git replace)` / `Bash(git replace *)`,
+      `Bash(git update-ref)` / `Bash(git update-ref *)`,
+      `Bash(git config --global *)`, `Bash(git config --local *)`,
+      `Bash(git config --worktree *)`.
+    - `required_hooks`: attach `block-dangerous-git.sh` and
+      `block-no-verify.sh` on the `Bash` matcher (alongside the
+      existing `block-git-push.sh` / `block-org-structure.sh`).
+    - `disallow_allow_regex`: add `^Bash\(git worktree.*\)$`.
+  - `worker_roles.default` and `worker_roles.claude-org-self-edit`:
+    - `permissions.allow`: drop `Bash(git worktree:*)`.
+    - `permissions.deny`: add the same dangerous-git family as
+      `roles.worker` plus the `git -C <dir>` variants, the `git remote
+      add|set-url|remove|rm` family (with `-C` variants), and the
+      `git reflog expire|delete` family (with `-C` variants).
+    - `hooks.PreToolUse[matcher=Bash]`: attach
+      `block-dangerous-git.sh` and `block-no-verify.sh` after
+      `block-git-push.sh`. `worker_roles.default` keeps
+      `block-org-structure.sh` last; `worker_roles.claude-org-self-edit`
+      retains its existing org-structure carve-out (no
+      `block-org-structure.sh` on the self-edit role by design).
+
+### Notes
+
+- Runtime evaluator behaviour is unchanged. This release ships only
+  the schema surface needed for ja's Phase 2 worker git guardrails so
+  ja's drift CI passes once the runtime pin window widens to include
+  `0.1.9`.
+- Concrete `sandbox` / `sandbox_by_pattern` bodies remain ja-side
+  policy and are not bundled with the runtime; the byte-drift check
+  strips both sides' bodies before comparison
+  (`_strip_ja_only_sandbox_bodies` in
+  `tools/check_runtime_schema_drift.py`).
+- Tagging, GitHub release, and PyPI publish are handled secretary-side
+  post-merge (see `knowledge/curated/release-process.md`).
+
 ## [0.1.8] - 2026-05-11
 
 ### Added
