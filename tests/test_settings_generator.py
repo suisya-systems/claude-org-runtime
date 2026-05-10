@@ -1466,3 +1466,689 @@ def test_cli_show_role_kind_org_with_explain(tmp_path: Path) -> None:
     suppressions = payload["sandbox"]["suppressions"]
     assert len(suppressions) == 1
     assert suppressions[0]["entry"]["path"] == "/etc/shadow"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (Refs `claude-org-runtime#13`): sandbox_by_pattern + base_clone anchor
+# ---------------------------------------------------------------------------
+
+
+def _pattern_sandbox(
+    *,
+    deny_read: list | None = None,
+    deny_write: list | None = None,
+    additional: list[str] | None = None,
+) -> dict:
+    """Compact builder for a single sandbox_by_pattern entry."""
+    return {
+        "enabled": True,
+        "filesystem": {
+            "denyRead": list(deny_read or []),
+            "denyWrite": list(deny_write or []),
+            "additionalDirectories": list(additional or []),
+        },
+        "failIfUnavailable": False,
+    }
+
+
+def _pattern_role(*, sandbox_by_pattern: dict, sandbox: dict | None = None) -> dict:
+    """Compact builder for a worker role exercising sandbox_by_pattern."""
+    body: dict = {
+        "permissions": {
+            "deny": [
+                "Bash(git push *)",
+                "Read(.env)",
+            ],
+        },
+        "sandbox_by_pattern": sandbox_by_pattern,
+    }
+    if sandbox is not None:
+        body["sandbox"] = sandbox
+    return body
+
+
+def test_pattern_a_renders_pattern_a_sandbox(tmp_path: Path) -> None:
+    """--pattern A selects sandbox_by_pattern.A as the rendered sandbox."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "A": _pattern_sandbox(
+                        deny_read=["secrets.env"],
+                        additional=["{worker_dir}"],
+                    ),
+                    "B": _pattern_sandbox(
+                        deny_read=[
+                            _structured("base_clone", ".git/config"),
+                        ],
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        pattern="A",
+        wsl_detector=lambda: False,
+    )
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == ["secrets.env"]
+    # additionalDirectories was substituted with the concrete worker_dir;
+    # base_clone-flavored entries from sandbox_by_pattern.B did NOT leak in.
+    assert fs["additionalDirectories"] == [worker_dir]
+    # sandbox_by_pattern itself never appears in the rendered output.
+    assert "sandbox_by_pattern" not in result.settings
+
+
+def test_pattern_b_renders_pattern_b_sandbox_with_base_clone() -> None:
+    """--pattern B selects sandbox_by_pattern.B and resolves base_clone anchors."""
+    worker_dir = "/home/u/work/proj/.worktrees/task-42"
+    base_clone = "/home/u/work/proj"
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "A": _pattern_sandbox(
+                        additional=["{worker_dir}"],
+                    ),
+                    "B": _pattern_sandbox(
+                        deny_read=[
+                            _structured("base_clone", ".git/HEAD"),
+                        ],
+                        deny_write=[
+                            _structured("base_clone", ".git/config"),
+                        ],
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                            "{base_clone}/.git/objects",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        base_clone=base_clone,
+        task_id="task-42",
+        branch_ref="feat/x",
+        pattern="B",
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    fs = result.settings["sandbox"]["filesystem"]
+    # additionalDirectories was substituted with concrete paths.
+    assert fs["additionalDirectories"] == [
+        worker_dir,
+        f"{base_clone}/.git/worktrees/task-42",
+        f"{base_clone}/.git/objects",
+    ]
+    # base_clone anchor entries survive when their realpath is inside one
+    # of the additionalDirectories (here .git/HEAD is not inside .git/objects
+    # nor .git/worktrees/task-42 -> suppressed).
+    assert any(
+        s.layer == "sandbox.filesystem.denyRead"
+        and isinstance(s.entry, dict)
+        and s.entry["anchor"] == "base_clone"
+        and s.entry["path"] == ".git/HEAD"
+        for s in result.sandbox.suppressions
+    )
+
+
+def test_pattern_c_renders_pattern_c_sandbox(tmp_path: Path) -> None:
+    """--pattern C selects sandbox_by_pattern.C surface (ephemeral)."""
+    worker_dir = str(tmp_path / "ephemeral-task")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "A": _pattern_sandbox(additional=["{worker_dir}"]),
+                    "C": _pattern_sandbox(
+                        deny_read=["secrets.env"],
+                        additional=["{worker_dir}"],
+                    ),
+                },
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        pattern="C",
+        wsl_detector=lambda: False,
+    )
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == ["secrets.env"]
+    assert fs["additionalDirectories"] == [worker_dir]
+
+
+def test_sandbox_by_pattern_requires_pattern() -> None:
+    """A worker role with sandbox_by_pattern errors when --pattern is missing."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={"A": _pattern_sandbox()},
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+        )
+    msg = str(info.value)
+    assert "sandbox_by_pattern" in msg
+    assert "--pattern" in msg
+
+
+def test_sandbox_by_pattern_unknown_pattern_key_rejected() -> None:
+    """Unknown pattern keys (e.g. 'D') in sandbox_by_pattern are rejected."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "A": _pattern_sandbox(),
+                    "D": _pattern_sandbox(),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    assert "unknown pattern keys" in str(info.value)
+
+
+def test_sandbox_by_pattern_missing_selected_pattern_rejected() -> None:
+    """Selecting a pattern not defined on the role surfaces an error."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={"A": _pattern_sandbox()},
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="B",
+        )
+    msg = str(info.value)
+    assert "no entry for pattern 'B'" in msg
+    assert "['A']" in msg
+
+
+def test_worker_role_sandbox_and_sandbox_by_pattern_mutually_exclusive() -> None:
+    """worker_roles[<role>] cannot declare both 'sandbox' and 'sandbox_by_pattern'."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={"A": _pattern_sandbox()},
+                sandbox=_pattern_sandbox(deny_read=["legacy.env"]),
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    msg = str(info.value)
+    assert "mutually exclusive" in msg
+    assert "sandbox_by_pattern" in msg
+
+
+def test_org_role_sandbox_by_pattern_rejected() -> None:
+    """Org roles (roles[*]) may not declare sandbox_by_pattern."""
+    schema = {
+        "roles": {
+            "secretary": {
+                "sandbox_by_pattern": {"A": _pattern_sandbox()},
+            }
+        },
+        "worker_roles": {},
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="secretary",
+            role_kind="org",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    msg = str(info.value)
+    assert "reserved for worker roles" in msg
+
+
+def test_sandbox_by_pattern_must_be_dict() -> None:
+    """sandbox_by_pattern: <non-dict> is rejected up-front."""
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": ["A", "B"],
+            }
+        }
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    assert "must be a dict" in str(info.value)
+
+
+def test_sandbox_by_pattern_null_value_rejected() -> None:
+    """``sandbox_by_pattern: null`` (key present, value None) is rejected.
+
+    Key-presence (not value-truthiness) drives the routing so a worker
+    role declaring ``{ sandbox: ..., sandbox_by_pattern: null }`` does
+    not silently fall through to the legacy single-``sandbox`` path
+    (which would smuggle in the wrong Pattern A/B/C surface).
+    """
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": None,
+                "sandbox": _pattern_sandbox(deny_read=["legacy.env"]),
+            }
+        }
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    msg = str(info.value)
+    # Mutual-exclusivity catches this ahead of the dict-shape check.
+    assert "mutually exclusive" in msg
+
+
+def test_sandbox_by_pattern_null_value_alone_rejected() -> None:
+    """``sandbox_by_pattern: null`` without sandbox still fails (not a dict)."""
+    schema = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": None,
+            }
+        }
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="A",
+        )
+    assert "must be a dict" in str(info.value)
+
+
+def test_pattern_b_placeholder_without_base_clone_rejected() -> None:
+    """Pattern B sandbox referencing {base_clone} without --base-clone errors out.
+
+    Without the matching context, ``_substitute`` would leave a literal
+    ``{base_clone}`` in the rendered sandbox; the bwrap launcher
+    consumes ``sandbox.filesystem.additionalDirectories`` as concrete
+    paths, so the misconfiguration must be caught at render time.
+    """
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="B",
+        )
+    msg = str(info.value)
+    assert "{base_clone}" in msg
+    assert "--base-clone" in msg
+    assert "--pattern B" in msg
+
+
+def test_pattern_b_placeholder_without_task_id_rejected() -> None:
+    """{task_id} without --task-id is also caught (independent of base_clone)."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        additional=[
+                            "{worker_dir}",
+                            "{base_clone}/.git/worktrees/{task_id}",
+                        ],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            base_clone="/home/u/proj",  # task_id intentionally omitted
+            pattern="B",
+        )
+    msg = str(info.value)
+    # base_clone resolved, but task_id is left dangling.
+    assert "{task_id}" in msg
+    assert "--task-id" in msg
+
+
+def test_pattern_b_placeholder_in_deny_read_string_rejected() -> None:
+    """An unresolved {base_clone} on a legacy-string deny entry is also caught."""
+    schema = {
+        "worker_roles": {
+            "demo": _pattern_role(
+                sandbox_by_pattern={
+                    "B": _pattern_sandbox(
+                        deny_read=["{base_clone}/.git/HEAD"],
+                        additional=["{worker_dir}"],
+                    ),
+                },
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/wd",
+            claude_org_path="/co",
+            pattern="B",
+        )
+    assert "{base_clone}" in str(info.value)
+
+
+def test_org_role_sandbox_by_pattern_null_rejected() -> None:
+    """``sandbox_by_pattern: null`` on an org role is also misconfiguration."""
+    schema = {
+        "roles": {
+            "secretary": {"sandbox_by_pattern": None},
+        },
+        "worker_roles": {},
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="secretary",
+            role_kind="org",
+            worker_dir="/wd",
+            claude_org_path="/co",
+        )
+    assert "reserved for worker roles" in str(info.value)
+
+
+def test_legacy_sandbox_unaffected_by_pattern_flag(tmp_path: Path) -> None:
+    """Roles using the legacy single 'sandbox' ignore --pattern."""
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=["secrets.env"]),
+        }
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        pattern="B",
+        wsl_detector=lambda: False,
+    )
+    # Pre-Phase-1 behavior preserved: --pattern is informational and the
+    # legacy single sandbox renders unchanged.
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [
+        "secrets.env"
+    ]
+
+
+def test_base_clone_anchor_resolves_to_ctx_base_clone() -> None:
+    """anchor='base_clone' joins entry.path against ctx.base_clone."""
+    worker_dir = "/home/u/work/proj/.worktrees/task-1"
+    base_clone = "/home/u/work/proj"
+    captured: list[str] = []
+
+    def fake_realpath(p: str) -> str:
+        captured.append(p)
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("base_clone", ".git/config")],
+                additional=[],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        base_clone=base_clone,
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: False,
+    )
+    # The anchor base path (base_clone) is realpath'd, then .git/config
+    # is joined onto it for the reachability check. ``os.path.join`` is
+    # platform-aware so the joined path uses backslashes on Windows --
+    # match that here instead of hard-coding a POSIX separator (the
+    # existing home-anchor test uses the same pattern).
+    expected_joined = os.path.join(base_clone, ".git/config")
+    assert any(p == base_clone for p in captured)
+    assert any(p == expected_joined for p in captured)
+    # base_clone is outside worker_dir read root -> suppressed.
+    assert len(result.sandbox.suppressions) == 1
+
+
+def test_base_clone_anchor_without_base_clone_context_raises() -> None:
+    """anchor='base_clone' without --base-clone surfaces a usable error."""
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[_structured("base_clone", ".git/HEAD")],
+                additional=[],
+            ),
+        },
+    }
+    with pytest.raises(ValueError) as info:
+        generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir="/home/u/wd",
+            claude_org_path="/home/u/co",
+            wsl_detector=lambda: False,
+        )
+    msg = str(info.value)
+    assert "anchor='base_clone'" in msg
+    assert "--base-clone" in msg
+
+
+def test_normalize_sandbox_entry_accepts_base_clone_anchor() -> None:
+    """_normalize_sandbox_entry accepts the new base_clone anchor."""
+    norm = generator._normalize_sandbox_entry(
+        {"anchor": "base_clone", "path": ".git/objects"}
+    )
+    assert norm is not None
+    assert norm.anchor == "base_clone"
+    assert norm.path == ".git/objects"
+
+
+def test_cli_pattern_choices_rejects_typo(tmp_path: Path) -> None:
+    """--pattern choices=A|B|C rejects free-form values like 'b'."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps({"worker_roles": {"demo": {"permissions": {"deny": []}}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as info:
+        generator.main(
+            [
+                "--role",
+                "demo",
+                "--worker-dir",
+                "/wd",
+                "--claude-org-path",
+                "/co",
+                "--pattern",
+                "b",  # lowercase typo -- must be rejected
+                "--schema",
+                str(schema_path),
+            ]
+        )
+    assert info.value.code != 0
+
+
+def test_cli_pattern_b_sandbox_by_pattern_renders(tmp_path: Path) -> None:
+    """End-to-end: settings generate --pattern B writes Pattern B sandbox."""
+    schema_path = tmp_path / "schema.json"
+    schema_payload = {
+        "worker_roles": {
+            "demo": {
+                "permissions": {"deny": []},
+                "sandbox_by_pattern": {
+                    "A": {
+                        "enabled": True,
+                        "filesystem": {
+                            "denyRead": ["secrets.env"],
+                            "denyWrite": [],
+                            "additionalDirectories": ["{worker_dir}"],
+                        },
+                        "failIfUnavailable": False,
+                    },
+                    "B": {
+                        "enabled": True,
+                        "filesystem": {
+                            "denyRead": [],
+                            "denyWrite": [],
+                            "additionalDirectories": [
+                                "{worker_dir}",
+                                "{base_clone}/.git/worktrees/{task_id}",
+                            ],
+                        },
+                        "failIfUnavailable": False,
+                    },
+                },
+            }
+        }
+    }
+    schema_path.write_text(json.dumps(schema_payload), encoding="utf-8")
+    out = tmp_path / "out.json"
+    rc = generator.main(
+        [
+            "--role",
+            "demo",
+            "--worker-dir",
+            "/home/u/proj/.worktrees/task-1",
+            "--claude-org-path",
+            "/home/u/co",
+            "--base-clone",
+            "/home/u/proj",
+            "--task-id",
+            "task-1",
+            "--branch-ref",
+            "feat/x",
+            "--pattern",
+            "B",
+            "--schema",
+            str(schema_path),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    assert "sandbox_by_pattern" not in parsed
+    fs = parsed["sandbox"]["filesystem"]
+    assert fs["additionalDirectories"] == [
+        "/home/u/proj/.worktrees/task-1",
+        "/home/u/proj/.git/worktrees/task-1",
+    ]
+
+
+def test_cli_pattern_required_when_sandbox_by_pattern_present(tmp_path: Path) -> None:
+    """settings generate without --pattern errors out when role uses sandbox_by_pattern."""
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps(
+            {
+                "worker_roles": {
+                    "demo": {
+                        "permissions": {"deny": []},
+                        "sandbox_by_pattern": {
+                            "A": {"enabled": True, "filesystem": {}},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = generator.main(
+        [
+            "--role",
+            "demo",
+            "--worker-dir",
+            "/wd",
+            "--claude-org-path",
+            "/co",
+            "--schema",
+            str(schema_path),
+        ]
+    )
+    assert rc == 2

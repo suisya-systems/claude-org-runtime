@@ -120,7 +120,7 @@ python -m claude_org_runtime.settings.generator \
 | `--base-clone PATH` | Pattern B context: substituted as `{base_clone}` in entry paths and `additionalDirectories` before realpath evaluation. |
 | `--task-id ID` | Pattern B context: substituted as `{task_id}`. |
 | `--branch-ref REF` | Pattern B context: substituted as `{branch_ref}`. |
-| `--pattern LABEL` | Informational dispatch pattern label (e.g. `A`, `B`); passed through to the renderer for consumers that branch on it. The renderer itself does not gate behavior on `--pattern`. |
+| `--pattern {A,B,C}` | Dispatch pattern. Required when the selected role declares `sandbox_by_pattern`; the renderer then forwards `sandbox_by_pattern[<pattern>]` as the role's sandbox surface (contract SoT: claude-org-ja's `docs/contracts/role-pattern-sandbox-contract.md`, not part of this runtime repo). For roles using the legacy single `sandbox` shape it stays informational and is ignored by the renderer. Free-form values like `b` are rejected by argparse to prevent silent fallthrough. |
 
 ## `settings show`
 
@@ -154,7 +154,7 @@ claude-org-runtime settings show \
 | `--base-clone PATH` | Pattern B context: substituted as `{base_clone}` before realpath evaluation. |
 | `--task-id ID` | Pattern B context: substituted as `{task_id}`. |
 | `--branch-ref REF` | Pattern B context: substituted as `{branch_ref}`. |
-| `--pattern LABEL` | Informational dispatch pattern label; passed through to the renderer. |
+| `--pattern {A,B,C}` | Same as `settings generate`: required when the role declares `sandbox_by_pattern`, otherwise informational. |
 
 The runtime applies WSL/realpath suppression at render time: any
 `sandbox.filesystem.denyRead / denyWrite` entry whose realpath escapes
