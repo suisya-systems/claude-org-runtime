@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-05-11
+
+### Added
+
+- `claude_org_runtime.settings.generator`: Phase 3 case E — extend WSL
+  detection markers and emit sandbox suppression `$comment` metadata
+  (Refs `claude-org-ja#392`, `claude-org-ja#389`).
+  - `_detect_wsl` now matches `Microsoft` / `WSL` in `/proc/version`
+    (covers WSL1 `Linux version 4.4.0-19041-Microsoft` and WSL2
+    proc/version-only detection paths) in addition to the historical
+    `microsoft-standard-WSL` marker on `/proc/sys/kernel/osrelease`,
+    per `phase3-bootstrap-policy-design.md` §5.2(a).
+  - `$comment` is emitted on the rendered settings whenever the runtime
+    suppressed at least one Layer 3 `sandbox.filesystem.denyRead` /
+    `denyWrite` entry. Format follows
+    `sandbox-launcher-contract.md` §2.1:
+    `platform=<linux|wsl>, layer-3 entries suppressed: [<list>]`. The
+    launcher's `/sandbox` status surface parses the fixed prefix to
+    discover the suppressed set without re-deriving it. Structured
+    anchor entries render as `<anchor>:<path>`; legacy raw strings
+    render as-is. Layer 2 `permissions.deny` is untouched per design
+    §5.2(b).
+  - `settings show` text mode now surfaces the `$comment` line in both
+    bare and `--explain` modes so operators get an at-a-glance
+    suppression summary even without `--explain`'s full per-entry
+    block. JSON mode already exposed it via `payload['settings']`.
+  - Documentation: `render_role` docstring now distinguishes between
+    `$comment` keys dropped from input role specs vs. the suppression
+    `$comment` the runtime adds to the rendered output.
+  - `_normalize_sandbox_entry` docstring clarifies that legacy raw
+    `~/...` strings are NOT auto-expanded — operators wiring
+    home-relative case E suppression must use the structured
+    `{anchor: 'home', path: ...}` form (Phase 1 backward-compat
+    decision).
+
+### Notes
+
+- Realpath-escape suppression on `sandbox.filesystem.denyRead` /
+  `denyWrite` itself is unchanged from 0.1.4; this release ships only
+  the metadata + observability surface alongside the broadened WSL
+  detection markers.
+- Out of scope (deferred per `claude-org-ja#392` task brief): case A
+  bootstrap fallback (launcher-side, `sandbox-launcher-contract.md`
+  §3), `failIfUnavailable` redefinition (pends case A), and the
+  `/sandbox` status output (claude-org-ja territory).
+
 ## [0.1.7] - 2026-05-10
 
 ### Added
