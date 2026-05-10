@@ -1985,9 +1985,13 @@ def test_base_clone_anchor_resolves_to_ctx_base_clone() -> None:
         wsl_detector=lambda: False,
     )
     # The anchor base path (base_clone) is realpath'd, then .git/config
-    # is joined onto it for the reachability check.
+    # is joined onto it for the reachability check. ``os.path.join`` is
+    # platform-aware so the joined path uses backslashes on Windows --
+    # match that here instead of hard-coding a POSIX separator (the
+    # existing home-anchor test uses the same pattern).
+    expected_joined = os.path.join(base_clone, ".git/config")
     assert any(p == base_clone for p in captured)
-    assert any(p == f"{base_clone}/.git/config" for p in captured)
+    assert any(p == expected_joined for p in captured)
     # base_clone is outside worker_dir read root -> suppressed.
     assert len(result.sandbox.suppressions) == 1
 
