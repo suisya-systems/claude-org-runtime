@@ -756,31 +756,78 @@ def test_render_role_dict_api_still_returns_dict() -> None:
 
 
 def test_comment_emitted_with_wsl_platform_when_suppressed() -> None:
-    """WSL escape suppression emits ``$comment`` with ``platform=wsl``."""
+    """WSL escape suppression emits ``$comment`` with ``platform=wsl``.
+
+    Mirrors the typical production WSL layout per
+    ``phase3-bootstrap-policy-design.md`` §1: ``worker_dir`` lives on
+    the Linux side (``/home/<u>/work/wd``) and is NOT a host-cross
+    symlink, while only ``~/.aws`` / ``~/.ssh`` resolve into
+    ``/mnt/c/...``. Layer 3 ``denyRead`` / ``denyWrite`` entries on
+    those home-anchored paths are what need suppression. Per the
+    schema's ``worker_roles.$comment_sandbox_anchor``, home-anchored
+    entries SHOULD be authored as the structured form
+    (``{anchor: 'home', path: '.aws/.env'}``); legacy raw ``~/...``
+    strings stay worker_dir-anchored for backward compat.
+    """
     worker_dir = "/home/u/work/wd"
+    home = "/home/u"
 
     def fake_realpath(p: str) -> str:
-        if p == worker_dir or p.startswith(worker_dir + "/"):
-            return p.replace(worker_dir, "/mnt/c/Users/u/work/wd", 1)
+        # Only ~/.aws and ~/.ssh escape to /mnt/c/...; worker_dir is
+        # NOT a symlink (faithfully reproduces the WSL fragility).
+        if p == f"{home}/.aws" or p.startswith(f"{home}/.aws/"):
+            return p.replace(f"{home}/.aws", "/mnt/c/Users/u/.aws", 1)
+        if p == f"{home}/.ssh" or p.startswith(f"{home}/.ssh/"):
+            return p.replace(f"{home}/.ssh", "/mnt/c/Users/u/.ssh", 1)
         return p
 
     schema = {
         "worker_roles": {
             "demo": _sandbox_role(
-                deny_read=["~/.aws/.env", "~/.ssh/id_rsa"],
-                deny_write=["build/"],
+                deny_read=[
+                    {
+                        "anchor": "home",
+                        "path": ".aws/.env",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                    {
+                        "anchor": "home",
+                        "path": ".ssh/id_rsa",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                ],
+                deny_write=[
+                    {
+                        "anchor": "home",
+                        "path": ".aws/credentials",
+                        "suppressOnSymlinkEscape": True,
+                    },
+                ],
                 additional=[],
             ),
         },
     }
-    result = generator.render_role_with_metadata(
-        schema,
-        role="demo",
-        worker_dir=worker_dir,
-        claude_org_path="/home/u/co",
-        realpath_fn=fake_realpath,
-        wsl_detector=lambda: True,
-    )
+    # Force HOME so _anchor_base_path("home") resolves to the same
+    # /home/u that fake_realpath is rewriting.
+    import os as _os
+
+    saved_home = _os.environ.get("HOME")
+    _os.environ["HOME"] = home
+    try:
+        result = generator.render_role_with_metadata(
+            schema,
+            role="demo",
+            worker_dir=worker_dir,
+            claude_org_path="/home/u/co",
+            realpath_fn=fake_realpath,
+            wsl_detector=lambda: True,
+        )
+    finally:
+        if saved_home is None:
+            _os.environ.pop("HOME", None)
+        else:
+            _os.environ["HOME"] = saved_home
+
     comment = result.settings.get("$comment")
     assert isinstance(comment, str)
     # Fixed prefix per sandbox-launcher-contract.md §2.1 (machine-parseable
@@ -789,10 +836,15 @@ def test_comment_emitted_with_wsl_platform_when_suppressed() -> None:
         "platform=wsl, layer-3 entries suppressed: ["
     )
     assert comment.endswith("]")
-    # Each suppressed entry appears literally in the comment list.
-    assert "~/.aws/.env" in comment
-    assert "~/.ssh/id_rsa" in comment
-    assert "build/" in comment
+    # Each suppressed structured entry surfaces as ``home:<path>`` so
+    # the launcher can render the operator's authored form.
+    assert "home:.aws/.env" in comment
+    assert "home:.ssh/id_rsa" in comment
+    assert "home:.aws/credentials" in comment
+    # Layer 3 was actually emptied (3 → 0 dropped entries).
+    fs = result.settings["sandbox"]["filesystem"]
+    assert fs["denyRead"] == []
+    assert fs["denyWrite"] == []
 
 
 def test_comment_uses_linux_platform_when_not_wsl() -> None:

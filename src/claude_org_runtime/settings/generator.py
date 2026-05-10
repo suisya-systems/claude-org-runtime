@@ -333,9 +333,20 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
     """Convert a raw-string or structured deny entry into the unified form.
 
     Legacy strings keep their historical anchoring: absolute paths are
-    treated as ``anchor='absolute'``, everything else is anchored at
-    ``worker_dir``. ``suppressOnSymlinkEscape`` defaults to ``True`` to
-    match the prior unconditional suppression behavior.
+    treated as ``anchor='absolute'``, everything else (including
+    ``~``-prefixed strings such as ``~/.aws/credentials``) is anchored
+    at ``worker_dir``. The schema's ``worker_roles.$comment_sandbox_anchor``
+    flags the ``~/...``-as-worker_dir-relative behavior as a legacy
+    ambiguity ("Codex Major 1") that the structured-form
+    ``{anchor: 'home', path: '.aws/credentials'}`` was introduced to
+    fix; the legacy interpretation is kept here for backward compat.
+    Operators wiring case E suppression on home-relative paths SHOULD
+    use the structured ``anchor='home'`` form so the realpath escape
+    check sees ``/home/<user>/.aws/...`` and not
+    ``<worker_dir>/~/.aws/...``.
+
+    ``suppressOnSymlinkEscape`` defaults to ``True`` to match the prior
+    unconditional suppression behavior.
 
     Returns ``None`` when the entry shape is unrecognized so the caller
     can pass it through to the rendered output untouched (the launcher
