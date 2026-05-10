@@ -80,8 +80,20 @@ from typing import Any, Callable
 # never appears in output.
 _META_KEYS = {"description", "$comment", "sandbox_by_pattern"}
 
-# WSL kernel marker as exposed by /proc/version + /proc/sys/kernel/osrelease.
-_WSL_MARKER = "microsoft-standard-WSL"
+# WSL kernel markers as exposed by /proc/version + /proc/sys/kernel/osrelease.
+# Per phase3-bootstrap-policy-design.md §5.2(a): WSL is detected when
+# ``/proc/version`` contains ``Microsoft`` or ``WSL`` (covers WSL1's
+# ``Linux version 4.4.0-19041-Microsoft`` and WSL2's
+# ``microsoft-standard-WSL2`` substrings) or ``/proc/sys/kernel/osrelease``
+# contains ``microsoft-standard-WSL``. ``microsoft-standard-WSL`` keeps
+# the legacy precise marker so historical fixtures continue to match;
+# ``Microsoft`` / ``WSL`` add coverage for WSL1 and proc/version-only
+# detection paths.
+_WSL_MARKERS: tuple[str, ...] = (
+    "microsoft-standard-WSL",
+    "Microsoft",
+    "WSL",
+)
 _DEFAULT_WSL_PROBE_PATHS: tuple[str, ...] = (
     "/proc/version",
     "/proc/sys/kernel/osrelease",
@@ -127,17 +139,22 @@ def _detect_wsl(probe_paths: tuple[str, ...] = _DEFAULT_WSL_PROBE_PATHS) -> bool
     """Annotation-only WSL detection.
 
     Reads ``/proc/version`` and ``/proc/sys/kernel/osrelease`` and looks
-    for the standard WSL kernel marker. The result is recorded in
-    suppression metadata for ``settings show --explain`` but does NOT
-    gate the suppression decision -- escape is judged from realpath.
+    for any of the kernel markers in ``_WSL_MARKERS`` (per
+    phase3-bootstrap-policy-design.md §5.2(a)). The result is recorded
+    in suppression metadata for ``settings show --explain`` and in the
+    emitted ``$comment`` ``platform=`` prefix, but does NOT gate the
+    suppression decision -- escape is judged from realpath so
+    devcontainer / non-WSL symlink-escape cases also suppress.
     """
     for path in probe_paths:
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                if _WSL_MARKER in fh.read():
-                    return True
+                content = fh.read()
         except OSError:
             continue
+        for marker in _WSL_MARKERS:
+            if marker in content:
+                return True
     return False
 
 
@@ -542,6 +559,46 @@ def _evaluate_sandbox_suppressions(
     return new_sandbox, metadata
 
 
+def _format_entry_for_comment(entry: Any) -> str:
+    """Render a deny entry for inclusion in the ``$comment`` list.
+
+    Legacy raw strings render as-is (matching the contract example
+    ``[~/.aws/**, ~/.ssh/**]`` in
+    ``docs/contracts/sandbox-launcher-contract.md`` §2.1). Structured
+    entries render as ``<anchor>:<path>`` so the anchor is preserved
+    for the launcher's ``/sandbox`` status display, except for
+    ``anchor=absolute`` where the path itself is fully-qualified and the
+    prefix would be redundant.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        anchor = entry.get("anchor", "worker_dir")
+        path = entry.get("path", "")
+        if anchor == "absolute":
+            return str(path)
+        return f"{anchor}:{path}"
+    return repr(entry)
+
+
+def _format_suppression_comment(metadata: SandboxMetadata) -> str:
+    """Produce the top-level ``$comment`` string per case E §5.2(b).
+
+    Format is fixed at ``platform=<linux|wsl>, layer-3 entries
+    suppressed: [<comma-separated list>]`` -- see
+    ``docs/contracts/sandbox-launcher-contract.md`` §2.1, which calls
+    out the ``platform=<linux|wsl>, layer-3 entries suppressed: [``
+    prefix as the launcher's machine-parseable anchor when surfacing
+    suppressed entries on ``/sandbox`` status.
+    """
+    platform = "wsl" if metadata.wsl_detected else "linux"
+    formatted = [_format_entry_for_comment(s.entry) for s in metadata.suppressions]
+    return (
+        f"platform={platform}, layer-3 entries suppressed: "
+        f"[{', '.join(formatted)}]"
+    )
+
+
 _ROLE_KIND_TO_SCHEMA_KEY = {
     "worker": "worker_roles",
     "org": "roles",
@@ -800,6 +857,15 @@ def render_role_with_metadata(
         rendered["sandbox"] = new_sandbox
     else:
         metadata = SandboxMetadata(wsl_detected=wsl_detector())
+    # Phase 3 case E §5.2(b): emit the conditionally-required ``$comment``
+    # whenever the runtime suppressed at least one Layer 3 entry. The
+    # launcher's /sandbox status surface parses the fixed prefix
+    # ``platform=<linux|wsl>, layer-3 entries suppressed: [`` to discover
+    # the suppressed set without re-deriving it. ``$comment`` is dropped
+    # from the input role via ``_META_KEYS`` before render, so this
+    # assignment never overwrites operator-authored metadata.
+    if metadata.suppressions:
+        rendered["$comment"] = _format_suppression_comment(metadata)
     return RenderResult(settings=rendered, sandbox=metadata)
 
 
@@ -1084,6 +1150,15 @@ def _format_show_output(
             )
     else:
         lines.append("sandbox.enabled: false")
+
+    # Phase 3 case E observability: surface the runtime-emitted
+    # ``$comment`` (``platform=<linux|wsl>, layer-3 entries suppressed:
+    # [...]``) in both --explain and bare modes so operators always see
+    # the at-a-glance suppression summary, even when --explain's full
+    # ``suppressions`` block is omitted.
+    comment = result.settings.get("$comment")
+    if isinstance(comment, str):
+        lines.append(f"$comment: {comment}")
 
     if explain:
         lines.append(f"wsl_detected: {result.sandbox.wsl_detected}")
