@@ -238,6 +238,8 @@
         "Bash(git checkout:*)",
         "Bash(git switch:*)",
         "Bash(git stash:*)",
+        "Bash(git fetch:*)",
+        "Bash(git -C * fetch:*)",
         "Bash(sleep:*)"
       ],
       "allowed_allow_regex": [],
@@ -246,8 +248,6 @@
         "Bash(git push)",
         "Bash(git worktree)",
         "Bash(git worktree *)",
-        "Bash(git fetch)",
-        "Bash(git fetch *)",
         "Bash(git pull)",
         "Bash(git pull *)",
         "Bash(git submodule)",
@@ -328,6 +328,8 @@
           "Bash(git checkout:*)",
           "Bash(git switch:*)",
           "Bash(git stash:*)",
+          "Bash(git fetch:*)",
+          "Bash(git -C * fetch:*)",
           "Bash(sleep:*)"
         ],
         "deny": [
@@ -337,10 +339,6 @@
           "Bash(git worktree *)",
           "Bash(git -C * worktree)",
           "Bash(git -C * worktree *)",
-          "Bash(git fetch)",
-          "Bash(git fetch *)",
-          "Bash(git -C * fetch)",
-          "Bash(git -C * fetch *)",
           "Bash(git pull)",
           "Bash(git pull *)",
           "Bash(git -C * pull)",
@@ -452,6 +450,8 @@
           "Bash(git checkout:*)",
           "Bash(git switch:*)",
           "Bash(git stash:*)",
+          "Bash(git fetch:*)",
+          "Bash(git -C * fetch:*)",
           "Bash(sleep:*)"
         ],
         "deny": [
@@ -461,10 +461,6 @@
           "Bash(git worktree *)",
           "Bash(git -C * worktree)",
           "Bash(git -C * worktree *)",
-          "Bash(git fetch)",
-          "Bash(git fetch *)",
-          "Bash(git -C * fetch)",
-          "Bash(git -C * fetch *)",
           "Bash(git pull)",
           "Bash(git pull *)",
           "Bash(git -C * pull)",
