@@ -239,7 +239,6 @@
         "Bash(git switch:*)",
         "Bash(git stash:*)",
         "Bash(git fetch:*)",
-        "Bash(git -C * fetch:*)",
         "Bash(sleep:*)"
       ],
       "allowed_allow_regex": [],
@@ -329,7 +328,6 @@
           "Bash(git switch:*)",
           "Bash(git stash:*)",
           "Bash(git fetch:*)",
-          "Bash(git -C * fetch:*)",
           "Bash(sleep:*)"
         ],
         "deny": [
@@ -451,7 +449,6 @@
           "Bash(git switch:*)",
           "Bash(git stash:*)",
           "Bash(git fetch:*)",
-          "Bash(git -C * fetch:*)",
           "Bash(sleep:*)"
         ],
         "deny": [

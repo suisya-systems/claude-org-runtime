@@ -2495,6 +2495,16 @@ def test_worker_role_required_allow_does_not_contain_git_push_variants() -> None
     assert not (forbidden_push_variants & set(worker["required_allow"]))
 
 
+def test_worker_role_required_allow_scoped_to_cwd_fetch_only() -> None:
+    """Worker fetch must be scoped to the worker's own cwd. Granting
+    Bash(git -C * fetch:*) would let workers fetch into arbitrary repos."""
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git -C * fetch:*)" not in worker["required_allow"]
+    for template in ("default", "claude-org-self-edit"):
+        allow = _bundled_schema()["worker_roles"][template]["permissions"]["allow"]
+        assert "Bash(git -C * fetch:*)" not in allow
+
+
 def test_worker_role_required_deny_no_longer_blocks_git_fetch() -> None:
     worker = _bundled_schema()["roles"]["worker"]
     assert "Bash(git fetch)" not in worker["required_deny"]
