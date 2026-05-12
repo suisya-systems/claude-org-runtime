@@ -2528,13 +2528,16 @@ def test_default_worker_template_allow_contains_git_fetch_colon_star() -> None:
     assert "Bash(git fetch:*)" in template["permissions"]["allow"]
 
 
-def test_default_worker_template_deny_no_longer_blocks_git_fetch() -> None:
+def test_default_worker_template_deny_no_longer_blocks_cwd_git_fetch() -> None:
+    """cwd-form fetch must be removed from deny (it's now allowed), but the
+    -C form stays denied for defense-in-depth — workers should only fetch
+    into their own worktree."""
     template = _bundled_schema()["worker_roles"]["default"]
     deny = template["permissions"]["deny"]
     assert "Bash(git fetch)" not in deny
     assert "Bash(git fetch *)" not in deny
-    assert "Bash(git -C * fetch)" not in deny
-    assert "Bash(git -C * fetch *)" not in deny
+    assert "Bash(git -C * fetch)" in deny
+    assert "Bash(git -C * fetch *)" in deny
 
 
 def test_default_worker_template_deny_still_blocks_push_and_pull() -> None:
@@ -2550,14 +2553,15 @@ def test_claude_org_self_edit_template_allow_contains_git_fetch_colon_star() -> 
     assert "Bash(git fetch:*)" in template["permissions"]["allow"]
 
 
-def test_claude_org_self_edit_template_deny_no_longer_blocks_git_fetch() -> None:
+def test_claude_org_self_edit_template_deny_no_longer_blocks_cwd_git_fetch() -> None:
+    """Same shape as the default template: cwd fetch allowed, -C variant denied."""
     deny = _bundled_schema()["worker_roles"]["claude-org-self-edit"]["permissions"][
         "deny"
     ]
     assert "Bash(git fetch)" not in deny
     assert "Bash(git fetch *)" not in deny
-    assert "Bash(git -C * fetch)" not in deny
-    assert "Bash(git -C * fetch *)" not in deny
+    assert "Bash(git -C * fetch)" in deny
+    assert "Bash(git -C * fetch *)" in deny
 
 
 def test_claude_org_self_edit_template_deny_still_blocks_push_and_pull() -> None:
