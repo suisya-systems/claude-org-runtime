@@ -2484,6 +2484,15 @@ def test_worker_role_required_allow_contains_git_fetch_colon_star() -> None:
     assert "Bash(git fetch:*)" in worker["required_allow"]
 
 
+def test_worker_role_required_allow_contains_git_merge_for_post_fetch_sync() -> None:
+    """Workers do `git fetch` + `git merge origin/...` instead of `git pull`."""
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git merge:*)" in worker["required_allow"]
+    for template in ("default", "claude-org-self-edit"):
+        allow = _bundled_schema()["worker_roles"][template]["permissions"]["allow"]
+        assert "Bash(git merge:*)" in allow
+
+
 def test_worker_role_required_allow_does_not_contain_git_push_variants() -> None:
     worker = _bundled_schema()["roles"]["worker"]
     forbidden_push_variants = {
