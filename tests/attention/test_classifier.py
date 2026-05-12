@@ -335,6 +335,35 @@ def test_notify_map_unknown_value_falls_back_to_default() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_malformed_received_at_treated_as_stale() -> None:
+    """Round 4 codex Minor: garbled timestamps must fire alerts, not hide them."""
+    entry = {
+        "task_id": "garbled",
+        "received_at": "not-a-real-timestamp",
+        "raw_message": "?",
+        "status": "pending",
+    }
+    ev = classify_pending(
+        entry, _NOW, pending_decision_min=15, user_replied_min=15,
+    )
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+    assert ev.severity == "urgent"
+
+
+def test_missing_received_at_treated_as_stale() -> None:
+    entry = {
+        "task_id": "no-ts",
+        "raw_message": "?",
+        "status": "pending",
+    }
+    ev = classify_pending(
+        entry, _NOW, pending_decision_min=15, user_replied_min=15,
+    )
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+
+
 @pytest.mark.parametrize(
     "subkind,expected_kind",
     [

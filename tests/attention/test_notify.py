@@ -178,6 +178,39 @@ def test_stdout_backend_no_subprocess_but_bells_on_urgent() -> None:
     assert "URGENT" in out.getvalue()
 
 
+def test_bell_rings_on_macos_desktop_success() -> None:
+    """§5 ``macOS sound = afplay / else bell``: bell on urgent success."""
+    result = notify(
+        _event(), AttentionConfig(),  # urgent + sound=urgent-only
+        backend="macos", log_stream=StringIO(),
+        runner=lambda cmd: None,  # success
+    )
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is True
+
+
+def test_bell_rings_on_linux_desktop_success() -> None:
+    """§5 ``Linux sound = paplay / canberra / bell``: bell on urgent success."""
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="linux", log_stream=StringIO(),
+        runner=lambda cmd: None,
+    )
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is True
+
+
+def test_no_double_bell_on_windows_success() -> None:
+    """Windows / WSL PowerShell command embeds beep — no terminal bell."""
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="windows", log_stream=StringIO(),
+        runner=lambda cmd: None,
+    )
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is False
+
+
 def test_normal_severity_no_bell_with_urgent_only() -> None:
     cfg = AttentionConfig()
     out = StringIO()
@@ -299,16 +332,20 @@ def test_reached_user_true_when_desktop_disabled_only() -> None:
 
 
 @pytest.mark.parametrize("backend", ["windows", "wsl"])
-def test_powershell_beep_skipped_when_sound_off(backend) -> None:
+def test_powershell_subprocess_skipped_when_sound_off(backend) -> None:
+    """Win/WSL with sound off: the subprocess would be invisible to the
+    user (Write-Host into a captured stream), so we skip it entirely
+    and treat delivery as intentional stdout-only mode.
+    """
     calls: list[list[str]] = []
     cfg = AttentionConfig(sound="off")
-    notify(
+    result = notify(
         _event(), cfg, backend=backend, log_stream=StringIO(),
         runner=lambda cmd: calls.append(cmd),
     )
-    assert calls, "subprocess command should have been invoked"
-    joined = " ".join(calls[0])
-    assert "console]::beep" not in joined
+    assert calls == []
+    assert result.desktop_intended is False
+    assert result.reached_user is True
 
 
 @pytest.mark.parametrize("backend", ["windows", "wsl"])

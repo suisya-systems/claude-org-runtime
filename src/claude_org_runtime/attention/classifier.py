@@ -368,11 +368,20 @@ def _coerce_int(v: Any) -> Optional[int]:
 
 
 def _minutes_since(iso_ts: Any, now: datetime) -> float:
+    """Minutes between ``iso_ts`` and ``now``.
+
+    Malformed / missing timestamps return a large positive number so
+    the surrounding classifier sees the entry as "older than threshold"
+    and fires the urgent alert — false-positives are preferable to
+    false-negatives for a relay-gap watcher (matches the ja-side
+    ``pending_decisions.py`` posture which also surfaces malformed
+    timestamps as stale).
+    """
     if not iso_ts or not isinstance(iso_ts, str):
-        return 0.0
+        return float("inf")
     parsed = _parse_iso(iso_ts)
     if parsed is None:
-        return 0.0
+        return float("inf")
     return (now - parsed).total_seconds() / 60.0
 
 

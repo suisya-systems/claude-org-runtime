@@ -121,6 +121,15 @@ def notify(
     play_sound = _should_play_sound(cfg.sound, event.severity)
     desktop_intended = bool(cfg.desktop) and chosen != "stdout"
 
+    # Windows / WSL backends signal exclusively through the embedded
+    # ``[console]::beep`` — the ``Write-Host`` output goes to a
+    # captured PowerShell stdout we discard, so it is invisible to the
+    # user. With sound suppressed the subprocess would dispatch
+    # successfully yet deliver nothing, so downgrade to intentional
+    # stdout-only delivery instead of pretending it worked.
+    if chosen in ("windows", "wsl") and not play_sound:
+        desktop_intended = False
+
     log_stream.write(
         f"[attention] {event.severity.upper()} {event.kind} "
         f"key={event.key} task={event.task_id or '-'} :: {title}\n"
@@ -142,11 +151,15 @@ def notify(
             chosen, title, body, play_sound=play_sound, runner=runner,
         )
 
-    # Bell fallback applies when sound is wanted and either:
-    #   (a) no desktop backend was usable, OR
-    #   (b) the subprocess failed, OR
-    #   (c) desktop was disabled outright.
-    if play_sound and (not desktop_dispatched or not cfg.desktop):
+    # Bell semantics per §5:
+    #   - macOS / Linux: notification is visual-only; ring the bell as
+    #     the audio channel (afplay / paplay would be a richer choice
+    #     but those would each need an opt-in dep — bell stays generic).
+    #   - Windows / WSL: ``[console]::beep`` is already inside the
+    #     PowerShell command, so adding a bell here would double up.
+    #   - desktop disabled / dispatch failed / stdout-only: bell is
+    #     the only audio surface left.
+    if play_sound and chosen not in ("windows", "wsl"):
         bell()
         bell_dispatched = True
 
