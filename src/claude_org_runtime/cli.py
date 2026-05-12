@@ -5,6 +5,7 @@ Subcommands:
 - ``dispatcher delegate-plan ...`` -> :mod:`claude_org_runtime.dispatcher.runner`
 - ``settings generate ...`` -> :mod:`claude_org_runtime.settings.generator`
 - ``migrate ...`` -> :mod:`claude_org_runtime.migrate.v1_to_v2`
+- ``attention scan|watch ...`` -> :mod:`claude_org_runtime.attention.cli`
 
 The subcommands re-use the same parser builders the per-module CLIs
 expose, so flags stay in lock-step.
@@ -17,6 +18,7 @@ import sys
 from typing import Optional
 
 from . import __version__
+from .attention import cli as attention_cli
 from .dispatcher import runner as dispatcher_runner
 from .migrate import v1_to_v2 as migrate_v1_to_v2
 from .settings import generator as settings_generator
@@ -79,6 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     settings_generator.add_show_arguments(show_p)
     show_p.set_defaults(func=_run_settings_show)
+
+    # attention
+    attention_p = sub.add_parser(
+        "attention",
+        help=(
+            "Attention scan/watch CLI for human-required events "
+            "(approval blocked, CI failed, pending decision, ...)"
+        ),
+    )
+    attention_sub = attention_p.add_subparsers(dest="cmd", required=True)
+    attention_cli.add_subparsers(attention_sub)
 
     # migrate
     migrate_p = sub.add_parser(
