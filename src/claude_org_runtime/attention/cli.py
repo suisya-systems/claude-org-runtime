@@ -61,6 +61,7 @@ def _scan_once(
     effective_log = log_stream
     if emit_json and effective_log is None:
         effective_log = sys.stderr
+    state_dirty = False
     for ev in classified:
         if not should_notify(
             state, ev.key,
@@ -79,10 +80,18 @@ def _scan_once(
         payload = ev.to_dict()
         payload["title"] = formatted.title
         payload["body"] = formatted.body
+        payload["desktop_dispatched"] = formatted.desktop_dispatched
+        payload["bell_dispatched"] = formatted.bell_dispatched
         notified_payloads.append(payload)
-        if not dry_run:
+        if dry_run:
+            continue
+        # Only mark dedup'd when *something* reached the user. If the
+        # desktop subprocess failed and sound was off / suppressed, the
+        # next poll should retry rather than silently swallow the event.
+        if formatted.desktop_dispatched or formatted.bell_dispatched:
             record_notified(state, ev.key, source=ev.source, now=now)
-    if not dry_run and notified:
+            state_dirty = True
+    if state_dirty:
         save_state(dedup_path, state)
     if emit_json:
         json.dump(

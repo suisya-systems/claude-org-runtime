@@ -26,6 +26,11 @@ DEFAULT_NOTIFY: dict[str, Severity] = {
     "ci_failed": "urgent",
     "pending_decision": "urgent",
     "user_reply_not_forwarded": "urgent",
+    "pane_silent": "urgent",
+    "pane_crashed": "urgent",
+    "worker_stalled": "urgent",
+    "worker_not_reported": "urgent",
+    "worker_error": "urgent",
     "worker_completed": "normal",
     "pr_merged": "normal",
 }

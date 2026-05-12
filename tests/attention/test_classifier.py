@@ -328,3 +328,36 @@ def test_notify_map_unknown_value_falls_back_to_default() -> None:
     )
     assert ev is not None
     assert ev.severity == "urgent"  # design default
+
+
+# ---------------------------------------------------------------------------
+# Expanded notify_sent subkind coverage (round 2 codex feedback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "subkind,expected_kind",
+    [
+        ("pane_silent", "pane_silent"),
+        ("pane_crashed", "pane_crashed"),
+        ("worker_stalled", "worker_stalled"),
+        ("worker_not_reported", "worker_not_reported"),
+        ("error", "worker_error"),
+    ],
+)
+def test_notify_sent_production_subkinds_urgent(
+    subkind: str, expected_kind: str,
+) -> None:
+    """AnomalyKind enum values + dispatcher's ``error`` tag must classify.
+
+    Codex round 2 caught that the design's 3-row table did not match
+    production. These are urgent because the human is the only
+    recovery path for a stalled / crashed / silent worker.
+    """
+    ev = classify_event(_row(
+        kind="notify_sent",
+        payload={"kind": subkind, "worker": "w1", "task_id": "t1"},
+    ))
+    assert ev is not None
+    assert ev.kind == expected_kind
+    assert ev.severity == "urgent"

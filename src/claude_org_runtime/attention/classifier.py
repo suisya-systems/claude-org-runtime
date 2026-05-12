@@ -18,12 +18,23 @@ Severity = Literal["urgent", "normal"]
 
 
 # ``events.kind='notify_sent'`` carries a payload ``kind`` that names the
-# specific notification subtype. The table below maps those subtypes to
-# the attention-layer kind used downstream.
+# specific notification subtype. The table maps those subtypes to the
+# attention-layer kind used downstream. Covers the 3 design-doc subkinds
+# (§5) plus the broader vocabulary actually emitted in production: the
+# ``AnomalyKind`` enum (``pane_silent`` / ``pane_crashed`` / ``worker_stalled``
+# / ``worker_not_reported``) and the freeform ``error`` tag used by the
+# dispatcher prompt (``prompts/templates/dispatcher.md:410``). Any unknown
+# subtype is intentionally ignored so duplicate/progress-only ``notify_sent``
+# rows do not produce attention spam (design §5 "通知しないもの").
 _NOTIFY_SUBKIND_TO_KIND: dict[str, str] = {
     "approval_blocked": "approval_blocked",
     "relay_gap_suspected": "relay_gap_suspected",
     "pane_output_without_peer_msg": "silent_worker_output",
+    "pane_silent": "pane_silent",
+    "pane_crashed": "pane_crashed",
+    "worker_stalled": "worker_stalled",
+    "worker_not_reported": "worker_not_reported",
+    "error": "worker_error",
 }
 
 # CI run statuses that classify as a failure. Mirrors §5 column 2.
@@ -288,6 +299,26 @@ _DEFAULT_TEMPLATES: dict[str, tuple[str, str]] = {
     "user_reply_not_forwarded": (
         "User reply not forwarded",
         "{task_id}: user reply has not been relayed to the worker.",
+    ),
+    "pane_silent": (
+        "Worker pane silent",
+        "{worker} pane has gone silent.",
+    ),
+    "pane_crashed": (
+        "Worker pane crashed",
+        "{worker} pane crashed unexpectedly.",
+    ),
+    "worker_stalled": (
+        "Worker stalled",
+        "{worker} appears stalled (no progress).",
+    ),
+    "worker_not_reported": (
+        "Worker not reported",
+        "{worker} has not reported back to the secretary.",
+    ),
+    "worker_error": (
+        "Worker error",
+        "{worker} reported an error.",
     ),
 }
 

@@ -234,8 +234,8 @@ def _truncate(s: str, limit: int) -> str:
 
 
 def _strip_control(s: str) -> str:
-    """Strip ASCII control bytes except SPACE."""
-    return "".join(ch for ch in s if ord(ch) >= 0x20 or ch == " ")
+    """Drop ASCII C0 control bytes and DEL (\\x00-\\x1f, \\x7f)."""
+    return "".join(ch for ch in s if 0x20 <= ord(ch) < 0x7F or ord(ch) > 0x7F)
 
 
 def _apple_quote(s: str) -> str:

@@ -99,3 +99,16 @@ def test_read_pending_decisions_filters_non_dict_entries(tmp_path: Path) -> None
     out = read_pending_decisions(path)
     assert len(out) == 1
     assert out[0]["task_id"] == "ok"
+
+
+def test_read_events_non_sqlite_file_returns_empty(
+    tmp_path: Path, capsys
+) -> None:
+    """A garbage file at ``state.db`` must not crash the long-running watch."""
+    fake_db = tmp_path / "state.db"
+    fake_db.write_bytes(b"not-a-sqlite-database\x00\x01")
+    assert read_events(fake_db) == []
+    err = capsys.readouterr().err
+    # Either the connect failed or the master-table read failed; both
+    # paths must surface a warning rather than raise.
+    assert "state DB" in err

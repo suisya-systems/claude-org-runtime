@@ -277,3 +277,53 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     payload = json.loads(captured.out)
     wc = next(ev for ev in payload if ev["kind"] == "worker_completed")
     assert wc["severity"] == "urgent"
+
+
+def test_scan_failed_dispatch_does_not_dedup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed desktop + suppressed bell must allow the next poll to retry.
+
+    Reproduces the round-2 codex Major: previously ``record_notified``
+    fired regardless of whether anything reached the user, so a
+    silently-failing ``notify-send`` left the event permanently
+    suppressed.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    # sound=off so no bell fallback masks the failure.
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({"sound": "off"}), encoding="utf-8")
+
+    # Force every event onto the linux backend with a runner that always
+    # returns non-zero, simulating ``notify-send`` failing for lack of
+    # DBus. ``platform.detect_backend`` is replaced so test-host's real
+    # backend does not interfere.
+    monkeypatch.setattr(
+        "claude_org_runtime.attention.notify.detect_backend",
+        lambda **kw: "linux",
+    )
+
+    class FailingProc:
+        returncode = 1
+
+    monkeypatch.setattr(
+        "claude_org_runtime.attention.notify._safe_subprocess_run",
+        lambda cmd: FailingProc(),
+    )
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+    ])
+    args.func(args)
+
+    notified_path = state_dir / "attention_notified.json"
+    # No event was dedup'd because nothing reached the user.
+    if notified_path.exists():
+        data = json.loads(notified_path.read_text(encoding="utf-8"))
+        assert data["events"] == {}
+        assert data["pending"] == {}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,29 +28,56 @@ RELEVANT_EVENT_KINDS: tuple[str, ...] = (
 def read_events(state_db_path: Path) -> list[dict[str, Any]]:
     """Return rows from ``events`` that may produce attention events.
 
-    Returns ``[]`` if the file does not exist or the database has no
-    ``events`` table (matches the pre-M4 / pre-init state).
+    Returns ``[]`` for any read error — missing file, missing
+    ``events`` table, non-SQLite file, corrupt page, or query-time
+    SQLite errors. A long-running ``watch`` must not crash because of
+    a transient DB issue; we log a one-line warning and let the next
+    poll retry.
     """
     p = Path(state_db_path)
     if not p.exists():
         return []
-    # Open read-only so a watcher cannot accidentally mutate the SoT.
     uri = f"file:{p.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        print(
+            f"warning: cannot open state DB {p}: {exc}; "
+            "treating as no events",
+            file=sys.stderr,
+        )
+        return []
     try:
         conn.row_factory = sqlite3.Row
-        if conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='events'"
-        ).fetchone() is None:
+        try:
+            has_events = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='events'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            print(
+                f"warning: state DB {p} is unreadable ({exc}); "
+                "treating as no events",
+                file=sys.stderr,
+            )
+            return []
+        if has_events is None:
             return []
         placeholders = ",".join("?" * len(RELEVANT_EVENT_KINDS))
-        cur = conn.execute(
-            f"SELECT id, occurred_at, actor, kind, payload_json "
-            f"FROM events WHERE kind IN ({placeholders}) "
-            f"ORDER BY id ASC",
-            RELEVANT_EVENT_KINDS,
-        )
+        try:
+            cur = conn.execute(
+                f"SELECT id, occurred_at, actor, kind, payload_json "
+                f"FROM events WHERE kind IN ({placeholders}) "
+                f"ORDER BY id ASC",
+                RELEVANT_EVENT_KINDS,
+            )
+        except sqlite3.Error as exc:
+            print(
+                f"warning: state DB events query failed ({exc}); "
+                "treating as no events",
+                file=sys.stderr,
+            )
+            return []
         out: list[dict[str, Any]] = []
         for r in cur:
             out.append({
