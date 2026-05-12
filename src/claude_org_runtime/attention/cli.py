@@ -76,12 +76,17 @@ def _scan_once(
             log_stream=effective_log,
         )
         # Emit the rendered title/body in --json so the payload reflects
-        # what was actually sent (post-template, post-truncation).
+        # what was actually sent (post-template, post-truncation). The
+        # ``delivered`` flag mirrors ``FormattedNotification.reached_user``
+        # so a ja golden test (or any other machine consumer) can tell
+        # "classified" from "actually delivered" without re-implementing
+        # the dispatch contract.
         payload = ev.to_dict()
         payload["title"] = formatted.title
         payload["body"] = formatted.body
         payload["desktop_dispatched"] = formatted.desktop_dispatched
         payload["bell_dispatched"] = formatted.bell_dispatched
+        payload["delivered"] = formatted.reached_user
         notified_payloads.append(payload)
         if dry_run:
             continue

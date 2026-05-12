@@ -349,3 +349,24 @@ def test_scan_failed_dispatch_does_not_dedup(
         data = json.loads(notified_path.read_text(encoding="utf-8"))
         assert data["events"] == {}
         assert data["pending"] == {}
+
+
+def test_scan_json_payload_delivered_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The ``--json`` payload exposes ``delivered`` so machine consumers
+    can distinguish "classified" from "actually reached the user"."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--dry-run", "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert all("delivered" in ev for ev in payload)

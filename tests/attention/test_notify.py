@@ -78,6 +78,30 @@ def test_render_unknown_placeholder_falls_back(capsys) -> None:
     assert "falling back" in err
 
 
+def test_render_attribute_lookup_rejected(capsys) -> None:
+    """Round 5 nit: templates may not reach into Python attributes."""
+    cfg = AttentionConfig(templates={
+        "ci_failed": Template(
+            title="X", body="{summary.__class__}",
+        ),
+    })
+    title, body = render_text(_event(), cfg)
+    # Whole-template fallback because the field_name uses ``.``.
+    assert title == "CI failed"
+    assert body == "PR #42 finished with failed."
+    err = capsys.readouterr().err
+    assert "falling back" in err
+
+
+def test_render_index_lookup_rejected(capsys) -> None:
+    cfg = AttentionConfig(templates={
+        "ci_failed": Template(title="X", body="{summary[0]}"),
+    })
+    title, body = render_text(_event(), cfg)
+    assert title == "CI failed"
+    assert body == "PR #42 finished with failed."
+
+
 def test_render_truncates_long_body() -> None:
     cfg = AttentionConfig(
         max_title_chars=10, max_body_chars=20,

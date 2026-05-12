@@ -288,7 +288,11 @@ def _placeholders(template: str) -> set[str]:
     """Return the set of named placeholders referenced by ``template``.
 
     Uses :class:`string.Formatter` so ``{key:format-spec}`` and
-    ``{key!conv}`` forms are recognised, not just ``{key}``.
+    ``{key!conv}`` forms are recognised. Anything beyond a bare
+    identifier — index / attribute lookups like ``{summary[0]}`` or
+    ``{summary.__class__}`` — is treated as an unknown placeholder so
+    the §6 allowlist stays strict: a template cannot reach into an
+    arbitrary attribute of the AttentionEvent.
     """
     out: set[str] = set()
     formatter = string.Formatter()
@@ -296,14 +300,11 @@ def _placeholders(template: str) -> set[str]:
         for _, field_name, _, _ in formatter.parse(template):
             if not field_name:
                 continue
-            # Strip ``.attr`` / ``[idx]`` lookups — we only allow the
-            # top-level name through.
-            head = field_name.split(".")[0].split("[")[0]
-            if head:
-                out.add(head)
+            if "." in field_name or "[" in field_name:
+                out.add("__invalid__")
+                continue
+            out.add(field_name)
     except ValueError:
-        # An unparsable template — treat every placeholder as unknown.
-        # The caller will trigger the fallback path.
         out.add("__invalid__")
     return out
 
