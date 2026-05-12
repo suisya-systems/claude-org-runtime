@@ -5,6 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-05-13
+
+### Added
+
+- `claude_org_runtime.attention`: new top-level package implementing the
+  attention / notification watcher per `claude-org-ja`
+  `docs/design/attention-notification.md` §5 / §6 (merged ja PR #443,
+  2026-05-12). Closes `claude-org-runtime#19` and `claude-org-runtime#20`.
+  - New CLI subcommand family mounted on the top-level
+    `claude-org-runtime` entry point:
+    - `claude-org-runtime attention scan --state-dir DIR [--dry-run]
+      [--json]` — one-shot pass over `state.db` events + pending
+      decisions, classifies and (unless `--dry-run`) dispatches a
+      notification per anomaly, dedup'd against prior runs.
+    - `claude-org-runtime attention watch --state-dir DIR
+      [--config PATH]` — long-running poll loop with backend probing
+      and config-driven template / severity overrides.
+  - `attention.classifier`: pure events / pending → `AttentionEvent`
+    mapping. Covers the 3 design-doc subkinds plus the production
+    `notify_sent.kind` vocabulary: every `schema.AnomalyKind` enum
+    (`pane_silent` / `pane_crashed` / `worker_stalled` /
+    `worker_not_reported`) and the dispatcher prompt's freeform
+    `error` tag (`prompts/templates/dispatcher.md` line 410). All
+    map to urgent attention with bundled English titles that templates
+    may override.
+  - `attention.config`: `AttentionConfig` dataclass + JSON loader
+    (`load_config`). Operators may override per-`kind` severity via a
+    `notify` map (e.g. `{"worker_completed": "urgent"}`) which now
+    reaches the emitted `AttentionEvent.severity` — the classifier
+    accepts a `notify_map` parameter instead of hard-coding severity.
+  - `attention.notify`: template render + truncation + subprocess
+    dispatch. `_placeholders` enforces a flat identifier allowlist —
+    attribute / index forms like `{summary[0]}` or
+    `{summary.__class__}` are rejected before reaching `format_map`,
+    so templates cannot reach into arbitrary `AttentionEvent`
+    internals. `_strip_control` also drops DEL (0x7f) per its
+    docstring intent. `max_title` / `max_body` truncation is applied
+    post-render.
+  - `attention.platform`: macOS / Linux / Windows / WSL / stdout
+    backend probing. Windows / WSL PowerShell commands gate the
+    `[console]::beep(800,200)` invocation on `play_sound=True` so
+    `sound="off"` actually silences the watcher on those platforms;
+    when both sound and the visible PowerShell host stream are
+    suppressed the dispatch downgrades to intentional stdout-only
+    delivery (`desktop_intended=False`) so `reached_user` stays
+    honest. macOS / Linux paths now also ring the terminal bell on
+    successful `osascript` / `notify-send` delivery so the §5 urgent
+    sound row actually fires (visual-only delivery was the previous
+    behaviour).
+  - `attention.dedup`: atomic JSON state with corruption recovery —
+    a malformed dedup file is treated as empty rather than crashing
+    the watcher.
+  - `attention.readers`: `state.db` (sqlite3, `events` table) and
+    `pending_decisions.json` readers. Both tolerate corruption:
+    `read_events` traps `sqlite3.Error` so a non-SQLite / corrupt
+    `state.db` does not crash a long-running watch loop, matching
+    the pending-decisions reader posture. `_minutes_since` returns
+    `+inf` for missing or malformed ISO timestamps so the pending
+    classifier alerts on a corrupt `received_at` / `user_replied_at`
+    instead of silently treating the entry as "0 minutes old" —
+    false-positive is the right error direction for a relay-gap
+    watcher.
+  - Dedup contract: an event is only marked delivered when something
+    actually reached the user. Desktop subprocess success OR bell
+    fallback OR explicit stdout-only / desktop-disabled mode all
+    count; a silently-failing `notify-send` (non-zero returncode)
+    retries on the next poll instead of being dedup'd into oblivion.
+    `_dispatch_desktop` runs subprocesses with `check=False` and
+    inspects the returncode itself.
+  - `attention scan --json` payload reports the rendered title /
+    body from `FormattedNotification` (post-template, post-truncation)
+    plus a `delivered` boolean mirroring `reached_user`. Machine
+    consumers (notably the planned `claude-org-ja#445` golden test)
+    can now tell a classified event from one that actually reached
+    the user without re-implementing the dispatch contract.
+  - `attention` CLI wraps `load_config` in `_load_cfg_or_exit` so a
+    malformed config JSON produces a one-line error + exit code 2
+    instead of a Python traceback.
+
+### Notes
+
+- Tests under `tests/attention/` cover every §5 / §6 acceptance
+  criterion — backend selection across all 5 platforms (macOS / Linux
+  / Windows / WSL / stdout), dry-run subprocess suppression, dedup
+  recovery from broken JSON, template unknown-placeholder fallback,
+  `max_title` / `max_body` truncation, the dedup-retry contract on
+  desktop-dispatch failure, PowerShell beep gating, malformed-config
+  CLI error path, missing / malformed ISO timestamp handling, and a
+  Japanese template smoke test (109 attention tests, 292 tests
+  total).
+- Tag-triggered release workflow at `.github/workflows/release.yml`
+  builds sdist + wheel and publishes to PyPI via OIDC Trusted
+  Publisher, then attaches artifacts to the GitHub Release. PyPI
+  publication is out of worker scope; the `v0.1.10` tag push
+  triggers it.
+
 ## [0.1.9] - 2026-05-11
 
 ### Changed
