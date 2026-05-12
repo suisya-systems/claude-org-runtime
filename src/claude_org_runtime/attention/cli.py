@@ -50,9 +50,11 @@ def _scan_once(
     classified = classify_all(
         events, pending, now,
         cfg.pending_decision_min, cfg.user_replied_min,
+        notify_map=cfg.notify,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []
+    notified_payloads: list[dict] = []
     # When ``--json`` is requested the caller wants a machine-readable
     # stdout payload; sending the human log lines to stderr keeps the
     # stdout stream pure JSON for the §8 ja-side golden test.
@@ -68,17 +70,23 @@ def _scan_once(
         ):
             continue
         notified.append(ev)
-        run_notify(
+        formatted = run_notify(
             ev, cfg, dry_run=dry_run, backend=backend,
             log_stream=effective_log,
         )
+        # Emit the rendered title/body in --json so the payload reflects
+        # what was actually sent (post-template, post-truncation).
+        payload = ev.to_dict()
+        payload["title"] = formatted.title
+        payload["body"] = formatted.body
+        notified_payloads.append(payload)
         if not dry_run:
             record_notified(state, ev.key, source=ev.source, now=now)
     if not dry_run and notified:
         save_state(dedup_path, state)
     if emit_json:
         json.dump(
-            [ev.to_dict() for ev in notified],
+            notified_payloads,
             sys.stdout, indent=2, ensure_ascii=False,
         )
         sys.stdout.write("\n")

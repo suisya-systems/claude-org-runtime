@@ -220,3 +220,60 @@ def test_scan_with_template_config(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     # Log lines go to stdout when --json is absent.
     assert "CI が失敗しました" in captured.out
+
+
+def test_scan_json_reflects_rendered_template(tmp_path: Path, capsys) -> None:
+    """``--json`` payload must show the rendered (not raw) title/body."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "templates": {
+            "ci_failed": {
+                "title": "CI Failed Override",
+                "body": "PR #{pr} status={status}",
+            },
+        },
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--dry-run", "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    ci = next(ev for ev in payload if ev["kind"] == "ci_failed")
+    assert ci["title"] == "CI Failed Override"
+    assert ci["body"].startswith("PR #")
+    assert "status=failed" in ci["body"]
+
+
+def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
+    """``config.notify`` overrides reach the JSON payload."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "notify": {"worker_completed": "urgent"},
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--dry-run", "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    wc = next(ev for ev in payload if ev["kind"] == "worker_completed")
+    assert wc["severity"] == "urgent"

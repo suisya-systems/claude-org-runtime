@@ -213,6 +213,25 @@ def test_runner_exception_falls_back_to_bell(capsys) -> None:
     assert "failed" in err
 
 
+def test_runner_nonzero_returncode_falls_back_to_bell(capsys) -> None:
+    """A failing notify-send (DBus missing, etc.) must NOT report success."""
+    class FakeProc:
+        returncode = 1
+
+    def failing_runner(cmd: list[str]):
+        return FakeProc()
+
+    out = StringIO()
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="linux", log_stream=out, runner=failing_runner,
+    )
+    assert result.desktop_dispatched is False
+    assert result.bell_dispatched is True
+    err = capsys.readouterr().err
+    assert "exited with code 1" in err
+
+
 def test_desktop_disabled_still_bells_on_urgent() -> None:
     cfg = AttentionConfig(desktop=False)
     out = StringIO()

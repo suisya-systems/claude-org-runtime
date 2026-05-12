@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
+
+from .config import DEFAULT_NOTIFY
 
 Severity = Literal["urgent", "normal"]
 
@@ -70,12 +72,16 @@ class AttentionEvent:
         return out
 
 
-def classify_event(row: dict[str, Any]) -> Optional[AttentionEvent]:
+def classify_event(
+    row: dict[str, Any],
+    notify_map: Optional[Mapping[str, str]] = None,
+) -> Optional[AttentionEvent]:
     """Map one ``events`` row to an :class:`AttentionEvent` or ``None``.
 
     Returns ``None`` for rows that should not produce a notification
     (e.g. ``ci_completed status=success``, unrecognized
-    ``notify_sent.kind``).
+    ``notify_sent.kind``). ``notify_map`` overrides the §5 default
+    severity-per-kind table; missing keys fall back to the default.
     """
     kind = row.get("kind")
     payload = row.get("payload") or {}
@@ -97,7 +103,7 @@ def classify_event(row: dict[str, Any]) -> Optional[AttentionEvent]:
             a_kind, task_id=task_id, worker=worker, pr=pr,
         )
         return AttentionEvent(
-            key=key, kind=a_kind, severity="urgent",
+            key=key, kind=a_kind, severity=_severity_for(a_kind, notify_map),
             title=title, body=body, source="state.db.events",
             task_id=task_id, worker=worker, pr=pr,
             created_at=occurred_at,
@@ -112,7 +118,8 @@ def classify_event(row: dict[str, Any]) -> Optional[AttentionEvent]:
             status=status,
         )
         return AttentionEvent(
-            key=key, kind="ci_failed", severity="urgent",
+            key=key, kind="ci_failed",
+            severity=_severity_for("ci_failed", notify_map),
             title=title, body=body, source="state.db.events",
             task_id=task_id, worker=worker, pr=pr, status=status,
             created_at=occurred_at,
@@ -123,7 +130,8 @@ def classify_event(row: dict[str, Any]) -> Optional[AttentionEvent]:
             "worker_completed", task_id=task_id, worker=worker, pr=pr,
         )
         return AttentionEvent(
-            key=key, kind="worker_completed", severity="normal",
+            key=key, kind="worker_completed",
+            severity=_severity_for("worker_completed", notify_map),
             title=title, body=body, source="state.db.events",
             task_id=task_id, worker=worker, pr=pr,
             created_at=occurred_at,
@@ -134,7 +142,8 @@ def classify_event(row: dict[str, Any]) -> Optional[AttentionEvent]:
             "pr_merged", task_id=task_id, worker=worker, pr=pr,
         )
         return AttentionEvent(
-            key=key, kind="pr_merged", severity="normal",
+            key=key, kind="pr_merged",
+            severity=_severity_for("pr_merged", notify_map),
             title=title, body=body, source="state.db.events",
             task_id=task_id, worker=worker, pr=pr,
             created_at=occurred_at,
@@ -148,6 +157,7 @@ def classify_pending(
     now: datetime,
     pending_decision_min: int,
     user_replied_min: int,
+    notify_map: Optional[Mapping[str, str]] = None,
 ) -> Optional[AttentionEvent]:
     """Map a ``pending_decisions.json`` entry to an :class:`AttentionEvent`.
 
@@ -176,7 +186,7 @@ def classify_pending(
             return AttentionEvent(
                 key=f"pending:{task_id}:pending_decision",
                 kind="pending_decision",
-                severity="urgent",
+                severity=_severity_for("pending_decision", notify_map),
                 title=title, body=body,
                 source="pending_decisions",
                 task_id=task_id,
@@ -192,7 +202,9 @@ def classify_pending(
             return AttentionEvent(
                 key=f"pending:{task_id}:user_reply_not_forwarded",
                 kind="user_reply_not_forwarded",
-                severity="urgent",
+                severity=_severity_for(
+                    "user_reply_not_forwarded", notify_map,
+                ),
                 title=title, body=body,
                 source="pending_decisions",
                 task_id=task_id,
@@ -209,20 +221,34 @@ def classify_all(
     now: datetime,
     pending_decision_min: int,
     user_replied_min: int,
+    notify_map: Optional[Mapping[str, str]] = None,
 ) -> list[AttentionEvent]:
     """Classify both inputs in order: DB events first, then pending."""
     out: list[AttentionEvent] = []
     for row in events:
-        ev = classify_event(row)
+        ev = classify_event(row, notify_map=notify_map)
         if ev is not None:
             out.append(ev)
     for entry in pending:
         ev = classify_pending(
             entry, now, pending_decision_min, user_replied_min,
+            notify_map=notify_map,
         )
         if ev is not None:
             out.append(ev)
     return out
+
+
+def _severity_for(
+    kind: str, notify_map: Optional[Mapping[str, str]],
+) -> Severity:
+    """Resolve severity for ``kind`` via override map then design default."""
+    if notify_map is not None and kind in notify_map:
+        sev = notify_map[kind]
+        if sev in ("urgent", "normal"):
+            return sev  # type: ignore[return-value]
+    default = DEFAULT_NOTIFY.get(kind, "normal")
+    return default  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

@@ -285,3 +285,46 @@ def test_pending_missing_task_id_returns_none() -> None:
     assert classify_pending(
         entry, _NOW, pending_decision_min=15, user_replied_min=15,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# notify_map severity override (Issue #19 / §5 config schema)
+# ---------------------------------------------------------------------------
+
+
+def test_notify_map_overrides_severity_event() -> None:
+    """A config ``notify`` override must reach the emitted AttentionEvent."""
+    ev = classify_event(
+        _row(kind="worker_completed", payload={"task_id": "t"}),
+        notify_map={"worker_completed": "urgent"},
+    )
+    assert ev is not None
+    assert ev.severity == "urgent"
+
+
+def test_notify_map_overrides_severity_pending() -> None:
+    received = (_NOW - timedelta(minutes=30)).isoformat().replace(
+        "+00:00", "Z",
+    )
+    entry = {
+        "task_id": "T",
+        "received_at": received,
+        "raw_message": "?",
+        "status": "pending",
+    }
+    ev = classify_pending(
+        entry, _NOW, pending_decision_min=15, user_replied_min=15,
+        notify_map={"pending_decision": "normal"},
+    )
+    assert ev is not None
+    assert ev.severity == "normal"
+
+
+def test_notify_map_unknown_value_falls_back_to_default() -> None:
+    """An invalid override is ignored — design defaults stand."""
+    ev = classify_event(
+        _row(kind="ci_completed", payload={"status": "failed", "pr": 1}),
+        notify_map={"ci_failed": "loud"},  # type: ignore[dict-item]
+    )
+    assert ev is not None
+    assert ev.severity == "urgent"  # design default

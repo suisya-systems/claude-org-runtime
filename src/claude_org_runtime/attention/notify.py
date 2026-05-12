@@ -147,19 +147,36 @@ def _dispatch_desktop(
     backend: Backend, title: str, body: str,
     *, runner=None,
 ) -> bool:
+    """Run the backend subprocess; return True only on a clean exit.
+
+    ``run_fn`` is ``subprocess.run`` with ``check=False`` so a failing
+    backend (e.g. ``notify-send`` with no DBus) does not raise; we
+    inspect ``returncode`` explicitly. A non-zero exit demotes the
+    return to ``False`` so :func:`notify` falls back to a bell — and,
+    crucially, the caller does not mark the event as dedup'd, so the
+    next poll re-attempts the notification.
+    """
     cmd = _backend_command(backend, title, body)
     if cmd is None:
         return False
     run_fn = runner or _safe_subprocess_run
     try:
-        run_fn(cmd)
-        return True
+        result = run_fn(cmd)
     except (OSError, subprocess.SubprocessError) as exc:
         print(
             f"warning: desktop notification via {backend!r} failed: {exc}",
             file=sys.stderr,
         )
         return False
+    returncode = getattr(result, "returncode", 0)
+    if returncode and returncode != 0:
+        print(
+            f"warning: desktop notification via {backend!r} exited "
+            f"with code {returncode}",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _safe_subprocess_run(cmd: list[str]) -> subprocess.CompletedProcess:
