@@ -2463,3 +2463,162 @@ def test_cli_pattern_required_when_sandbox_by_pattern_present(tmp_path: Path) ->
         ]
     )
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# Worker git policy regression (Refs: fix-worker-git-fetch-allow)
+#
+# Workers must be able to `git fetch` to sync upstream (otherwise Secretary
+# has to fetch on their behalf), but `git push` and `git pull` remain denied
+# (push: only Secretary publishes; pull: workers do explicit fetch + merge so
+# non-fast-forward merges never happen silently).
+# ---------------------------------------------------------------------------
+
+
+def _bundled_schema() -> dict:
+    return generator.load_schema()
+
+
+def test_worker_role_required_allow_contains_git_fetch_colon_star() -> None:
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git fetch:*)" in worker["required_allow"]
+
+
+def test_worker_role_required_allow_contains_git_merge_for_post_fetch_sync() -> None:
+    """Workers do `git fetch` + `git merge origin/...` instead of `git pull`."""
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git merge:*)" in worker["required_allow"]
+    for template in ("default", "claude-org-self-edit"):
+        allow = _bundled_schema()["worker_roles"][template]["permissions"]["allow"]
+        assert "Bash(git merge:*)" in allow
+
+
+def test_worker_role_required_allow_does_not_contain_git_push_variants() -> None:
+    worker = _bundled_schema()["roles"]["worker"]
+    forbidden_push_variants = {
+        "Bash(git push:*)",
+        "Bash(git push)",
+        "Bash(git push *)",
+        "Bash(git -C * push:*)",
+    }
+    assert not (forbidden_push_variants & set(worker["required_allow"]))
+
+
+def test_worker_role_required_allow_scoped_to_cwd_fetch_only() -> None:
+    """Worker fetch must be scoped to the worker's own cwd. Granting
+    Bash(git -C * fetch:*) would let workers fetch into arbitrary repos."""
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git -C * fetch:*)" not in worker["required_allow"]
+    for template in ("default", "claude-org-self-edit"):
+        allow = _bundled_schema()["worker_roles"][template]["permissions"]["allow"]
+        assert "Bash(git -C * fetch:*)" not in allow
+
+
+def test_worker_role_required_deny_no_longer_blocks_git_fetch() -> None:
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git fetch)" not in worker["required_deny"]
+    assert "Bash(git fetch *)" not in worker["required_deny"]
+
+
+def test_worker_role_required_deny_still_blocks_git_push() -> None:
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git push)" in worker["required_deny"]
+    assert "Bash(git push *)" in worker["required_deny"]
+
+
+def test_worker_role_required_deny_still_blocks_git_pull() -> None:
+    worker = _bundled_schema()["roles"]["worker"]
+    assert "Bash(git pull)" in worker["required_deny"]
+    assert "Bash(git pull *)" in worker["required_deny"]
+
+
+def test_default_worker_template_allow_contains_git_fetch_colon_star() -> None:
+    template = _bundled_schema()["worker_roles"]["default"]
+    assert "Bash(git fetch:*)" in template["permissions"]["allow"]
+
+
+def test_default_worker_template_deny_no_longer_blocks_cwd_git_fetch() -> None:
+    """cwd-form fetch must be removed from deny (it's now allowed), but the
+    -C form stays denied for defense-in-depth — workers should only fetch
+    into their own worktree."""
+    template = _bundled_schema()["worker_roles"]["default"]
+    deny = template["permissions"]["deny"]
+    assert "Bash(git fetch)" not in deny
+    assert "Bash(git fetch *)" not in deny
+    assert "Bash(git -C * fetch)" in deny
+    assert "Bash(git -C * fetch *)" in deny
+
+
+def test_default_worker_template_deny_still_blocks_push_and_pull() -> None:
+    deny = _bundled_schema()["worker_roles"]["default"]["permissions"]["deny"]
+    assert "Bash(git push)" in deny
+    assert "Bash(git push *)" in deny
+    assert "Bash(git pull)" in deny
+    assert "Bash(git pull *)" in deny
+
+
+def test_claude_org_self_edit_template_allow_contains_git_fetch_colon_star() -> None:
+    template = _bundled_schema()["worker_roles"]["claude-org-self-edit"]
+    assert "Bash(git fetch:*)" in template["permissions"]["allow"]
+
+
+def test_claude_org_self_edit_template_deny_no_longer_blocks_cwd_git_fetch() -> None:
+    """Same shape as the default template: cwd fetch allowed, -C variant denied."""
+    deny = _bundled_schema()["worker_roles"]["claude-org-self-edit"]["permissions"][
+        "deny"
+    ]
+    assert "Bash(git fetch)" not in deny
+    assert "Bash(git fetch *)" not in deny
+    assert "Bash(git -C * fetch)" in deny
+    assert "Bash(git -C * fetch *)" in deny
+
+
+def test_claude_org_self_edit_template_deny_still_blocks_push_and_pull() -> None:
+    deny = _bundled_schema()["worker_roles"]["claude-org-self-edit"]["permissions"][
+        "deny"
+    ]
+    assert "Bash(git push)" in deny
+    assert "Bash(git push *)" in deny
+    assert "Bash(git pull)" in deny
+    assert "Bash(git pull *)" in deny
+
+
+def test_global_forbidden_allow_exact_still_lists_space_form_fetch_and_pull() -> None:
+    """The colon form `Bash(git fetch:*)` is allowed; the space form is still globally banned."""
+    forbidden = _bundled_schema()["global"]["forbidden_allow_exact"]
+    assert "Bash(git fetch *)" in forbidden
+    assert "Bash(git pull *)" in forbidden
+    assert "Bash(git push *)" in forbidden
+    assert "Bash(git fetch:*)" not in forbidden
+
+
+def test_rendered_default_worker_settings_include_git_fetch_colon_star(
+    tmp_path: Path,
+) -> None:
+    """CLI smoke: generated settings.local.json for the default worker template
+    must include Bash(git fetch:*) in allow and must not include git push/pull
+    in allow."""
+    out = tmp_path / "settings.local.json"
+    rc = generator.main(
+        [
+            "--role",
+            "default",
+            "--worker-dir",
+            str(tmp_path / "wd"),
+            "--claude-org-path",
+            str(tmp_path / "co"),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    allow = parsed["permissions"]["allow"]
+    deny = parsed["permissions"]["deny"]
+    assert "Bash(git fetch:*)" in allow
+    assert "Bash(git push:*)" not in allow
+    assert "Bash(git pull:*)" not in allow
+    assert "Bash(git push)" in deny
+    assert "Bash(git pull)" in deny
+    assert "Bash(git fetch)" not in deny
+    assert "Bash(git fetch *)" not in deny
