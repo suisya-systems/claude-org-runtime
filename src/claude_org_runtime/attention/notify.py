@@ -36,7 +36,15 @@ _SUBPROCESS_TIMEOUT_SEC: float = 5.0
 
 @dataclass(frozen=True)
 class FormattedNotification:
-    """Record of what was sent (returned by :func:`notify`)."""
+    """Record of what was sent (returned by :func:`notify`).
+
+    ``reached_user`` is True when at least one user-visible channel ran:
+    either the desktop subprocess succeeded, the bell rang, or the
+    runtime is intentionally in stdout-only mode (the log line is the
+    notification). The CLI uses this to decide whether to record dedup
+    state — a silently-failing desktop subprocess should retry on the
+    next poll, but an stdout-only setup must not replay forever.
+    """
 
     title: str
     body: str
@@ -45,6 +53,16 @@ class FormattedNotification:
     backend: Backend
     desktop_dispatched: bool
     bell_dispatched: bool
+    desktop_intended: bool
+
+    @property
+    def reached_user(self) -> bool:
+        if self.desktop_dispatched or self.bell_dispatched:
+            return True
+        # No desktop attempt was made: this is the user's chosen
+        # stdout-only or desktop-disabled mode and the log line is the
+        # entire notification surface. Treat it as delivered.
+        return not self.desktop_intended
 
 
 def render_text(
@@ -101,6 +119,7 @@ def notify(
     title, body = render_text(event, cfg)
     chosen = backend if backend is not None else detect_backend()
     play_sound = _should_play_sound(cfg.sound, event.severity)
+    desktop_intended = bool(cfg.desktop) and chosen != "stdout"
 
     log_stream.write(
         f"[attention] {event.severity.upper()} {event.kind} "
@@ -115,11 +134,12 @@ def notify(
             title=title, body=body, severity=event.severity,
             sound=play_sound, backend=chosen,
             desktop_dispatched=False, bell_dispatched=False,
+            desktop_intended=desktop_intended,
         )
 
-    if cfg.desktop and chosen != "stdout":
+    if desktop_intended:
         desktop_dispatched = _dispatch_desktop(
-            chosen, title, body, runner=runner,
+            chosen, title, body, play_sound=play_sound, runner=runner,
         )
 
     # Bell fallback applies when sound is wanted and either:
@@ -135,6 +155,7 @@ def notify(
         sound=play_sound, backend=chosen,
         desktop_dispatched=desktop_dispatched,
         bell_dispatched=bell_dispatched,
+        desktop_intended=desktop_intended,
     )
 
 
@@ -145,7 +166,7 @@ def notify(
 
 def _dispatch_desktop(
     backend: Backend, title: str, body: str,
-    *, runner=None,
+    *, play_sound: bool, runner=None,
 ) -> bool:
     """Run the backend subprocess; return True only on a clean exit.
 
@@ -154,9 +175,12 @@ def _dispatch_desktop(
     inspect ``returncode`` explicitly. A non-zero exit demotes the
     return to ``False`` so :func:`notify` falls back to a bell — and,
     crucially, the caller does not mark the event as dedup'd, so the
-    next poll re-attempts the notification.
+    next poll re-attempts the notification. ``play_sound`` is threaded
+    in so the Windows / WSL PowerShell command can conditionally
+    include the ``[console]::beep`` — otherwise ``cfg.sound='off'``
+    would still ring a beep on those platforms.
     """
-    cmd = _backend_command(backend, title, body)
+    cmd = _backend_command(backend, title, body, play_sound=play_sound)
     if cmd is None:
         return False
     run_fn = runner or _safe_subprocess_run
@@ -190,6 +214,7 @@ def _safe_subprocess_run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 def _backend_command(
     backend: Backend, title: str, body: str,
+    *, play_sound: bool,
 ) -> Optional[list[str]]:
     safe_title = _strip_control(title)
     safe_body = _strip_control(body)
@@ -201,18 +226,18 @@ def _backend_command(
         return ["osascript", "-e", script]
     if backend == "linux":
         return ["notify-send", safe_title, safe_body]
-    if backend == "windows":
-        ps = shutil.which("powershell.exe") or "powershell"
+    if backend in ("windows", "wsl"):
+        # Honour ``cfg.sound`` on the PowerShell path: include the
+        # beep iff the caller asked for sound. Without this guard
+        # ``sound="off"`` users still hear a beep on Windows / WSL.
+        beep = "; [console]::beep(800,200)" if play_sound else ""
         message = (
             f"Write-Host '{_ps_quote(safe_title)}: "
-            f"{_ps_quote(safe_body)}'; [console]::beep(800,200)"
+            f"{_ps_quote(safe_body)}'{beep}"
         )
-        return [ps, "-NoProfile", "-Command", message]
-    if backend == "wsl":
-        message = (
-            f"Write-Host '{_ps_quote(safe_title)}: "
-            f"{_ps_quote(safe_body)}'; [console]::beep(800,200)"
-        )
+        if backend == "windows":
+            ps = shutil.which("powershell.exe") or "powershell"
+            return [ps, "-NoProfile", "-Command", message]
         return ["powershell.exe", "-NoProfile", "-Command", message]
     return None
 

@@ -279,6 +279,28 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     assert wc["severity"] == "urgent"
 
 
+def test_scan_invalid_config_exits_cleanly(
+    tmp_path: Path, capsys
+) -> None:
+    """Round 3 Minor: garbled config JSON should produce a clean error."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    cfg_path = tmp_path / "broken.json"
+    cfg_path.write_text("{ not json", encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        args.func(args)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid attention config" in err
+
+
 def test_scan_failed_dispatch_does_not_dedup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

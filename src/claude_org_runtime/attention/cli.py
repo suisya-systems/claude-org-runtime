@@ -85,10 +85,12 @@ def _scan_once(
         notified_payloads.append(payload)
         if dry_run:
             continue
-        # Only mark dedup'd when *something* reached the user. If the
-        # desktop subprocess failed and sound was off / suppressed, the
-        # next poll should retry rather than silently swallow the event.
-        if formatted.desktop_dispatched or formatted.bell_dispatched:
+        # Only mark dedup'd when the notification reached the user.
+        # ``reached_user`` covers desktop success, bell fallback, and
+        # the intentional stdout-only / desktop-disabled modes; a
+        # silently-failing desktop subprocess does NOT count, so the
+        # next poll retries instead of suppressing forever.
+        if formatted.reached_user:
             record_notified(state, ev.key, source=ev.source, now=now)
             state_dirty = True
     if state_dirty:
@@ -102,9 +104,23 @@ def _scan_once(
     return notified
 
 
+def _load_cfg_or_exit(config_arg: Optional[str]) -> AttentionConfig:
+    """Wrap :func:`load_config` to surface a clean error on bad JSON."""
+    if not config_arg:
+        return load_config(None)
+    try:
+        return load_config(Path(config_arg))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(
+            f"error: invalid attention config {config_arg!r}: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def cmd_attention_scan(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
-    cfg = load_config(Path(args.config) if args.config else None)
+    cfg = _load_cfg_or_exit(args.config)
     _scan_once(
         state_dir, cfg,
         now=datetime.now(timezone.utc),
@@ -116,7 +132,7 @@ def cmd_attention_scan(args: argparse.Namespace) -> int:
 
 def cmd_attention_watch(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
-    cfg = load_config(Path(args.config) if args.config else None)
+    cfg = _load_cfg_or_exit(args.config)
     interval = max(1, int(cfg.poll_interval_sec))
     max_iterations: Optional[int] = getattr(args, "max_iterations", None)
     count = 0

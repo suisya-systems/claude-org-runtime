@@ -232,6 +232,98 @@ def test_runner_nonzero_returncode_falls_back_to_bell(capsys) -> None:
     assert "exited with code 1" in err
 
 
+# ---------------------------------------------------------------------------
+# reached_user contract (round 3 codex Major)
+# ---------------------------------------------------------------------------
+
+
+def test_reached_user_true_for_stdout_only_mode() -> None:
+    """No desktop attempt + no bell still counts as reached when intentional."""
+    result = notify(
+        _event(severity="normal", kind="worker_completed"),
+        AttentionConfig(),
+        backend="stdout", log_stream=StringIO(),
+    )
+    assert result.desktop_intended is False
+    assert result.desktop_dispatched is False
+    assert result.bell_dispatched is False
+    assert result.reached_user is True
+
+
+def test_reached_user_false_when_desktop_failed_and_silent() -> None:
+    """sound=off + backend failure → did not reach the user → retry."""
+    class FailingProc:
+        returncode = 1
+
+    cfg = AttentionConfig(sound="off")
+    result = notify(
+        _event(severity="normal", kind="worker_completed"),
+        cfg, backend="linux", log_stream=StringIO(),
+        runner=lambda _: FailingProc(),
+    )
+    assert result.desktop_intended is True
+    assert result.desktop_dispatched is False
+    assert result.bell_dispatched is False
+    assert result.reached_user is False
+
+
+def test_reached_user_true_when_bell_rang_after_desktop_failed() -> None:
+    class FailingProc:
+        returncode = 1
+
+    result = notify(
+        _event(),  # urgent
+        AttentionConfig(),  # sound=urgent-only
+        backend="linux", log_stream=StringIO(),
+        runner=lambda _: FailingProc(),
+    )
+    assert result.bell_dispatched is True
+    assert result.reached_user is True
+
+
+def test_reached_user_true_when_desktop_disabled_only() -> None:
+    """``desktop=False`` is an intentional config — log alone is delivery."""
+    cfg = AttentionConfig(desktop=False, sound="off")
+    result = notify(
+        _event(severity="normal", kind="worker_completed"),
+        cfg, backend="linux", log_stream=StringIO(),
+        runner=lambda _: pytest.fail("desktop=False, runner must not run"),
+    )
+    assert result.desktop_intended is False
+    assert result.reached_user is True
+
+
+# ---------------------------------------------------------------------------
+# Windows / WSL beep gating (round 3 codex Major)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["windows", "wsl"])
+def test_powershell_beep_skipped_when_sound_off(backend) -> None:
+    calls: list[list[str]] = []
+    cfg = AttentionConfig(sound="off")
+    notify(
+        _event(), cfg, backend=backend, log_stream=StringIO(),
+        runner=lambda cmd: calls.append(cmd),
+    )
+    assert calls, "subprocess command should have been invoked"
+    joined = " ".join(calls[0])
+    assert "console]::beep" not in joined
+
+
+@pytest.mark.parametrize("backend", ["windows", "wsl"])
+def test_powershell_beep_present_when_sound_urgent(backend) -> None:
+    calls: list[list[str]] = []
+    cfg = AttentionConfig()  # sound="urgent-only", event is urgent
+    notify(
+        _event(), cfg, backend=backend, log_stream=StringIO(),
+        runner=lambda cmd: calls.append(cmd),
+    )
+    assert calls
+    joined = " ".join(calls[0])
+    assert "console]::beep" in joined
+
+
 def test_desktop_disabled_still_bells_on_urgent() -> None:
     cfg = AttentionConfig(desktop=False)
     out = StringIO()
