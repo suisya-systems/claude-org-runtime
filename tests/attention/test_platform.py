@@ -54,6 +54,21 @@ def test_wsl_without_powershell_falls_back() -> None:
     ) == "stdout"
 
 
+def test_wsl_prefers_wsl_notify_send_when_present() -> None:
+    """Issue #25: prefer wsl-notify-send.exe (real toast) over Write-Host."""
+    assert detect_backend(
+        system="Linux", is_wsl=True,
+        which=_which_factory({"wsl-notify-send.exe", "powershell.exe"}),
+    ) == "wsl-notify-send"
+
+
+def test_wsl_falls_back_to_write_host_without_wsl_notify_send() -> None:
+    """No wsl-notify-send.exe + powershell.exe present → legacy ``wsl`` path."""
+    assert detect_backend(
+        system="Linux", is_wsl=True, which=_which_factory({"powershell.exe"}),
+    ) == "wsl"
+
+
 def test_windows_with_powershell() -> None:
     assert detect_backend(
         system="Windows", is_wsl=False,
