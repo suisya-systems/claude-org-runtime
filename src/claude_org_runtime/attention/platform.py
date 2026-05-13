@@ -7,7 +7,8 @@ unit tests can drive every branch without a real OS check. Per §5:
 * Linux  → ``notify-send``
 * WSL    → ``wsl-notify-send.exe`` (Windows toast) when installed,
   else ``powershell.exe`` Write-Host fallback
-* Windows → PowerShell beep + Write-Host fallback
+* Windows → ``wsl-notify-send.exe`` (Windows toast) when installed,
+  else PowerShell beep + Write-Host fallback
 * anything else / missing binary → ``"stdout"`` (caller bells + logs)
 """
 
@@ -57,6 +58,8 @@ def detect_backend(
         return "linux" if which_fn("notify-send") else "stdout"
 
     if sys_name == "Windows":
+        if which_fn("wsl-notify-send.exe"):
+            return "wsl-notify-send"
         if which_fn("powershell.exe") or which_fn("powershell"):
             return "windows"
         return "stdout"
