@@ -12,6 +12,8 @@ import pytest
 
 from claude_org_runtime.attention.classifier import (
     AttentionEvent,
+    _NOTIFY_SUBKIND_TO_KIND,
+    _default_text,
     classify_all,
     classify_event,
     classify_pending,
@@ -578,3 +580,46 @@ def test_notify_sent_production_subkinds_severity(
     assert ev is not None
     assert ev.kind == expected_kind
     assert ev.severity == expected_severity
+
+
+# ---------------------------------------------------------------------------
+# Issue #28: secretary_awaiting_user (notify_sent subkind 'awaiting_user')
+# ---------------------------------------------------------------------------
+
+
+def test_notify_subkind_table_includes_awaiting_user() -> None:
+    """Issue #28 runtime: 'awaiting_user' → 'secretary_awaiting_user'."""
+    assert _NOTIFY_SUBKIND_TO_KIND["awaiting_user"] == "secretary_awaiting_user"
+
+
+def test_notify_sent_awaiting_user_classifies_urgent() -> None:
+    """notify_sent payload kind='awaiting_user' must surface as urgent.
+
+    Issue #28: the secretary paused for the user — "human is the sole
+    recovery path", so the kind joins approval_blocked / pending_decision
+    in the urgent tier by default.
+    """
+    ev = classify_event(_row(
+        kind="notify_sent",
+        payload={
+            "kind": "awaiting_user",
+            "task_id": "issue-28",
+            "worker": "secretary",
+        },
+    ))
+    assert ev is not None
+    assert ev.kind == "secretary_awaiting_user"
+    assert ev.severity == "urgent"
+    assert ev.task_id == "issue-28"
+
+
+def test_secretary_awaiting_user_default_text_non_empty() -> None:
+    """_default_text must return real strings (ja templates override UX)."""
+    title, body = _default_text(
+        "secretary_awaiting_user", task_id="issue-28",
+    )
+    assert title
+    assert body
+    # task_id must reach the body — it's the only identifying field on a
+    # paused-secretary notification, and ja templates lean on it.
+    assert "issue-28" in body

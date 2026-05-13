@@ -41,6 +41,10 @@ DEFAULT_NOTIFY: dict[str, Severity] = {
     "worker_error": "normal",
     "worker_completed": "normal",
     "pr_merged": "normal",
+    # Issue #28: secretary paused for a user-bound decision — "human is the
+    # sole recovery path" tier, so it joins approval_blocked /
+    # pending_decision at ``urgent`` by default.
+    "secretary_awaiting_user": "urgent",
 }
 
 # Placeholder allowlist from design §6. Anything outside this set

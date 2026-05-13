@@ -58,6 +58,34 @@ def test_default_notify_severity_part_b_rebalance() -> None:
     assert DEFAULT_NOTIFY["pr_merged"] == "normal"
 
 
+def test_default_notify_secretary_awaiting_user_urgent() -> None:
+    """Issue #28: secretary_awaiting_user joins the urgent tier by default."""
+    assert DEFAULT_NOTIFY["secretary_awaiting_user"] == "urgent"
+
+
+def test_backward_compat_legacy_notify_omits_secretary_awaiting_user(
+    tmp_path: Path,
+) -> None:
+    """Pre-Issue-#28 user configs (no secretary_awaiting_user override) still
+    pick up the urgent default via DEFAULT_NOTIFY when the classifier
+    resolves severity for the kind.
+
+    The loader keeps ``cfg.notify`` sparse (Issue #26 round 4), so an
+    absent key simply falls through to DEFAULT_NOTIFY at classification
+    time — no override means the design default wins.
+    """
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps({"notify": {"worker_completed": "urgent"}}),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert "secretary_awaiting_user" not in cfg.notify
+    # The design default still applies when looked up via DEFAULT_NOTIFY,
+    # which is the table the classifier consults for unset keys.
+    assert DEFAULT_NOTIFY["secretary_awaiting_user"] == "urgent"
+
+
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "missing.json")
     assert cfg == AttentionConfig()

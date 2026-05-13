@@ -36,6 +36,12 @@ _NOTIFY_SUBKIND_TO_KIND: dict[str, str] = {
     "worker_stalled": "worker_stalled",
     "worker_not_reported": "worker_not_reported",
     "error": "worker_error",
+    # Issue #28: secretary has paused for a user-bound decision (escalation
+    # surface complementary to ``pending_decision``). ja-side emission lives
+    # in the paired PR; this runtime side only registers the mapping +
+    # severity default so the classifier routes ``notify_sent`` rows with
+    # payload kind ``awaiting_user`` to the attention layer.
+    "awaiting_user": "secretary_awaiting_user",
 }
 
 # CI run statuses that classify as a failure. Mirrors §5 column 2.
@@ -424,6 +430,10 @@ _DEFAULT_TEMPLATES: dict[str, tuple[str, str]] = {
     "worker_error": (
         "Worker error",
         "{worker} reported an error.",
+    ),
+    "secretary_awaiting_user": (
+        "Secretary awaiting user",
+        "Secretary is waiting for the user on {task_id}.",
     ),
 }
 
