@@ -82,6 +82,22 @@ def test_windows_without_powershell_falls_back() -> None:
     ) == "stdout"
 
 
+def test_windows_prefers_wsl_notify_send_when_present() -> None:
+    """Issue #33: Windows native prefers wsl-notify-send.exe over Write-Host."""
+    assert detect_backend(
+        system="Windows", is_wsl=False,
+        which=_which_factory({"wsl-notify-send.exe", "powershell.exe"}),
+    ) == "wsl-notify-send"
+
+
+def test_windows_uses_wsl_notify_send_without_powershell() -> None:
+    """Edge case: wsl-notify-send.exe present but powershell.exe missing."""
+    assert detect_backend(
+        system="Windows", is_wsl=False,
+        which=_which_factory({"wsl-notify-send.exe"}),
+    ) == "wsl-notify-send"
+
+
 def test_unknown_system_falls_back() -> None:
     assert detect_backend(
         system="Haiku", is_wsl=False, which=_which_factory({"anything"}),
