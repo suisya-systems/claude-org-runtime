@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] - 2026-05-13
+
+### Added
+
+- `attention.classifier`: new `notify_sent.kind = "awaiting_user"`
+  subkind maps to attention kind `secretary_awaiting_user` at default
+  `urgent` severity. Designed to fire when the secretary is waiting on
+  user input at the 3 canonical gates — worker completion approval,
+  CI-green merge approval, and escalation reply forward. Refs
+  `claude-org-runtime#28` (PR #30).
+- `attention.platform`: WSL attention backend now invokes
+  `wsl-notify-send.exe` when the binary is on `PATH`, producing real
+  Windows toast notifications instead of the previous
+  `Write-Host` no-op. Original `wsl` PowerShell backend retained
+  bit-for-bit as a fallback when the binary is absent. Beep dispatched
+  as a separate `powershell.exe` call so toast delivery is independent
+  of sound playback. Closes `claude-org-runtime#25` (PR #27).
+- `attention.config`: `pending_decisions` TTL ladder. Two new knobs —
+  `pending_decision_max` (default 1440 minutes / 24h, urgent → normal
+  demote) and `pending_decision_drop` (default 10080 minutes / 7d,
+  suppress to `--json-only`) — applied symmetrically to both
+  `pending_decision` and `user_reply_not_forwarded` attention kinds.
+  `AttentionEvent.suppressed` flag added so callers can distinguish
+  the drop-to-json-only tier from active dispatch. Closes
+  `claude-org-runtime#26` (PR #29).
+
+### Changed
+
+- `attention.classifier` `DEFAULT_NOTIFY` severity rebalance: 6
+  anomaly subkinds demoted from `urgent` to `normal` —
+  `relay_gap_suspected`, `silent_worker_output`, `pane_silent`,
+  `worker_stalled`, `worker_not_reported`, `worker_error`. `urgent`
+  is now reserved for action-required moments only:
+  `approval_blocked`, `pending_decision`,
+  `user_reply_not_forwarded`, `ci_failed`, `pane_crashed`. Closes
+  `claude-org-runtime#26` (PR #29).
+
 ## [0.1.10] - 2026-05-13
 
 ### Added
