@@ -96,12 +96,22 @@ class AttentionConfig:
         # Validate the TTL ladder once at construction so a malformed
         # default-built config (e.g. test scaffolding that overrides
         # only one threshold) trips immediately rather than producing
-        # silently wrong classifications downstream.
+        # silently wrong classifications downstream. The ladder must
+        # admit a real "urgent" window for BOTH the pending_decision
+        # path (clock at received_at) and the user_reply_not_forwarded
+        # path (clock at user_replied_at), so ``max`` has to exceed
+        # both lower bounds.
         if self.pending_decision_max <= self.pending_decision_min:
             raise ValueError(
                 "config.pending_decision_max must be greater than "
                 "pending_decision_min "
                 f"({self.pending_decision_max} <= {self.pending_decision_min})"
+            )
+        if self.pending_decision_max <= self.user_replied_min:
+            raise ValueError(
+                "config.pending_decision_max must be greater than "
+                "user_replied_min "
+                f"({self.pending_decision_max} <= {self.user_replied_min})"
             )
         if self.pending_decision_drop <= self.pending_decision_max:
             raise ValueError(
@@ -198,28 +208,30 @@ def load_config(path: Path | None) -> AttentionConfig:
         kwargs["templates"] = templates
 
     # Issue #26 backward-compat: a pre-#26 user config that only
-    # raises ``pending_decision_min`` above the new default ``max``
-    # (1440) — or only raises ``pending_decision_max`` above the new
+    # raised ``pending_decision_min`` or ``user_replied_min`` above the
+    # new default ``max`` (1440) — or only raised ``max`` above the new
     # default ``drop`` (10080) — used to load fine. Validation now
-    # requires ``min < max < drop``, so auto-scale the missing knobs
-    # to keep legacy configs loading. Explicit user values for ``max``
-    # / ``drop`` always win, and the dataclass validator still rejects
-    # any inversion they introduce.
-    _default_max = AttentionConfig.__dataclass_fields__[
-        "pending_decision_max"
-    ].default
-    _default_drop = AttentionConfig.__dataclass_fields__[
-        "pending_decision_drop"
-    ].default
-    supplied_min = kwargs.get("pending_decision_min")
-    if (
-        supplied_min is not None
-        and "pending_decision_max" not in raw
-        and supplied_min >= _default_max
-    ):
-        # Bump max one notch above min so the ladder stays
-        # well-ordered without inventing arbitrary policy.
-        kwargs["pending_decision_max"] = supplied_min + 1
+    # requires both ``min`` and ``user_replied_min`` to be below ``max``
+    # below ``drop``, so auto-scale any missing knob upward to keep
+    # legacy configs loading. Explicit user values for ``max`` / ``drop``
+    # always win, and the dataclass validator still rejects any
+    # inversion they introduce.
+    _fields = AttentionConfig.__dataclass_fields__
+    _default_max = _fields["pending_decision_max"].default
+    _default_drop = _fields["pending_decision_drop"].default
+    _default_user_replied_min = _fields["user_replied_min"].default
+    _default_pending_decision_min = _fields["pending_decision_min"].default
+    if "pending_decision_max" not in raw:
+        # Both ladder paths share the same ``max`` threshold, so the
+        # auto-scaled value has to clear whichever lower bound is
+        # larger. ``+1`` keeps validation happy without inventing a
+        # specific policy multiplier.
+        effective_min_floor = max(
+            kwargs.get("pending_decision_min", _default_pending_decision_min),
+            kwargs.get("user_replied_min", _default_user_replied_min),
+        )
+        if effective_min_floor >= _default_max:
+            kwargs["pending_decision_max"] = effective_min_floor + 1
     effective_max = kwargs.get("pending_decision_max", _default_max)
     if (
         "pending_decision_drop" not in raw

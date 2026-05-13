@@ -247,6 +247,44 @@ def test_pending_decision_drop_below_max_rejected() -> None:
         )
 
 
+def test_pending_decision_max_must_exceed_user_replied_min() -> None:
+    """user_reply_not_forwarded shares the ``max`` ceiling.
+
+    If a user pins ``user_replied_min`` ≥ ``pending_decision_max``,
+    the user_reply ladder never produces an urgent tier — the first
+    eligible age is already past ``max``. Validate so the
+    misconfiguration trips at construction instead of silently
+    suppressing all relay-gap alerts.
+    """
+    with pytest.raises(
+        ValueError,
+        match="pending_decision_max must be greater than user_replied_min",
+    ):
+        AttentionConfig(
+            pending_decision_min=10,
+            user_replied_min=2000,
+            pending_decision_max=1440,
+        )
+
+
+def test_backward_compat_user_replied_min_above_default_max_auto_scales(
+    tmp_path: Path,
+) -> None:
+    """Same backward-compat as ``pending_decision_min``, but for
+    ``user_replied_min`` — a legacy "alert me after a day" config
+    should still load.
+    """
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps({"user_replied_min": 2880}),  # 48h, > default max
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.user_replied_min == 2880
+    assert cfg.pending_decision_max > 2880
+    assert cfg.pending_decision_drop > cfg.pending_decision_max
+
+
 def test_load_config_propagates_ttl_validation(tmp_path: Path) -> None:
     """An invalid TTL ladder in JSON surfaces ValueError via load_config."""
     path = tmp_path / "bad.json"

@@ -195,9 +195,11 @@ def classify_pending(
       - ``max ≤ age < pending_decision_drop`` → severity demoted to
         ``normal`` (the design-default ``urgent`` becomes ``normal``; an
         explicit ``notify_map`` override still wins so ops can pin it).
-      - ``age ≥ pending_decision_drop`` → ``None`` (suppressed entirely
-        from notify; ``attention scan --json`` still surfaces the row
-        because it re-reads the raw input).
+      - ``age ≥ pending_decision_drop`` → still emitted but with
+        :attr:`AttentionEvent.suppressed` = ``True``: the dispatcher in
+        :mod:`cli` skips ``notify`` for these rows, so they never wake
+        the operator, while ``attention scan --json`` still surfaces
+        them so an operator can triage stale pending entries.
 
     * ``status=='escalated'`` (Secretary told the user) but the
       ``user_replied_at`` mark predates any ``to_worker`` resolution →

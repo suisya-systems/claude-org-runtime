@@ -20,6 +20,13 @@ from claude_org_runtime.cli import build_parser as build_top_parser
 from .conftest import make_state_db, write_pending_decisions
 
 
+# The CLI calls ``datetime.now(timezone.utc)`` to compute pending ages,
+# so timestamps relative to a hard-coded ``_FROZEN_NOW`` drift over
+# wall-clock time. Issue #26's TTL ladder makes that drift load-bearing
+# (an old fixture eventually slides into ``demote``/``drop`` tiers and
+# changes notify behavior). Anchor fixture timestamps to real now via
+# :func:`_stale_iso` and freeze the classifier's clock via
+# :func:`_freeze_now` so tests stay deterministic at any future date.
 _FROZEN_NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -31,6 +38,32 @@ def _suppress_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "claude_org_runtime.attention.notify._safe_subprocess_run",
         _no_op_runner,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze ``attention.cli`` clock to ``_FROZEN_NOW`` for determinism.
+
+    Without this, ``_stale_iso(30)`` slides from "30 min old" to
+    "30 min + (real now − _FROZEN_NOW)" old as the calendar advances,
+    eventually pushing fixture rows past the Issue #26 demote/drop
+    tiers and flipping notify behavior. The patch matches the import
+    path the CLI module uses so its ``datetime.now(...)`` calls see a
+    stable instant.
+    """
+    real_datetime = datetime
+
+    class _FrozenDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is None:
+                return _FROZEN_NOW.replace(tzinfo=None)
+            return _FROZEN_NOW.astimezone(tz)
+
+    monkeypatch.setattr(
+        "claude_org_runtime.attention.cli.datetime",
+        _FrozenDateTime,
     )
 
 
@@ -295,8 +328,8 @@ def test_scan_drop_tier_pending_surfaces_in_json_but_not_notified(
     write_pending_decisions(state_dir / "pending_decisions.json", [
         {
             "task_id": "T-old",
-            # Well past the 7-day drop threshold relative to real now.
-            "received_at": _stale_iso(11000 + 60 * 24 * 30),
+            # 12000 min ≈ 8.3 d, > default ``pending_decision_drop`` (7d).
+            "received_at": _stale_iso(12000),
             "raw_message": "old",
             "status": "pending",
         },
