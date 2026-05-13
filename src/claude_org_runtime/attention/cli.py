@@ -65,6 +65,20 @@ def _scan_once(
         effective_log = sys.stderr
     state_dirty = False
     for ev in classified:
+        # Issue #26 Part A: drop-tier rows are surfaced in
+        # ``attention scan --json`` for triage but never routed to
+        # ``notify`` (no desktop ping, no bell, no dedup update). The
+        # ``delivered`` flag stays False so a machine consumer can
+        # distinguish "classified but suppressed" from "delivered".
+        if ev.suppressed:
+            payload = ev.to_dict()
+            payload["title"] = ev.title
+            payload["body"] = ev.body
+            payload["desktop_dispatched"] = False
+            payload["bell_dispatched"] = False
+            payload["delivered"] = False
+            notified_payloads.append(payload)
+            continue
         if not should_notify(
             state, ev.key,
             source=ev.source,

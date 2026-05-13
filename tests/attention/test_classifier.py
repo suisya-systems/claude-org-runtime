@@ -258,15 +258,26 @@ def test_pending_decision_ttl_max_to_drop_demoted_to_normal() -> None:
     assert ev.severity == "normal"
 
 
-def test_pending_decision_ttl_above_drop_suppressed() -> None:
-    """age ≥ pending_decision_drop → suppressed (None)."""
-    # 11000 min (~7.6d) > 10080 (drop).
+def test_pending_decision_ttl_above_drop_suppressed_for_notify() -> None:
+    """age ≥ pending_decision_drop → still emitted but ``suppressed=True``.
+
+    The classifier surfaces the row so ``attention scan --json`` can
+    list it for triage; the dispatcher in cli.py is what skips routing
+    it to ``notify``.
+    """
     ev = classify_pending(
         _pending(received_ago_min=11000), _NOW,
         pending_decision_min=15, user_replied_min=15,
         pending_decision_max=1440, pending_decision_drop=10080,
     )
-    assert ev is None
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+    assert ev.suppressed is True
+    # Dropped rows are de-escalated severity-wise; the ``suppressed``
+    # marker is the real signal to consumers.
+    assert ev.severity == "normal"
+    payload = ev.to_dict()
+    assert payload["suppressed"] is True
 
 
 def test_pending_decision_demotion_respects_notify_map_override() -> None:
@@ -316,13 +327,49 @@ def test_user_reply_not_forwarded_ttl_max_to_drop_demoted_to_normal() -> None:
     assert ev.severity == "normal"
 
 
-def test_user_reply_not_forwarded_ttl_above_drop_suppressed() -> None:
+def test_user_reply_not_forwarded_ttl_above_drop_suppressed_for_notify() -> None:
     ev = classify_pending(
         _user_replied(replied_ago_min=11000), _NOW,
         pending_decision_min=15, user_replied_min=15,
         pending_decision_max=1440, pending_decision_drop=10080,
     )
-    assert ev is None
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
+    assert ev.suppressed is True
+    assert ev.severity == "normal"
+
+
+def test_user_reply_not_forwarded_skipped_when_resolution_is_to_worker() -> None:
+    """Once the secretary has forwarded the reply, the alert must clear.
+
+    Even if ``status`` lingers at ``escalated`` and ``user_replied_at``
+    is old, an explicit ``resolution_kind == 'to_worker'`` marker means
+    the gap closed and the urgent classification no longer applies.
+    """
+    entry = _user_replied(replied_ago_min=60)
+    entry["resolution_kind"] = "to_worker"
+    assert classify_pending(
+        entry, _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    ) is None
+
+
+def test_user_reply_not_forwarded_fires_for_other_resolution_kinds() -> None:
+    """Non-``to_worker`` resolution_kind values still fire the alert.
+
+    Only ``to_worker`` indicates the relay actually completed; any
+    other value (or a missing field) leaves the gap open.
+    """
+    entry = _user_replied(replied_ago_min=60)
+    entry["resolution_kind"] = "answered"
+    ev = classify_pending(
+        entry, _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
 
 
 def test_user_reply_not_forwarded_urgent() -> None:

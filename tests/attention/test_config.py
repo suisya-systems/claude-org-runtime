@@ -271,3 +271,60 @@ def test_negative_pending_decision_max_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="non-negative"):
         load_config(path)
+
+
+def test_backward_compat_min_above_default_max_auto_scales(
+    tmp_path: Path,
+) -> None:
+    """A legacy config with min > default_max (1440) must still load.
+
+    Before Issue #26 there was no ``max`` / ``drop`` knob, so a user
+    config that set ``pending_decision_min`` arbitrarily high (e.g. a
+    silenced "alert me after 2 days" setup) would still work. The
+    new validation would otherwise reject it because the default max
+    (1440) would be ≤ the user min. The loader auto-scales the
+    missing ``max`` / ``drop`` knobs upward so the legacy config keeps
+    loading.
+    """
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps({"pending_decision_min": 2880}),  # 48h, > default max
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.pending_decision_min == 2880
+    assert cfg.pending_decision_max > 2880
+    assert cfg.pending_decision_drop > cfg.pending_decision_max
+
+
+def test_backward_compat_explicit_max_above_default_drop_auto_scales(
+    tmp_path: Path,
+) -> None:
+    """If a user pins ``max`` above the default ``drop``, drop scales too."""
+    path = tmp_path / "weird.json"
+    path.write_text(
+        json.dumps({
+            "pending_decision_min": 60,
+            "pending_decision_max": 20000,  # > default drop (10080)
+        }),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.pending_decision_max == 20000
+    assert cfg.pending_decision_drop > 20000
+
+
+def test_explicit_inversion_in_config_still_rejected(tmp_path: Path) -> None:
+    """Backward-compat auto-scale must not mask an explicit inversion."""
+    path = tmp_path / "bad.json"
+    path.write_text(
+        json.dumps({
+            "pending_decision_min": 50,
+            "pending_decision_max": 30,  # explicitly < min
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="pending_decision_max must be greater than"
+    ):
+        load_config(path)

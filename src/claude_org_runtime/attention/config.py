@@ -197,4 +197,34 @@ def load_config(path: Path | None) -> AttentionConfig:
             templates[kind] = Template(title=title, body=body)
         kwargs["templates"] = templates
 
+    # Issue #26 backward-compat: a pre-#26 user config that only
+    # raises ``pending_decision_min`` above the new default ``max``
+    # (1440) — or only raises ``pending_decision_max`` above the new
+    # default ``drop`` (10080) — used to load fine. Validation now
+    # requires ``min < max < drop``, so auto-scale the missing knobs
+    # to keep legacy configs loading. Explicit user values for ``max``
+    # / ``drop`` always win, and the dataclass validator still rejects
+    # any inversion they introduce.
+    _default_max = AttentionConfig.__dataclass_fields__[
+        "pending_decision_max"
+    ].default
+    _default_drop = AttentionConfig.__dataclass_fields__[
+        "pending_decision_drop"
+    ].default
+    supplied_min = kwargs.get("pending_decision_min")
+    if (
+        supplied_min is not None
+        and "pending_decision_max" not in raw
+        and supplied_min >= _default_max
+    ):
+        # Bump max one notch above min so the ladder stays
+        # well-ordered without inventing arbitrary policy.
+        kwargs["pending_decision_max"] = supplied_min + 1
+    effective_max = kwargs.get("pending_decision_max", _default_max)
+    if (
+        "pending_decision_drop" not in raw
+        and effective_max >= _default_drop
+    ):
+        kwargs["pending_decision_drop"] = effective_max + 1
+
     return AttentionConfig(**kwargs)

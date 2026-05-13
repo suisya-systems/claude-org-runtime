@@ -53,6 +53,12 @@ class AttentionEvent:
     hold the runtime-default English copy; :func:`notify.render_text`
     overlays user-supplied templates from :class:`AttentionConfig`
     before dispatch.
+
+    ``suppressed`` is the Issue #26 Part A "age ≥ drop" marker: the
+    classifier still emits the record so triage tools (``attention
+    scan --json``) can list it, but the dispatcher in :mod:`cli` must
+    NOT route it to ``notify`` — no desktop notification, no bell, no
+    dedup-state update.
     """
 
     key: str
@@ -67,6 +73,7 @@ class AttentionEvent:
     status: Optional[str] = None
     summary: Optional[str] = None
     created_at: Optional[str] = None
+    suppressed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -81,6 +88,8 @@ class AttentionEvent:
             v = getattr(self, f)
             if v is not None:
                 out[f] = v
+        if self.suppressed:
+            out["suppressed"] = True
         return out
 
 
@@ -220,16 +229,22 @@ def classify_pending(
                 key=f"pending:{task_id}:pending_decision",
                 kind="pending_decision",
                 severity=_severity_for(
-                    "pending_decision", notify_map, demote=ladder == "demote",
+                    "pending_decision", notify_map,
+                    demote=ladder in ("demote", "drop"),
                 ),
                 title=title, body=body,
                 source="pending_decisions",
                 task_id=task_id,
                 summary=_short_summary(raw_message),
                 created_at=received_at,
+                suppressed=ladder == "drop",
             )
 
-    if status == "escalated" and user_replied_at:
+    if (
+        status == "escalated"
+        and user_replied_at
+        and entry.get("resolution_kind") != "to_worker"
+    ):
         age = _minutes_since(user_replied_at, now)
         ladder = _ttl_ladder(
             age,
@@ -246,13 +261,14 @@ def classify_pending(
                 kind="user_reply_not_forwarded",
                 severity=_severity_for(
                     "user_reply_not_forwarded", notify_map,
-                    demote=ladder == "demote",
+                    demote=ladder in ("demote", "drop"),
                 ),
                 title=title, body=body,
                 source="pending_decisions",
                 task_id=task_id,
                 summary=_short_summary(raw_message),
                 created_at=user_replied_at,
+                suppressed=ladder == "drop",
             )
 
     return None
@@ -322,13 +338,15 @@ def _ttl_ladder(
     min_minutes: int,
     max_minutes: int,
     drop_minutes: int,
-) -> Optional[Literal["urgent", "demote"]]:
+) -> Optional[Literal["urgent", "demote", "drop"]]:
     """Issue #26 Part A TTL tier for a pending-style row.
 
-    Returns ``"urgent"`` for the standard min..max window, ``"demote"``
-    when the row has aged past ``max`` but not yet past ``drop`` (keep
-    notifying but at ``normal``), and ``None`` outside both ends (too
-    fresh → wait, or too stale → suppress).
+    Returns ``"urgent"`` for the standard ``min..max`` window,
+    ``"demote"`` when the row has aged past ``max`` but not yet past
+    ``drop`` (keep notifying but at ``normal``), ``"drop"`` when the
+    row has aged past ``drop`` (notify is suppressed but the row must
+    still surface in ``attention scan --json`` for triage), and
+    ``None`` only when the row is still fresher than ``min``.
 
     An infinite ``age_minutes`` (the malformed/missing-timestamp
     sentinel returned by :func:`_minutes_since`) short-circuits to
@@ -341,7 +359,7 @@ def _ttl_ladder(
     if age_minutes < min_minutes:
         return None
     if age_minutes >= drop_minutes:
-        return None
+        return "drop"
     if age_minutes >= max_minutes:
         return "demote"
     return "urgent"

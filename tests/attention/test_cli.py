@@ -279,6 +279,53 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     assert wc["severity"] == "urgent"
 
 
+def test_scan_drop_tier_pending_surfaces_in_json_but_not_notified(
+    tmp_path: Path, capsys
+) -> None:
+    """Issue #26 Part A: a pending row older than ``drop`` must appear
+    in ``attention scan --json`` (marked ``suppressed=True`` and
+    ``delivered=False``) but must NOT be routed to ``notify`` or to
+    the dedup state — operators need a triage path that doesn't burn
+    a notification cycle.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    # Empty state.db so the only row classified is the pending one.
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-old",
+            # Well past the 7-day drop threshold relative to real now.
+            "received_at": _stale_iso(11000 + 60 * 24 * 30),
+            "raw_message": "old",
+            "status": "pending",
+        },
+    ])
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--json",
+    ])
+    rc = args.func(args)
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    drops = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-old" and ev.get("kind") == "pending_decision"
+    ]
+    assert drops, payload
+    assert drops[0]["suppressed"] is True
+    assert drops[0]["delivered"] is False
+    assert drops[0]["desktop_dispatched"] is False
+    # No dedup file should be written — suppressed rows must not lock
+    # out a future urgent re-classification if the operator re-arms
+    # the entry by trimming ``received_at``.
+    assert not (state_dir / "attention_notified.json").exists()
+
+
 def test_scan_invalid_config_exits_cleanly(
     tmp_path: Path, capsys
 ) -> None:
