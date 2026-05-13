@@ -87,9 +87,15 @@ class AttentionConfig:
     user_replied_min: int = 15
     max_title_chars: int = 80
     max_body_chars: int = 240
-    notify: dict[str, Severity] = field(
-        default_factory=lambda: dict(DEFAULT_NOTIFY)
-    )
+    # Sparse map of *explicit user overrides* only (Issue #26 round-4
+    # fix). Pre-#26 this was pre-filled with every ``DEFAULT_NOTIFY``
+    # entry, which caused the TTL demote check in
+    # :func:`classifier._severity_for` to treat every default as an
+    # operator override — defeating the ``max ≤ age < drop`` demote
+    # path entirely on the CLI route. Keeping the dict sparse lets the
+    # classifier fall back to ``DEFAULT_NOTIFY`` for unset keys and
+    # apply demote there, while honoring genuine user overrides.
+    notify: dict[str, Severity] = field(default_factory=dict)
     templates: dict[str, Template] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -178,7 +184,12 @@ def load_config(path: Path | None) -> AttentionConfig:
     if "notify" in raw:
         if not isinstance(raw["notify"], dict):
             raise ValueError("config.notify must be a JSON object")
-        notify = dict(DEFAULT_NOTIFY)
+        # Issue #26 round-4: keep this dict sparse so the classifier
+        # can distinguish "operator pinned this severity" from "the
+        # design default happens to be urgent". Pre-filling the dict
+        # with DEFAULT_NOTIFY would mask the difference and break the
+        # TTL demote path on the CLI route.
+        notify: dict[str, Severity] = {}
         for k, v in raw["notify"].items():
             if v not in ("urgent", "normal"):
                 raise ValueError(

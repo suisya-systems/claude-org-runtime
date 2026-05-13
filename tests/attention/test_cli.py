@@ -312,6 +312,99 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     assert wc["severity"] == "urgent"
 
 
+def test_scan_demote_tier_pending_emits_normal_via_real_config(
+    tmp_path: Path, capsys
+) -> None:
+    """End-to-end check that ``max ≤ age < drop`` produces ``normal``.
+
+    Round-4 codex caught that the pre-fix ``cfg.notify`` shape pre-
+    filled DEFAULT_NOTIFY, which fooled :func:`_severity_for` into
+    treating every default as an explicit operator override and
+    bypassing TTL demote. This test runs the real
+    :class:`AttentionConfig` defaults through the CLI to guard against
+    a regression of that shape.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-demote",
+            # 1500 min ≈ 25h, > default ``pending_decision_max`` (24h)
+            # but < default ``pending_decision_drop`` (7d).
+            "received_at": _stale_iso(1500),
+            "raw_message": "demote",
+            "status": "pending",
+        },
+    ])
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--dry-run",
+        "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    demoted = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-demote"
+        and ev.get("kind") == "pending_decision"
+    ]
+    assert demoted, payload
+    assert demoted[0]["severity"] == "normal"
+    assert demoted[0].get("suppressed") is not True
+
+
+def test_scan_pending_explicit_severity_override_resists_ttl_demote(
+    tmp_path: Path, capsys
+) -> None:
+    """An explicit ``notify`` config override must beat the TTL demote.
+
+    The companion to ``test_scan_demote_tier_pending_emits_normal_via_real_config``:
+    when the operator pins ``pending_decision: urgent`` in the config,
+    even a 25h-old row must surface as ``urgent`` rather than the
+    TTL-demoted ``normal``. Round-4 fix kept this path working by
+    making ``cfg.notify`` sparse so a real override is still
+    distinguishable.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-pinned",
+            "received_at": _stale_iso(1500),  # demote tier age.
+            "raw_message": "pinned",
+            "status": "pending",
+        },
+    ])
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "notify": {"pending_decision": "urgent"},
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--dry-run", "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    pinned = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-pinned"
+        and ev.get("kind") == "pending_decision"
+    ]
+    assert pinned, payload
+    assert pinned[0]["severity"] == "urgent"
+
+
 def test_scan_drop_tier_pending_honors_template_overrides(
     tmp_path: Path, capsys
 ) -> None:

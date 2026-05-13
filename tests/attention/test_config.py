@@ -28,7 +28,11 @@ def test_defaults_match_design_doc() -> None:
     assert cfg.user_replied_min == 15
     assert cfg.max_title_chars == 80
     assert cfg.max_body_chars == 240
-    assert cfg.notify == DEFAULT_NOTIFY
+    # Issue #26 round-4: ``notify`` is sparse — empty unless the user
+    # provided overrides. The merged severity table lives in
+    # :data:`DEFAULT_NOTIFY` and is consulted by the classifier when
+    # ``cfg.notify`` has no entry for a kind.
+    assert cfg.notify == {}
     assert cfg.templates == {}
 
 
@@ -95,8 +99,11 @@ def test_load_full_config(tmp_path: Path) -> None:
     assert cfg.max_title_chars == 40
     assert cfg.max_body_chars == 100
     assert cfg.notify["worker_completed"] == "urgent"
-    # Defaults preserved for keys not overridden.
-    assert cfg.notify["approval_blocked"] == "urgent"
+    # Issue #26 round-4: cfg.notify is sparse — only entries explicitly
+    # set in the config JSON live here. Unset keys are resolved against
+    # DEFAULT_NOTIFY by the classifier, which is what makes the TTL
+    # demote path work on the CLI route.
+    assert "approval_blocked" not in cfg.notify
     assert cfg.templates["ci_failed"] == Template(
         title="CI Failed", body="PR #{pr} status={status}",
     )
