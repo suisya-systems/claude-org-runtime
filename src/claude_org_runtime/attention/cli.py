@@ -51,6 +51,8 @@ def _scan_once(
         events, pending, now,
         cfg.pending_decision_min, cfg.user_replied_min,
         notify_map=cfg.notify,
+        pending_decision_max=cfg.pending_decision_max,
+        pending_decision_drop=cfg.pending_decision_drop,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []

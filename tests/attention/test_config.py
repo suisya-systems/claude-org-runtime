@@ -22,11 +22,36 @@ def test_defaults_match_design_doc() -> None:
     assert cfg.cooldown_sec == 300
     assert cfg.poll_interval_sec == 10
     assert cfg.pending_decision_min == 15
+    # Issue #26 Part A TTL ladder: 24h demote → 7d drop.
+    assert cfg.pending_decision_max == 1440
+    assert cfg.pending_decision_drop == 10080
     assert cfg.user_replied_min == 15
     assert cfg.max_title_chars == 80
     assert cfg.max_body_chars == 240
     assert cfg.notify == DEFAULT_NOTIFY
     assert cfg.templates == {}
+
+
+def test_default_notify_severity_part_b_rebalance() -> None:
+    """Issue #26 Part B: only the human-only-recovery kinds stay urgent."""
+    assert DEFAULT_NOTIFY["approval_blocked"] == "urgent"
+    assert DEFAULT_NOTIFY["pending_decision"] == "urgent"
+    assert DEFAULT_NOTIFY["user_reply_not_forwarded"] == "urgent"
+    assert DEFAULT_NOTIFY["ci_failed"] == "urgent"
+    assert DEFAULT_NOTIFY["pane_crashed"] == "urgent"
+    # Demoted to normal in this PR.
+    for demoted in (
+        "relay_gap_suspected",
+        "silent_worker_output",
+        "pane_silent",
+        "worker_stalled",
+        "worker_not_reported",
+        "worker_error",
+    ):
+        assert DEFAULT_NOTIFY[demoted] == "normal", demoted
+    # Already-normal kinds unchanged.
+    assert DEFAULT_NOTIFY["worker_completed"] == "normal"
+    assert DEFAULT_NOTIFY["pr_merged"] == "normal"
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -143,4 +168,106 @@ def test_top_level_must_be_object(tmp_path: Path) -> None:
     path = tmp_path / "bad.json"
     path.write_text(json.dumps([1, 2]), encoding="utf-8")
     with pytest.raises(ValueError, match="must be a JSON object"):
+        load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Issue #26 Part A: TTL ladder config (pending_decision_max / _drop)
+# ---------------------------------------------------------------------------
+
+
+def test_load_pending_decision_max_and_drop(tmp_path: Path) -> None:
+    """New TTL knobs round-trip from JSON into AttentionConfig."""
+    path = tmp_path / "attention.json"
+    path.write_text(
+        json.dumps({
+            "pending_decision_min": 5,
+            "pending_decision_max": 60,
+            "pending_decision_drop": 600,
+        }),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.pending_decision_min == 5
+    assert cfg.pending_decision_max == 60
+    assert cfg.pending_decision_drop == 600
+
+
+def test_backward_compat_missing_ttl_keys_fills_defaults(tmp_path: Path) -> None:
+    """Pre-Issue-#26 user configs (no TTL keys) keep working with defaults."""
+    path = tmp_path / "attention.json"
+    path.write_text(
+        json.dumps({"pending_decision_min": 30}),  # no max/drop
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert cfg.pending_decision_min == 30
+    assert cfg.pending_decision_max == 1440  # default fallback
+    assert cfg.pending_decision_drop == 10080  # default fallback
+
+
+def test_pending_decision_max_must_exceed_min() -> None:
+    with pytest.raises(
+        ValueError, match="pending_decision_max must be greater than"
+    ):
+        AttentionConfig(
+            pending_decision_min=100, pending_decision_max=100,
+        )
+
+
+def test_pending_decision_max_must_strictly_exceed_min() -> None:
+    """``max == min`` is rejected — needs a real demotion window."""
+    with pytest.raises(
+        ValueError, match="pending_decision_max must be greater than"
+    ):
+        AttentionConfig(
+            pending_decision_min=200, pending_decision_max=150,
+        )
+
+
+def test_pending_decision_drop_must_exceed_max() -> None:
+    with pytest.raises(
+        ValueError, match="pending_decision_drop must be greater than"
+    ):
+        AttentionConfig(
+            pending_decision_min=10,
+            pending_decision_max=100,
+            pending_decision_drop=100,
+        )
+
+
+def test_pending_decision_drop_below_max_rejected() -> None:
+    with pytest.raises(
+        ValueError, match="pending_decision_drop must be greater than"
+    ):
+        AttentionConfig(
+            pending_decision_min=10,
+            pending_decision_max=100,
+            pending_decision_drop=50,
+        )
+
+
+def test_load_config_propagates_ttl_validation(tmp_path: Path) -> None:
+    """An invalid TTL ladder in JSON surfaces ValueError via load_config."""
+    path = tmp_path / "bad.json"
+    path.write_text(
+        json.dumps({
+            "pending_decision_min": 10,
+            "pending_decision_max": 5,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="pending_decision_max must be greater than"
+    ):
+        load_config(path)
+
+
+def test_negative_pending_decision_max_rejected(tmp_path: Path) -> None:
+    """non-negative guard applies to the new knobs too."""
+    path = tmp_path / "bad.json"
+    path.write_text(
+        json.dumps({"pending_decision_max": -1}), encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="non-negative"):
         load_config(path)

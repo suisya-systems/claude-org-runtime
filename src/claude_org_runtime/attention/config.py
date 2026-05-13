@@ -19,18 +19,26 @@ SoundMode = Literal["off", "urgent-only", "all"]
 
 # Default severity per attention kind. ja config may override individual
 # entries; unknown kinds inherit ``normal`` unless overridden.
+#
+# Issue #26 Part B rebalance: only "human is the sole recovery path"
+# events stay ``urgent`` (approval_blocked / pending_decision /
+# user_reply_not_forwarded / ci_failed / pane_crashed). The anomaly-
+# detector kinds (relay_gap_suspected / silent_worker_output /
+# pane_silent / worker_stalled / worker_not_reported / worker_error)
+# are best-effort signals that often self-resolve, so they ride at
+# ``normal`` to avoid alert fatigue.
 DEFAULT_NOTIFY: dict[str, Severity] = {
     "approval_blocked": "urgent",
-    "relay_gap_suspected": "urgent",
-    "silent_worker_output": "urgent",
+    "relay_gap_suspected": "normal",
+    "silent_worker_output": "normal",
     "ci_failed": "urgent",
     "pending_decision": "urgent",
     "user_reply_not_forwarded": "urgent",
-    "pane_silent": "urgent",
+    "pane_silent": "normal",
     "pane_crashed": "urgent",
-    "worker_stalled": "urgent",
-    "worker_not_reported": "urgent",
-    "worker_error": "urgent",
+    "worker_stalled": "normal",
+    "worker_not_reported": "normal",
+    "worker_error": "normal",
     "worker_completed": "normal",
     "pr_merged": "normal",
 }
@@ -68,6 +76,14 @@ class AttentionConfig:
     cooldown_sec: int = 300
     poll_interval_sec: int = 10
     pending_decision_min: int = 15
+    # Issue #26 Part A TTL ladder for urgent pending_decisions:
+    # min ≤ age < max → urgent (escalate); max ≤ age < drop → demote to
+    # normal (still notify); age ≥ drop → suppress entirely from notify
+    # but ``attention scan --json`` still surfaces the row so an operator
+    # can run a triage report. Same ladder applies to
+    # ``user_reply_not_forwarded`` (clock starts at ``user_replied_at``).
+    pending_decision_max: int = 1440  # 24h
+    pending_decision_drop: int = 10080  # 7d
     user_replied_min: int = 15
     max_title_chars: int = 80
     max_body_chars: int = 240
@@ -75,6 +91,24 @@ class AttentionConfig:
         default_factory=lambda: dict(DEFAULT_NOTIFY)
     )
     templates: dict[str, Template] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Validate the TTL ladder once at construction so a malformed
+        # default-built config (e.g. test scaffolding that overrides
+        # only one threshold) trips immediately rather than producing
+        # silently wrong classifications downstream.
+        if self.pending_decision_max <= self.pending_decision_min:
+            raise ValueError(
+                "config.pending_decision_max must be greater than "
+                "pending_decision_min "
+                f"({self.pending_decision_max} <= {self.pending_decision_min})"
+            )
+        if self.pending_decision_drop <= self.pending_decision_max:
+            raise ValueError(
+                "config.pending_decision_drop must be greater than "
+                "pending_decision_max "
+                f"({self.pending_decision_drop} <= {self.pending_decision_max})"
+            )
 
 
 def load_config(path: Path | None) -> AttentionConfig:
@@ -102,7 +136,9 @@ def load_config(path: Path | None) -> AttentionConfig:
 
     for key in (
         "cooldown_sec", "poll_interval_sec",
-        "pending_decision_min", "user_replied_min",
+        "pending_decision_min",
+        "pending_decision_max", "pending_decision_drop",
+        "user_replied_min",
         "max_title_chars", "max_body_chars",
     ):
         if key in raw:

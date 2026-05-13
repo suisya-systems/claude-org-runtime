@@ -8,6 +8,7 @@ can consume. The classification table is the §5 design doc verbatim.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Literal, Mapping, Optional
@@ -169,17 +170,31 @@ def classify_pending(
     pending_decision_min: int,
     user_replied_min: int,
     notify_map: Optional[Mapping[str, str]] = None,
+    *,
+    pending_decision_max: int = 1440,
+    pending_decision_drop: int = 10080,
 ) -> Optional[AttentionEvent]:
     """Map a ``pending_decisions.json`` entry to an :class:`AttentionEvent`.
 
     Two attention paths:
 
-    * ``status=='pending'`` older than ``pending_decision_min`` →
-      ``pending_decision`` urgent.
+    * ``status=='pending'`` → ``pending_decision`` with the Issue #26
+      Part A TTL ladder (clock starts at ``received_at``):
+
+      - ``age < pending_decision_min`` → no event.
+      - ``min ≤ age < pending_decision_max`` → urgent (escalate).
+      - ``max ≤ age < pending_decision_drop`` → severity demoted to
+        ``normal`` (the design-default ``urgent`` becomes ``normal``; an
+        explicit ``notify_map`` override still wins so ops can pin it).
+      - ``age ≥ pending_decision_drop`` → ``None`` (suppressed entirely
+        from notify; ``attention scan --json`` still surfaces the row
+        because it re-reads the raw input).
+
     * ``status=='escalated'`` (Secretary told the user) but the
-      ``user_replied_at`` mark is older than ``user_replied_min`` →
-      ``user_reply_not_forwarded`` urgent. Mirrors the deterministic
-      relay-gap path the Dispatcher already uses on the ja side.
+      ``user_replied_at`` mark predates any ``to_worker`` resolution →
+      ``user_reply_not_forwarded``. The same TTL ladder applies, with
+      ``user_replied_at`` as the clock — i.e. "how long has the
+      secretary failed to forward the user's reply to the worker".
     """
     status = entry.get("status")
     task_id = _str_or_none(entry.get("task_id"))
@@ -190,14 +205,23 @@ def classify_pending(
         return None
 
     if status == "pending":
-        if _minutes_since(received_at, now) >= pending_decision_min:
+        age = _minutes_since(received_at, now)
+        ladder = _ttl_ladder(
+            age,
+            pending_decision_min,
+            pending_decision_max,
+            pending_decision_drop,
+        )
+        if ladder is not None:
             title, body = _default_text(
                 "pending_decision", task_id=task_id,
             )
             return AttentionEvent(
                 key=f"pending:{task_id}:pending_decision",
                 kind="pending_decision",
-                severity=_severity_for("pending_decision", notify_map),
+                severity=_severity_for(
+                    "pending_decision", notify_map, demote=ladder == "demote",
+                ),
                 title=title, body=body,
                 source="pending_decisions",
                 task_id=task_id,
@@ -206,7 +230,14 @@ def classify_pending(
             )
 
     if status == "escalated" and user_replied_at:
-        if _minutes_since(user_replied_at, now) >= user_replied_min:
+        age = _minutes_since(user_replied_at, now)
+        ladder = _ttl_ladder(
+            age,
+            user_replied_min,
+            pending_decision_max,
+            pending_decision_drop,
+        )
+        if ladder is not None:
             title, body = _default_text(
                 "user_reply_not_forwarded", task_id=task_id,
             )
@@ -215,6 +246,7 @@ def classify_pending(
                 kind="user_reply_not_forwarded",
                 severity=_severity_for(
                     "user_reply_not_forwarded", notify_map,
+                    demote=ladder == "demote",
                 ),
                 title=title, body=body,
                 source="pending_decisions",
@@ -233,8 +265,16 @@ def classify_all(
     pending_decision_min: int,
     user_replied_min: int,
     notify_map: Optional[Mapping[str, str]] = None,
+    *,
+    pending_decision_max: int = 1440,
+    pending_decision_drop: int = 10080,
 ) -> list[AttentionEvent]:
-    """Classify both inputs in order: DB events first, then pending."""
+    """Classify both inputs in order: DB events first, then pending.
+
+    The ``pending_decision_max`` / ``pending_decision_drop`` defaults
+    mirror :class:`AttentionConfig` so test callers that pre-date
+    Issue #26 keep working without passing the new ladder thresholds.
+    """
     out: list[AttentionEvent] = []
     for row in events:
         ev = classify_event(row, notify_map=notify_map)
@@ -244,6 +284,8 @@ def classify_all(
         ev = classify_pending(
             entry, now, pending_decision_min, user_replied_min,
             notify_map=notify_map,
+            pending_decision_max=pending_decision_max,
+            pending_decision_drop=pending_decision_drop,
         )
         if ev is not None:
             out.append(ev)
@@ -251,15 +293,58 @@ def classify_all(
 
 
 def _severity_for(
-    kind: str, notify_map: Optional[Mapping[str, str]],
+    kind: str,
+    notify_map: Optional[Mapping[str, str]],
+    *,
+    demote: bool = False,
 ) -> Severity:
-    """Resolve severity for ``kind`` via override map then design default."""
+    """Resolve severity for ``kind`` via override map then design default.
+
+    ``demote=True`` is the Issue #26 Part A "max ≤ age < drop" tier:
+    a pending event the design defaults to ``urgent`` becomes
+    ``normal`` so it still surfaces but no longer wakes the operator.
+    An explicit ``notify_map`` override always wins over both the
+    default and the demotion — ops can pin ``"urgent"`` on a
+    long-running event class if they want the loud behavior back.
+    """
     if notify_map is not None and kind in notify_map:
         sev = notify_map[kind]
         if sev in ("urgent", "normal"):
             return sev  # type: ignore[return-value]
     default = DEFAULT_NOTIFY.get(kind, "normal")
+    if demote and default == "urgent":
+        return "normal"
     return default  # type: ignore[return-value]
+
+
+def _ttl_ladder(
+    age_minutes: float,
+    min_minutes: int,
+    max_minutes: int,
+    drop_minutes: int,
+) -> Optional[Literal["urgent", "demote"]]:
+    """Issue #26 Part A TTL tier for a pending-style row.
+
+    Returns ``"urgent"`` for the standard min..max window, ``"demote"``
+    when the row has aged past ``max`` but not yet past ``drop`` (keep
+    notifying but at ``normal``), and ``None`` outside both ends (too
+    fresh → wait, or too stale → suppress).
+
+    An infinite ``age_minutes`` (the malformed/missing-timestamp
+    sentinel returned by :func:`_minutes_since`) short-circuits to
+    ``"urgent"`` so a garbled ``received_at`` never silently falls
+    into the ``drop`` bucket and disappears — the existing false-
+    positive posture for relay-gap detection wins over silence.
+    """
+    if math.isinf(age_minutes):
+        return "urgent"
+    if age_minutes < min_minutes:
+        return None
+    if age_minutes >= drop_minutes:
+        return None
+    if age_minutes >= max_minutes:
+        return "demote"
+    return "urgent"
 
 
 # ---------------------------------------------------------------------------
