@@ -20,7 +20,7 @@ from .config import AttentionConfig, load_config
 from .dedup import (
     DedupState, load_state, record_notified, save_state, should_notify,
 )
-from .notify import notify as run_notify
+from .notify import notify as run_notify, render_text
 from .readers import read_events, read_pending_decisions
 
 
@@ -67,13 +67,19 @@ def _scan_once(
     for ev in classified:
         # Issue #26 Part A: drop-tier rows are surfaced in
         # ``attention scan --json`` for triage but never routed to
-        # ``notify`` (no desktop ping, no bell, no dedup update). The
-        # ``delivered`` flag stays False so a machine consumer can
-        # distinguish "classified but suppressed" from "delivered".
+        # ``notify`` (no desktop ping, no bell, no dedup update).
+        # ``render_text`` runs even on the suppressed branch so ja
+        # template overrides and ``max_*_chars`` truncation apply to
+        # the JSON title/body — otherwise a stale pending would emit
+        # the runtime-default English copy while every other row uses
+        # the operator's template. ``delivered`` stays False so a
+        # machine consumer can distinguish "classified but suppressed"
+        # from "delivered".
         if ev.suppressed:
+            rendered_title, rendered_body = render_text(ev, cfg)
             payload = ev.to_dict()
-            payload["title"] = ev.title
-            payload["body"] = ev.body
+            payload["title"] = rendered_title
+            payload["body"] = rendered_body
             payload["desktop_dispatched"] = False
             payload["bell_dispatched"] = False
             payload["delivered"] = False

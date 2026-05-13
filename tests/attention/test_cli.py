@@ -312,6 +312,58 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     assert wc["severity"] == "urgent"
 
 
+def test_scan_drop_tier_pending_honors_template_overrides(
+    tmp_path: Path, capsys
+) -> None:
+    """A suppressed drop-tier row must still go through ``render_text``.
+
+    Otherwise the runtime-default English title/body shows up in
+    ``--json`` while every other row carries the operator's template,
+    breaking machine consumers that diff against a ja template.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-old",
+            "received_at": _stale_iso(12000),
+            "raw_message": "stale",
+            "status": "pending",
+        },
+    ])
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "templates": {
+            "pending_decision": {
+                "title": "Stale Pending",
+                "body": "task_id={task_id} kind={kind}",
+            },
+        },
+        # Also exercise truncation: title shouldn't get cut here but a
+        # tight ``max_*`` would catch a regression where template
+        # rendering was skipped entirely for suppressed rows.
+        "max_title_chars": 40,
+        "max_body_chars": 80,
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    drops = [ev for ev in payload if ev.get("task_id") == "T-old"]
+    assert drops, payload
+    assert drops[0]["suppressed"] is True
+    assert drops[0]["title"] == "Stale Pending"
+    assert drops[0]["body"] == "task_id=T-old kind=pending_decision"
+
+
 def test_scan_drop_tier_pending_surfaces_in_json_but_not_notified(
     tmp_path: Path, capsys
 ) -> None:
