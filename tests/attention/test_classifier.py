@@ -59,24 +59,26 @@ def test_notify_sent_approval_blocked_urgent() -> None:
     assert ev.key == "event:1"
 
 
-def test_notify_sent_relay_gap_urgent() -> None:
+def test_notify_sent_relay_gap_normal() -> None:
+    """Issue #26 Part B: anomaly-detector signals ride at ``normal``."""
     ev = classify_event(_row(
         kind="notify_sent",
         payload={"kind": "relay_gap_suspected", "task_id": "T1"},
     ))
     assert ev is not None
     assert ev.kind == "relay_gap_suspected"
-    assert ev.severity == "urgent"
+    assert ev.severity == "normal"
 
 
-def test_notify_sent_silent_worker_urgent() -> None:
+def test_notify_sent_silent_worker_normal() -> None:
+    """Issue #26 Part B: best-effort relay signal demoted to ``normal``."""
     ev = classify_event(_row(
         kind="notify_sent",
         payload={"kind": "pane_output_without_peer_msg", "worker": "wkr"},
     ))
     assert ev is not None
     assert ev.kind == "silent_worker_output"
-    assert ev.severity == "urgent"
+    assert ev.severity == "normal"
 
 
 def test_notify_sent_unknown_subkind_ignored() -> None:
@@ -186,6 +188,188 @@ def test_fresh_pending_decision_not_urgent() -> None:
     assert classify_pending(
         entry, _NOW, pending_decision_min=15, user_replied_min=15,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #26 Part A: pending_decision TTL ladder (min / max / drop)
+# ---------------------------------------------------------------------------
+
+
+def _pending(received_ago_min: float) -> dict:
+    """Helper: a pending entry whose ``received_at`` is N minutes ago."""
+    received = (_NOW - timedelta(minutes=received_ago_min)).isoformat().replace(
+        "+00:00", "Z",
+    )
+    return {
+        "task_id": "ttl-task",
+        "received_at": received,
+        "raw_message": "should we ship?",
+        "status": "pending",
+    }
+
+
+def _user_replied(replied_ago_min: float) -> dict:
+    """Helper: an escalated entry whose ``user_replied_at`` is N minutes ago."""
+    replied = (_NOW - timedelta(minutes=replied_ago_min)).isoformat().replace(
+        "+00:00", "Z",
+    )
+    return {
+        "task_id": "ttl-reply",
+        "received_at": "2026-05-01T00:00:00Z",
+        "raw_message": "go ahead",
+        "status": "escalated",
+        "user_replied_at": replied,
+    }
+
+
+def test_pending_decision_ttl_below_min_no_event() -> None:
+    """age < pending_decision_min → no event (entry is still fresh)."""
+    ev = classify_pending(
+        _pending(received_ago_min=5), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is None
+
+
+def test_pending_decision_ttl_min_to_max_urgent() -> None:
+    """min ≤ age < max → urgent (escalate)."""
+    # 60 min ≥ 15 (min) but well below 1440 (max).
+    ev = classify_pending(
+        _pending(received_ago_min=60), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+    assert ev.severity == "urgent"
+
+
+def test_pending_decision_ttl_max_to_drop_demoted_to_normal() -> None:
+    """max ≤ age < drop → severity demoted from urgent to normal."""
+    # 1500 min (25h) > 1440 (max) but < 10080 (drop).
+    ev = classify_pending(
+        _pending(received_ago_min=1500), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+    assert ev.severity == "normal"
+
+
+def test_pending_decision_ttl_above_drop_suppressed_for_notify() -> None:
+    """age ≥ pending_decision_drop → still emitted but ``suppressed=True``.
+
+    The classifier surfaces the row so ``attention scan --json`` can
+    list it for triage; the dispatcher in cli.py is what skips routing
+    it to ``notify``.
+    """
+    ev = classify_pending(
+        _pending(received_ago_min=11000), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "pending_decision"
+    assert ev.suppressed is True
+    # Dropped rows are de-escalated severity-wise; the ``suppressed``
+    # marker is the real signal to consumers.
+    assert ev.severity == "normal"
+    payload = ev.to_dict()
+    assert payload["suppressed"] is True
+
+
+def test_pending_decision_demotion_respects_notify_map_override() -> None:
+    """An explicit ``notify_map`` override still wins over demotion.
+
+    Ops can pin ``"urgent"`` on a long-lived event class via config;
+    the TTL ladder should not silently override that intent.
+    """
+    ev = classify_pending(
+        _pending(received_ago_min=1500), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+        notify_map={"pending_decision": "urgent"},
+    )
+    assert ev is not None
+    assert ev.severity == "urgent"
+
+
+def test_user_reply_not_forwarded_ttl_below_min_no_event() -> None:
+    ev = classify_pending(
+        _user_replied(replied_ago_min=5), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is None
+
+
+def test_user_reply_not_forwarded_ttl_min_to_max_urgent() -> None:
+    ev = classify_pending(
+        _user_replied(replied_ago_min=60), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
+    assert ev.severity == "urgent"
+
+
+def test_user_reply_not_forwarded_ttl_max_to_drop_demoted_to_normal() -> None:
+    ev = classify_pending(
+        _user_replied(replied_ago_min=1500), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
+    assert ev.severity == "normal"
+
+
+def test_user_reply_not_forwarded_ttl_above_drop_suppressed_for_notify() -> None:
+    ev = classify_pending(
+        _user_replied(replied_ago_min=11000), _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
+    assert ev.suppressed is True
+    assert ev.severity == "normal"
+
+
+def test_user_reply_not_forwarded_skipped_when_resolution_is_to_worker() -> None:
+    """Once the secretary has forwarded the reply, the alert must clear.
+
+    Even if ``status`` lingers at ``escalated`` and ``user_replied_at``
+    is old, an explicit ``resolution_kind == 'to_worker'`` marker means
+    the gap closed and the urgent classification no longer applies.
+    """
+    entry = _user_replied(replied_ago_min=60)
+    entry["resolution_kind"] = "to_worker"
+    assert classify_pending(
+        entry, _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    ) is None
+
+
+def test_user_reply_not_forwarded_fires_for_other_resolution_kinds() -> None:
+    """Non-``to_worker`` resolution_kind values still fire the alert.
+
+    Only ``to_worker`` indicates the relay actually completed; any
+    other value (or a missing field) leaves the gap open.
+    """
+    entry = _user_replied(replied_ago_min=60)
+    entry["resolution_kind"] = "answered"
+    ev = classify_pending(
+        entry, _NOW,
+        pending_decision_min=15, user_replied_min=15,
+        pending_decision_max=1440, pending_decision_drop=10080,
+    )
+    assert ev is not None
+    assert ev.kind == "user_reply_not_forwarded"
 
 
 def test_user_reply_not_forwarded_urgent() -> None:
@@ -365,23 +549,27 @@ def test_missing_received_at_treated_as_stale() -> None:
 
 
 @pytest.mark.parametrize(
-    "subkind,expected_kind",
+    "subkind,expected_kind,expected_severity",
     [
-        ("pane_silent", "pane_silent"),
-        ("pane_crashed", "pane_crashed"),
-        ("worker_stalled", "worker_stalled"),
-        ("worker_not_reported", "worker_not_reported"),
-        ("error", "worker_error"),
+        # Issue #26 Part B: only ``pane_crashed`` keeps ``urgent`` —
+        # the others are best-effort anomaly signals that often
+        # self-resolve, so they ride at ``normal`` to avoid alert fatigue.
+        ("pane_silent", "pane_silent", "normal"),
+        ("pane_crashed", "pane_crashed", "urgent"),
+        ("worker_stalled", "worker_stalled", "normal"),
+        ("worker_not_reported", "worker_not_reported", "normal"),
+        ("error", "worker_error", "normal"),
     ],
 )
-def test_notify_sent_production_subkinds_urgent(
-    subkind: str, expected_kind: str,
+def test_notify_sent_production_subkinds_severity(
+    subkind: str, expected_kind: str, expected_severity: str,
 ) -> None:
     """AnomalyKind enum values + dispatcher's ``error`` tag must classify.
 
-    Codex round 2 caught that the design's 3-row table did not match
-    production. These are urgent because the human is the only
-    recovery path for a stalled / crashed / silent worker.
+    Codex round 2 originally caught that the design's 3-row table did
+    not match production. Issue #26 Part B then rebalanced severity:
+    a crashed pane is the only one a human has to look at right now;
+    silent / stalled / not-reported / generic-error are softer signals.
     """
     ev = classify_event(_row(
         kind="notify_sent",
@@ -389,4 +577,4 @@ def test_notify_sent_production_subkinds_urgent(
     ))
     assert ev is not None
     assert ev.kind == expected_kind
-    assert ev.severity == "urgent"
+    assert ev.severity == expected_severity

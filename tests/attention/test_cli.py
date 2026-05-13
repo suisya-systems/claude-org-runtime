@@ -20,6 +20,13 @@ from claude_org_runtime.cli import build_parser as build_top_parser
 from .conftest import make_state_db, write_pending_decisions
 
 
+# The CLI calls ``datetime.now(timezone.utc)`` to compute pending ages,
+# so timestamps relative to a hard-coded ``_FROZEN_NOW`` drift over
+# wall-clock time. Issue #26's TTL ladder makes that drift load-bearing
+# (an old fixture eventually slides into ``demote``/``drop`` tiers and
+# changes notify behavior). Anchor fixture timestamps to real now via
+# :func:`_stale_iso` and freeze the classifier's clock via
+# :func:`_freeze_now` so tests stay deterministic at any future date.
 _FROZEN_NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -31,6 +38,32 @@ def _suppress_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "claude_org_runtime.attention.notify._safe_subprocess_run",
         _no_op_runner,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze ``attention.cli`` clock to ``_FROZEN_NOW`` for determinism.
+
+    Without this, ``_stale_iso(30)`` slides from "30 min old" to
+    "30 min + (real now − _FROZEN_NOW)" old as the calendar advances,
+    eventually pushing fixture rows past the Issue #26 demote/drop
+    tiers and flipping notify behavior. The patch matches the import
+    path the CLI module uses so its ``datetime.now(...)`` calls see a
+    stable instant.
+    """
+    real_datetime = datetime
+
+    class _FrozenDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is None:
+                return _FROZEN_NOW.replace(tzinfo=None)
+            return _FROZEN_NOW.astimezone(tz)
+
+    monkeypatch.setattr(
+        "claude_org_runtime.attention.cli.datetime",
+        _FrozenDateTime,
     )
 
 
@@ -277,6 +310,198 @@ def test_scan_severity_override_via_config(tmp_path: Path, capsys) -> None:
     payload = json.loads(captured.out)
     wc = next(ev for ev in payload if ev["kind"] == "worker_completed")
     assert wc["severity"] == "urgent"
+
+
+def test_scan_demote_tier_pending_emits_normal_via_real_config(
+    tmp_path: Path, capsys
+) -> None:
+    """End-to-end check that ``max ≤ age < drop`` produces ``normal``.
+
+    Round-4 codex caught that the pre-fix ``cfg.notify`` shape pre-
+    filled DEFAULT_NOTIFY, which fooled :func:`_severity_for` into
+    treating every default as an explicit operator override and
+    bypassing TTL demote. This test runs the real
+    :class:`AttentionConfig` defaults through the CLI to guard against
+    a regression of that shape.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-demote",
+            # 1500 min ≈ 25h, > default ``pending_decision_max`` (24h)
+            # but < default ``pending_decision_drop`` (7d).
+            "received_at": _stale_iso(1500),
+            "raw_message": "demote",
+            "status": "pending",
+        },
+    ])
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--dry-run",
+        "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    demoted = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-demote"
+        and ev.get("kind") == "pending_decision"
+    ]
+    assert demoted, payload
+    assert demoted[0]["severity"] == "normal"
+    assert demoted[0].get("suppressed") is not True
+
+
+def test_scan_pending_explicit_severity_override_resists_ttl_demote(
+    tmp_path: Path, capsys
+) -> None:
+    """An explicit ``notify`` config override must beat the TTL demote.
+
+    The companion to ``test_scan_demote_tier_pending_emits_normal_via_real_config``:
+    when the operator pins ``pending_decision: urgent`` in the config,
+    even a 25h-old row must surface as ``urgent`` rather than the
+    TTL-demoted ``normal``. Round-4 fix kept this path working by
+    making ``cfg.notify`` sparse so a real override is still
+    distinguishable.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-pinned",
+            "received_at": _stale_iso(1500),  # demote tier age.
+            "raw_message": "pinned",
+            "status": "pending",
+        },
+    ])
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "notify": {"pending_decision": "urgent"},
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--dry-run", "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    pinned = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-pinned"
+        and ev.get("kind") == "pending_decision"
+    ]
+    assert pinned, payload
+    assert pinned[0]["severity"] == "urgent"
+
+
+def test_scan_drop_tier_pending_honors_template_overrides(
+    tmp_path: Path, capsys
+) -> None:
+    """A suppressed drop-tier row must still go through ``render_text``.
+
+    Otherwise the runtime-default English title/body shows up in
+    ``--json`` while every other row carries the operator's template,
+    breaking machine consumers that diff against a ja template.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-old",
+            "received_at": _stale_iso(12000),
+            "raw_message": "stale",
+            "status": "pending",
+        },
+    ])
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text(json.dumps({
+        "templates": {
+            "pending_decision": {
+                "title": "Stale Pending",
+                "body": "task_id={task_id} kind={kind}",
+            },
+        },
+        # Also exercise truncation: title shouldn't get cut here but a
+        # tight ``max_*`` would catch a regression where template
+        # rendering was skipped entirely for suppressed rows.
+        "max_title_chars": 40,
+        "max_body_chars": 80,
+    }), encoding="utf-8")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--config", str(cfg_path),
+        "--json",
+    ])
+    args.func(args)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    drops = [ev for ev in payload if ev.get("task_id") == "T-old"]
+    assert drops, payload
+    assert drops[0]["suppressed"] is True
+    assert drops[0]["title"] == "Stale Pending"
+    assert drops[0]["body"] == "task_id=T-old kind=pending_decision"
+
+
+def test_scan_drop_tier_pending_surfaces_in_json_but_not_notified(
+    tmp_path: Path, capsys
+) -> None:
+    """Issue #26 Part A: a pending row older than ``drop`` must appear
+    in ``attention scan --json`` (marked ``suppressed=True`` and
+    ``delivered=False``) but must NOT be routed to ``notify`` or to
+    the dedup state — operators need a triage path that doesn't burn
+    a notification cycle.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    # Empty state.db so the only row classified is the pending one.
+    make_state_db(state_dir / "state.db", [])
+    write_pending_decisions(state_dir / "pending_decisions.json", [
+        {
+            "task_id": "T-old",
+            # 12000 min ≈ 8.3 d, > default ``pending_decision_drop`` (7d).
+            "received_at": _stale_iso(12000),
+            "raw_message": "old",
+            "status": "pending",
+        },
+    ])
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "scan",
+        "--state-dir", str(state_dir),
+        "--json",
+    ])
+    rc = args.func(args)
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    drops = [
+        ev for ev in payload
+        if ev.get("task_id") == "T-old" and ev.get("kind") == "pending_decision"
+    ]
+    assert drops, payload
+    assert drops[0]["suppressed"] is True
+    assert drops[0]["delivered"] is False
+    assert drops[0]["desktop_dispatched"] is False
+    # No dedup file should be written — suppressed rows must not lock
+    # out a future urgent re-classification if the operator re-arms
+    # the entry by trimming ``received_at``.
+    assert not (state_dir / "attention_notified.json").exists()
 
 
 def test_scan_invalid_config_exits_cleanly(

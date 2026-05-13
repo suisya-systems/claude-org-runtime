@@ -20,7 +20,7 @@ from .config import AttentionConfig, load_config
 from .dedup import (
     DedupState, load_state, record_notified, save_state, should_notify,
 )
-from .notify import notify as run_notify
+from .notify import notify as run_notify, render_text
 from .readers import read_events, read_pending_decisions
 
 
@@ -51,6 +51,8 @@ def _scan_once(
         events, pending, now,
         cfg.pending_decision_min, cfg.user_replied_min,
         notify_map=cfg.notify,
+        pending_decision_max=cfg.pending_decision_max,
+        pending_decision_drop=cfg.pending_decision_drop,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []
@@ -63,6 +65,26 @@ def _scan_once(
         effective_log = sys.stderr
     state_dirty = False
     for ev in classified:
+        # Issue #26 Part A: drop-tier rows are surfaced in
+        # ``attention scan --json`` for triage but never routed to
+        # ``notify`` (no desktop ping, no bell, no dedup update).
+        # ``render_text`` runs even on the suppressed branch so ja
+        # template overrides and ``max_*_chars`` truncation apply to
+        # the JSON title/body — otherwise a stale pending would emit
+        # the runtime-default English copy while every other row uses
+        # the operator's template. ``delivered`` stays False so a
+        # machine consumer can distinguish "classified but suppressed"
+        # from "delivered".
+        if ev.suppressed:
+            rendered_title, rendered_body = render_text(ev, cfg)
+            payload = ev.to_dict()
+            payload["title"] = rendered_title
+            payload["body"] = rendered_body
+            payload["desktop_dispatched"] = False
+            payload["bell_dispatched"] = False
+            payload["delivered"] = False
+            notified_payloads.append(payload)
+            continue
         if not should_notify(
             state, ev.key,
             source=ev.source,
