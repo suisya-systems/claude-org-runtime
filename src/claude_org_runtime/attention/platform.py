@@ -5,7 +5,8 @@ unit tests can drive every branch without a real OS check. Per §5:
 
 * macOS  → ``osascript display notification``
 * Linux  → ``notify-send``
-* WSL    → ``powershell.exe`` on the Windows host
+* WSL    → ``wsl-notify-send.exe`` (Windows toast) when installed,
+  else ``powershell.exe`` Write-Host fallback
 * Windows → PowerShell beep + Write-Host fallback
 * anything else / missing binary → ``"stdout"`` (caller bells + logs)
 """
@@ -18,7 +19,9 @@ import shutil
 import sys
 from typing import Callable, Literal, Optional
 
-Backend = Literal["macos", "linux", "windows", "wsl", "stdout"]
+Backend = Literal[
+    "macos", "linux", "windows", "wsl", "wsl-notify-send", "stdout",
+]
 
 
 def detect_backend(
@@ -42,6 +45,14 @@ def detect_backend(
 
     if sys_name == "Linux":
         if wsl:
+            # Prefer wsl-notify-send.exe: it surfaces a real Windows
+            # toast notification, while the legacy Write-Host path only
+            # writes to a captured PowerShell stdout that the user never
+            # sees (Issue #25). Fall back when the binary is not on PATH
+            # so users without the optional install keep the existing
+            # beep-via-powershell behavior bit-for-bit.
+            if which_fn("wsl-notify-send.exe"):
+                return "wsl-notify-send"
             return "wsl" if which_fn("powershell.exe") else "stdout"
         return "linux" if which_fn("notify-send") else "stdout"
 

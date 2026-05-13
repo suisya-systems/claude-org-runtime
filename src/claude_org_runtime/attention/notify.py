@@ -121,12 +121,15 @@ def notify(
     play_sound = _should_play_sound(cfg.sound, event.severity)
     desktop_intended = bool(cfg.desktop) and chosen != "stdout"
 
-    # Windows / WSL backends signal exclusively through the embedded
-    # ``[console]::beep`` — the ``Write-Host`` output goes to a
-    # captured PowerShell stdout we discard, so it is invisible to the
-    # user. With sound suppressed the subprocess would dispatch
+    # Legacy Windows / WSL Write-Host backends signal exclusively
+    # through the embedded ``[console]::beep`` — ``Write-Host`` goes to
+    # a captured PowerShell stdout we discard, so it is invisible to
+    # the user. With sound suppressed the subprocess would dispatch
     # successfully yet deliver nothing, so downgrade to intentional
     # stdout-only delivery instead of pretending it worked.
+    # ``wsl-notify-send`` is intentionally excluded: it raises a real
+    # Windows toast which stays visible regardless of ``cfg.sound``,
+    # so suppressing sound must not suppress the toast itself.
     if chosen in ("windows", "wsl") and not play_sound:
         desktop_intended = False
 
@@ -157,9 +160,18 @@ def notify(
     #     but those would each need an opt-in dep — bell stays generic).
     #   - Windows / WSL: ``[console]::beep`` is already inside the
     #     PowerShell command, so adding a bell here would double up.
+    #   - wsl-notify-send: the dispatcher fires a companion
+    #     ``powershell.exe`` beep alongside a successful toast; we
+    #     suppress the bell there to avoid double audio. If the toast
+    #     subprocess itself failed (binary missing, host notifications
+    #     blocked, etc.) the bell becomes the audio fallback, matching
+    #     the macOS / Linux failure path.
     #   - desktop disabled / dispatch failed / stdout-only: bell is
     #     the only audio surface left.
-    if play_sound and chosen not in ("windows", "wsl"):
+    should_bell = play_sound and chosen not in ("windows", "wsl")
+    if chosen == "wsl-notify-send" and desktop_dispatched:
+        should_bell = False
+    if should_bell:
         bell()
         bell_dispatched = True
 
@@ -192,6 +204,12 @@ def _dispatch_desktop(
     in so the Windows / WSL PowerShell command can conditionally
     include the ``[console]::beep`` — otherwise ``cfg.sound='off'``
     would still ring a beep on those platforms.
+
+    The ``wsl-notify-send`` backend is special: the binary itself has
+    no beep flag, so when ``play_sound`` is set we fire a second
+    ``powershell.exe [console]::beep`` subprocess after the toast.
+    A failing beep does not demote the toast result — the user already
+    saw the notification, so the event still counts as delivered.
     """
     cmd = _backend_command(backend, title, body, play_sound=play_sound)
     if cmd is None:
@@ -213,7 +231,36 @@ def _dispatch_desktop(
             file=sys.stderr,
         )
         return False
+    if backend == "wsl-notify-send" and play_sound:
+        _dispatch_wsl_notify_send_beep(run_fn)
     return True
+
+
+def _dispatch_wsl_notify_send_beep(run_fn: Callable[[list[str]], Any]) -> None:
+    """Fire the supplementary PowerShell beep next to a wsl-notify-send toast.
+
+    Logged as a warning on failure but never demotes the toast result:
+    the user has already seen the toast, so the event is delivered even
+    if the audio side fails (host with no console audio, etc.).
+    """
+    beep_cmd = [
+        "powershell.exe", "-NoProfile", "-Command",
+        "[console]::beep(800,200)",
+    ]
+    try:
+        beep_result = run_fn(beep_cmd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"warning: wsl-notify-send beep subprocess failed: {exc}",
+            file=sys.stderr,
+        )
+        return
+    beep_rc = getattr(beep_result, "returncode", 0)
+    if beep_rc and beep_rc != 0:
+        print(
+            f"warning: wsl-notify-send beep exited with code {beep_rc}",
+            file=sys.stderr,
+        )
 
 
 def _safe_subprocess_run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -239,6 +286,19 @@ def _backend_command(
         return ["osascript", "-e", script]
     if backend == "linux":
         return ["notify-send", safe_title, safe_body]
+    if backend == "wsl-notify-send":
+        # Upstream main.go: ``--category`` is documented as
+        # "Notification category (used as title)" — passing the
+        # rendered title there gives the toast a per-event headline
+        # that respects user template overrides, while the body goes
+        # in the positional argument. Beep is a separate subprocess
+        # fired by :func:`_dispatch_desktop` when ``play_sound`` is
+        # set; the binary itself has no audio flag.
+        return [
+            "wsl-notify-send.exe",
+            "--category", safe_title,
+            safe_body,
+        ]
     if backend in ("windows", "wsl"):
         # Honour ``cfg.sound`` on the PowerShell path: include the
         # beep iff the caller asked for sound. Without this guard

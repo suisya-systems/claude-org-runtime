@@ -409,3 +409,128 @@ def test_control_chars_stripped_from_command() -> None:
     title_arg, body_arg = calls[0][1], calls[0][2]
     assert "\x07" not in title_arg
     assert "\n" not in body_arg
+
+
+# ---------------------------------------------------------------------------
+# wsl-notify-send backend (Issue #25)
+# ---------------------------------------------------------------------------
+
+
+def test_wsl_notify_send_toast_only_when_sound_off() -> None:
+    """``sound='off'`` produces just the toast subprocess — no beep."""
+    calls: list[list[str]] = []
+    cfg = AttentionConfig(sound="off")
+    result = notify(
+        _event(), cfg, backend="wsl-notify-send",
+        log_stream=StringIO(), runner=lambda cmd: calls.append(cmd),
+    )
+    # Toast is visible without sound, so desktop must stay intended
+    # (unlike the legacy ``wsl`` / ``windows`` Write-Host backends).
+    assert result.desktop_intended is True
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is False
+    assert len(calls) == 1
+    toast = calls[0]
+    assert toast[0] == "wsl-notify-send.exe"
+    assert "--category" in toast
+    assert toast[toast.index("--category") + 1] == "CI failed"
+    # Body is the final positional argument.
+    assert toast[-1] == "PR #42 finished with failed."
+
+
+def test_wsl_notify_send_toast_and_beep_when_sound_on() -> None:
+    """Urgent event with sound on: toast subprocess + separate beep subprocess."""
+    calls: list[list[str]] = []
+    cfg = AttentionConfig()  # sound="urgent-only", event is urgent
+    result = notify(
+        _event(), cfg, backend="wsl-notify-send",
+        log_stream=StringIO(), runner=lambda cmd: calls.append(cmd),
+    )
+    assert result.desktop_dispatched is True
+    # Beep is a separate powershell subprocess, NOT the terminal bell.
+    assert result.bell_dispatched is False
+    assert len(calls) == 2
+    assert calls[0][0] == "wsl-notify-send.exe"
+    assert calls[1][0] == "powershell.exe"
+    joined_beep = " ".join(calls[1])
+    assert "console]::beep" in joined_beep
+
+
+def test_wsl_notify_send_no_double_bell_on_success() -> None:
+    """A successful wsl-notify-send dispatch must not also ring the terminal bell."""
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="wsl-notify-send", log_stream=StringIO(),
+        runner=lambda cmd: None,
+    )
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is False
+
+
+def test_wsl_notify_send_toast_failure_skips_beep(capsys) -> None:
+    """If the toast subprocess fails, do not fire the beep subprocess."""
+    class FailingProc:
+        returncode = 1
+
+    calls: list[list[str]] = []
+
+    def fail_first(cmd: list[str]):
+        calls.append(cmd)
+        return FailingProc()
+
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="wsl-notify-send", log_stream=StringIO(),
+        runner=fail_first,
+    )
+    assert result.desktop_dispatched is False
+    # Failed desktop on an urgent event still bells as the audio
+    # fallback — the powershell beep never ran.
+    assert result.bell_dispatched is True
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert "exited with code 1" in err
+
+
+def test_wsl_notify_send_beep_failure_does_not_demote_toast(capsys) -> None:
+    """Beep failure is non-fatal: the user already saw the toast."""
+    class TwoResults:
+        def __init__(self) -> None:
+            self.idx = 0
+
+        def __call__(self, cmd: list[str]):
+            self.idx += 1
+            if self.idx == 1:
+                class Ok:
+                    returncode = 0
+                return Ok()
+
+            class BadBeep:
+                returncode = 7
+            return BadBeep()
+
+    runner = TwoResults()
+    result = notify(
+        _event(), AttentionConfig(),
+        backend="wsl-notify-send", log_stream=StringIO(), runner=runner,
+    )
+    assert result.desktop_dispatched is True
+    assert result.bell_dispatched is False
+    err = capsys.readouterr().err
+    assert "wsl-notify-send beep" in err
+
+
+def test_wsl_notify_send_strips_control_chars() -> None:
+    calls: list[list[str]] = []
+    ev = _event(title="ok\x07evil", body="hi\nthere")
+    notify(
+        ev, AttentionConfig(sound="off"),
+        backend="wsl-notify-send", log_stream=StringIO(),
+        runner=lambda cmd: calls.append(cmd),
+    )
+    assert calls
+    toast = calls[0]
+    category = toast[toast.index("--category") + 1]
+    body = toast[-1]
+    assert "\x07" not in category
+    assert "\n" not in body
