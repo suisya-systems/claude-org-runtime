@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-06-09
+
+### Fixed
+
+- `dispatcher.choose_split`: curator オンデマンド化後に通常サイズの端末で
+  `None` (`SPLIT_CAPACITY_EXCEEDED`) を返していた問題を修正。curator 不在時に
+  dispatcher を last-resort 候補に含め、両方向を min-size fallback 付きで
+  評価、`SECRETARY_MIN_WIDTH` を 140→120 に。Closes `claude-org-runtime#35`
+  (PR #36).
+
 ## [0.1.11] - 2026-05-13
 
 ### Added
