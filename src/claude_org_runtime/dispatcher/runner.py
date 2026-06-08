@@ -58,7 +58,13 @@ _ALL_DIGITS = re.compile(r"^\d+$")
 # claude-org-ja `.claude/skills/org-delegate/references/pane-layout.md`.
 MIN_PANE_WIDTH = 20
 MIN_PANE_HEIGHT = 5
-SECRETARY_MIN_WIDTH = 140
+# SECRETARY_MIN_WIDTH was 140 (claude-org-ja #310) but that made the
+# secretary unsplittable on common laptop terminals: a 258w secretary
+# halves to 129w < 140, so choose_split returned no candidate even though
+# an operator-forced vertical split at 129w was perfectly usable in live
+# operation (claude-org-runtime #35). Lowered to 120 so a vertical split
+# at the operator-confirmed-usable 129w (and similar widths) is allowed.
+SECRETARY_MIN_WIDTH = 120
 SECRETARY_MIN_HEIGHT = 30
 
 # Role priority for balanced-split target selection. Higher wins.
@@ -223,6 +229,40 @@ class SplitChoice:
     role: str = ""
 
 
+def _split_options(p: Pane) -> list[tuple[str, int, int, int]]:
+    """Return the size-satisfying split options for ``p`` as a list of
+    ``(direction, new_w, new_h, metric)`` tuples.
+
+    Both directions are evaluated -- ``"vertical"`` halves the width,
+    ``"horizontal"`` halves the height -- and only directions whose
+    resulting child clears the ``MIN_PANE_*`` floors (and the
+    ``SECRETARY_MIN_*`` floors when ``p`` is the secretary) are returned.
+    The pre-#35 algorithm committed to a single aspect-ratio-derived
+    direction and dropped the pane entirely if that one failed the floors,
+    never trying the other direction; evaluating both lets a wide-short
+    pane fall back to the fitting split instead of yielding no candidate.
+
+    ``metric`` is the resulting size along the halved dimension (``new_w``
+    for vertical, ``new_h`` for horizontal), so a larger metric means a
+    larger remaining child -- the key both this function's caller (to pick
+    the better of the two directions) and :func:`choose_split` (to rank
+    candidates) sort on.
+    """
+    options: list[tuple[str, int, int, int]] = []
+    for direction, new_w, new_h, metric in (
+        ("vertical", p.width // 2, p.height, p.width // 2),
+        ("horizontal", p.width, p.height // 2, p.height // 2),
+    ):
+        if new_w < MIN_PANE_WIDTH or new_h < MIN_PANE_HEIGHT:
+            continue
+        if p.role == "secretary" and (
+            new_w < SECRETARY_MIN_WIDTH or new_h < SECRETARY_MIN_HEIGHT
+        ):
+            continue
+        options.append((direction, new_w, new_h, metric))
+    return options
+
+
 def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
     """Select the next balanced-split target/direction, or None if no candidate.
 
@@ -235,31 +275,29 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
         if p.role not in ("secretary", "dispatcher", "worker", "curator"):
             continue
 
+        # The dispatcher is a last-resort candidate (lowest _ROLE_PRIORITY).
+        # When a curator is present the original resident-curator adjacency
+        # requirement still applies; but after the curator was made
+        # on-demand (claude-org-ja #503) ``curator is None`` is the normal
+        # steady state, and the old gate dropped the dispatcher
+        # unconditionally in that case (claude-org-runtime #35). Only skip
+        # the dispatcher when a curator exists but is not adjacent.
         if p.role == "dispatcher":
-            if curator is None or not rect_adjacent(p, curator):
+            if curator is not None and not rect_adjacent(p, curator):
                 continue
-
-        if p.width > p.height * 2:
-            direction = "vertical"
-            new_w = p.width // 2
-            new_h = p.height
-            metric = new_w
-        else:
-            direction = "horizontal"
-            new_w = p.width
-            new_h = p.height // 2
-            metric = new_h
-
-        if new_w < MIN_PANE_WIDTH or new_h < MIN_PANE_HEIGHT:
-            continue
-
-        if p.role == "secretary" and (
-            new_w < SECRETARY_MIN_WIDTH or new_h < SECRETARY_MIN_HEIGHT
-        ):
-            continue
 
         if p.name is None:
             continue
+
+        options = _split_options(p)
+        if not options:
+            continue
+
+        # Both directions may satisfy the floors; pick the one with the
+        # larger remaining child (metric desc). ``max`` returns the first
+        # maximal element, and vertical is listed first in _split_options,
+        # so ties deterministically favour the vertical split.
+        direction, new_w, new_h, metric = max(options, key=lambda o: o[3])
 
         candidates.append(SplitChoice(
             target_name=p.name,

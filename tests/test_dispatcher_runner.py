@@ -161,13 +161,14 @@ def test_choose_split_includes_curator_as_candidate() -> None:
 def test_choose_split_secretary_280x43_picks_secretary() -> None:
     # Regression scenario for the threshold tweak (issue #310):
     # 280x86 terminal with secretary 280x43, dispatcher 140x43
-    # adjacent to a 140x43 curator. Under the old thresholds
+    # adjacent to a 140x43 curator. Under the pre-#310 thresholds
     # (SECRETARY_MIN_WIDTH=125, SECRETARY_MIN_HEIGHT=45) the secretary
     # was excluded because horizontal split gave new_h=21 < 45 and
     # vertical split gave new_w=140 >= 125 but new_h=43 < 45 either
     # way -- *the secretary was never splittable in this layout*.
-    # New thresholds (140 / 30) make the vertical split (140x43)
-    # exactly meet both, so secretary should be picked.
+    # The current thresholds (SECRETARY_MIN_WIDTH=120 after #35,
+    # SECRETARY_MIN_HEIGHT=30) make the vertical split (140x43) clear
+    # both floors, so secretary should be picked.
     panes = [
         _pane(1, name="curator", role="curator",
               x=0, y=0, w=140, h=43),
@@ -200,6 +201,119 @@ def test_choose_split_tie_break_by_id_within_same_role() -> None:
     assert choice is not None
     assert choice.target_name == "worker-a"
     assert choice.target_id == 5
+
+
+# --- claude-org-runtime #35 regression coverage ---------------------------
+
+
+def test_choose_split_dispatcher_candidate_when_no_curator() -> None:
+    # Acceptance (a): after the curator was made on-demand
+    # (claude-org-ja #503), ``curator is None`` is the steady state. The
+    # pre-#35 gate dropped the dispatcher unconditionally in that case,
+    # leaving zero candidates. With no curator present the dispatcher must
+    # become a valid (last-resort) candidate.
+    panes = [
+        _pane(2, name="dispatcher", role="dispatcher", x=0, y=0, w=200, h=50),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
+    assert choice.direction == "vertical"
+
+
+def test_choose_split_wide_short_secretary_picks_fitting_direction() -> None:
+    # Acceptance (b): a wide-short secretary whose aspect-derived direction
+    # (vertical, since 200 > 2*60) fails the secretary width floor
+    # (200//2 = 100 < SECRETARY_MIN_WIDTH=120). The pre-#35 algorithm
+    # committed to that single direction and returned None. Evaluating both
+    # directions lets the horizontal split (200x30, clearing 120/30) win
+    # instead of yielding no candidate.
+    panes = [
+        _pane(3, name="secretary", role="secretary", x=0, y=0, w=200, h=60),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.direction == "horizontal"
+    assert choice.new_w == 200
+    assert choice.new_h == 30
+
+
+def test_choose_split_both_directions_valid_prefers_larger_child() -> None:
+    # #35 factor 2: when BOTH directions clear the floors, pick the one with
+    # the larger remaining child (metric desc). Worker 150x100 is only
+    # mildly wide (150 <= 2*100), so the pre-#35 aspect heuristic would have
+    # chosen horizontal (150x50, metric=50); max-metric instead picks
+    # vertical (75x100, metric=75). Pins the new tie-break direction.
+    panes = [
+        _pane(4, name="worker-a", role="worker", x=0, y=0, w=150, h=100),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "worker-a"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 75
+    assert choice.new_h == 100
+    assert choice.metric == 75
+
+
+def test_choose_split_equal_metric_directions_prefer_vertical() -> None:
+    # #35 factor 2 tie-break: a square pane (100x100) yields equal metrics
+    # for both directions (vertical 50x100 metric=50, horizontal 100x50
+    # metric=50). The documented tie-break favours vertical; pin it so a
+    # future reordering of _split_options can't silently flip the choice.
+    panes = [
+        _pane(4, name="worker-a", role="worker", x=0, y=0, w=100, h=100),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.direction == "vertical"
+    assert choice.new_w == 50
+    assert choice.new_h == 100
+
+
+def test_choose_split_live_failure_258x42_yields_valid_choice() -> None:
+    # Acceptance: the live failure layout (claude-org-runtime #35) --
+    # secretary 258x42, dispatcher present, no curator -- must yield a
+    # valid SplitChoice instead of None. The secretary (priority 4) wins
+    # over the now-eligible dispatcher, and its vertical split at 129x42
+    # clears the lowered floors (129 >= 120, 42 >= 30): exactly the split
+    # the operator forced manually.
+    panes = [
+        _pane(3, name="secretary", role="secretary", x=0, y=0, w=258, h=42),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=0, y=42, w=258, h=42),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 129
+    assert choice.new_h == 42
+
+
+def test_choose_split_resident_curator_layout_unchanged() -> None:
+    # Acceptance (c) regression: a resident-curator layout (curator present,
+    # dispatcher adjacent) must still choose the same target/direction as
+    # before the #35 rework. Secretary 300x100 (priority 4) wins with a
+    # vertical split (150x100) -- unchanged. The adjacent dispatcher stays
+    # eligible and the non-adjacency gate is still honoured (covered by
+    # test_choose_split_dispatcher_requires_curator_adjacency).
+    panes = [
+        _pane(1, name="curator", role="curator", x=0, y=0, w=150, h=100),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=150, y=0, w=150, h=100),
+        _pane(3, name="secretary", role="secretary",
+              x=0, y=100, w=300, h=100),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.role == "secretary"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 150
+    assert choice.new_h == 100
 
 
 # ---------------------------------------------------------------------------
