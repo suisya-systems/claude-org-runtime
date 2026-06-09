@@ -67,6 +67,20 @@ MIN_PANE_HEIGHT = 5
 SECRETARY_MIN_WIDTH = 120
 SECRETARY_MIN_HEIGHT = 30
 
+# Comfortable minimum width for the dispatcher's own (left) viewport when
+# it gives back the on-demand curator's freed slot via a vertical split.
+# Background: the curator was made on-demand (claude-org-ja #503), so
+# org-start no longer spawns a resident curator and the dispatcher absorbs
+# the right-hand slot the curator used to occupy -- a wide, otherwise
+# wasted bottom zone. ``choose_split`` reclaims that freed zone for workers
+# by vertically splitting the dispatcher, but only while the remaining
+# (left) dispatcher child stays >= this width, so the dispatcher's active
+# monitoring viewport is never shrunk below a usable size (the reason the
+# dispatcher is otherwise a last-resort split target). The dispatcher is a
+# compact relay/control pane, so this floor sits below the secretary's
+# content-pane floor.
+DISPATCHER_MIN_WIDTH = 80
+
 # Role priority for balanced-split target selection. Higher wins.
 # Mirrors claude-org-ja's pane-layout.md sort regime: priority is the
 # primary key (so a higher-priority pane always beats a lower-priority
@@ -74,6 +88,11 @@ SECRETARY_MIN_HEIGHT = 30
 # breakers. The ordering keeps the most-load-bearing panes
 # (secretary > curator > worker > dispatcher) splittable first so the
 # tab fills out evenly under repeated delegations.
+#
+# Exception: when no curator is resident, the dispatcher holds the freed
+# on-demand-curator slot (see ``DISPATCHER_MIN_WIDTH``); ``choose_split``
+# promotes that single vertical reclaim to the *curator* priority slot so
+# the freed bottom zone is filled before lower-priority workers are halved.
 _ROLE_PRIORITY = {
     "secretary": 4,
     "curator": 3,
@@ -270,7 +289,11 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
     """
     curator = next((p for p in panes if p.role == "curator"), None)
 
-    candidates: list[SplitChoice] = []
+    # Each entry pairs a SplitChoice with the role priority used to rank it.
+    # The priority is normally ``_ROLE_PRIORITY[role]`` but the dispatcher's
+    # freed-curator-zone reclaim overrides it (see below), so it is tracked
+    # separately rather than re-derived from ``choice.role`` at sort time.
+    candidates: list[tuple[int, SplitChoice]] = []
     for p in panes:
         if p.role not in ("secretary", "dispatcher", "worker", "curator"):
             continue
@@ -298,8 +321,26 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
         # maximal element, and vertical is listed first in _split_options,
         # so ties deterministically favour the vertical split.
         direction, new_w, new_h, metric = max(options, key=lambda o: o[3])
+        priority = _ROLE_PRIORITY.get(p.role or "", 0)
 
-        candidates.append(SplitChoice(
+        # Freed on-demand-curator zone: with no curator resident, a
+        # dispatcher whose vertical split leaves its own (left) child at or
+        # above DISPATCHER_MIN_WIDTH is holding the slot the curator used to
+        # occupy. Reclaim that right-hand zone for a worker via the vertical
+        # split and rank it at the curator's priority -- so the freed bottom
+        # space is filled before lower-priority workers get halved -- instead
+        # of the dispatcher's last-resort priority. The DISPATCHER_MIN_WIDTH
+        # floor self-limits: once the dispatcher has been split down to its
+        # comfortable width the vertical child drops below the floor and it
+        # reverts to last-resort, so the active viewport is never repeatedly
+        # halved past usability.
+        if p.role == "dispatcher" and curator is None:
+            vert = next((o for o in options if o[0] == "vertical"), None)
+            if vert is not None and vert[1] >= DISPATCHER_MIN_WIDTH:
+                direction, new_w, new_h, metric = vert
+                priority = _ROLE_PRIORITY["curator"]
+
+        candidates.append((priority, SplitChoice(
             target_name=p.name,
             target_id=p.id,
             direction=direction,
@@ -307,15 +348,15 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
             new_h=new_h,
             metric=metric,
             role=p.role or "",
-        ))
+        )))
 
     if not candidates:
         return None
 
     candidates.sort(
-        key=lambda c: (-_ROLE_PRIORITY.get(c.role, 0), -c.metric, c.target_id)
+        key=lambda pc: (-pc[0], -pc[1].metric, pc[1].target_id)
     )
-    return candidates[0]
+    return candidates[0][1]
 
 
 # ----------------------------------------------------------------------------

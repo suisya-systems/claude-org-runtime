@@ -316,6 +316,66 @@ def test_choose_split_resident_curator_layout_unchanged() -> None:
     assert choice.new_h == 100
 
 
+# --- freed on-demand-curator zone (balanced-split-curator-space) -----------
+
+
+def test_choose_split_reclaims_freed_curator_zone_before_worker() -> None:
+    # After the curator was made on-demand (claude-org-ja #503) the
+    # dispatcher absorbs the curator's freed right-hand slot, leaving a wide,
+    # otherwise-wasted bottom zone. A wide dispatcher (vertical child
+    # 130 >= DISPATCHER_MIN_WIDTH=80) must be reclaimed at the *curator*
+    # priority slot, outranking an existing worker (priority 2) so the freed
+    # space is filled before the worker's viewport is halved. Pre-fix the
+    # dispatcher's last-resort priority (1) lost to the worker and the freed
+    # bottom zone stayed unused.
+    panes = [
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=0, y=40, w=260, h=40),
+        _pane(5, name="worker-a", role="worker",
+              x=0, y=0, w=200, h=40),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 130
+
+
+def test_choose_split_narrow_dispatcher_stays_last_resort() -> None:
+    # Self-limit guard: a dispatcher already at its comfortable width
+    # (vertical child 60 < DISPATCHER_MIN_WIDTH=80) is NOT holding freed
+    # curator space, so it stays a last-resort candidate (priority 1) and
+    # the worker (priority 2) is preferred. This pins that the freed-zone
+    # promotion does not repeatedly halve the dispatcher's own viewport.
+    panes = [
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=0, y=40, w=120, h=40),
+        _pane(5, name="worker-a", role="worker",
+              x=0, y=0, w=200, h=40),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "worker-a"
+
+
+def test_choose_split_resident_curator_blocks_freed_zone_promotion() -> None:
+    # When a curator is actually resident the dispatcher is NOT holding freed
+    # space, so even a wide dispatcher must keep its last-resort priority and
+    # lose to a worker. Guards the ``curator is None`` precondition of the
+    # freed-zone reclaim.
+    panes = [
+        _pane(1, name="curator", role="curator", x=260, y=40, w=18, h=8),
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=0, y=40, w=260, h=40),
+        _pane(5, name="worker-a", role="worker",
+              x=0, y=0, w=200, h=40),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "worker-a"
+
+
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
