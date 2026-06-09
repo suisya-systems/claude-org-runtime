@@ -67,38 +67,47 @@ MIN_PANE_HEIGHT = 5
 SECRETARY_MIN_WIDTH = 120
 SECRETARY_MIN_HEIGHT = 30
 
-# Comfortable minimum width for the dispatcher's own (left) viewport when
-# it gives back the on-demand curator's freed slot via a vertical split.
-# Background: the curator was made on-demand (claude-org-ja #503), so
-# org-start no longer spawns a resident curator and the dispatcher absorbs
-# the right-hand slot the curator used to occupy -- a wide, otherwise
-# wasted bottom zone. ``choose_split`` reclaims that freed zone for workers
-# by vertically splitting the dispatcher, but only while the remaining
-# (left) dispatcher child stays >= this width, so the dispatcher's active
-# monitoring viewport is never shrunk below a usable size (the reason the
-# dispatcher is otherwise a last-resort split target). The dispatcher is a
-# compact relay/control pane, so this floor sits below the secretary's
-# content-pane floor.
+# Comfortable minimum width for the dispatcher's own (left) viewport.
+# The dispatcher is now the *primary* balanced-split target (top
+# ``_ROLE_PRIORITY``): new workers are spawned by vertically splitting the
+# dispatcher so they take its right-hand zone. To keep the dispatcher's own
+# (left) monitoring viewport usable it only stays the top split target while
+# that left child remains >= this width; once the dispatcher has been split
+# down to its comfortable width it is demoted to a strict last resort
+# (``_DISPATCHER_NARROW_PRIORITY``) so further workers split each other
+# instead of halving the dispatcher's viewport past usability. The
+# dispatcher is a compact relay/control pane, so this floor sits below the
+# secretary's content-pane floor.
 DISPATCHER_MIN_WIDTH = 80
 
 # Role priority for balanced-split target selection. Higher wins.
 # Mirrors claude-org-ja's pane-layout.md sort regime: priority is the
 # primary key (so a higher-priority pane always beats a lower-priority
 # one regardless of metric), with metric desc and id asc as tie
-# breakers. The ordering keeps the most-load-bearing panes
-# (secretary > curator > worker > dispatcher) splittable first so the
-# tab fills out evenly under repeated delegations.
+# breakers.
 #
-# Exception: when no curator is resident, the dispatcher holds the freed
-# on-demand-curator slot (see ``DISPATCHER_MIN_WIDTH``); ``choose_split``
-# promotes that single vertical reclaim to the *curator* priority slot so
-# the freed bottom zone is filled before lower-priority workers are halved.
+# The dispatcher is the primary split target: workers are carved out of the
+# dispatcher's pane first (while it stays wide enough -- see
+# ``DISPATCHER_MIN_WIDTH`` / ``_DISPATCHER_NARROW_PRIORITY``), and the
+# secretary is the last resort so its content viewport is kept intact.
+# The full ordering is dispatcher > curator > worker > secretary; the
+# load-bearing intent is "dispatcher first, secretary last", while the
+# curator > worker middle ordering is carried over unchanged from the
+# previous regime.
 _ROLE_PRIORITY = {
-    "secretary": 4,
+    "dispatcher": 4,
     "curator": 3,
     "worker": 2,
-    "dispatcher": 1,
+    "secretary": 1,
 }
+
+# Priority assigned to a dispatcher that has already been split down to (or
+# below) ``DISPATCHER_MIN_WIDTH``: strictly below every entry in
+# ``_ROLE_PRIORITY`` (all >= 1) so a narrow dispatcher becomes a pure
+# last-resort fallback and its monitoring viewport is protected from being
+# halved again while any other pane (worker, curator, even the secretary)
+# can absorb the next worker.
+_DISPATCHER_NARROW_PRIORITY = 0
 
 # Default Claude model for worker panes. The auto-mode safety classifier
 # is unstable on sonnet -- opus-only per the claude-org-ja worker-model
@@ -290,21 +299,21 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
     curator = next((p for p in panes if p.role == "curator"), None)
 
     # Each entry pairs a SplitChoice with the role priority used to rank it.
-    # The priority is normally ``_ROLE_PRIORITY[role]`` but the dispatcher's
-    # freed-curator-zone reclaim overrides it (see below), so it is tracked
-    # separately rather than re-derived from ``choice.role`` at sort time.
+    # The priority is normally ``_ROLE_PRIORITY[role]`` but a dispatcher that
+    # has been split down to its comfortable width is demoted (see below), so
+    # it is tracked separately rather than re-derived from ``choice.role`` at
+    # sort time.
     candidates: list[tuple[int, SplitChoice]] = []
     for p in panes:
         if p.role not in ("secretary", "dispatcher", "worker", "curator"):
             continue
 
-        # The dispatcher is a last-resort candidate (lowest _ROLE_PRIORITY).
-        # When a curator is present the original resident-curator adjacency
-        # requirement still applies; but after the curator was made
-        # on-demand (claude-org-ja #503) ``curator is None`` is the normal
-        # steady state, and the old gate dropped the dispatcher
-        # unconditionally in that case (claude-org-runtime #35). Only skip
-        # the dispatcher when a curator exists but is not adjacent.
+        # The dispatcher is the primary split target, but when a curator is
+        # actually resident we keep the original adjacency requirement: a
+        # dispatcher detached from the resident curator is an unexpected
+        # layout, so skip it rather than carve workers out of it. After the
+        # curator was made on-demand (claude-org-ja #503) ``curator is None``
+        # is the normal steady state and this gate is a no-op.
         if p.role == "dispatcher":
             if curator is not None and not rect_adjacent(p, curator):
                 continue
@@ -323,22 +332,19 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
         direction, new_w, new_h, metric = max(options, key=lambda o: o[3])
         priority = _ROLE_PRIORITY.get(p.role or "", 0)
 
-        # Freed on-demand-curator zone: with no curator resident, a
-        # dispatcher whose vertical split leaves its own (left) child at or
-        # above DISPATCHER_MIN_WIDTH is holding the slot the curator used to
-        # occupy. Reclaim that right-hand zone for a worker via the vertical
-        # split and rank it at the curator's priority -- so the freed bottom
-        # space is filled before lower-priority workers get halved -- instead
-        # of the dispatcher's last-resort priority. The DISPATCHER_MIN_WIDTH
-        # floor self-limits: once the dispatcher has been split down to its
-        # comfortable width the vertical child drops below the floor and it
-        # reverts to last-resort, so the active viewport is never repeatedly
-        # halved past usability.
-        if p.role == "dispatcher" and curator is None:
+        # Dispatcher-first split: spawn the worker by vertically splitting the
+        # dispatcher so it takes the right-hand zone, keeping the dispatcher's
+        # top priority -- but only while the dispatcher's own (left) child
+        # stays >= DISPATCHER_MIN_WIDTH. Once the dispatcher has been split
+        # down to (or below) its comfortable width, demote it to a strict
+        # last resort so further workers split each other instead of halving
+        # the dispatcher's monitoring viewport past usability.
+        if p.role == "dispatcher":
             vert = next((o for o in options if o[0] == "vertical"), None)
             if vert is not None and vert[1] >= DISPATCHER_MIN_WIDTH:
                 direction, new_w, new_h, metric = vert
-                priority = _ROLE_PRIORITY["curator"]
+            else:
+                priority = _DISPATCHER_NARROW_PRIORITY
 
         candidates.append((priority, SplitChoice(
             target_name=p.name,

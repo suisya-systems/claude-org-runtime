@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-06-09
+
+### Changed
+
+- `dispatcher.choose_split`: `_ROLE_PRIORITY` を反転し、**dispatcher を最優先
+  分割ターゲット (priority=4)、secretary を最低優先 (priority=1)** に変更。
+  worker は dispatcher ペインを垂直分割して spawn されるようになり (curator=3 >
+  worker=2 は従来の相対順を維持)、secretary の content viewport は last-resort
+  までは分割されない。
+- dispatcher の viewport 保護ロジックを再構成。従来は「last-resort の dispatcher
+  を curator priority へ昇格させる freed-curator-zone reclaim」だったが、
+  dispatcher が常時最優先になったため、垂直分割で残る左 child が
+  `DISPATCHER_MIN_WIDTH`(=80) 以上の間だけ最優先を保ち、それを下回ると新定数
+  `_DISPATCHER_NARROW_PRIORITY`(=0、全ロール未満) へ降格して active 監視ペインが
+  繰り返し半減されないよう self-limit する方式に変更。dispatcher の
+  adjacency gate (resident curator 非隣接時のスキップ) は不変。
+
 ## [0.1.13] - 2026-06-09
 
 ### Fixed

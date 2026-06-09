@@ -76,8 +76,9 @@ def test_rect_adjacent_no_overlap() -> None:
 
 def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:
     # Curator too small to split (would fall under MIN_PANE_HEIGHT after
-    # halving), so dispatcher is the only viable candidate even though
-    # it has the lowest role priority.
+    # halving). The dispatcher is the primary split target (top priority) and
+    # is adjacent to the curator with a vertical child (100) >=
+    # DISPATCHER_MIN_WIDTH, so it is chosen with a vertical split.
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=18, h=8),
         _pane(2, name="dispatcher", role="dispatcher", x=18, y=0, w=200, h=50),
@@ -88,11 +89,12 @@ def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:
     assert choice.direction == "vertical"
 
 
-def test_choose_split_picks_largest_metric() -> None:
-    # New sort regime: (role priority desc, metric desc, id asc).
-    # secretary priority=4 outranks dispatcher priority=1, so secretary
-    # wins regardless of metric — verified separately in
-    # test_choose_split_role_priority_outranks_metric.
+def test_choose_split_dispatcher_first_outranks_larger_pane() -> None:
+    # Dispatcher-first regime: the dispatcher is the primary split target
+    # (priority 4), so it is chosen even when another pane (the secretary,
+    # priority 1) offers a larger split metric. The dispatcher is adjacent to
+    # the resident curator (gate satisfied) and its vertical child (100)
+    # clears DISPATCHER_MIN_WIDTH=80, so it keeps top priority.
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=50),
         _pane(2, name="dispatcher", role="dispatcher", x=100, y=0, w=200, h=50),
@@ -100,7 +102,10 @@ def test_choose_split_picks_largest_metric() -> None:
     ]
     choice = choose_split(panes)
     assert choice is not None
-    assert choice.target_name == "secretary"
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 100
 
 
 def test_choose_split_returns_none_when_no_candidate() -> None:
@@ -121,34 +126,31 @@ def test_choose_split_dispatcher_requires_curator_adjacency() -> None:
 
 
 def test_choose_split_role_priority_outranks_metric() -> None:
-    # Worker has the larger metric (vertical split -> 200x60, metric=200)
-    # but secretary (priority 4) outranks worker (priority 2) in the new
-    # sort regime, so secretary is picked despite its smaller metric
-    # (vertical split -> 75x60, metric=75... but that's < SECRETARY_MIN
-    # -- use a secretary big enough to clear the threshold).
+    # Role priority is the primary sort key: the curator (priority 3) is
+    # chosen over a worker (priority 2) even though the worker's split metric
+    # (vertical -> 200x60, metric=200) is far larger than the curator's
+    # (vertical -> 50x60, metric=50). No dispatcher is present, so the
+    # dispatcher-first rule does not apply here.
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=100, h=60),
-        _pane(2, name="dispatcher", role="dispatcher",
-              x=100, y=0, w=100, h=60),
-        _pane(3, name="secretary", role="secretary",
-              x=0, y=60, w=300, h=60),
         _pane(4, name="worker-a", role="worker",
-              x=0, y=120, w=400, h=60),
+              x=0, y=60, w=400, h=60),
     ]
     choice = choose_split(panes)
     assert choice is not None
-    assert choice.target_name == "secretary"
-    assert choice.role == "secretary"
+    assert choice.target_name == "curator"
+    assert choice.role == "curator"
 
 
 def test_choose_split_includes_curator_as_candidate() -> None:
-    # Pre-fix curator was not a candidate. With curator added at
-    # priority 3 (above worker=2, below secretary=4), it should now be
-    # selected when no secretary is splittable.
+    # The curator is a candidate at priority 3 (above worker=2). Here the
+    # dispatcher is already at its comfortable width (vertical child 50 <
+    # DISPATCHER_MIN_WIDTH=80, so demoted to last resort), so the curator
+    # outranks the worker and is selected.
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=200, h=60),
         _pane(2, name="dispatcher", role="dispatcher",
-              x=200, y=0, w=200, h=60),
+              x=200, y=0, w=100, h=60),
         _pane(3, name="worker-a", role="worker",
               x=0, y=60, w=200, h=60),
     ]
@@ -159,23 +161,16 @@ def test_choose_split_includes_curator_as_candidate() -> None:
 
 
 def test_choose_split_secretary_280x43_picks_secretary() -> None:
-    # Regression scenario for the threshold tweak (issue #310):
-    # 280x86 terminal with secretary 280x43, dispatcher 140x43
-    # adjacent to a 140x43 curator. Under the pre-#310 thresholds
-    # (SECRETARY_MIN_WIDTH=125, SECRETARY_MIN_HEIGHT=45) the secretary
-    # was excluded because horizontal split gave new_h=21 < 45 and
-    # vertical split gave new_w=140 >= 125 but new_h=43 < 45 either
-    # way -- *the secretary was never splittable in this layout*.
-    # The current thresholds (SECRETARY_MIN_WIDTH=120 after #35,
-    # SECRETARY_MIN_HEIGHT=30) make the vertical split (140x43) clear
-    # both floors, so secretary should be picked.
+    # Regression for the secretary split-floor tweak (#310 / #35). The
+    # secretary is now the lowest-priority split target, so to exercise its
+    # floor in isolation it is the only pane present (with a dispatcher in the
+    # layout the dispatcher would win). Under the current thresholds
+    # (SECRETARY_MIN_WIDTH=120, SECRETARY_MIN_HEIGHT=30) the vertical split
+    # (140x43) clears both floors while the horizontal split (280x21) fails
+    # the height floor, so the vertical split is chosen.
     panes = [
-        _pane(1, name="curator", role="curator",
-              x=0, y=0, w=140, h=43),
-        _pane(2, name="dispatcher", role="dispatcher",
-              x=140, y=0, w=140, h=43),
         _pane(3, name="secretary", role="secretary",
-              x=0, y=43, w=280, h=43),
+              x=0, y=0, w=280, h=43),
     ]
     choice = choose_split(panes)
     assert choice is not None
@@ -211,7 +206,8 @@ def test_choose_split_dispatcher_candidate_when_no_curator() -> None:
     # (claude-org-ja #503), ``curator is None`` is the steady state. The
     # pre-#35 gate dropped the dispatcher unconditionally in that case,
     # leaving zero candidates. With no curator present the dispatcher must
-    # become a valid (last-resort) candidate.
+    # be a valid candidate -- and under the dispatcher-first regime it is the
+    # primary one, picked with a vertical split.
     panes = [
         _pane(2, name="dispatcher", role="dispatcher", x=0, y=0, w=200, h=50),
     ]
@@ -275,11 +271,11 @@ def test_choose_split_equal_metric_directions_prefer_vertical() -> None:
 
 def test_choose_split_live_failure_258x42_yields_valid_choice() -> None:
     # Acceptance: the live failure layout (claude-org-runtime #35) --
-    # secretary 258x42, dispatcher present, no curator -- must yield a
-    # valid SplitChoice instead of None. The secretary (priority 4) wins
-    # over the now-eligible dispatcher, and its vertical split at 129x42
-    # clears the lowered floors (129 >= 120, 42 >= 30): exactly the split
-    # the operator forced manually.
+    # secretary 258x42, dispatcher present, no curator -- must yield a valid
+    # SplitChoice instead of None. Under the dispatcher-first regime the
+    # dispatcher (priority 4) is the target; its vertical split at 129x42
+    # clears DISPATCHER_MIN_WIDTH=80, so the new worker is carved out of the
+    # dispatcher rather than the secretary.
     panes = [
         _pane(3, name="secretary", role="secretary", x=0, y=0, w=258, h=42),
         _pane(2, name="dispatcher", role="dispatcher",
@@ -287,47 +283,42 @@ def test_choose_split_live_failure_258x42_yields_valid_choice() -> None:
     ]
     choice = choose_split(panes)
     assert choice is not None
-    assert choice.target_name == "secretary"
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
     assert choice.direction == "vertical"
     assert choice.new_w == 129
     assert choice.new_h == 42
 
 
-def test_choose_split_resident_curator_layout_unchanged() -> None:
-    # Acceptance (c) regression: a resident-curator layout (curator present,
-    # dispatcher adjacent) must still choose the same target/direction as
-    # before the #35 rework. Secretary 300x100 (priority 4) wins with a
-    # vertical split (150x100) -- unchanged. The adjacent dispatcher stays
-    # eligible and the non-adjacency gate is still honoured (covered by
-    # test_choose_split_dispatcher_requires_curator_adjacency).
+def test_choose_split_resident_curator_wide_dispatcher_wins() -> None:
+    # Dispatcher-first even with a resident curator: a wide dispatcher that is
+    # adjacent to the curator (vertical child 100 >= DISPATCHER_MIN_WIDTH=80)
+    # keeps its top priority (4) and is chosen over both the resident curator
+    # (priority 3) and the secretary (priority 1).
     panes = [
         _pane(1, name="curator", role="curator", x=0, y=0, w=150, h=100),
         _pane(2, name="dispatcher", role="dispatcher",
-              x=150, y=0, w=150, h=100),
+              x=150, y=0, w=200, h=100),
         _pane(3, name="secretary", role="secretary",
-              x=0, y=100, w=300, h=100),
+              x=0, y=100, w=350, h=100),
     ]
     choice = choose_split(panes)
     assert choice is not None
-    assert choice.target_name == "secretary"
-    assert choice.role == "secretary"
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
     assert choice.direction == "vertical"
-    assert choice.new_w == 150
+    assert choice.new_w == 100
     assert choice.new_h == 100
 
 
-# --- freed on-demand-curator zone (balanced-split-curator-space) -----------
+# --- dispatcher-first split target (viewport self-limit) -------------------
 
 
-def test_choose_split_reclaims_freed_curator_zone_before_worker() -> None:
-    # After the curator was made on-demand (claude-org-ja #503) the
-    # dispatcher absorbs the curator's freed right-hand slot, leaving a wide,
-    # otherwise-wasted bottom zone. A wide dispatcher (vertical child
-    # 130 >= DISPATCHER_MIN_WIDTH=80) must be reclaimed at the *curator*
-    # priority slot, outranking an existing worker (priority 2) so the freed
-    # space is filled before the worker's viewport is halved. Pre-fix the
-    # dispatcher's last-resort priority (1) lost to the worker and the freed
-    # bottom zone stayed unused.
+def test_choose_split_wide_dispatcher_outranks_worker() -> None:
+    # Dispatcher-first: a wide dispatcher (vertical child 130 >=
+    # DISPATCHER_MIN_WIDTH=80) keeps its top priority (4) and outranks an
+    # existing worker (priority 2), so the new worker is carved out of the
+    # dispatcher's pane before the existing worker's viewport is halved.
     panes = [
         _pane(2, name="dispatcher", role="dispatcher",
               x=0, y=40, w=260, h=40),
@@ -342,12 +333,45 @@ def test_choose_split_reclaims_freed_curator_zone_before_worker() -> None:
     assert choice.new_w == 130
 
 
+def test_choose_split_secretary_is_lowest_priority() -> None:
+    # The secretary is now the lowest-priority split target: a worker
+    # (priority 2) is carved up before the secretary (priority 1) so the
+    # secretary's content viewport is preserved. Both panes clear their split
+    # floors, so the choice is decided purely by role priority.
+    panes = [
+        _pane(3, name="secretary", role="secretary", x=0, y=0, w=300, h=100),
+        _pane(5, name="worker-a", role="worker", x=0, y=100, w=300, h=100),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "worker-a"
+    assert choice.role == "worker"
+
+
+def test_choose_split_narrow_dispatcher_demotes_below_secretary() -> None:
+    # The narrow-dispatcher last resort sits strictly below every role,
+    # including the lowest-priority secretary: when the only alternative to a
+    # comfortable-width dispatcher (vertical child 60 < DISPATCHER_MIN_WIDTH)
+    # is the secretary, the secretary (priority 1 > 0) absorbs the worker so
+    # the dispatcher's viewport is protected.
+    panes = [
+        _pane(2, name="dispatcher", role="dispatcher",
+              x=0, y=0, w=120, h=40),
+        _pane(3, name="secretary", role="secretary",
+              x=0, y=40, w=300, h=40),
+    ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "secretary"
+    assert choice.role == "secretary"
+
+
 def test_choose_split_narrow_dispatcher_stays_last_resort() -> None:
     # Self-limit guard: a dispatcher already at its comfortable width
-    # (vertical child 60 < DISPATCHER_MIN_WIDTH=80) is NOT holding freed
-    # curator space, so it stays a last-resort candidate (priority 1) and
-    # the worker (priority 2) is preferred. This pins that the freed-zone
-    # promotion does not repeatedly halve the dispatcher's own viewport.
+    # (vertical child 60 < DISPATCHER_MIN_WIDTH=80) is demoted to a strict
+    # last resort (below every role), so the worker (priority 2) is preferred.
+    # This pins that the dispatcher-first rule does not repeatedly halve the
+    # dispatcher's own monitoring viewport past usability.
     panes = [
         _pane(2, name="dispatcher", role="dispatcher",
               x=0, y=40, w=120, h=40),
@@ -359,13 +383,14 @@ def test_choose_split_narrow_dispatcher_stays_last_resort() -> None:
     assert choice.target_name == "worker-a"
 
 
-def test_choose_split_resident_curator_blocks_freed_zone_promotion() -> None:
-    # When a curator is actually resident the dispatcher is NOT holding freed
-    # space, so even a wide dispatcher must keep its last-resort priority and
-    # lose to a worker. Guards the ``curator is None`` precondition of the
-    # freed-zone reclaim.
+def test_choose_split_nonadjacent_dispatcher_gated_with_resident_curator() -> None:
+    # The dispatcher's adjacency gate still applies when a curator is
+    # resident: a wide dispatcher that is NOT adjacent to the resident curator
+    # is skipped (unexpected layout), so the worker (priority 2) is the target
+    # even though a wide dispatcher would otherwise outrank it. The curator is
+    # deliberately too small to split, isolating the gate's effect.
     panes = [
-        _pane(1, name="curator", role="curator", x=260, y=40, w=18, h=8),
+        _pane(1, name="curator", role="curator", x=300, y=0, w=18, h=8),
         _pane(2, name="dispatcher", role="dispatcher",
               x=0, y=40, w=260, h=40),
         _pane(5, name="worker-a", role="worker",
