@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-06-09
+
 ### Fixed
 
 - `dispatcher.choose_split`: curator のオンデマンド化 (claude-org-ja #503)
@@ -20,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   戻るため active 監視ペインの viewport が繰り返し半減されることはない。
   既存の #35/#36 挙動 (curator 不在時の last-resort 候補化・両方向評価・
   resident-curator レイアウト) は不変。
+
+## [0.1.12] - 2026-06-09
 
 ### Fixed
 
