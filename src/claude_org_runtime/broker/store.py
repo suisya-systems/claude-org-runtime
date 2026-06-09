@@ -51,6 +51,19 @@ class StoreMixin:
 
     def enqueue(self, from_bind: "AgentBind", to_id: str, message: str) -> dict:
         """queue store 投入 + ナッジ配達 trigger。帰属は token 由来 (自己申告不可)。"""
+        entry = {
+            "from_id": from_bind.agent_id,
+            "from_name": from_bind.name,
+            "sent_at": time.time(),
+            "message": message,
+        }
+        # 宛先の registered 確認と queue append を**同一ロックスコープ**で原子的に
+        # 行う。移植元 spike は確認と append を別スコープに分けており、その間に
+        # DELETE が走ると登録解除済み session に enqueue できる残存レースがあった。
+        # 「DELETE 後は配送先から外す」(round 3 Major) verified intent を並行時にも
+        # 守るため、確認+append を 1 スコープに統合する (codex self-review Major 対応)。
+        # I/O (_journal) と PTY 注入 (_trigger_nudge) は従来どおりロック外に出し、
+        # 非再入 Lock の二重取得デッドロック回避契約は維持する。
         with self._lock:
             target: "AgentBind | None" = None
             for b in self._binds.values():
@@ -61,15 +74,8 @@ class StoreMixin:
                 if b.agent_id == to_id or b.name == to_id:
                     target = b
                     break
-        if target is None:
-            return {"ok": False, "error": f"[peer_not_found] no agent '{to_id}'"}
-        entry = {
-            "from_id": from_bind.agent_id,
-            "from_name": from_bind.name,
-            "sent_at": time.time(),
-            "message": message,
-        }
-        with self._lock:
+            if target is None:
+                return {"ok": False, "error": f"[peer_not_found] no agent '{to_id}'"}
             self._queues.setdefault(target.agent_id, []).append(entry)
         self._journal(
             "message_enqueued",
