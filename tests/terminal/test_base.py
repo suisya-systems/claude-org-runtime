@@ -150,28 +150,33 @@ def test_make_adapter_unknown_backend_raises() -> None:
 
 
 def test_make_adapter_tmux_branch(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Patch the lookup site (terminal.tmux.find_tmux), not base, since
-    # make_adapter lazily imports TmuxAdapter whose default_factory binds it.
+    # make_adapter() instantiates TmuxAdapter, whose ``exe`` default_factory is
+    # the *original* find_tmux captured at class-definition time -- patching the
+    # module's find_tmux name would not reach it. Patch the PATH probe it calls
+    # (shutil.which) so the real factory succeeds without a tmux binary present
+    # (otherwise red on CI runners that lack tmux/wezterm).
     from claude_org_runtime.terminal import tmux as tmux_mod
 
-    monkeypatch.setattr(tmux_mod, "find_tmux", lambda: "tmux")
+    monkeypatch.setattr(tmux_mod.shutil, "which", lambda _n: "/fake/bin/tmux")
     adapter = make_adapter("tmux")
     assert isinstance(adapter, tmux_mod.TmuxAdapter)
+    assert adapter.exe == "/fake/bin/tmux"
 
 
 def test_make_adapter_wezterm_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     from claude_org_runtime.terminal import wezterm as wez_mod
 
-    monkeypatch.setattr(wez_mod, "find_wezterm", lambda: "wezterm")
+    monkeypatch.setattr(wez_mod.shutil, "which", lambda _n: "/fake/bin/wezterm")
     adapter = make_adapter("wezterm")
     assert isinstance(adapter, wez_mod.WezTermAdapter)
+    assert adapter.exe == "/fake/bin/wezterm"
 
 
 def test_make_adapter_uses_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     from claude_org_runtime.terminal import tmux as tmux_mod
 
     monkeypatch.setenv("SPIKE_BACKEND", "tmux")
-    monkeypatch.setattr(tmux_mod, "find_tmux", lambda: "tmux")
+    monkeypatch.setattr(tmux_mod.shutil, "which", lambda _n: "/fake/bin/tmux")
     assert isinstance(make_adapter(), tmux_mod.TmuxAdapter)
 
 
