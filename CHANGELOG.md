@@ -5,7 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.12] - 2026-06-09
+## [Unreleased]
+
+### Fixed
+
+- `dispatcher.choose_split`: curator のオンデマンド化 (claude-org-ja #503)
+  で dispatcher が吸収した「旧 curator スロット」の空きスペースが balanced
+  split のターゲット選定で考慮されず、bottom zone が無駄になっていた問題を
+  修正。curator 不在かつ dispatcher の垂直分割で残る左 child が新定数
+  `DISPATCHER_MIN_WIDTH`(=80) 以上のとき、その垂直分割を curator の
+  role-priority スロットに昇格させ、下位 priority の worker を半減させる前に
+  空きスペースを worker zone として埋める。`DISPATCHER_MIN_WIDTH` フロアが
+  self-limit として働き、dispatcher が快適幅まで縮んだ後は last-resort に
+  戻るため active 監視ペインの viewport が繰り返し半減されることはない。
+  既存の #35/#36 挙動 (curator 不在時の last-resort 候補化・両方向評価・
+  resident-curator レイアウト) は不変。
 
 ### Fixed
 
