@@ -30,4 +30,19 @@ def worker_dir_entry_schema() -> dict[str, Any]:
     return _load("worker_dir_entry.schema.json")
 
 
-__all__ = ["journal_event_schema", "worker_dir_entry_schema"]
+def broker_queue_event_schema() -> dict[str, Any]:
+    """Return the parsed JSON Schema for a ``.state/broker/queue.jsonl`` line.
+
+    Contract Set C amendment for ``.state/broker/`` (the org-broker journal).
+    Unlike :func:`journal_event_schema`, ``ts`` is a float epoch (the broker
+    writes ``time.time()``), not an ISO8601 string.
+    """
+
+    return _load("broker_queue_event.schema.json")
+
+
+__all__ = [
+    "broker_queue_event_schema",
+    "journal_event_schema",
+    "worker_dir_entry_schema",
+]
