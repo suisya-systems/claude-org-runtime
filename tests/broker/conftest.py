@@ -10,6 +10,7 @@ harness: protocol behaviour is exercised without spawning a real Claude.
 
 from __future__ import annotations
 
+import itertools
 import json
 import urllib.error
 import urllib.request
@@ -17,6 +18,78 @@ import urllib.request
 import pytest
 
 from claude_org_runtime.broker.server import Broker
+from claude_org_runtime.terminal import PaneRef
+
+
+class FakeAdapter:
+    """In-memory TerminalAdapter for pane-op tests (no real backend).
+
+    Mirrors the tmux-style native ``list_panes`` schema the broker normalizes
+    (``pane_id`` / ``left`` / ``top`` / ``width`` / ``height`` / ``active`` /
+    ``cursor_x`` / ``cursor_y``). ``spawn`` records the built argv so tests can
+    assert what the broker's structured builders emitted.
+    """
+
+    def __init__(self) -> None:
+        self._panes: dict[int, dict] = {}
+        self._screens: dict[int, str] = {}
+        self.spawned: list[dict] = []
+        self.killed: list[int] = []
+        self._counter = itertools.count(1)
+
+    # bootstrap a pre-existing pane (e.g. the caller pane) ------------------
+    def add_pane(self, active: bool = False, **geom) -> int:
+        handle = next(self._counter)
+        rec = {
+            "pane_id": handle, "active": active, "left": 0, "top": 0,
+            "width": 80, "height": 24, "cursor_x": 0, "cursor_y": 0,
+        }
+        rec.update(geom)
+        self._panes[handle] = rec
+        self._screens[handle] = ""
+        return handle
+
+    def set_focused(self, handle: int) -> None:
+        for h, p in self._panes.items():
+            p["active"] = (h == handle)
+
+    # TerminalAdapter Protocol --------------------------------------------
+    def spawn(self, argv, cwd=None, new_window=True) -> PaneRef:
+        handle = self.add_pane()
+        self.spawned.append({"argv": list(argv), "cwd": cwd, "handle": handle})
+        return PaneRef(pane_id=handle)
+
+    def list_panes(self) -> list[dict]:
+        return [dict(p) for p in self._panes.values()]
+
+    def pane_exists(self, pane_id) -> bool:
+        return pane_id in self._panes
+
+    def get_text(self, pane_id, escapes: bool = False) -> str:
+        return self._screens.get(pane_id, "")
+
+    def type_text(self, pane_id, text) -> None:
+        self._screens[pane_id] = self._screens.get(pane_id, "") + text
+
+    def send_enter(self, pane_id) -> None:
+        self._screens[pane_id] = self._screens.get(pane_id, "") + "\n"
+
+    def send_line(self, pane_id, text, settle: float = 0.0) -> None:
+        self.type_text(pane_id, text)
+        self.send_enter(pane_id)
+
+    def send_interrupt(self, pane_id) -> None:
+        self._screens[pane_id] = self._screens.get(pane_id, "") + "<C-c>"
+
+    def kill_pane(self, pane_id) -> None:
+        self._panes.pop(pane_id, None)
+        self._screens.pop(pane_id, None)
+        self.killed.append(pane_id)
+
+
+@pytest.fixture
+def fake_adapter():
+    return FakeAdapter()
 
 
 class MiniMcpClient:

@@ -27,18 +27,36 @@ if TYPE_CHECKING:  # mixin が前提とする Broker の共有状態 (型のみ)
 
 @dataclass
 class AgentBind:
-    """token ↔ agent/pane の bind (設計書 §4.4)。broker のみが保持する。"""
+    """token ↔ agent/pane の bind (設計書 §4.4)。broker のみが保持する。
+
+    role / auth_role の二系統 (Issue B codex Blocker 対応の維持):
+    ``auth_role`` は token 発行時に確定する**不変の権限 tier** で、surface の
+    role-scoped 公開 (§4.2) / tier gating はこれ**のみ**で決める。``role`` は
+    list_peers / list_panes に出る**表示専用**ラベルで、``set_pane_identity``
+    で書き換えられる (renga three-state)。表示 role を auth に使うと
+    set_pane_identity 経由の権限昇格を許すため、両者を分離している
+    (意図的セキュリティ強化であり gap ではない)。
+    """
 
     token: str
     agent_id: str
     name: str
-    role: str
+    role: str                         # 表示専用 (set_pane_identity で可変)
+    auth_role: str = ""               # 不変の権限 tier (issue_token で確定)
     pane_id: PaneId | None = None     # backend ネイティブ型 (WezTerm=int / tmux="%N"=str)
+    cwd: str | None = None            # spawn 時に broker が保持 (Set D cwd parity, §3.3-4)
+    kind: str | None = None           # peer client 種別 ("claude" / "codex" / None)
     registered: bool = False          # MCP initialize 到達で True (AC-2-3 の検知点)
     registered_at: float | None = None
     session_id: str | None = None
     summary: str = ""
     revoked: bool = False
+
+    def __post_init__(self) -> None:
+        # auth_role 未指定なら発行時 role を権限 tier の初期値にする。以後
+        # set_pane_identity が role を書き換えても auth_role は不変に保つ。
+        if not self.auth_role:
+            self.auth_role = self.role
 
 
 class TokenMixin:
@@ -56,13 +74,27 @@ class TokenMixin:
     _queues: dict[str, list[dict]]
 
     def issue_token(
-        self, agent_id: str, name: str, role: str, pane_id: PaneId | None = None
+        self,
+        agent_id: str,
+        name: str,
+        role: str,
+        pane_id: PaneId | None = None,
+        cwd: str | None = None,
+        kind: str | None = None,
     ) -> str:
-        """spawn 時の per-agent token 発行 (設計書 §4.4)。"""
+        """spawn 時の per-agent token 発行 (設計書 §4.4)。
+
+        ``role`` は発行時点で表示 role と権限 tier (``auth_role``) の双方の
+        初期値になる。以後 ``set_pane_identity`` が表示 role を書き換えても
+        ``auth_role`` は不変 (tier gating の根拠を昇格不能にする)。``cwd`` /
+        ``kind`` は spawn フローが渡し、list_peers / list_panes 出力の
+        cwd parity (§3.3-4) に使う。
+        """
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._binds[token] = AgentBind(
-                token=token, agent_id=agent_id, name=name, role=role, pane_id=pane_id
+                token=token, agent_id=agent_id, name=name, role=role,
+                auth_role=role, pane_id=pane_id, cwd=cwd, kind=kind,
             )
             self._queues.setdefault(agent_id, [])
         self._journal("token_issued", agent_id=agent_id, role=role, pane_id=pane_id)

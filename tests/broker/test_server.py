@@ -12,6 +12,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from claude_org_runtime.broker.server import Broker
+from claude_org_runtime.broker.surface import ToolArgError, dispatch_tool
+
 from .conftest import MiniMcpClient
 
 
@@ -159,3 +164,199 @@ def test_queue_journal_written_to_state_dir(broker, client_factory):
             "message_enqueued", "queue_drained"} <= kinds
     # ts は epoch float (broker_queue_event schema と整合)。
     assert all(isinstance(e["ts"], float) for e in events)
+
+
+# ===================================================================== pane ops
+# Pane-control surface (Issue C) を FakeAdapter 上で dispatch_tool 直叩きで検証する。
+# HTTP は messaging テストで網羅済みなので、ここはロジック面に集中する。
+
+def _ops(b, agent_id="d", role="dispatcher"):
+    """登録済みの ops-tier bind を作る。"""
+    tok = b.issue_token(agent_id, agent_id, role)
+    b.register_local(tok)
+    return b.get_bind(tok)
+
+
+def _text(out):
+    return json.loads(out["content"][0]["text"])
+
+
+def test_spawn_claude_builds_interactive_argv_and_registers(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {
+        "direction": "vertical", "name": "worker-foo", "role": "worker",
+        "model": "opus", "permission_mode": "acceptEdits", "cwd": "/repo",
+    })
+    res = _text(out)
+    assert res["agent_id"] == "worker-foo"
+    spawned = fake_adapter.spawned[-1]
+    argv = spawned["argv"]
+    assert argv[0] == "claude" and "--mcp-config" in argv
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+    assert spawned["cwd"] == "/repo"
+    # broker が注入した mcp-config は token bearer を含む (帰属の根拠)。
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert "Authorization" in cfg["mcpServers"]["org-broker"]["headers"]
+    # list_panes に cwd/name/role/kind が出る (cwd parity, §3.3-4)。
+    panes = _text(dispatch_tool(b, disp, "list_panes", {}))["panes"]
+    rec = [p for p in panes if p["name"] == "worker-foo"][0]
+    assert rec["cwd"] == "/repo" and rec["role"] == "worker" and rec["kind"] == "claude"
+
+
+def test_spawn_orphan_token_not_created_on_bad_args(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    before = len(b._binds)
+    with pytest.raises(ToolArgError):
+        dispatch_tool(b, disp, "spawn_claude_pane",
+                      {"direction": "vertical", "args": ["-p"]})  # headless
+    assert len(b._binds) == before  # pre-validate で token を作っていない
+    assert fake_adapter.spawned == []
+
+
+def test_resolve_target_three_ways(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    h0 = fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "alpha"})
+    h1 = fake_adapter.spawned[-1]["handle"]
+    assert b.resolve_target("alpha") == h1        # stable name
+    assert b.resolve_target(str(h1)) == h1        # 全桁数字 → handle
+    assert b.resolve_target("focused") == h0      # focused
+    assert b.resolve_target("nope") is None
+
+
+def test_spawn_codex_via_dispatch_rejects_exec_but_allows_tui(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    sec = _ops(b, "s", "secretary")
+    with pytest.raises(ToolArgError):
+        dispatch_tool(b, sec, "spawn_codex_pane",
+                      {"direction": "vertical", "args": ["exec", "ls"]})
+    # 拒否時に orphan token / spawn を残さない。
+    assert fake_adapter.spawned == []
+    out = dispatch_tool(b, sec, "spawn_codex_pane", {"direction": "vertical", "name": "cdx"})
+    assert _text(out)["agent_id"] == "cdx"
+    assert fake_adapter.spawned[-1]["argv"][0] == "codex"
+
+
+def test_spawn_generic_secretary_only_no_token(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    sec = _ops(b, "s", "secretary")
+    out = dispatch_tool(b, sec, "spawn_pane",
+                        {"direction": "horizontal", "command": "watch ls", "name": "watcher"})
+    assert _text(out)["name"] == "watcher"
+    h = fake_adapter.spawned[-1]["handle"]
+    assert b._meta_for(h)["token"] is None        # token 非注入 (非 org spawn)
+    assert "watch ls" in fake_adapter.spawned[-1]["argv"]
+
+
+def test_set_pane_identity_three_state_keeps_auth_role(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w1", "role": "worker"})
+    h = fake_adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    # str=設定
+    out = dispatch_tool(b, disp, "set_pane_identity", {"target": "w1", "role": "reviewer"})
+    assert _text(out)["role"] == "reviewer"
+    # auth tier (auth_role) は不変 — 表示 role 変更で権限昇格しない (§3.3-5)。
+    assert b._binds[tok].auth_role == "worker"
+    assert b._binds[tok].role == "reviewer"
+    # null=クリア
+    out = dispatch_tool(b, disp, "set_pane_identity", {"target": "w1", "role": None})
+    assert _text(out)["role"] is None
+    # omit=据置 — name は触っていないので w1 のまま (まだ name で引ける)。
+    assert b.resolve_target("w1") == h
+
+
+def test_set_pane_identity_name_collision_is_invalid_params(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "aa"})
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "bb"})
+    with pytest.raises(ToolArgError):
+        dispatch_tool(b, disp, "set_pane_identity", {"target": "bb", "name": "aa"})
+
+
+def test_close_pane_revokes_token_and_emits_event(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)   # keep pane count > 1
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = fake_adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    out = dispatch_tool(b, disp, "close_pane", {"target": "w"})
+    assert _text(out)["closed"] == h
+    assert h in fake_adapter.killed
+    assert b._binds[tok].revoked is True
+    assert b._meta_for(h) is None
+
+
+def test_close_last_pane_is_guarded(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "close_pane", {"target": "focused"})
+    assert out["isError"] is True
+    assert "[last_pane]" in out["content"][0]["text"]
+
+
+def test_poll_events_baseline_then_emit_and_filter(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    # 初回は「今以降」: 履歴 replay なし。timeout 0 で即 return。
+    first = b.poll_events(None, 0, None)
+    assert first["events"] == []
+    cur = first["next_since"]
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    drained = b.poll_events(cur, 0, None)
+    assert any(e["type"] == "pane_started" for e in drained["events"])
+    # types フィルタは返却を絞るが cursor は前進する。
+    filtered = b.poll_events(cur, 0, ["pane_exited"])
+    assert filtered["events"] == []
+
+
+def test_send_keys_enter_supported_others_flagged(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    h0 = fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "send_keys",
+                        {"target": "focused", "text": "y", "enter": True})
+    assert _text(out)["ok"] is True
+    assert "y" in fake_adapter.get_text(h0)
+    # 未知キー名は -32602 (renga vocab parity)。
+    with pytest.raises(ToolArgError):
+        dispatch_tool(b, disp, "send_keys", {"target": "focused", "keys": ["Hyper+Z"]})
+    # 有効だが現 adapter 非対応キー (Shift+Tab) は既知制限として明示エラー。
+    out = dispatch_tool(b, disp, "send_keys", {"target": "focused", "keys": ["Shift+Tab"]})
+    assert out["isError"] is True
+    assert "[key_unsupported]" in out["content"][0]["text"]
+
+
+def test_inspect_pane_text_and_grid(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    h0 = fake_adapter.add_pane(active=True)
+    fake_adapter._screens[h0] = "line1\nline2\nline3"
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "inspect_pane", {"target": "focused", "lines": 2})
+    assert out["structuredContent"]["text"] == "line2\nline3"
+    out = dispatch_tool(b, disp, "inspect_pane", {"target": "focused", "format": "grid"})
+    assert out["structuredContent"]["grid"][0]["text"] == "line1"
+
+
+def test_spawn_requires_backend(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical"})
+    assert out["isError"] is True
+    assert "[no_backend]" in out["content"][0]["text"]

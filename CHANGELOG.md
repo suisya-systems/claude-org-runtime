@@ -38,6 +38,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.state/broker/` — a bundled JSON Schema (Draft 2020-12) for a
   `queue.jsonl` line. `ts` is a float epoch (`time.time()`), distinct from
   `journal_event`'s ISO8601 string timestamp.
+- `broker`: pane-control MCP surface brought to the renga-peers **golden
+  shape** (Issue C / Epic #6 next stage C — drop-in form-difference-zero).
+  The catalogue grows from the 4 messaging tools to the 13-tool golden shape:
+  the 12 ported faces (`send_message` / `check_messages` / `list_peers` /
+  `set_summary` / `list_panes` / `inspect_pane` / `send_keys` / `poll_events`
+  / `close_pane` / `set_pane_identity` / `spawn_claude_pane` / `spawn_pane`)
+  **plus the newly added `spawn_codex_pane`**. `new_tab` / `focus_pane` are
+  intentionally excluded from the initial surface (human-judgment).
+- `broker`: structured `spawn_claude_pane` / `spawn_codex_pane` builders
+  assemble the interactive-TUI argv inside the broker (Claude gets the broker
+  MCP injected via `--mcp-config <token>` instead of renga's dev-channel
+  flag). The billing-neutral guard is now a **default-deny allowlist on the
+  broker's own builder output** (not caller-argv inspection), closing the
+  false-reject surface: value-flags carry arity, `argv[0]` is matched by
+  basename, and subcommands / bare positionals / `--` / unknown or headless
+  flags are rejected. `spawn_codex_pane` structurally restricts to the
+  interactive TUI — `exec` / `review` / `mcp-server` / `app-server` /
+  `exec-server` / `apply` / `sandbox` / `completion` and any other
+  subcommand are default-denied (mandatory test coverage).
+- `broker`: pane addressing resolves three ways (`Broker.resolve_target`) —
+  all-digit string → handle, non-digit string → stable name, `'focused'` →
+  focused pane — matching renga's addressing.
+- `broker`: `list_peers` / `list_panes` now carry **cwd** (kept in the broker
+  bind / pane registry at spawn time, since `tmux capture-pane` does not
+  expose it). `receive_mode` is the constant `"pull"` (broker delivery is
+  uniformly pull via `check_messages`; a Set D amendment vs renga's
+  push/poll distinction) and `kind` reflects the spawned client
+  (`"claude"` / `"codex"` / `null`).
+- `broker`: `set_pane_identity` gains renga three-state semantics
+  (omit = keep / `null` = clear / string = set) for `name` / `role`. The
+  display `role` is decoupled from an immutable `auth_role`: **tier gating
+  (§4.2) is decided by `auth_role` only**, so renaming a pane's display role
+  cannot escalate its privileges (Issue B codex Blocker carried forward as an
+  intentional security strengthening).
+- `broker`: role-scoped tool exposure (`tools/list` and dispatch are filtered
+  by `auth_role`) — worker / curator see messaging only; dispatcher adds the
+  pane-control tools; secretary additionally gets the generic `spawn_pane`
+  (attention-watcher launch). Reaching a tool outside one's tier is rejected
+  structurally, not by permission config.
+
+### Changed
+
+- `broker`: `list_peers` output gains `cwd` / `kind` / `receive_mode` fields
+  (additive; existing `id` / `name` / `role` / `summary` unchanged).
+
+### Known limitations
+
+- `broker`: this stage establishes the **surface shape** (catalogue + schemas
+  + builders + guards + target resolution + cwd parity + three-state
+  identity); the terminal adapter's native capabilities are out of scope and
+  tracked for Epic #6 next stage (#4, full backend adapter). Concretely:
+  directional split is accepted for shape parity but `adapter.spawn` opens a
+  new window/session (no in-place split); `send_keys` validates the full
+  renga key vocabulary (unknown names → `-32602`) but only emits the keys the
+  current adapter supports (literal text / Enter / Ctrl+C) — other valid keys
+  (e.g. Shift+Tab) return `[key_unsupported]`; `poll_events` is served from a
+  broker-internal lifecycle ring (spawn / close) rather than native backend
+  events; and `spawn_codex_pane` does not yet inject the broker MCP into Codex
+  (renga relies on a `RENGA_PEER_CLIENT_KIND` env that `adapter.spawn` cannot
+  set today). `claude-org-ja` is untouched (flag-gated, inactive under renga).
 
 ## [0.1.14] - 2026-06-09
 
