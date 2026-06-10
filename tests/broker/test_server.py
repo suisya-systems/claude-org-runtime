@@ -434,6 +434,8 @@ def test_spawn_failure_releases_name_reservation(tmp_path, fake_adapter):
     with pytest.raises(RuntimeError):
         dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "r"})
     assert "r" not in b._reserved_names             # 失敗時に解放されている
+    # 発行済み token も revoke され配送対象に残らない (部分 spawn のロールバック)。
+    assert all(bd.revoked for bd in b._binds.values() if bd.agent_id == "r")
     fake_adapter.spawn = orig
     out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "r"})
     assert _text(out)["agent_id"] == "r"            # 同名で再 spawn 可能

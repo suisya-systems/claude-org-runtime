@@ -466,6 +466,18 @@ class Broker(TokenMixin, StoreMixin):
         with self._lock:
             self._reserved_names.discard(name)
 
+    def _revoke_token(self, token: str | None) -> None:
+        """spawn 途中失敗時の発行済み token の掃除 (部分 spawn のロールバック)。
+
+        ``adapter.spawn`` 失敗時、token は既に発行済みだが pane に bind されない。
+        未登録のまま放置すると benign だが残存するため revoke して掃除する。"""
+        if not token:
+            return
+        with self._lock:
+            b = self._binds.get(token)
+            if b is not None:
+                b.revoked = True
+
     def _resolve_split_target(self, target: str) -> tuple["PaneId | None", dict | None]:
         """spawn 対象 pane を解決・検証する (Major 対応)。
 
@@ -506,6 +518,7 @@ class Broker(TokenMixin, StoreMixin):
         )
         if (err := self._reserve_name(name)) is not None:
             return _err(err)
+        token: str | None = None  # generic spawn では None のまま
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("claude")
@@ -519,10 +532,12 @@ class Broker(TokenMixin, StoreMixin):
             )
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
         except BaseException:
-            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
-            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
-            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
+            # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
+            # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
+            # discard を原子的に行う (spawn 成功後〜meta 登録前に同名 spawn が
+            # 再予約できる窓を作らない)。token は generic spawn では None。
             self._release_name(name)
+            self._revoke_token(token)
             raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token)
@@ -558,6 +573,7 @@ class Broker(TokenMixin, StoreMixin):
         argv = surface.build_codex_argv(extra_args=extra)
         if (err := self._reserve_name(name)) is not None:
             return _err(err)
+        token: str | None = None  # generic spawn では None のまま
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("codex")
@@ -567,10 +583,12 @@ class Broker(TokenMixin, StoreMixin):
             )
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
         except BaseException:
-            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
-            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
-            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
+            # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
+            # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
+            # discard を原子的に行う (spawn 成功後〜meta 登録前に同名 spawn が
+            # 再予約できる窓を作らない)。token は generic spawn では None。
             self._release_name(name)
+            self._revoke_token(token)
             raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "codex", token)
@@ -601,14 +619,17 @@ class Broker(TokenMixin, StoreMixin):
             return terr
         if (err := self._reserve_name(name)) is not None:
             return _err(err)
+        token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
         except BaseException:
-            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
-            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
-            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
+            # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
+            # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
+            # discard を原子的に行う (spawn 成功後〜meta 登録前に同名 spawn が
+            # 再予約できる窓を作らない)。token は generic spawn では None。
             self._release_name(name)
+            self._revoke_token(token)
             raise
         agent_id = name or self._gen_agent_id("pane")
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, None, None)
