@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/suisya-systems/claude-org-runtime/schema/broker_queue_event.schema.json",
+  "title": "BrokerQueueEvent",
+  "description": "One line of .state/broker/queue.jsonl, the org-broker's append-only journal (Contract Set C amendment for .state/broker/). Required: ts (epoch seconds, float) + event. Note: unlike .state/journal.jsonl (journal_event.schema.json, ISO8601 string ts), the broker writes ts as a float epoch via time.time(); the type difference is intentional and explicit here.",
+  "type": "object",
+  "required": ["ts", "event"],
+  "properties": {
+    "ts": {
+      "type": "number",
+      "description": "Epoch seconds (float) from time.time() at the moment the event was journalled. Distinct from journal_event.ts, which is an ISO8601 string."
+    },
+    "event": {
+      "type": "string",
+      "enum": [
+        "broker_started",
+        "broker_stopped",
+        "token_issued",
+        "agent_registered",
+        "session_closed",
+        "message_enqueued",
+        "queue_drained",
+        "nudge_sent",
+        "nudge_deferred",
+        "nudge_failed"
+      ]
+    },
+    "host": { "type": ["string", "null"] },
+    "port": { "type": ["integer", "null"] },
+    "agent_id": { "type": ["string", "null"] },
+    "from_id": { "type": ["string", "null"] },
+    "to_id": { "type": ["string", "null"] },
+    "role": { "type": ["string", "null"] },
+    "pane_id": {
+      "type": ["integer", "string", "null"],
+      "description": "Backend-native pane id: int on WezTerm, string (e.g. \"%3\") on tmux."
+    },
+    "chars": {
+      "type": ["integer", "null"],
+      "description": "Length of the delivered message body (the body itself is never journalled)."
+    },
+    "count": {
+      "type": ["integer", "null"],
+      "description": "Number of messages drained in a queue_drained event."
+    },
+    "attempt": {
+      "type": ["integer", "null"],
+      "description": "1-based nudge delivery attempt index (nudge_sent / nudge_deferred)."
+    },
+    "state": {
+      "type": ["string", "null"],
+      "description": "classify_pane_state result at a deferred nudge (busy|input_pending|idle|unknown)."
+    },
+    "error": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

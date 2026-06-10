@@ -19,6 +19,7 @@ from typing import Optional
 
 from . import __version__
 from .attention import cli as attention_cli
+from .broker import cli as broker_cli
 from .dispatcher import runner as dispatcher_runner
 from .migrate import v1_to_v2 as migrate_v1_to_v2
 from .settings import generator as settings_generator
@@ -92,6 +93,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attention_sub = attention_p.add_subparsers(dest="cmd", required=True)
     attention_cli.add_subparsers(attention_sub)
+
+    # broker
+    broker_p = sub.add_parser(
+        "broker",
+        help=(
+            "org-broker daemon (localhost MCP server + queue store + nudge "
+            "delivery). Flag-gated; inactive by default (renga)."
+        ),
+    )
+    broker_sub = broker_p.add_subparsers(dest="cmd", required=True)
+    broker_cli.add_subparsers(broker_sub)
 
     # migrate
     migrate_p = sub.add_parser(

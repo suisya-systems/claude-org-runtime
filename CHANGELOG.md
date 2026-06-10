@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `broker`: new subpackage porting the `claude-org-transport-lab`
+  `spike/broker.py` org-broker (Phase 4/5 で確定した MCP surface +
+  allowlist guard + session 検証) into `claude_org_runtime/broker/`,
+  split into four responsibilities — `surface` (MCP 面: PROTOCOL_VERSIONS /
+  SERVER_INFO / TOOLS / ToolArgError / `dispatch_tool`), `tokens`
+  (`AgentBind` + `TokenMixin`), `store` (`StoreMixin`: queue 永続化 +
+  JSONL journal), and `server` (`Broker` orchestrator: localhost HTTP MCP
+  server + nudge delivery + `_McpHandler`). The single-lock concurrency
+  contract (nudge double-injection check-and-set / DELETE deadlock
+  avoidance) is carried over unchanged. Nudge delivery lives in `server`,
+  not `store`, so queue persistence and PTY injection stay decoupled.
+- `broker`: queue journal is now written to `.state/broker/queue.jsonl`
+  (CWD-relative default; the spike wrote to its self-contained
+  `spike/broker-state/`).
+- `broker serve`: new daemon CLI entry, exposed both as
+  `claude-org-runtime broker serve ...` and
+  `python -m claude_org_runtime.broker`.
+- `broker.placement`: thin one-way reuse of
+  `dispatcher.runner.choose_split` (`list_panes(dict) -> Pane.from_dict ->
+  choose_split`) for balanced-split placement. Pure-function wrapper only;
+  it is intentionally NOT wired into spawn (the terminal adapter exposes no
+  split-target surface — that deeper integration is tracked separately).
+  Dependency direction is one-way: `broker -> terminal` / `choose_split`;
+  `claude-org-ja` does not import `broker` (flag-gated, inactive by default
+  under renga).
+- `schema.broker_queue_event_schema()`: Contract Set C amendment for
+  `.state/broker/` — a bundled JSON Schema (Draft 2020-12) for a
+  `queue.jsonl` line. `ts` is a float epoch (`time.time()`), distinct from
+  `journal_event`'s ISO8601 string timestamp.
+
 ## [0.1.14] - 2026-06-09
 
 ### Changed

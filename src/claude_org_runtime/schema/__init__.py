@@ -10,12 +10,17 @@ Public surface:
 - :mod:`.org_state` -- parser for the ``org-state.md`` Worker Directory
   Registry table.
 - :mod:`.json_schema` -- bundled JSON Schema (Draft 2020-12) files for
-  ``JournalEvent`` and ``WorkerDirEntry``.
+  ``JournalEvent``, ``WorkerDirEntry`` and the ``.state/broker/`` queue
+  journal (``BrokerQueueEvent``).
 """
 
 from .enums import AnomalyKind, JournalEventType, WorkerStatus
 from .journal_event import JournalEvent
-from .json_schema import journal_event_schema, worker_dir_entry_schema
+from .json_schema import (
+    broker_queue_event_schema,
+    journal_event_schema,
+    worker_dir_entry_schema,
+)
 from .org_state import WorkerDirEntry, parse_worker_directory_registry
 
 __all__ = [
@@ -24,6 +29,7 @@ __all__ = [
     "JournalEventType",
     "WorkerDirEntry",
     "WorkerStatus",
+    "broker_queue_event_schema",
     "journal_event_schema",
     "parse_worker_directory_registry",
     "worker_dir_entry_schema",
