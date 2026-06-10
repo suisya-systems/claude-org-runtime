@@ -343,6 +343,26 @@ def tools_for(auth_role: str) -> list[dict]:
     return [t for t in TOOLS if t["name"] in allowed]
 
 
+# tier 序列 (権限の強さ)。spawn 子の auth_role を caller tier で上限を切るのに使う。
+_TIER_RANK = {"secretary": 2, "dispatcher": 1}
+
+
+def capped_auth_role(requested_role: str | None, caller_auth_role: str) -> str:
+    """spawn 子 token の権限 tier を decide する (Blocker 対応)。
+
+    表示 role の自己申告で tier を昇格できないよう、要求 role 由来の tier を
+    **caller tier で上限を切る** (caller が持つ以上の権限は渡せない)。返り値は
+    tier gating が解釈する canonical な auth_role 文字列。表示 role はこれとは
+    別に (要求どおり) 保持される。
+    """
+    eff = min(_TIER_RANK.get(requested_role or "", 0), _TIER_RANK.get(caller_auth_role, 0))
+    if eff >= 2:
+        return "secretary"
+    if eff == 1:
+        return "dispatcher"
+    return "worker"  # messaging-only tier (worker / curator / 未知 role)
+
+
 # ---------------------------------------------------------------------------
 # 課金中立 spawn argv ビルダー (default-deny allowlist)
 # ---------------------------------------------------------------------------
@@ -690,10 +710,11 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
             if permission_mode is not None and not isinstance(permission_mode, str):
                 raise ToolArgError("permission_mode must be a string")
             return broker.spawn_claude(
-                direction, target, pane_name, role, model, permission_mode, extra, cwd
+                bind, direction, target, pane_name, role, model,
+                permission_mode, extra, cwd,
             )
         if name == "spawn_codex_pane":
-            return broker.spawn_codex(direction, target, pane_name, role, extra, cwd)
+            return broker.spawn_codex(bind, direction, target, pane_name, role, extra, cwd)
         # spawn_pane (generic)
         command = args.get("command")
         if command is not None and not isinstance(command, str):

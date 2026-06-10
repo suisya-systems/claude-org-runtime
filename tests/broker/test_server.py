@@ -360,3 +360,48 @@ def test_spawn_requires_backend(tmp_path):
     out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical"})
     assert out["isError"] is True
     assert "[no_backend]" in out["content"][0]["text"]
+
+
+def test_spawn_child_auth_role_capped_by_caller_tier(tmp_path, fake_adapter):
+    """Blocker 対応: 表示 role の自己申告で tier を昇格できない (caller tier 上限)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b, "d", "dispatcher")
+    # dispatcher が role="secretary" を申告 → auth_role は dispatcher 止まり。
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "x", "role": "secretary"})
+    tok = b._meta_for(fake_adapter.spawned[-1]["handle"])["token"]
+    assert b._binds[tok].auth_role == "dispatcher"   # 昇格していない
+    assert b._binds[tok].role == "secretary"          # 表示は要求どおり
+    # role 未指定は messaging tier (worker)。
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "y"})
+    tok2 = b._meta_for(fake_adapter.spawned[-1]["handle"])["token"]
+    assert b._binds[tok2].auth_role == "worker"
+    # secretary は dispatcher tier を子に渡せる。
+    sec = _ops(b, "s", "secretary")
+    dispatch_tool(b, sec, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "z", "role": "dispatcher"})
+    tok3 = b._meta_for(fake_adapter.spawned[-1]["handle"])["token"]
+    assert b._binds[tok3].auth_role == "dispatcher"
+
+
+def test_spawn_rejects_unknown_explicit_target(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane",
+                        {"direction": "vertical", "target": "ghost"})
+    assert out["isError"] is True
+    assert "[pane_not_found]" in out["content"][0]["text"]
+    assert fake_adapter.spawned == []   # 解決前に弾く (orphan を作らない)
+
+
+def test_set_pane_identity_null_name_clears_bind(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    tok = b._meta_for(fake_adapter.spawned[-1]["handle"])["token"]
+    dispatch_tool(b, disp, "set_pane_identity", {"target": "w", "name": None})
+    assert b._binds[tok].name == ""         # bind 側 name もクリア (Minor 対応)
+    assert b.resolve_target("w") is None     # 旧名で解決され続けない

@@ -74,7 +74,11 @@ class Broker(TokenMixin, StoreMixin):
         # agent_id, token}。list_panes / resolve_target / set_pane_identity の
         # org メタ (name/role/cwd) の単一の出所。token pane は bind 表にも載るが、
         # generic spawn_pane (token 非注入) はここにのみ載る。
+        # _pane_meta / _reserved_names は ``_lock`` (binds/queues と同一の単一
+        # Lock) で守る。_lock 下では adapter I/O / _journal / _emit_event を
+        # 呼ばない (既存のデッドロック回避契約を pane registry にも適用する)。
         self._pane_meta: dict[str, dict] = {}
+        self._reserved_names: set[str] = set()  # spawn in-flight の name 予約
         self._pane_counter = itertools.count(1)
 
         # poll_events 用 lifecycle イベント ring (cursor = list index)。
@@ -200,17 +204,20 @@ class Broker(TokenMixin, StoreMixin):
         """
         if self.adapter is None:
             return None
+        # adapter I/O は lock 外で先に済ませる (lock 下で I/O しない契約)。
+        panes = self._adapter_panes()
         if target == "focused":
-            for p in self._adapter_panes():
+            for p in panes:
                 if p.get("active"):
                     return p.get("pane_id")
             return None
         if surface._ALL_DIGITS.match(target):
             # 全桁数字は常に handle (renga 契約)。native 型を保って返す。
-            meta = self._pane_meta.get(target)
+            with self._lock:
+                meta = self._pane_meta.get(target)
             if meta is not None:
                 return meta["handle"]
-            for p in self._adapter_panes():
+            for p in panes:
                 if str(p.get("pane_id")) == target:
                     return p.get("pane_id")
             return None
@@ -242,10 +249,13 @@ class Broker(TokenMixin, StoreMixin):
         (cwd は tmux capture に無いため bind/登録簿が唯一の出所 — §3.3-4)。
         receive_mode は全 pull 統一の定数 (Set D amendment)。
         """
+        panes = self._adapter_panes()
+        with self._lock:  # _pane_meta の一貫スナップショット (iteration 中 mutation 回避)
+            meta_snapshot = {k: dict(v) for k, v in self._pane_meta.items()}
         out: list[dict] = []
-        for p in self._adapter_panes():
+        for p in panes:
             handle = p.get("pane_id")
-            meta = self._meta_for(handle) or {}
+            meta = meta_snapshot.get(str(handle), {})
             out.append({
                 "id": handle,
                 "name": meta.get("name"),
@@ -348,17 +358,15 @@ class Broker(TokenMixin, StoreMixin):
         if len(self._adapter_panes()) <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)
-        meta = self._pane_meta.pop(str(handle), None)
-        agent_id = None
-        if meta is not None:
-            agent_id = meta.get("agent_id")
-            tok = meta.get("token")
-            if tok:
-                with self._lock:
-                    b = self._binds.get(tok)
-                    if b is not None:
-                        b.revoked = True
-                        b.registered = False
+        # registry の pop と token revoke を 1 ロックスコープで原子的に行う。
+        with self._lock:
+            meta = self._pane_meta.pop(str(handle), None)
+            agent_id = meta.get("agent_id") if meta else None
+            tok = meta.get("token") if meta else None
+            if tok and tok in self._binds:
+                b = self._binds[tok]
+                b.revoked = True
+                b.registered = False
         self._emit_event({"type": "pane_exited", "pane_id": handle, "agent_id": agent_id})
         self._journal("pane_closed", pane_id=handle, agent_id=agent_id)
         return _ok({"ok": True, "closed": handle})
@@ -379,42 +387,48 @@ class Broker(TokenMixin, StoreMixin):
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
+        # resolve_target は内部で _lock を取るため lock 外で先に呼ぶ (非再入)。
         handle = self.resolve_target(target)
         if handle is None:
             return _err(f"[pane_not_found] no pane for target {target!r}")
-        meta = self._meta_for(handle)
-        if meta is None:
-            return _err(
-                f"[pane_not_found] target {target!r} is not a broker-managed pane "
-                "(identity lives in the broker pane registry)"
-            )
-        if has_name and new_name is not None:
-            # 衝突検査 (renga: name は tab 内一意)。自分自身は除外。
-            with self._lock:
-                for h, m in self._pane_meta.items():
-                    if h != str(handle) and m.get("name") == new_name:
-                        raise ToolArgError(f"name {new_name!r} collides with another pane")
-        # 適用。bind 表 (token pane) にも display を反映 (auth_role は不変)。
+        collision: str | None = None
+        record: dict | None = None
         with self._lock:
-            if has_name:
-                meta["name"] = new_name
-            if has_role:
-                meta["role"] = new_role
-            tok = meta.get("token")
-            if tok and tok in self._binds:
-                b = self._binds[tok]
-                if has_name and new_name is not None:
-                    b.name = new_name
+            meta = self._pane_meta.get(str(handle))
+            if meta is None:
+                return _err(
+                    f"[pane_not_found] target {target!r} is not a broker-managed "
+                    "pane (identity lives in the broker pane registry)"
+                )
+            # 衝突検査 (renga: name は tab 内一意)。自分自身 / in-flight 予約も除外せず見る。
+            if has_name and new_name is not None:
+                taken = new_name in self._reserved_names or any(
+                    h != str(handle) and m.get("name") == new_name
+                    for h, m in self._pane_meta.items()
+                )
+                if taken:
+                    collision = new_name
+            if collision is None:
+                if has_name:
+                    meta["name"] = new_name
                 if has_role:
-                    b.role = new_role if new_role is not None else ""
-        record = {
-            "id": handle,
-            "name": meta.get("name"),
-            "role": meta.get("role"),
-            "cwd": meta.get("cwd"),
-        }
+                    meta["role"] = new_role
+                tok = meta.get("token")
+                if tok and tok in self._binds:
+                    b = self._binds[tok]
+                    if has_name:
+                        # null クリアは bind 側 name も落とす (旧名で解決され続けない)。
+                        b.name = new_name if new_name is not None else ""
+                    if has_role:
+                        b.role = new_role if new_role is not None else ""
+                record = {
+                    "id": handle, "name": meta.get("name"),
+                    "role": meta.get("role"), "cwd": meta.get("cwd"),
+                }
+        if collision is not None:
+            raise ToolArgError(f"name {collision!r} collides with another pane")
         self._journal("pane_identity_set", pane_id=handle,
-                      name=meta.get("name"), role=meta.get("role"))
+                      name=record["name"], role=record["role"])
         return _ok(record)
 
     # ---------------------------------------------------------- pane: spawn
@@ -425,42 +439,87 @@ class Broker(TokenMixin, StoreMixin):
         self, handle: "PaneId", agent_id: str, name: str | None,
         role: str | None, cwd: str | None, kind: str | None, token: str | None,
     ) -> None:
-        self._pane_meta[str(handle)] = {
-            "handle": handle, "agent_id": agent_id, "name": name,
-            "role": role, "cwd": cwd, "kind": kind, "token": token,
-        }
+        with self._lock:
+            self._pane_meta[str(handle)] = {
+                "handle": handle, "agent_id": agent_id, "name": name,
+                "role": role, "cwd": cwd, "kind": kind, "token": token,
+            }
+            self._reserved_names.discard(name)  # 予約を確定 meta へ昇格
+
+    def _reserve_name(self, name: str | None) -> str | None:
+        """name を予約する (collision なら error 文字列)。spawn の I/O をまたいだ
+        TOCTOU で重複 name が通るのを防ぐ (in-flight 予約を含めて検査)。"""
+        if name is None:
+            return None
+        with self._lock:
+            taken = name in self._reserved_names or any(
+                m.get("name") == name for m in self._pane_meta.values()
+            )
+            if taken:
+                return f"[name_taken] pane name {name!r} already in use"
+            self._reserved_names.add(name)
+        return None
+
+    def _release_name(self, name: str | None) -> None:
+        if name is None:
+            return
+        with self._lock:
+            self._reserved_names.discard(name)
+
+    def _resolve_split_target(self, target: str) -> tuple["PaneId | None", dict | None]:
+        """spawn 対象 pane を解決・検証する (Major 対応)。
+
+        renga は target pane を split する契約。adapter は方向 split を持たない
+        (§4.7 Phase 4) ため実 spawn は new window になるが、**明示 target の
+        誤指定は検出する**: 解決不能かつ 'focused' 既定でなければ pane_not_found。
+        'focused' 既定は broker が caller pane を把握していない場合があるため
+        best-effort で通す。返り値は (resolved_handle, error_result)。
+        """
+        handle = self.resolve_target(target)
+        if handle is None and target != "focused":
+            return None, _err(f"[pane_not_found] no pane for split target {target!r}")
+        return handle, None
 
     def spawn_claude(
-        self, direction: str, target: str, name: str | None, role: str | None,
-        model: str | None, permission_mode: str | None,
+        self, caller: AgentBind, direction: str, target: str, name: str | None,
+        role: str | None, model: str | None, permission_mode: str | None,
         extra: list[str], cwd: str | None,
     ) -> dict:
         """spawn_claude_pane: 対話 TUI claude を broker MCP 接続で起動する。
 
         agent_id は name から導出 (無ければ生成)。argv は broker が構造化ビルダーで
-        組み (default-deny guard 込み)、--mcp-config で token を注入する。
-        adapter は方向 split を持たない (§4.7 Phase 4) ため direction は受理して
-        記録し、実 spawn は adapter.spawn (new window) で行う (本段の既知挙動)。
+        組み (default-deny guard 込み)、--mcp-config で token を注入する。子 token の
+        権限 tier (auth_role) は表示 role の自己申告ではなく **caller tier で上限を
+        切った** tier にする (Blocker: spawn 時 tier 昇格の阻止)。adapter は方向
+        split を持たない (§4.7 Phase 4) ため direction / target は受理して
+        記録・検証し、実 spawn は adapter.spawn (new window) で行う (本段の既知挙動)。
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
-        if name is not None and (err := self._name_collision(name)) is not None:
-            return _err(err)
+        split_handle, terr = self._resolve_split_target(target)
+        if terr is not None:
+            return terr
         # token 発行前に caller 由来 argv を pre-validate (orphan token を作らない)。
         surface.build_claude_argv(
             mcp_config_json="{}", model=model,
             permission_mode=permission_mode, extra_args=extra,
         )
-        role_val = role or "worker"  # 既定は最小権限 tier (messaging のみ)
-        agent_id = name or self._gen_agent_id("claude")
-        token = self.issue_token(
-            agent_id, name or agent_id, role_val, cwd=cwd, kind="claude"
-        )
-        argv = surface.build_claude_argv(
-            mcp_config_json=json.dumps(self.mcp_config_for(token)),
-            model=model, permission_mode=permission_mode, extra_args=extra,
-        )
-        ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        if (err := self._reserve_name(name)) is not None:
+            return _err(err)
+        try:
+            auth_role = surface.capped_auth_role(role, caller.auth_role)
+            agent_id = name or self._gen_agent_id("claude")
+            token = self.issue_token(
+                agent_id, name or agent_id, role or "", cwd=cwd, kind="claude",
+                auth_role=auth_role,
+            )
+            argv = surface.build_claude_argv(
+                mcp_config_json=json.dumps(self.mcp_config_for(token)),
+                model=model, permission_mode=permission_mode, extra_args=extra,
+            )
+            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        finally:
+            self._release_name(name)
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token)
         self._emit_event({
@@ -469,34 +528,42 @@ class Broker(TokenMixin, StoreMixin):
         self._journal("pane_spawned", kind="claude", agent_id=agent_id,
                       pane_id=ref.pane_id)
         return _ok({
-            "id": ref.pane_id, "agent_id": agent_id, "name": name,
-            "role": role, "direction": direction, "cwd": cwd,
+            "id": ref.pane_id, "agent_id": agent_id, "name": name, "role": role,
+            "direction": direction, "split_target": split_handle, "cwd": cwd,
         })
 
     def spawn_codex(
-        self, direction: str, target: str, name: str | None, role: str | None,
-        extra: list[str], cwd: str | None,
+        self, caller: AgentBind, direction: str, target: str, name: str | None,
+        role: str | None, extra: list[str], cwd: str | None,
     ) -> dict:
         """spawn_codex_pane: 対話 TUI codex を起動する (§3.3-6)。
 
         課金中立 default-deny guard で対話 TUI に構造的限定する (exec / review /
-        *-server 等の非対話サブコマンドを拒否)。codex の MCP 自動登録は renga の
+        *-server 等の非対話サブコマンドを拒否)。子 token の auth_role は caller tier
+        上限で切る (Blocker 対応)。codex の MCP 自動登録は renga の
         RENGA_PEER_CLIENT_KIND env 注入に相当する env を adapter.spawn が持たない
         ため本段では行わない (token は bind/帰属簿のため発行・記録のみ。env 注入は
         Phase 4 / full backend adapter。既知制限)。
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
-        if name is not None and (err := self._name_collision(name)) is not None:
-            return _err(err)
+        split_handle, terr = self._resolve_split_target(target)
+        if terr is not None:
+            return terr
         # token 発行前に default-deny guard を通す (orphan token を作らない)。
         argv = surface.build_codex_argv(extra_args=extra)
-        role_val = role or "worker"
-        agent_id = name or self._gen_agent_id("codex")
-        token = self.issue_token(
-            agent_id, name or agent_id, role_val, cwd=cwd, kind="codex"
-        )
-        ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        if (err := self._reserve_name(name)) is not None:
+            return _err(err)
+        try:
+            auth_role = surface.capped_auth_role(role, caller.auth_role)
+            agent_id = name or self._gen_agent_id("codex")
+            token = self.issue_token(
+                agent_id, name or agent_id, role or "", cwd=cwd, kind="codex",
+                auth_role=auth_role,
+            )
+            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        finally:
+            self._release_name(name)
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "codex", token)
         self._emit_event({
@@ -505,8 +572,8 @@ class Broker(TokenMixin, StoreMixin):
         self._journal("pane_spawned", kind="codex", agent_id=agent_id,
                       pane_id=ref.pane_id)
         return _ok({
-            "id": ref.pane_id, "agent_id": agent_id, "name": name,
-            "role": role, "direction": direction, "cwd": cwd,
+            "id": ref.pane_id, "agent_id": agent_id, "name": name, "role": role,
+            "direction": direction, "split_target": split_handle, "cwd": cwd,
         })
 
     def spawn_generic(
@@ -516,30 +583,29 @@ class Broker(TokenMixin, StoreMixin):
         """spawn_pane (generic, secretary tier): 任意コマンドを起動する。
 
         token を注入しない非 org spawn 経路 (attention watcher 用, §3.3-3)。
-        bind は作らない (peer にならない) が、name/role/cwd は pane 登録簿に残す
-        (list_panes に出すため)。command 無しは shell のみ起動。
+        bind は作らない (peer にならない・tier を持たない) が、name/role/cwd は
+        pane 登録簿に残す (list_panes に出すため)。command 無しは shell のみ起動。
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
-        if name is not None and (err := self._name_collision(name)) is not None:
+        split_handle, terr = self._resolve_split_target(target)
+        if terr is not None:
+            return terr
+        if (err := self._reserve_name(name)) is not None:
             return _err(err)
-        argv = ["sh", "-c", command] if command else ["sh"]
-        ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        try:
+            argv = ["sh", "-c", command] if command else ["sh"]
+            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+        finally:
+            self._release_name(name)
         agent_id = name or self._gen_agent_id("pane")
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, None, None)
         self._emit_event({"type": "pane_started", "pane_id": ref.pane_id})
         self._journal("pane_spawned", kind="generic", pane_id=ref.pane_id)
         return _ok({
             "id": ref.pane_id, "name": name, "role": role,
-            "direction": direction, "cwd": cwd,
+            "direction": direction, "split_target": split_handle, "cwd": cwd,
         })
-
-    def _name_collision(self, name: str) -> str | None:
-        with self._lock:
-            for m in self._pane_meta.values():
-                if m.get("name") == name:
-                    return f"[name_taken] pane name {name!r} already in use"
-        return None
 
     # ---------------------------------------------------------- pane: events
     def _emit_event(self, ev: dict) -> None:

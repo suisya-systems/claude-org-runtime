@@ -81,20 +81,23 @@ class TokenMixin:
         pane_id: PaneId | None = None,
         cwd: str | None = None,
         kind: str | None = None,
+        auth_role: str | None = None,
     ) -> str:
         """spawn 時の per-agent token 発行 (設計書 §4.4)。
 
-        ``role`` は発行時点で表示 role と権限 tier (``auth_role``) の双方の
-        初期値になる。以後 ``set_pane_identity`` が表示 role を書き換えても
-        ``auth_role`` は不変 (tier gating の根拠を昇格不能にする)。``cwd`` /
-        ``kind`` は spawn フローが渡し、list_peers / list_panes 出力の
+        ``role`` は**表示専用**ラベル。``auth_role`` は**不変の権限 tier** で、
+        省略時は ``role`` を初期値にする。spawn フローは表示 role の自己申告に
+        よる tier 昇格を防ぐため、caller tier で上限を切った tier を ``auth_role``
+        に明示渡しする (表示 role はそのまま渡す)。以後 ``set_pane_identity`` が
+        表示 role を書き換えても ``auth_role`` は不変 (tier gating の根拠を
+        昇格不能にする)。``cwd`` / ``kind`` は list_peers / list_panes 出力の
         cwd parity (§3.3-4) に使う。
         """
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._binds[token] = AgentBind(
                 token=token, agent_id=agent_id, name=name, role=role,
-                auth_role=role, pane_id=pane_id, cwd=cwd, kind=kind,
+                auth_role=auth_role or role, pane_id=pane_id, cwd=cwd, kind=kind,
             )
             self._queues.setdefault(agent_id, [])
         self._journal("token_issued", agent_id=agent_id, role=role, pane_id=pane_id)
