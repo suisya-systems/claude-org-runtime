@@ -405,3 +405,43 @@ def test_set_pane_identity_null_name_clears_bind(tmp_path, fake_adapter):
     dispatch_tool(b, disp, "set_pane_identity", {"target": "w", "name": None})
     assert b._binds[tok].name == ""         # bind 側 name もクリア (Minor 対応)
     assert b.resolve_target("w") is None     # 旧名で解決され続けない
+
+
+def test_spawn_name_reservation_promotes_to_meta(tmp_path, fake_adapter):
+    """予約は spawn 成功後 _register_pane が meta へ確定昇格し、予約集合に残さない。
+    確定後の同名 spawn は name_taken (in-flight 窓も meta も両方で重複を弾く)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "dup"})
+    assert "dup" not in b._reserved_names          # 予約は meta へ昇格済み
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "dup"})
+    assert out["isError"] is True
+    assert "[name_taken]" in out["content"][0]["text"]
+
+
+def test_spawn_failure_releases_name_reservation(tmp_path, fake_adapter):
+    """spawn (adapter I/O) 失敗時は except 経路で予約を解放し、同名を再利用できる。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    orig = fake_adapter.spawn
+
+    def boom(*a, **k):
+        raise RuntimeError("adapter spawn failed")
+
+    fake_adapter.spawn = boom
+    with pytest.raises(RuntimeError):
+        dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "r"})
+    assert "r" not in b._reserved_names             # 失敗時に解放されている
+    fake_adapter.spawn = orig
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "r"})
+    assert _text(out)["agent_id"] == "r"            # 同名で再 spawn 可能
+
+
+def test_spawn_target_must_be_string(tmp_path, fake_adapter):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    with pytest.raises(ToolArgError):
+        dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "target": 123})

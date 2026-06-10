@@ -518,8 +518,12 @@ class Broker(TokenMixin, StoreMixin):
                 model=model, permission_mode=permission_mode, extra_args=extra,
             )
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
-        finally:
+        except BaseException:
+            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
+            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
+            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
             self._release_name(name)
+            raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token)
         self._emit_event({
@@ -562,8 +566,12 @@ class Broker(TokenMixin, StoreMixin):
                 auth_role=auth_role,
             )
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
-        finally:
+        except BaseException:
+            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
+            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
+            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
             self._release_name(name)
+            raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "codex", token)
         self._emit_event({
@@ -596,8 +604,12 @@ class Broker(TokenMixin, StoreMixin):
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
-        finally:
+        except BaseException:
+            # 失敗時のみ予約を解放する。成功時は予約を保持したまま
+            # _register_pane が _lock 下で meta 登録と予約 discard を原子的に行う
+            # (spawn 成功後〜meta 登録前に同名 spawn が再予約できる窓を作らない)。
             self._release_name(name)
+            raise
         agent_id = name or self._gen_agent_id("pane")
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, None, None)
         self._emit_event({"type": "pane_started", "pane_id": ref.pane_id})

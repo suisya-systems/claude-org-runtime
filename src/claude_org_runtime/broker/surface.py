@@ -687,6 +687,8 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
         if direction not in ("vertical", "horizontal"):
             raise ToolArgError("direction must be 'vertical' or 'horizontal'")
         target = args.get("target", "focused")
+        if not isinstance(target, str):
+            raise ToolArgError("target must be a string")
         pane_name = args.get("name")
         if pane_name is not None:
             if not isinstance(pane_name, str):
