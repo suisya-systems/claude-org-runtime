@@ -250,3 +250,56 @@ def test_renga_surface_bit_equivalent_to_schema_user_common() -> None:
         td.get_surface("renga").allow_entries_for_role("user_common")
     )
     assert descriptor_entries == _schema_user_common_renga_tools()
+
+
+def _schema_roles_renga_bare_tools() -> dict[str, set[str]]:
+    """role 名 -> その required_allow に並ぶ renga bare tool 名集合。"""
+    resource = files("claude_org_runtime.settings").joinpath(
+        "role_configs_schema.json"
+    )
+    schema = json.loads(resource.read_text(encoding="utf-8"))
+    out: dict[str, set[str]] = {}
+    prefix = "mcp__renga-peers__"
+    for role, cfg in schema["roles"].items():
+        names = {
+            e[len(prefix):]
+            for e in cfg.get("required_allow", [])
+            if e.startswith(prefix)
+        }
+        if names:
+            out[role] = names
+    return out
+
+
+def test_every_role_schema_renga_is_subset_of_descriptor() -> None:
+    """**per-role drift 検知**: 各ロールの現行 schema renga 集合 ⊆ descriptor 14。
+
+    descriptor の renga capability surface が各ロールの defense-in-depth
+    subset (例 secretary 12 面) を漏れなく包含する faithful superset である
+    ことを固定する。schema が descriptor に無い renga tool を足したら fail し、
+    drift を検知する (codex review 指摘への回帰)。
+    """
+    descriptor_14 = set(td.RENGA_REQUIRED_TOOLS)
+    per_role = _schema_roles_renga_bare_tools()
+    # 少なくとも user_common / secretary は renga 面を持つ (前提崩れの検知)。
+    assert "user_common" in per_role
+    assert "secretary" in per_role
+    for role, names in per_role.items():
+        missing = names - descriptor_14
+        assert not missing, f"{role}: schema renga tools absent from descriptor: {missing}"
+
+
+def test_schema_secretary_is_narrowed_subset_not_full_14() -> None:
+    """secretary の schema renga 面は 14 の真部分集合 (narrowing が機能)。
+
+    descriptor は capability surface (14) を返すが、schema の per-role
+    narrowing は subset であることを明示的に固定する (uniform-14 と per-role
+    narrowing の関係を文書化する回帰)。
+    """
+    per_role = _schema_roles_renga_bare_tools()
+    secretary = per_role["secretary"]
+    descriptor_14 = set(td.RENGA_REQUIRED_TOOLS)
+    assert secretary < descriptor_14  # 真部分集合
+    # secretary は人間補助の new_tab / focus_pane を含まない (§3.1)。
+    assert "new_tab" not in secretary
+    assert "focus_pane" not in secretary

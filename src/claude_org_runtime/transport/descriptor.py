@@ -16,8 +16,19 @@ renga (§3.1): server ``renga-peers``, injection
 ``--dangerously-load-development-channels server:renga-peers``, **全ロール同一
 surface = required 14 面** (``tools/check_renga_compat.py`` の
 ``REQUIRED_MCP_TOOLS`` / renga 0.18.0 と一致)。renga には構造的 tier gating が
-無いため、transport surface はロールに依らず一様 (schema の per-role narrowing は
-descriptor の transport surface ではなく defense-in-depth の subset)。
+無いため、transport surface はロールに依らず一様。
+
+**capability surface vs per-role narrowing (重要)**: descriptor が表すのは
+transport の *capability surface*。renga ではこれが全ロール一様の 14 面である。
+一方 ``role_configs_schema.json`` の各ロール ``required_allow`` に並ぶ
+``mcp__renga-peers__*`` (例: secretary は ``focus_pane``/``new_tab`` を外した
+12 面) は、共有 ``user_common`` の 14 面の上にかける **defense-in-depth の
+allowlist 絞り込み (subset)** であり、descriptor が再現する対象ではない
+(§5.3「renga 時の全ロール同一 surface を allowlist で絞る」モデル)。bit 等価の
+anchor は共有 ``user_common`` の renga 14 面 (= REQUIRED_MCP_TOOLS) であり、
+各ロールの subset 関係は不変条件としてテストで固定する (per-role drift 検知)。
+ロール別の絞り込みをどう per-role ファイルへ反映するかは ja 側配線 (ja#513) の
+責務で、本 runtime のスコープ外。
 
 broker (§4.2 / §5.3): server ``org-broker``, injection ``--mcp-config
 <broker>``, **role tier 別**。tier 別集合は
