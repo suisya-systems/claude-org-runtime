@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-06-12
+
+### Added
+
+- `broker serve --root-role {worker,curator,dispatcher,secretary}`
+  (default `worker`): the manual-verification token issued by
+  `broker serve` was previously pinned to the worker tier (`issue_token`
+  hard-coded `"worker"`), so there was no CLI path to bind the root agent
+  at the secretary (or any other) tier. The new flag flows into the issued
+  token's `auth_role`, so `tools/list` is structurally narrowed to that
+  tier's surface. `default=worker` keeps the current behavior unchanged
+  (messaging 4 面). Token issuance is extracted into `issue_root_token()`
+  so the `--root-role → auth_role → 公開面` boundary is unit-testable
+  independently of the blocking `serve` loop. The `--mcp-config` display
+  and the billing-neutral `spawn` guard are unchanged. Closes
+  `claude-org-runtime#53` (PR #54).
+
 ## [0.1.17] - 2026-06-11
 
 ### Added
