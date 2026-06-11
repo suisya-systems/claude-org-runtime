@@ -107,6 +107,12 @@ def run(args: argparse.Namespace) -> int:
     tok = issue_root_token(broker, args.root_role)
     print(f"manual test token ({args.root_role}):", tok)
     print("mcp-config:", json.dumps(broker.mcp_config_for(tok)))
+    # root pane (人間駆動の窓口) を pane 登録簿に論理ペインとして載せる (Issue #57)。
+    # bind.pane_id は None のままなので PTY ナッジは飛ばない (人間は check_messages
+    # で読む)。これで list_panes に窓口が出て、子を 1 つ spawn した状態でも
+    # close_pane が [last_pane] 誤判定せず子を閉じられる。
+    root_pane = broker.register_logical_pane(tok)
+    print(f"root pane registered (logical, id={root_pane['id']}, role={args.root_role})")
     try:
         while True:
             time.sleep(3600)

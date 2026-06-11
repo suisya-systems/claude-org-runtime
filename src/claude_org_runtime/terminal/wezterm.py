@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 # 共有基盤から再エクスポート (既存 import 経路 `from wezterm import ...` を壊さない
 # ため)。NUDGE_TEXT / PaneRef / classify_pane_state / wait_for_state は backend
@@ -54,6 +55,13 @@ def find_wezterm() -> str:
 
 @dataclass
 class WezTermAdapter:
+    # wezterm cli list は global mux を見せるため、窓口の実 pane も匿名で
+    # list_panes() に出る (dedicated socket 分離が無い)。broker の last-pane
+    # ガードは論理ペイン (窓口) を +1 計上しない backend (窓口は既に実 pane
+    # として数えられる/不在なら +1 は stale なため)。backend 固定の能力なので
+    # ClassVar (dataclass field にしない)。
+    isolated_session: ClassVar[bool] = False
+
     exe: str = field(default_factory=find_wezterm)
     timeout: float = 15.0
 

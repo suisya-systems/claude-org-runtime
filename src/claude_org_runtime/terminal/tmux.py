@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
 
@@ -73,6 +74,12 @@ def find_tmux() -> str:
 
 @dataclass
 class TmuxAdapter:
+    # 専用 socket (-L claude-org-spike) で既存サーバーと完全分離するため、
+    # list_panes() は自分が spawn した pane のみ見せる (人間の窓口 pane は出ない)。
+    # broker の last-pane ガードが論理ペイン (窓口) を +1 計上してよい backend。
+    # backend 固定の能力なので ClassVar (dataclass field にしない)。
+    isolated_session: ClassVar[bool] = True
+
     exe: str = field(default_factory=find_tmux)
     socket: str = SPIKE_SOCKET
     timeout: float = 15.0

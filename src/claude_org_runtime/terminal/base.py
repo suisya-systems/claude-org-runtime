@@ -66,6 +66,17 @@ class TerminalAdapter(Protocol):
 
     WezTermAdapter / TmuxAdapter が本 Protocol を満たす。全メソッドが target
     (pane_id) を明示で受け取り、フォーカス先や環境変数へのフォールバックをしない。
+
+    能力フラグ ``isolated_session`` (bool, ClassVar): backend が「自分が spawn
+    した pane だけ」を ``list_panes()`` で見せるか (= dedicated session 分離) を
+    表す。tmux (専用 socket -L claude-org-spike) は True (人間の窓口 pane は別
+    サーバーにあり出ない)、wezterm (cli list, global mux) は False (窓口の実
+    pane も匿名で出る)。broker の close_pane が論理ペイン (人間駆動の窓口) を
+    last-pane ガードに +1 計上してよいかの判断に使う (isolated な時だけ窓口は
+    adapter の外におり +1 が正当)。本 Protocol は ``@runtime_checkable`` で
+    ``issubclass`` 検査に使うため、非メソッド member を**注釈として宣言しない**
+    (注釈すると issubclass が TypeError)。concrete adapter が ClassVar として
+    持ち、broker は ``getattr(adapter, "isolated_session", False)`` で読む。
     """
 
     def spawn(

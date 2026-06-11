@@ -156,3 +156,34 @@ def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
     rc = broker_cli.run(args)
     assert rc == 0
     assert captured["auth_role"] == "dispatcher"
+
+
+def test_run_registers_root_logical_pane(tmp_path, monkeypatch):
+    """run() 実運用経路が root token を pane 登録簿に論理ペインとして載せることを
+    検証 (Issue #57)。serve ループを即時 KeyboardInterrupt に差し替えて run() を
+    最後まで回し、register_logical_pane の戻りを spy で捕捉する。"""
+    captured = {}
+    real_register = Broker.register_logical_pane
+
+    def spy(self, token):
+        res = real_register(self, token)
+        captured["pane"] = res
+        captured["in_meta"] = str(res["id"]) in self._pane_meta
+        return res
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Broker, "register_logical_pane", spy)
+    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+
+    parser = broker_cli.build_parser()
+    args = parser.parse_args(
+        ["serve", "--port", "0", "--no-nudge",
+         "--state-dir", str(tmp_path), "--root-role", "secretary"]
+    )
+    rc = broker_cli.run(args)
+    assert rc == 0
+    assert captured["pane"]["logical"] is True
+    assert captured["pane"]["role"] == "secretary"
+    assert captured["in_meta"] is True

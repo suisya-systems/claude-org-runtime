@@ -269,6 +269,33 @@ class Broker(TokenMixin, StoreMixin):
                 "kind": meta.get("kind"),
                 "receive_mode": surface.RECEIVE_MODE,
             })
+        # 論理ペイン (人間駆動の窓口) は実 adapter pane を持たないため上の loop に
+        # 出ない。``logical=True`` かつ adapter に存在しない登録簿エントリを
+        # first-class entry として補う (geometry/focused は実体なしの既定値)。
+        # 条件を「logical かつ非 adapter」に限定するのは、adapter が out-of-band で
+        # 閉じた pane の stale meta を resurface させないため。
+        #
+        # 既知制限 (global-mux backend, wezterm): wezterm `cli list` は dedicated
+        # socket 分離が無く、窓口自身の実 pane も匿名 (name/role=None) entry として
+        # 返す。よって wezterm では窓口が「匿名の実 pane」+「ここで補う logical
+        # entry」の二重で並ぶ。dedup には窓口の実 pane_id との相関 (= 実ペイン化、
+        # 本 Issue のスコープ外) が要るため、二重表示は許容する。tmux
+        # (isolated socket) では adapter に窓口が出ないため logical entry が唯一の
+        # 出所で、二重化は起きない。
+        adapter_handles = {str(p.get("pane_id")) for p in panes}
+        for hk, meta in meta_snapshot.items():
+            if hk in adapter_handles or not meta.get("logical"):
+                continue
+            out.append({
+                "id": meta.get("handle"),
+                "name": meta.get("name"),
+                "role": meta.get("role"),
+                "focused": False,
+                "x": 0, "y": 0, "w": 0, "h": 0,
+                "cwd": meta.get("cwd"),
+                "kind": meta.get("kind"),
+                "receive_mode": surface.RECEIVE_MODE,
+            })
         return out
 
     def inspect_pane_view(
@@ -354,8 +381,44 @@ class Broker(TokenMixin, StoreMixin):
         handle = self.resolve_target(target)
         if handle is None:
             return _err(f"[pane_not_found] no pane for target {target!r}")
-        # 最後の 1 pane は閉じない (renga: last_pane)。
-        if len(self._adapter_panes()) <= 1:
+        # adapter I/O は lock 外で先に済ませる (lock 下で I/O しない契約)。
+        adapter_panes = self._adapter_panes()
+        with self._lock:
+            target_meta = self._pane_meta.get(str(handle))
+            is_logical = bool(target_meta and target_meta.get("logical"))
+            logical_count = sum(
+                1 for m in self._pane_meta.values() if m.get("logical")
+            )
+        # 論理ペイン (人間駆動の窓口) は bookkeeping 専用で、実 adapter pane を
+        # 持たない。adapter.kill_pane を呼べば存在しない handle を kill しようと
+        # して backend がエラーになるため、窓口自身を閉じる操作は構造的に拒否する。
+        if is_logical:
+            return _err(
+                "[logical_pane] cannot close a human-driven logical pane "
+                "(the root secretary is a bookkeeping entry, not an adapter pane)"
+            )
+        # 最後の 1 pane は閉じない (renga: last_pane)。論理ペイン (窓口) も tab を
+        # 非空に保つ実体として数えるが、それは **(a) backend が isolated-session で
+        # 窓口を adapter の外に隠し、かつ (b) 閉じる対象が broker 管理 pane** の時に
+        # 限る (= 窓口が adapter から見えない backend で、自分が spawn した pane を
+        # 閉じる時だけ窓口を +1)。
+        #   - isolated-socket backend (tmux, -L claude-org-spike, isolated_session=
+        #     True): adapter.list_panes() に窓口が出ないため、子 1 つだけでも窓口を
+        #     +1 して [last_pane] 誤判定を防ぐ (= Issue #57 の本丸)。窓口は別 socket
+        #     に常駐するので +1 は常に妥当 (stale にならない)。
+        #   - global-mux backend (wezterm, cli list, isolated_session=False): 窓口の
+        #     実 pane は (在れば) 既に adapter pane として数えられ、無ければ +1 は
+        #     stale。どちらでも論理ペインを計上せず実 pane 数のみで [last_pane] を
+        #     守る。これで host pane の over-permit (窓口可視時) も、窓口が out-of-band
+        #     で消えた後に最後の実 pane を空にする over-permit も両方防ぐ
+        #     (Codex review round 2 Major 対応)。なお global-mux では adapter が窓口
+        #     を実 pane として見せるため、本来 [last_pane] 誤判定 (Issue #57) 自体が
+        #     起きない。
+        adapter_isolated = getattr(self.adapter, "isolated_session", False)
+        target_managed = target_meta is not None
+        count_logical = adapter_isolated and target_managed
+        effective_count = len(adapter_panes) + (logical_count if count_logical else 0)
+        if effective_count <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)
         # registry の pop と token revoke を 1 ロックスコープで原子的に行う。
@@ -445,6 +508,46 @@ class Broker(TokenMixin, StoreMixin):
                 "role": role, "cwd": cwd, "kind": kind, "token": token,
             }
             self._reserved_names.discard(name)  # 予約を確定 meta へ昇格
+
+    def register_logical_pane(self, token: str) -> dict:
+        """human 駆動の root pane (窓口/secretary) を pane 登録簿に first-class な
+        論理ペインとして載せる (Issue #57 の bootstrap gap 解消)。
+
+        窓口は人間が直接駆動するため、broker が send_keys/spawn で『駆動』する実
+        adapter pane を持たない。だが pane 登録簿にも close_pane の last-pane
+        カウントにも乗らないと、窓口が子を 1 つ spawn した瞬間その子が『唯一の
+        pane』と誤判定され、close_pane が [last_pane] で子を閉じられない
+        (= Issue #57)。さらに list_panes にも窓口が出ず balanced-split の
+        アンカーも無い。
+
+        本メソッドは ``bind.pane_id`` を **None のまま据え置く** (= :meth:
+        `_trigger_nudge` が pane_id None で early-return するため、人間駆動の窓口
+        に PTY ナッジが注入されない。人間は check_messages で読む) ことで実ペイン
+        駆動を構造的に避けつつ、pane 登録簿 (``_pane_meta``) に ``logical=True``
+        entry として載せる。これで (1) list_panes に窓口が first-class entry と
+        して現れ、(2) close_pane の last-pane カウントに数えられ子を誤判定なく
+        閉じられる。
+
+        handle は ``bind.name`` (非数字 str) を充てる: 実 adapter handle
+        (WezTerm=int / tmux="%N") と衝突せず、``resolve_target`` の既存 name
+        ブランチでそのまま解決できる (セキュリティ重要な共有解決関数を変更せずに
+        id/name 両系統で addressable にする)。
+        """
+        bind = self.get_bind(token)
+        if bind is None:
+            raise ValueError("cannot register logical pane: unknown or revoked token")
+        handle = bind.name or bind.agent_id
+        with self._lock:
+            self._pane_meta[str(handle)] = {
+                "handle": handle, "agent_id": bind.agent_id, "name": bind.name,
+                "role": bind.role, "cwd": bind.cwd, "kind": bind.kind,
+                "token": token, "logical": True,
+            }
+        self._journal("logical_pane_registered", agent_id=bind.agent_id, pane_id=handle)
+        return {
+            "id": handle, "agent_id": bind.agent_id, "name": bind.name,
+            "role": bind.role, "logical": True,
+        }
 
     def _reserve_name(self, name: str | None) -> str | None:
         """name を予約する (collision なら error 文字列)。spawn の I/O をまたいだ
