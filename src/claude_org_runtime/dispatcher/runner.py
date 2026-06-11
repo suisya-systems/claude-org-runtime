@@ -785,7 +785,19 @@ def _parse_panes(panes_data: Any) -> list[Pane]:
         panes_list = panes_data
     if not isinstance(panes_list, list):
         raise SystemExit("panes JSON must be a list or {panes: [...]} object")
-    return [Pane.from_dict(d) for d in panes_list]
+    panes: list[Pane] = []
+    for i, d in enumerate(panes_list):
+        try:
+            panes.append(Pane.from_dict(d))
+        except (ValueError, KeyError, TypeError) as exc:
+            # A malformed pane entry -- a bad/missing id (including an
+            # unrecognised tmux pane_id), missing geometry, or a non-int
+            # field -- is structural input invalidity. Surface it the same way
+            # as the not-a-list case above (clean message + exit 1) instead of
+            # letting the bare ValueError/KeyError escape as a traceback, so
+            # the CLI honours its input-error contract at the parse boundary.
+            raise SystemExit(f"panes[{i}] is invalid: {exc}") from None
+    return panes
 
 
 def _load_locale(path: Optional[str]) -> Optional[LocaleConfig]:

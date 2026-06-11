@@ -104,6 +104,19 @@ def test_parse_pane_id_rejects_malformed(raw: object) -> None:
         _parse_pane_id(raw)
 
 
+def test_parse_panes_rejects_malformed_id_as_systemexit() -> None:
+    # A malformed pane id is structural input invalidity: _parse_panes must
+    # translate the helper's ValueError into a clean SystemExit (exit 1 + a
+    # contextual message), matching the not-a-list path, rather than letting a
+    # bare traceback escape the CLI input-parse boundary.
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%x", "name": "dispatcher", "role": "dispatcher",
+             "x": 0, "y": 0, "width": 200, "height": 50},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
 def test_parse_panes_parses_tmux_pane_ids() -> None:
     panes = _parse_panes([
         {"id": "%0", "name": "dispatcher", "role": "dispatcher",
