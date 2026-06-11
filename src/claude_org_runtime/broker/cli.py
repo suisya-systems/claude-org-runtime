@@ -25,6 +25,12 @@ from .server import Broker
 DEFAULT_STATE_DIR = ".state/broker"
 DEFAULT_PORT = 48720
 
+# root agent (手動検証用 token) を bind する権限 tier。tools/list の公開面は
+# token の auth_role で構造的に絞られる (surface.tools_for)。既定 worker は
+# 現行挙動 (messaging 4 面) を不変に保つ。secretary 起動で 13 面全面になる。
+ROOT_ROLE_CHOICES = ("worker", "curator", "dispatcher", "secretary")
+DEFAULT_ROOT_ROLE = "worker"
+
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -52,6 +58,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--no-nudge", action="store_true",
         help="terminal adapter を生成せずナッジ配達を無効化する (queue のみ)。",
     )
+    parser.add_argument(
+        "--root-role", choices=ROOT_ROLE_CHOICES, default=DEFAULT_ROOT_ROLE,
+        help=(
+            "手動検証用 root token を bind する権限 tier (auth_role)。tools/list の "
+            f"公開面はこの tier で構造的に絞られる (既定 {DEFAULT_ROOT_ROLE} = "
+            "messaging 4 面で現行挙動不変; secretary で全 13 面)。"
+        ),
+    )
 
 
 def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
@@ -62,6 +76,20 @@ def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     add_arguments(serve_p)
     serve_p.set_defaults(func=run)
+
+
+def issue_root_token(broker: Broker, root_role: str = DEFAULT_ROOT_ROLE) -> str:
+    """手動検証用 root token を 1 本発行する (spike __main__ 同等)。
+
+    ``root_role`` は表示 role 兼 **権限 tier (auth_role)**。root token は spawn
+    子ではないため tier 上限切り (``capped_auth_role``) は適用せず、要求どおりの
+    tier で bind する。tools/list の公開面はこの ``auth_role`` で構造的に絞られる
+    (既定 worker = messaging 4 面で現行挙動不変; secretary で全 13 面)。``run``
+    がブロックする serve ループに入る前のこの一行を独立テスト可能にするための抽出。
+    """
+    return broker.issue_token(
+        "manual-test", "manual-test", root_role, auth_role=root_role
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -76,8 +104,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"org-broker listening on {broker.url}")
     print(f"queue store: {Path(args.state_dir).resolve() / 'queue.jsonl'}")
     # 手動検証用の token を 1 本発行して mcp-config を表示する (spike __main__ と同等)。
-    tok = broker.issue_token("manual-test", "manual-test", "worker")
-    print("manual test token:", tok)
+    tok = issue_root_token(broker, args.root_role)
+    print(f"manual test token ({args.root_role}):", tok)
     print("mcp-config:", json.dumps(broker.mcp_config_for(tok)))
     try:
         while True:
