@@ -39,8 +39,11 @@ def test_real_broker_journal_validates(tmp_path):
     from claude_org_runtime.broker.server import Broker
 
     b = Broker(state_dir=tmp_path / "broker", adapter=None)
-    tok = b.issue_token("src", "src", "worker")
+    tok = b.issue_token("src", "src", "secretary")
     b.register_local(tok)
+    # root secretary を論理ペインとして登録 -> logical_pane_registered を emit し、
+    # その payload (pane_id は bind.name = 文字列) が schema と噛み合うことも検証する。
+    b.register_logical_pane(tok)
     tok2 = b.issue_token("dst", "dst", "worker")
     b.register_local(tok2)
     b.enqueue(b.get_bind(tok), "dst", "hi")
