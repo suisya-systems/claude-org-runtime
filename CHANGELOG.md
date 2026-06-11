@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-06-11
+
+### Added
+
+- `transport`: new subpackage holding the **transport surface descriptor**
+  (ja-migration-plan §5.2 (i) / §5.3 / §3.1) — the single SoT mapping a
+  transport `flag` (`renga` | `broker`) to its concrete wiring:
+  `{server 名, spawn 注入 flag, role tier -> MCP tool 名集合}`. Additive,
+  flag-aware API consumed (via pin) by both the runtime `settings/generator`
+  and the ja-side generators (`tools/gen_delegate_payload.py` / worker_brief),
+  so the transport prefix / tool set lives in one place instead of being
+  hardcoded per generator (drift 防止).
+  - `renga`: server `renga-peers`, injection
+    `--dangerously-load-development-channels server:renga-peers`, **全ロール
+    一様の required 14 面** (`tools/check_renga_compat.py` REQUIRED_MCP_TOOLS /
+    renga 0.18.0 と一致; renga には構造的 tier gating が無いため一様)。
+  - `broker`: server `org-broker`, injection `--mcp-config <broker>`,
+    **role tier 別** (secretary 13 / dispatcher 12 / worker・curator 4)。
+    tier 別集合は `claude_org_runtime.broker.surface` の `tools_for` から
+    導出 (ハードコード二重管理を避ける — drift lock test 付き)。
+  - Public surface: `get_surface` / `resolve_transport` (explicit >
+    `ORG_TRANSPORT` env > default `renga`) / `tools_for_role` /
+    `allow_entries_for_role` / `TransportSurface`.
+- `settings.generator.transport_allowlist(role, *, transport=None, env=None)`:
+  descriptor-driven, flag-aware MCP allowlist projection. With the default
+  `renga` flag the emitted `mcp__renga-peers__*` entries are **bit-equivalent
+  with the current shared surface** (§5.3 non-breaking guarantee, regression
+  test included); `ORG_TRANSPORT=broker` yields the tier-appropriate
+  `mcp__org-broker__*` set. The transport is read from `ORG_TRANSPORT`
+  (env-only flag, §5.1 — no persisted config file so no Set C amendment).
+
+### Notes
+
+- Default transport stays `renga` (`ORG_TRANSPORT` unset ⇒ current behavior
+  unchanged). The broker default-flip (§8 Issue G) is a post-dogfood human
+  decision and is **not** made here.
+- Scope is runtime-only: ja-side wiring (pin bump / `gen_delegate_payload.py`
+  / worker_brief / golden) is ja#513 and prose/contract revisions are ja#514;
+  release publish (git tag / PyPI) + paired ja sync are coordinated by the
+  desk and intentionally **not** performed in this change.
+
 ## [0.1.16] - 2026-06-10
 
 ### Added

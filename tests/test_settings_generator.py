@@ -2622,3 +2622,66 @@ def test_rendered_default_worker_settings_include_git_fetch_colon_star(
     assert "Bash(git pull)" in deny
     assert "Bash(git fetch)" not in deny
     assert "Bash(git fetch *)" not in deny
+
+
+# ---------------------------------------------------------------------------
+# Transport-aware MCP allowlist (descriptor-driven, §5.2 (i) / §5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_transport_allowlist_default_is_renga(monkeypatch: pytest.MonkeyPatch) -> None:
+    """既定 (ORG_TRANSPORT 無設定) は renga surface を projektする。"""
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    entries = generator.transport_allowlist("worker")
+    assert entries
+    assert all(e.startswith("mcp__renga-peers__") for e in entries)
+    assert "mcp__renga-peers__send_message" in entries
+    assert len(entries) == 14  # 全ロール一様 required 14
+
+
+def test_transport_allowlist_renga_bit_equivalent_to_schema() -> None:
+    """**bit 等価回帰**: flag=renga の共有 surface == 現行 schema の renga 14。
+
+    既定 renga で現行と byte 同一 (非破壊) であることの回帰固定 (§5.3)。
+    """
+    schema = generator.load_schema()
+    schema_renga = [
+        e
+        for e in schema["roles"]["user_common"]["required_allow"]
+        if e.startswith("mcp__renga-peers__")
+    ]
+    generated = generator.transport_allowlist("user_common", transport="renga")
+    assert generated == schema_renga
+
+
+def test_transport_allowlist_broker_is_tier_differentiated() -> None:
+    secretary = generator.transport_allowlist("secretary", transport="broker")
+    worker = generator.transport_allowlist("worker", transport="broker")
+    assert all(e.startswith("mcp__org-broker__") for e in secretary)
+    assert all(e.startswith("mcp__org-broker__") for e in worker)
+    # worker は messaging-only (pane 操作なし)、secretary は全面。
+    assert "mcp__org-broker__send_keys" not in worker
+    assert "mcp__org-broker__send_keys" in secretary
+    assert "mcp__org-broker__spawn_pane" in secretary  # secretary-only generic
+    assert "mcp__org-broker__spawn_pane" not in (
+        generator.transport_allowlist("dispatcher", transport="broker")
+    )
+    assert len(worker) == 4
+    assert len(secretary) == 13
+
+
+def test_transport_allowlist_env_selects_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ORG_TRANSPORT", "broker")
+    entries = generator.transport_allowlist("dispatcher")
+    assert all(e.startswith("mcp__org-broker__") for e in entries)
+    assert len(entries) == 12
+
+
+def test_transport_allowlist_explicit_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ORG_TRANSPORT", "broker")
+    entries = generator.transport_allowlist("worker", transport="renga")
+    assert all(e.startswith("mcp__renga-peers__") for e in entries)
