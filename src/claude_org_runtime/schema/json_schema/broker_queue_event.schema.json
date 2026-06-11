@@ -22,7 +22,8 @@
         "queue_drained",
         "nudge_sent",
         "nudge_deferred",
-        "nudge_failed"
+        "nudge_failed",
+        "logical_pane_registered"
       ]
     },
     "host": { "type": ["string", "null"] },

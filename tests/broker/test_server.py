@@ -447,3 +447,93 @@ def test_spawn_target_must_be_string(tmp_path, fake_adapter):
     disp = _ops(b)
     with pytest.raises(ToolArgError):
         dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "target": 123})
+
+
+# ============================================ logical pane (root secretary, #57)
+# 窓口 (人間駆動の root pane) を pane 登録簿に first-class な論理ペインとして載せ、
+# list_panes 出現 / close_pane の [last_pane] 誤判定解消を固定する。
+
+def _secretary_with_logical_pane(b):
+    """登録済み secretary bind を作り、論理ペインとして pane 登録簿に載せる。"""
+    tok = b.issue_token("manual-test", "manual-test", "secretary")
+    b.register_local(tok)
+    b.register_logical_pane(tok)
+    return tok, b.get_bind(tok)
+
+
+def test_register_logical_pane_appears_in_list_panes_and_suppresses_nudge(
+    tmp_path, fake_adapter
+):
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    tok, sec = _secretary_with_logical_pane(b)
+    # bind.pane_id は None のまま — PTY ナッジを構造的に抑止 (人間は check_messages)。
+    assert sec.pane_id is None
+    # 実 adapter pane が 1 つも無くても、窓口が first-class entry として出る。
+    panes = _text(dispatch_tool(b, sec, "list_panes", {}))["panes"]
+    me = [p for p in panes if p["id"] == "manual-test"]
+    assert len(me) == 1
+    assert me[0]["role"] == "secretary"
+    assert me[0]["name"] == "manual-test"
+    assert me[0]["focused"] is False
+    # 論理 handle は bind.name なので resolve_target も既存 name ブランチで引ける。
+    assert b.resolve_target("manual-test") == "manual-test"
+
+
+def test_secretary_logical_pane_lets_close_child_escape_last_pane(tmp_path, fake_adapter):
+    """Issue #57 回帰: 窓口 (論理) + 子 1 つの状態で、子を [last_pane] 誤判定
+    されずに閉じられる。事前 adapter pane を作らないので spawn 後の実ペインは
+    子 1 つだけ — 論理ペインが数えられなければ close は [last_pane] になる。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    tok, sec = _secretary_with_logical_pane(b)
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    assert len(fake_adapter.list_panes()) == 1   # 実ペインは子のみ
+    out = dispatch_tool(b, sec, "close_pane", {"target": "child"})
+    assert "isError" not in out, out
+    res = _text(out)
+    assert res["ok"] is True
+    h = fake_adapter.spawned[-1]["handle"]
+    assert res["closed"] == h
+    assert h in fake_adapter.killed
+
+
+def test_close_only_child_without_logical_secretary_is_still_guarded(
+    tmp_path, fake_adapter
+):
+    """対照: 論理ペイン未登録 (窓口なし) なら従来どおり [last_pane]。
+    回帰の効果が『論理 pane を数える』ことに由来すると固定する。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    disp = _ops(b)  # dispatcher、論理ペイン登録なし
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "only"})
+    assert len(fake_adapter.list_panes()) == 1
+    out = dispatch_tool(b, disp, "close_pane", {"target": "only"})
+    assert out["isError"] is True
+    assert "[last_pane]" in out["content"][0]["text"]
+
+
+def test_close_pane_rejects_logical_secretary(tmp_path, fake_adapter):
+    """窓口自身を close_pane する操作は [logical_pane] で拒否する
+    (存在しない adapter handle を kill しに行かせない)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    tok, sec = _secretary_with_logical_pane(b)
+    # 子を 1 つ作り「最後の pane」条件を外す (last_pane と logical 拒否を分離)。
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    out = dispatch_tool(b, sec, "close_pane", {"target": "manual-test"})
+    assert out["isError"] is True
+    assert "[logical_pane]" in out["content"][0]["text"]
+    # 論理ペインは登録簿に残り、bind も revoke されない。
+    assert b._pane_meta.get("manual-test") is not None
+    assert b.get_bind(tok) is not None
+    assert "manual-test" not in fake_adapter.killed
+
+
+def test_logical_pane_coexists_with_real_panes_in_list(tmp_path, fake_adapter):
+    """論理ペインと実 adapter pane が list_panes に重複なく共存する。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    tok, sec = _secretary_with_logical_pane(b)
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    panes = _text(dispatch_tool(b, sec, "list_panes", {}))["panes"]
+    ids = [p["id"] for p in panes]
+    assert "manual-test" in ids                       # 論理ペイン
+    child_h = fake_adapter.spawned[-1]["handle"]
+    assert child_h in ids                             # 実ペイン
+    assert len(ids) == len(set(ids)) == 2             # 重複なし

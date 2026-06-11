@@ -269,6 +269,25 @@ class Broker(TokenMixin, StoreMixin):
                 "kind": meta.get("kind"),
                 "receive_mode": surface.RECEIVE_MODE,
             })
+        # 論理ペイン (人間駆動の窓口) は実 adapter pane を持たないため上の loop に
+        # 出ない。``logical=True`` かつ adapter に存在しない登録簿エントリを
+        # first-class entry として補う (geometry/focused は実体なしの既定値)。
+        # 条件を「logical かつ非 adapter」に限定するのは、adapter が out-of-band で
+        # 閉じた pane の stale meta を resurface させないため。
+        adapter_handles = {str(p.get("pane_id")) for p in panes}
+        for hk, meta in meta_snapshot.items():
+            if hk in adapter_handles or not meta.get("logical"):
+                continue
+            out.append({
+                "id": meta.get("handle"),
+                "name": meta.get("name"),
+                "role": meta.get("role"),
+                "focused": False,
+                "x": 0, "y": 0, "w": 0, "h": 0,
+                "cwd": meta.get("cwd"),
+                "kind": meta.get("kind"),
+                "receive_mode": surface.RECEIVE_MODE,
+            })
         return out
 
     def inspect_pane_view(
@@ -354,8 +373,26 @@ class Broker(TokenMixin, StoreMixin):
         handle = self.resolve_target(target)
         if handle is None:
             return _err(f"[pane_not_found] no pane for target {target!r}")
-        # 最後の 1 pane は閉じない (renga: last_pane)。
-        if len(self._adapter_panes()) <= 1:
+        # adapter I/O は lock 外で先に済ませる (lock 下で I/O しない契約)。
+        adapter_panes = self._adapter_panes()
+        with self._lock:
+            target_meta = self._pane_meta.get(str(handle))
+            is_logical = bool(target_meta and target_meta.get("logical"))
+            logical_count = sum(
+                1 for m in self._pane_meta.values() if m.get("logical")
+            )
+        # 論理ペイン (人間駆動の窓口) は bookkeeping 専用で、実 adapter pane を
+        # 持たない。adapter.kill_pane を呼べば存在しない handle を kill しようと
+        # して backend がエラーになるため、窓口自身を閉じる操作は構造的に拒否する。
+        if is_logical:
+            return _err(
+                "[logical_pane] cannot close a human-driven logical pane "
+                "(the root secretary is a bookkeeping entry, not an adapter pane)"
+            )
+        # 最後の 1 pane は閉じない (renga: last_pane)。論理ペイン (窓口) も tab を
+        # 非空に保つ実体として数える: 窓口 + 子 1 つの状態でも子を閉じられるように
+        # する (Issue #57: 窓口が pane に数えられず子が唯一ペイン扱いされる誤判定の解消)。
+        if len(adapter_panes) + logical_count <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)
         # registry の pop と token revoke を 1 ロックスコープで原子的に行う。
@@ -445,6 +482,46 @@ class Broker(TokenMixin, StoreMixin):
                 "role": role, "cwd": cwd, "kind": kind, "token": token,
             }
             self._reserved_names.discard(name)  # 予約を確定 meta へ昇格
+
+    def register_logical_pane(self, token: str) -> dict:
+        """human 駆動の root pane (窓口/secretary) を pane 登録簿に first-class な
+        論理ペインとして載せる (Issue #57 の bootstrap gap 解消)。
+
+        窓口は人間が直接駆動するため、broker が send_keys/spawn で『駆動』する実
+        adapter pane を持たない。だが pane 登録簿にも close_pane の last-pane
+        カウントにも乗らないと、窓口が子を 1 つ spawn した瞬間その子が『唯一の
+        pane』と誤判定され、close_pane が [last_pane] で子を閉じられない
+        (= Issue #57)。さらに list_panes にも窓口が出ず balanced-split の
+        アンカーも無い。
+
+        本メソッドは ``bind.pane_id`` を **None のまま据え置く** (= :meth:
+        `_trigger_nudge` が pane_id None で early-return するため、人間駆動の窓口
+        に PTY ナッジが注入されない。人間は check_messages で読む) ことで実ペイン
+        駆動を構造的に避けつつ、pane 登録簿 (``_pane_meta``) に ``logical=True``
+        entry として載せる。これで (1) list_panes に窓口が first-class entry と
+        して現れ、(2) close_pane の last-pane カウントに数えられ子を誤判定なく
+        閉じられる。
+
+        handle は ``bind.name`` (非数字 str) を充てる: 実 adapter handle
+        (WezTerm=int / tmux="%N") と衝突せず、``resolve_target`` の既存 name
+        ブランチでそのまま解決できる (セキュリティ重要な共有解決関数を変更せずに
+        id/name 両系統で addressable にする)。
+        """
+        bind = self.get_bind(token)
+        if bind is None:
+            raise ValueError("cannot register logical pane: unknown or revoked token")
+        handle = bind.name or bind.agent_id
+        with self._lock:
+            self._pane_meta[str(handle)] = {
+                "handle": handle, "agent_id": bind.agent_id, "name": bind.name,
+                "role": bind.role, "cwd": bind.cwd, "kind": bind.kind,
+                "token": token, "logical": True,
+            }
+        self._journal("logical_pane_registered", agent_id=bind.agent_id, pane_id=handle)
+        return {
+            "id": handle, "agent_id": bind.agent_id, "name": bind.name,
+            "role": bind.role, "logical": True,
+        }
 
     def _reserve_name(self, name: str | None) -> str | None:
         """name を予約する (collision なら error 文字列)。spawn の I/O をまたいだ
