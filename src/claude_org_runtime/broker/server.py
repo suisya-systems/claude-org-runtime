@@ -274,6 +274,14 @@ class Broker(TokenMixin, StoreMixin):
         # first-class entry として補う (geometry/focused は実体なしの既定値)。
         # 条件を「logical かつ非 adapter」に限定するのは、adapter が out-of-band で
         # 閉じた pane の stale meta を resurface させないため。
+        #
+        # 既知制限 (global-mux backend, wezterm): wezterm `cli list` は dedicated
+        # socket 分離が無く、窓口自身の実 pane も匿名 (name/role=None) entry として
+        # 返す。よって wezterm では窓口が「匿名の実 pane」+「ここで補う logical
+        # entry」の二重で並ぶ。dedup には窓口の実 pane_id との相関 (= 実ペイン化、
+        # 本 Issue のスコープ外) が要るため、二重表示は許容する。tmux
+        # (isolated socket) では adapter に窓口が出ないため logical entry が唯一の
+        # 出所で、二重化は起きない。
         adapter_handles = {str(p.get("pane_id")) for p in panes}
         for hk, meta in meta_snapshot.items():
             if hk in adapter_handles or not meta.get("logical"):
@@ -390,9 +398,19 @@ class Broker(TokenMixin, StoreMixin):
                 "(the root secretary is a bookkeeping entry, not an adapter pane)"
             )
         # 最後の 1 pane は閉じない (renga: last_pane)。論理ペイン (窓口) も tab を
-        # 非空に保つ実体として数える: 窓口 + 子 1 つの状態でも子を閉じられるように
-        # する (Issue #57: 窓口が pane に数えられず子が唯一ペイン扱いされる誤判定の解消)。
-        if len(adapter_panes) + logical_count <= 1:
+        # 非空に保つ実体として数えるが、**閉じる対象が broker 管理 pane の時に限る**。
+        #   - isolated-socket backend (tmux, -L claude-org-spike): adapter.list_panes()
+        #     に窓口が出ないため、子 1 つだけでも窓口を +1 して [last_pane] 誤判定を
+        #     防ぐ (= Issue #57 の本丸。窓口が pane に数えられず子が唯一ペイン扱い
+        #     される誤判定の解消)。
+        #   - global-mux backend (wezterm, cli list): 窓口の実 pane が既に adapter
+        #     pane として数えられる。そのため未管理 pane (= broker が spawn して
+        #     いない pane。典型は global mux 越しに見える窓口自身の host pane) を
+        #     閉じる場合は論理ペインを二重計上せず、実 pane 数のみで [last_pane] を
+        #     守る (broker の host pane を誤って閉じられる over-permit 退行を防ぐ)。
+        target_managed = target_meta is not None
+        effective_count = len(adapter_panes) + (logical_count if target_managed else 0)
+        if effective_count <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)
         # registry の pop と token revoke を 1 ロックスコープで原子的に行う。

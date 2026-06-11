@@ -527,7 +527,8 @@ def test_close_pane_rejects_logical_secretary(tmp_path, fake_adapter):
 
 
 def test_logical_pane_coexists_with_real_panes_in_list(tmp_path, fake_adapter):
-    """論理ペインと実 adapter pane が list_panes に重複なく共存する。"""
+    """論理ペインと spawn 済み実 adapter pane が list_panes に重複なく共存する
+    (isolated-socket backend モデル: adapter は broker 管理 pane のみ見せる)。"""
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
     tok, sec = _secretary_with_logical_pane(b)
     dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
@@ -537,3 +538,35 @@ def test_logical_pane_coexists_with_real_panes_in_list(tmp_path, fake_adapter):
     child_h = fake_adapter.spawned[-1]["handle"]
     assert child_h in ids                             # 実ペイン
     assert len(ids) == len(set(ids)) == 2             # 重複なし
+
+
+def test_logical_pane_on_global_mux_backend_does_not_overpermit_close(
+    tmp_path, fake_adapter
+):
+    """global-mux backend (wezterm 風) のシミュレーション: adapter が窓口の実 pane
+    を匿名 (meta 無し) entry として返すケースを再現する。
+
+    既知制限として list_panes は「匿名の実 pane」+「logical entry」の二重表示に
+    なる。重要なのは close_pane が over-permit しないこと: 論理ペインの last-pane
+    計上は『閉じる対象が broker 管理 pane の時のみ』なので、未管理の実 pane
+    (= broker の host pane 相当) を単独で閉じようとすると従来どおり [last_pane] で
+    守られる (論理 +1 で host pane を誤って閉じられる退行が無い)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    root_real = fake_adapter.add_pane(active=True)   # 窓口の実 pane (匿名)
+    tok, sec = _secretary_with_logical_pane(b)
+    # 既知制限: 匿名実 pane と logical entry が二重に並ぶ。
+    panes = _text(dispatch_tool(b, sec, "list_panes", {}))["panes"]
+    ids = [p["id"] for p in panes]
+    assert root_real in ids and "manual-test" in ids
+    # 未管理 (broker 非 spawn) の実 pane を単独で閉じる → 論理を二重計上しないので
+    # [last_pane] で守られる (over-permit 退行が無いことの固定)。
+    out = dispatch_tool(b, sec, "close_pane", {"target": str(root_real)})
+    assert out["isError"] is True
+    assert "[last_pane]" in out["content"][0]["text"]
+    assert root_real not in fake_adapter.killed
+    # 一方、broker 管理 pane (子) は同じ状況でも閉じられる (論理計上が効く)。
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    child_h = fake_adapter.spawned[-1]["handle"]
+    out = dispatch_tool(b, sec, "close_pane", {"target": "child"})
+    assert "isError" not in out, out
+    assert child_h in fake_adapter.killed
