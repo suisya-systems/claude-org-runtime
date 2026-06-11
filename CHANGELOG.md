@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-06-12
+
+### Added
+
+- `broker`: the terminal adapter now advertises an `isolated_session`
+  capability flag, exposing whether the backend spawns panes in an
+  isolated session so callers can branch on session-isolation support
+  instead of assuming it.
+
+### Fixed
+
+- `broker`: the root secretary is now registered as a logical pane in the
+  broker registry. Previously the root agent had a bind but no pane
+  registry entry, so it never appeared in `list_panes`, and `close_pane`
+  mis-counted the live panes and could trip the last-pane guard. Closes
+  `claude-org-runtime#57` (PR #58).
+
 ## [0.1.18] - 2026-06-12
 
 ### Added
