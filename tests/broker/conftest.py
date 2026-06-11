@@ -30,7 +30,10 @@ class FakeAdapter:
     assert what the broker's structured builders emitted.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, isolated_session: bool = True) -> None:
+        # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
+        # global-mux backend (wezterm) を模すテストは False を渡す。
+        self.isolated_session = isolated_session
         self._panes: dict[int, dict] = {}
         self._screens: dict[int, str] = {}
         self.spawned: list[dict] = []

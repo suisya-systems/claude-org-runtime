@@ -186,3 +186,9 @@ def test_find_tmux_raises_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tmux_mod.shutil, "which", lambda _n: None)
     with pytest.raises(FileNotFoundError):
         tmux_mod.find_tmux()
+
+
+def test_tmux_is_isolated_session() -> None:
+    # dedicated socket (-L claude-org-spike) で分離するため isolated_session=True。
+    # broker の last-pane ガードが論理ペイン (窓口) を計上してよい backend である根拠。
+    assert TmuxAdapter.isolated_session is True

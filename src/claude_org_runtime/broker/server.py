@@ -398,18 +398,26 @@ class Broker(TokenMixin, StoreMixin):
                 "(the root secretary is a bookkeeping entry, not an adapter pane)"
             )
         # 最後の 1 pane は閉じない (renga: last_pane)。論理ペイン (窓口) も tab を
-        # 非空に保つ実体として数えるが、**閉じる対象が broker 管理 pane の時に限る**。
-        #   - isolated-socket backend (tmux, -L claude-org-spike): adapter.list_panes()
-        #     に窓口が出ないため、子 1 つだけでも窓口を +1 して [last_pane] 誤判定を
-        #     防ぐ (= Issue #57 の本丸。窓口が pane に数えられず子が唯一ペイン扱い
-        #     される誤判定の解消)。
-        #   - global-mux backend (wezterm, cli list): 窓口の実 pane が既に adapter
-        #     pane として数えられる。そのため未管理 pane (= broker が spawn して
-        #     いない pane。典型は global mux 越しに見える窓口自身の host pane) を
-        #     閉じる場合は論理ペインを二重計上せず、実 pane 数のみで [last_pane] を
-        #     守る (broker の host pane を誤って閉じられる over-permit 退行を防ぐ)。
+        # 非空に保つ実体として数えるが、それは **(a) backend が isolated-session で
+        # 窓口を adapter の外に隠し、かつ (b) 閉じる対象が broker 管理 pane** の時に
+        # 限る (= 窓口が adapter から見えない backend で、自分が spawn した pane を
+        # 閉じる時だけ窓口を +1)。
+        #   - isolated-socket backend (tmux, -L claude-org-spike, isolated_session=
+        #     True): adapter.list_panes() に窓口が出ないため、子 1 つだけでも窓口を
+        #     +1 して [last_pane] 誤判定を防ぐ (= Issue #57 の本丸)。窓口は別 socket
+        #     に常駐するので +1 は常に妥当 (stale にならない)。
+        #   - global-mux backend (wezterm, cli list, isolated_session=False): 窓口の
+        #     実 pane は (在れば) 既に adapter pane として数えられ、無ければ +1 は
+        #     stale。どちらでも論理ペインを計上せず実 pane 数のみで [last_pane] を
+        #     守る。これで host pane の over-permit (窓口可視時) も、窓口が out-of-band
+        #     で消えた後に最後の実 pane を空にする over-permit も両方防ぐ
+        #     (Codex review round 2 Major 対応)。なお global-mux では adapter が窓口
+        #     を実 pane として見せるため、本来 [last_pane] 誤判定 (Issue #57) 自体が
+        #     起きない。
+        adapter_isolated = getattr(self.adapter, "isolated_session", False)
         target_managed = target_meta is not None
-        effective_count = len(adapter_panes) + (logical_count if target_managed else 0)
+        count_logical = adapter_isolated and target_managed
+        effective_count = len(adapter_panes) + (logical_count if count_logical else 0)
         if effective_count <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)

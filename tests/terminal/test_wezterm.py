@@ -168,3 +168,9 @@ def test_find_wezterm_raises_when_absent(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(wez_mod.os.path, "exists", lambda _p: False)
     with pytest.raises(FileNotFoundError):
         wez_mod.find_wezterm()
+
+
+def test_wezterm_is_not_isolated_session() -> None:
+    # wezterm cli list は global mux を見せる (dedicated socket 分離なし) ため
+    # isolated_session=False。broker は論理ペイン (窓口) を last-pane 計上しない。
+    assert WezTermAdapter.isolated_session is False
