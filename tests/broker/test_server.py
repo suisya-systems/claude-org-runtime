@@ -206,6 +206,65 @@ def test_spawn_claude_builds_interactive_argv_and_registers(tmp_path, fake_adapt
     assert rec["cwd"] == "/repo" and rec["role"] == "worker" and rec["kind"] == "claude"
 
 
+def _ops_with_cwd(b, cwd, agent_id="d", role="dispatcher"):
+    """cwd を持つ ops-tier bind を作る (caller pane の cwd を模す)。"""
+    tok = b.issue_token(agent_id, agent_id, role, cwd=cwd)
+    b.register_local(tok)
+    return b.get_bind(tok)
+
+
+def test_spawn_relative_cwd_anchors_on_caller_cwd(tmp_path, fake_adapter):
+    """Issue #61: relative cwd は caller pane の cwd を base に解決され、解決後の
+    absolute が adapter.spawn と list_panes に伝わる (daemon base で再解決させない)。"""
+    import os as _os
+
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    base = _os.path.join(_os.sep, "root", "dogfood", "claude-org-ja")
+    disp = _ops_with_cwd(b, base)
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {
+        "direction": "vertical", "name": "disp-child", "cwd": ".dispatcher",
+    })
+    res = _text(out)
+    expected = _os.path.normpath(_os.path.join(base, ".dispatcher"))
+    # adapter は解決済み absolute を受け取る (relative を素通ししない)。
+    assert fake_adapter.spawned[-1]["cwd"] == expected
+    # 結果 dict / list_panes にも解決済み cwd が出る (cwd parity)。
+    assert res["cwd"] == expected
+    panes = _text(dispatch_tool(b, disp, "list_panes", {}))["panes"]
+    rec = [p for p in panes if p["name"] == "disp-child"][0]
+    assert rec["cwd"] == expected
+    assert "dogfood" in rec["cwd"]  # 本 Issue: dogfood/ が落ちない
+
+
+def test_spawn_relative_cwd_unknown_caller_rejected(tmp_path, fake_adapter):
+    """Issue #61: caller cwd 不明 (cwd=None bind) + relative cwd は決定的に拒否。
+    token も pane も作らない (黙って daemon base に落とさない)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)  # cwd 無し (= 論理 root pane の cwd null を模す)
+    before = len(b._binds)
+    with pytest.raises(ToolArgError) as ei:
+        dispatch_tool(b, disp, "spawn_claude_pane", {
+            "direction": "vertical", "name": "orphan", "cwd": ".dispatcher",
+        })
+    assert "cwd_unanchored" in str(ei.value)
+    assert len(b._binds) == before        # orphan token を作らない
+    assert fake_adapter.spawned == []     # spawn にも到達しない
+
+
+def test_spawn_absolute_cwd_unchanged_regardless_of_caller(tmp_path, fake_adapter):
+    """Issue #61: absolute cwd は caller cwd に関わらず無変換で透過する。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops_with_cwd(b, "/some/caller/base")
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {
+        "direction": "vertical", "name": "abs-child", "cwd": "/repo",
+    })
+    assert _text(out)["cwd"] == "/repo"
+    assert fake_adapter.spawned[-1]["cwd"] == "/repo"
+
+
 def test_spawn_orphan_token_not_created_on_bad_args(tmp_path, fake_adapter):
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
     fake_adapter.add_pane(active=True)

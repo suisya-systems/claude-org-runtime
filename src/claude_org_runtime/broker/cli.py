@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -66,6 +67,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
             "messaging 4 面で現行挙動不変; secretary で全 13 面)。"
         ),
     )
+    parser.add_argument(
+        "--root-cwd", default=None,
+        help=(
+            "root pane (人間駆動の窓口/secretary) の cwd を bind に持たせる "
+            "(Issue #61)。spawn_* の relative cwd はこの cwd を base に解決される "
+            "(absolute は as-is)。**省略時は daemon の起動 cwd (os.getcwd) を充てる**: "
+            "本デーモンは session root から起動する運用契約のため、その起動ディレクトリ "
+            "が relative spawn の解決アンカーになる。運用上 session root 以外から "
+            "起動する場合は本フラグで明示せよ (= 決定的な解決 base。黙って間違った base "
+            "に落とさないための文書化済み既定)。relative を渡しても daemon 起動 cwd を "
+            "基準に **absolute 化** して bind に持たせる (解決アンカーは常に absolute)。"
+        ),
+    )
 
 
 def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
@@ -78,17 +92,28 @@ def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
     serve_p.set_defaults(func=run)
 
 
-def issue_root_token(broker: Broker, root_role: str = DEFAULT_ROOT_ROLE) -> str:
+def issue_root_token(
+    broker: Broker,
+    root_role: str = DEFAULT_ROOT_ROLE,
+    root_cwd: str | None = None,
+) -> str:
     """手動検証用 root token を 1 本発行する (spike __main__ 同等)。
 
     ``root_role`` は表示 role 兼 **権限 tier (auth_role)**。root token は spawn
     子ではないため tier 上限切り (``capped_auth_role``) は適用せず、要求どおりの
     tier で bind する。tools/list の公開面はこの ``auth_role`` で構造的に絞られる
-    (既定 worker = messaging 4 面で現行挙動不変; secretary で全 13 面)。``run``
-    がブロックする serve ループに入る前のこの一行を独立テスト可能にするための抽出。
+    (既定 worker = messaging 4 面で現行挙動不変; secretary で全 13 面)。
+
+    ``root_cwd`` は root pane の cwd (Issue #61)。これを bind に持たせることで、
+    人間駆動の窓口が ``spawn_claude_pane(cwd=".dispatcher")`` のような **relative
+    cwd** を投げたとき、broker が **この cwd を base に** absolute 解決できる
+    (cwd null だと解決アンカーが無く relative spawn が拒否される / 誤 base に
+    落ちる、が本 Issue の根因)。``run`` がブロックする serve ループに入る前の
+    この一行を独立テスト可能にするための抽出。
     """
     return broker.issue_token(
-        "manual-test", "manual-test", root_role, auth_role=root_role
+        "manual-test", "manual-test", root_role,
+        cwd=root_cwd, auth_role=root_role,
     )
 
 
@@ -104,8 +129,16 @@ def run(args: argparse.Namespace) -> int:
     print(f"org-broker listening on {broker.url}")
     print(f"queue store: {Path(args.state_dir).resolve() / 'queue.jsonl'}")
     # 手動検証用の token を 1 本発行して mcp-config を表示する (spike __main__ と同等)。
-    tok = issue_root_token(broker, args.root_role)
+    # root_cwd 省略時は daemon 起動 cwd (os.getcwd) を anchor に充てる (Issue #61。
+    # 運用契約: 本デーモンは session root から起動する。help 参照)。明示指定が
+    # relative の場合も **absolute 化** する: root の cwd が relative のままだと、
+    # 子 spawn の relative cwd 解決アンカーが relative になり、resolve_spawn_cwd の
+    # join 結果も relative → adapter (daemon base) で再解決され Issue #61 が再発する。
+    # CLI 境界で absolute に固定して解決アンカーを決定的にする (codex review Major)。
+    root_cwd = os.path.abspath(args.root_cwd) if args.root_cwd is not None else os.getcwd()
+    tok = issue_root_token(broker, args.root_role, root_cwd)
     print(f"manual test token ({args.root_role}):", tok)
+    print(f"root pane cwd (relative spawn anchor): {root_cwd}")
     print("mcp-config:", json.dumps(broker.mcp_config_for(tok)))
     # root pane (人間駆動の窓口) を pane 登録簿に論理ペインとして載せる (Issue #57)。
     # bind.pane_id は None のままなので PTY ナッジは飛ばない (人間は check_messages

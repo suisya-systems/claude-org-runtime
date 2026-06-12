@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `broker`: `spawn_claude_pane` / `spawn_codex_pane` / `spawn_pane` now
+  resolve a **relative** `cwd` against the **caller pane's** cwd before
+  handing it to the terminal adapter, matching the documented renga
+  contract (absolute paths used as-is; relative resolved against the
+  caller pane's cwd). Previously the relative path was passed straight to
+  the adapter, where `tmux new-session -c` re-resolved it against the
+  daemon/server base — in the `#515` broker dogfood this dropped the
+  `dogfood/` segment and landed the dispatcher in the wrong tree. The
+  caller's cwd is the broker bind's `cwd`, and the **resolved absolute**
+  cwd is what is now stored in the pane registry, so a child's own
+  relative spawns anchor correctly down the tree. When a relative `cwd` is
+  requested but the caller's cwd is unknown (e.g. a logical root pane
+  registered without a cwd), the spawn is **rejected deterministically**
+  (`[cwd_unanchored]`, invalid-params) rather than silently resolved
+  against the daemon's base. Absolute-path detection accepts both POSIX
+  and native-absolute forms so canonical POSIX paths (`/repo`) are honored
+  as absolute regardless of the daemon platform. Closes
+  `claude-org-runtime#61`.
+
+### Added
+
+- `broker serve --root-cwd <dir>` (default: the daemon's launch directory,
+  `os.getcwd()`): gives the manually-launched root pane (the human-driven
+  secretary) a cwd in its bind, so relative-`cwd` spawns from that pane
+  have a deterministic resolution anchor. The documented operating
+  contract is that the daemon is launched from the session root; pass
+  `--root-cwd` explicitly when launching from elsewhere. This is the
+  root-cause companion to the `#61` fix: the dogfood secretary's bind cwd
+  was `null`, leaving relative spawns with no anchor.
+
 ## [0.1.19] - 2026-06-12
 
 ### Added

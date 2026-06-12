@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 from typing import TYPE_CHECKING
 
@@ -533,6 +534,51 @@ def build_codex_argv(*, extra_args: list[str] | None = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# spawn cwd 解決 (renga 契約: absolute は as-is / relative は caller pane の cwd 基準)
+# ---------------------------------------------------------------------------
+
+def resolve_spawn_cwd(cwd: str | None, caller_cwd: str | None) -> str | None:
+    """spawn 系の cwd を renga 契約に従って解決する (Issue #61)。
+
+    renga セマンティクス (spawn_pane の ``cwd`` doc: "absolute, or relative to
+    the caller pane's cwd"):
+    - ``cwd`` が absolute → **そのまま** (adapter にも as-is で渡す)。
+    - ``cwd`` が relative → **caller pane の cwd を base に join** して absolute 化。
+    - ``cwd`` 省略 (None) → caller pane の cwd を継承する (renga: 省略時は呼び元の
+      cwd で起動)。caller cwd も不明なら None (adapter 既定に委ねる)。
+
+    **決定的な拒否 (Issue #61 の核心)**: relative cwd かつ caller cwd 不明
+    (論理ペイン等で bind に cwd が無い) 場合、解決アンカーが無い。ここで黙って
+    relative を adapter に渡すと、adapter (tmux ``new-session -c`` 等) が daemon
+    側の base で再解決し、本 Issue の「``dogfood/`` を欠いた別 tree に着地」が起きる。
+    よって **明確なエラーで拒否** し、黙って間違った base に落とさない。
+
+    absolute 判定は **posix と native (Windows) の双方**を absolute とみなす
+    (``posixpath.isabs(cwd) or os.path.isabs(cwd)``): 本コードベースの canonical な
+    パス表記は posix 形 (``/repo`` / ``/root/dogfood/...``) で、POSIX dogfood
+    (tmux) でも実際そう渡る。Windows daemon (Python 3.13+ の ntpath) は drive
+    letter の無い ``/repo`` を absolute と見なさないため、posix 判定を併用しないと
+    posix-absolute を relative と誤認して誤解決する。absolute はそのまま返す
+    (normpath しない) のでプラットフォームを問わず無変換で透過する。relative の
+    join のみ daemon native (``os.path``) で行う (POSIX daemon=posix / Windows
+    daemon=Windows パスとなり adapter 実行環境と一致)。
+    """
+    if cwd is None:
+        return caller_cwd  # 省略 → caller cwd を継承 (不明なら None)
+    if posixpath.isabs(cwd) or os.path.isabs(cwd):
+        return cwd  # absolute (posix / native 双方) は as-is (renga 契約; normpath しない)
+    if caller_cwd is None:
+        raise ToolArgError(
+            f"[cwd_unanchored] relative cwd {cwd!r} cannot be resolved: the "
+            "caller pane has no known cwd to anchor against (e.g. a logical "
+            "root pane registered without a cwd). Pass an absolute cwd, or "
+            "give the caller pane a cwd (broker serve --root-cwd for the root "
+            "secretary). Refusing to silently resolve against the daemon's base."
+        )
+    return os.path.normpath(os.path.join(caller_cwd, cwd))
+
+
+# ---------------------------------------------------------------------------
 # name 検証 (set_pane_identity / spawn 系で共有)
 # ---------------------------------------------------------------------------
 
@@ -700,6 +746,11 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
         cwd = args.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
             raise ToolArgError("cwd must be a string")
+        # renga 契約で cwd を解決する (Issue #61): absolute は as-is、relative は
+        # caller pane (= この bind) の cwd を base に。caller cwd 不明 + relative は
+        # ここで拒否される (黙って daemon base に落とさない)。token 発行前なので
+        # orphan token は作らない。三 spawn 系 (claude/codex/generic) 共通。
+        cwd = resolve_spawn_cwd(cwd, bind.cwd)
         extra = args.get("args") or []
         if not isinstance(extra, list) or not all(isinstance(a, str) for a in extra):
             raise ToolArgError("args must be a list of strings")

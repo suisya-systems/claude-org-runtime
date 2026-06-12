@@ -5,6 +5,7 @@ default-deny argv guards) — Issue C renga golden-shape compat."""
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -15,6 +16,7 @@ from claude_org_runtime.broker.surface import (
     build_claude_argv,
     build_codex_argv,
     dispatch_tool,
+    resolve_spawn_cwd,
     tools_for,
 )
 
@@ -31,6 +33,46 @@ def _bind(broker, agent_id, role="worker", register=True):
     if register:
         broker.register_local(token)
     return broker.get_bind(token)
+
+
+# ----------------------------------------------------- spawn cwd 解決 (#61)
+# renga 契約: absolute は as-is / relative は caller pane の cwd を base に。
+# caller cwd 不明 + relative は決定的に拒否 (黙って daemon base に落とさない)。
+
+def test_resolve_spawn_cwd_absolute_passes_through_unchanged():
+    # absolute は無変換で透過 (normpath もしない; プラットフォーム差を作らない)。
+    assert resolve_spawn_cwd("/repo", None) == "/repo"
+    assert resolve_spawn_cwd("/repo", "/other/base") == "/repo"
+
+
+def test_resolve_spawn_cwd_relative_anchors_on_caller_cwd():
+    # relative + caller cwd 既知 → caller cwd を base に join した absolute。
+    base = os.path.join(os.sep, "root", "dogfood", "claude-org-ja")
+    resolved = resolve_spawn_cwd(".dispatcher", base)
+    expected = os.path.normpath(os.path.join(base, ".dispatcher"))
+    assert resolved == expected
+    # 不変条件 (Windows/POSIX 双方で頑健): caller cwd が prefix で末尾に component。
+    # (os.path.isabs は Windows の ntpath が drive 無し rooted を absolute と
+    # 見なさない 3.13+ 挙動のため使わない。prefix/suffix 不変条件で代替する。)
+    assert resolved.startswith(os.path.normpath(base))
+    assert resolved.endswith(".dispatcher")
+    # 本 Issue の核心: dogfood/ セグメントが落ちない。
+    assert "dogfood" in resolved
+
+
+def test_resolve_spawn_cwd_relative_unknown_caller_is_rejected():
+    # relative + caller cwd 不明 (論理ペイン等) → 決定的に拒否 (ToolArgError)。
+    # 黙って adapter (daemon base) で再解決させない (= 本 Issue の誤着地の根因)。
+    with pytest.raises(ToolArgError) as ei:
+        resolve_spawn_cwd(".dispatcher", None)
+    assert "cwd_unanchored" in str(ei.value)
+
+
+def test_resolve_spawn_cwd_none_inherits_caller_cwd():
+    # cwd 省略 (None) → caller cwd を継承 (renga: 省略時は呼び元 cwd で起動)。
+    assert resolve_spawn_cwd(None, "/root/base") == "/root/base"
+    # caller cwd も不明なら None (adapter 既定に委ねる; relative ではないので拒否不要)。
+    assert resolve_spawn_cwd(None, None) is None
 
 
 # --------------------------------------------------------------- catalogue

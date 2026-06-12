@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from claude_org_runtime.broker import cli as broker_cli
@@ -31,6 +33,8 @@ def test_broker_parser_defaults():
     assert args.no_nudge is False
     # 既定 root tier は worker (現行挙動不変)。
     assert args.root_role == broker_cli.DEFAULT_ROOT_ROLE == "worker"
+    # --root-cwd 既定は None (run() が os.getcwd を充てる; Issue #61)。
+    assert args.root_cwd is None
     assert args.func is broker_cli.run
 
 
@@ -63,6 +67,20 @@ def test_broker_rejects_unknown_root_role():
     parser = broker_cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "--root-role", "admin"])
+
+
+def test_broker_parses_root_cwd(tmp_path):
+    # --root-cwd override が args に乗る (Issue #61 の relative spawn anchor)。
+    parser = broker_cli.build_parser()
+    args = parser.parse_args(["serve", "--root-cwd", str(tmp_path)])
+    assert args.root_cwd == str(tmp_path)
+
+
+def test_issue_root_token_carries_root_cwd(tmp_path):
+    # root_cwd が bind.cwd に乗る (relative spawn の解決アンカー; Issue #61)。
+    broker = Broker(state_dir=tmp_path, adapter=None)
+    tok = broker_cli.issue_root_token(broker, "secretary", str(tmp_path))
+    assert broker.get_bind(tok).cwd == str(tmp_path)
 
 
 def test_top_level_cli_exposes_broker_serve():
@@ -137,9 +155,10 @@ def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
     captured = {}
     real_issue = broker_cli.issue_root_token
 
-    def spy(broker, root_role=broker_cli.DEFAULT_ROOT_ROLE):
-        tok = real_issue(broker, root_role)
+    def spy(broker, root_role=broker_cli.DEFAULT_ROOT_ROLE, root_cwd=None):
+        tok = real_issue(broker, root_role, root_cwd)
         captured["auth_role"] = broker.get_bind(tok).auth_role
+        captured["cwd"] = broker.get_bind(tok).cwd
         return tok
 
     def boom(*_args, **_kwargs):
@@ -156,6 +175,41 @@ def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
     rc = broker_cli.run(args)
     assert rc == 0
     assert captured["auth_role"] == "dispatcher"
+    # --root-cwd 省略 → daemon 起動 cwd (os.getcwd) を anchor に充てる (Issue #61)。
+    assert captured["cwd"] == os.getcwd()
+
+
+def test_run_wires_explicit_root_cwd_into_bind(tmp_path, monkeypatch):
+    """run() 実運用経路が明示 --root-cwd を bind.cwd まで流し、relative を absolute
+    化することを検証 (codex review Minor / Major)。helper 直叩きや parser 単体では
+    run() が args.root_cwd を無視/相対のまま流す退行を拾えないため run() 経由で押さえる。
+    """
+    captured = {}
+    real_issue = broker_cli.issue_root_token
+
+    def spy(broker, root_role=broker_cli.DEFAULT_ROOT_ROLE, root_cwd=None):
+        tok = real_issue(broker, root_role, root_cwd)
+        captured["cwd"] = broker.get_bind(tok).cwd
+        return tok
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(broker_cli, "issue_root_token", spy)
+    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+
+    # relative な --root-cwd を渡し、run() が absolute 化して bind に載せることを確認。
+    parser = broker_cli.build_parser()
+    args = parser.parse_args(
+        ["serve", "--port", "0", "--no-nudge",
+         "--state-dir", str(tmp_path), "--root-role", "secretary",
+         "--root-cwd", "rel/sub"]
+    )
+    rc = broker_cli.run(args)
+    assert rc == 0
+    # relative → daemon 起動 cwd 基準で absolute 化 (解決アンカーは常に absolute)。
+    assert captured["cwd"] == os.path.abspath("rel/sub")
+    assert os.path.isabs(captured["cwd"])
 
 
 def test_run_registers_root_logical_pane(tmp_path, monkeypatch):
