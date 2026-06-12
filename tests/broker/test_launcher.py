@@ -427,3 +427,55 @@ def test_close_managed_panes_global_mux_limits_to_agent_kinds(tmp_path):
         assert ids["generic"] not in closed         # generic (kind=None) は残す
     finally:
         b.stop()
+
+
+# ============================== up: secretary TUI に broker transport を注入 (Issue #70)
+def test_launch_claude_posix_exec_injects_broker_transport(monkeypatch):
+    """POSIX exec 経路: execvpe に渡る子環境に ORG_TRANSPORT=broker が含まれる。
+
+    これが無いと secretary TUI の /org-start が「env 未設定 = 既定 renga」の正規
+    ルールで renga 経路に落ち、RENGA_PANE_ID 不在で停止する (Issue #70)。
+    """
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+
+    def fake_execvpe(file, argv, env):
+        captured["file"] = file
+        captured["argv"] = argv
+        captured["env"] = env
+
+    monkeypatch.setattr(launcher.os, "execvpe", fake_execvpe)
+    launcher._launch_claude(["claude", "--mcp-config", "{}"])
+    assert captured["file"] == "claude"
+    assert captured["env"].get("ORG_TRANSPORT") == "broker"
+
+
+def test_launch_claude_windows_subprocess_injects_broker_transport(monkeypatch):
+    """Windows subprocess 経路: subprocess.call に渡る env に ORG_TRANSPORT=broker。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    captured = {}
+
+    def fake_call(argv, *, env):
+        captured["argv"] = argv
+        captured["env"] = env
+        return 0
+
+    monkeypatch.setattr(launcher.subprocess, "call", fake_call)
+    rc = launcher._launch_claude(["claude", "--mcp-config", "{}"])
+    assert rc == 0
+    assert captured["env"].get("ORG_TRANSPORT") == "broker"
+
+
+def test_launch_claude_fallback_command_prefixes_broker_transport(monkeypatch, capsys):
+    """claude 不在時の 1 行コマンド表示 fallback にも env 前置を含める
+    (手で起動しても同じ broker transport になる)。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+
+    def fake_call(argv, *, env):
+        raise FileNotFoundError("claude not found")
+
+    monkeypatch.setattr(launcher.subprocess, "call", fake_call)
+    rc = launcher._launch_claude(["claude", "--mcp-config", "{}"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ORG_TRANSPORT=broker" in out
