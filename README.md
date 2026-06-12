@@ -33,6 +33,21 @@ python -m pip install -e .[dev]
 
 ## Quick start
 
+The single-command front door brings up a whole orchestrator session:
+
+```sh
+# Start the broker daemon, mint a secretary token, write its mcp-config,
+# and drop you into an interactive Claude Code TUI — one command:
+claude-org-runtime org up
+
+# Tear it back down: close residual broker panes, request a signal-free
+# shutdown, verify it stopped, and clean up the sidecar:
+claude-org-runtime org down
+```
+
+`org up` is reuse-or-start: a reachable daemon is reused, a stale sidecar
+is replaced. The lower-level building blocks are still available directly:
+
 ```sh
 # Render a per-role settings.local.json:
 claude-org-runtime settings generate \
@@ -48,8 +63,19 @@ claude-org-runtime dispatcher delegate-plan \
     --state-dir .state
 ```
 
-See [`docs/cli.md`](docs/cli.md) for the full CLI reference and the
-migration recipe for `claude-org-ja` consumers.
+See [`docs/cli.md`](docs/cli.md) for the full CLI reference, the `org up` /
+`org down` flags, and the migration recipe for `claude-org-ja` consumers.
+
+## Broker
+
+The broker is a renga-free transport for orchestrator sessions: a localhost
+MCP daemon plus a persisted queue and a terminal adapter (tmux / wezterm
+backends). Agents talk to it over plain HTTP MCP instead of a renga tab, so
+a session can run without the renga UI. It is billing-neutral by design —
+it only ever launches the interactive Claude Code TUI through a builder
+that rejects headless flags. `org up` / `org down` are a thin launcher over
+this control plane (the `daemon.json` sidecar + admin RPC); see
+[`docs/cli.md`](docs/cli.md) for details.
 
 ## Reference role prompts
 
