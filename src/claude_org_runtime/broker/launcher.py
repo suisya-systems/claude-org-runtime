@@ -324,20 +324,27 @@ def build_up_argv(
 def _launch_claude(argv: list[str]) -> int:
     """secretary TUI を起動する。POSIX は exec で置換、Windows は subprocess。
 
-    POSIX: ``os.execvp`` で現プロセスを claude に置換する (TUI が端末を引き継ぐ。
+    POSIX: ``os.execvpe`` で現プロセスを claude に置換する (TUI が端末を引き継ぐ。
     これ以降は返らない)。Windows: exec セマンティクスが無いため subprocess で
     起動し前景で待つ。claude バイナリが見つからない場合は 1 行コマンドを表示して
     人間に委ねる fallback (課金中立 argv はそのまま手で起動できる)。
+
+    どの経路でも子環境に ``ORG_TRANSPORT=broker`` を注入する (Issue #70)。これが
+    無いと secretary TUI の ``/org-start`` が「env 未設定 = 既定 renga」の正規
+    ルールで renga 経路に落ち、``RENGA_PANE_ID`` 不在で停止する。org up は broker
+    制御面を起動しているので、子は常に broker transport を使う。fallback の表示
+    コマンドにも env 前置を含め、手で起動しても同じ transport になるようにする。
     """
+    env = {**os.environ, "ORG_TRANSPORT": "broker"}
     if os.name != "nt":
-        os.execvp(argv[0], argv)  # 返らない (プロセス置換)
-        return 0  # pragma: no cover (execvp 成功時は到達しない)
+        os.execvpe(argv[0], argv, env)  # 返らない (プロセス置換)
+        return 0  # pragma: no cover (execvpe 成功時は到達しない)
     try:
-        return subprocess.call(argv)
+        return subprocess.call(argv, env=env)
     except (FileNotFoundError, OSError):
         import shlex
         print("claude を起動できませんでした。以下を手動で実行してください:")
-        print("  " + " ".join(shlex.quote(a) for a in argv))
+        print("  ORG_TRANSPORT=broker " + " ".join(shlex.quote(a) for a in argv))
         return 0
 
 
