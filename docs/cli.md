@@ -194,11 +194,14 @@ claude-org-runtime org down             # stop the daemon (signal-free) and veri
    `exec`s; Windows launches a subprocess (falling back to printing the
    command if `claude` is not found).
 
-`org down` discovers the daemon from its sidecar, closes residual
-`claude` / `codex` agent panes, requests a signal-free `shutdown`, and
-verifies `broker_stopped` appears exactly once in this run's
-`journal_offset` slice before cleaning up the sidecar. With no sidecar it
-is a no-op.
+`org down` discovers the daemon from its sidecar, closes residual broker
+panes, requests a signal-free `shutdown`, and verifies `broker_stopped`
+appears exactly once in this run's `journal_offset` slice before cleaning
+up the sidecar. The pane-close scope follows the daemon's backend: on an
+isolated backend (tmux) all broker-owned panes are closed (including
+generic `spawn_pane` panes like the attention watcher); on a global-mux
+backend (wezterm) only `claude` / `codex` agent children are closed to
+avoid killing unrelated panes. With no sidecar it is a no-op.
 
 ### `org up` flags
 

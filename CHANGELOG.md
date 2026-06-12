@@ -45,12 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `org down` discovers the daemon from its sidecar, mints its **own**
     auto-unique control token (never `name="secretary"`, which would
     collide with the live secretary it is tearing down), closes residual
-    `claude` / `codex` agent panes (the broker's `close_pane` enforces the
-    `last_pane` guard, logical-pane refusal, and `isolated_session`
-    backend distinction), requests a **signal-free** `shutdown` over the
-    admin RPC, and verifies `broker_stopped` appears exactly once in the
+    broker panes, requests a **signal-free** `shutdown` over the admin RPC,
+    and verifies `broker_stopped` appears exactly once in the
     `journal_offset` slice for this run (avoiding whole-history grep false
-    positives) before cleaning up the sidecar. Absent sidecar is a no-op.
+    positives) before cleaning up the sidecar. The pane-close scope is
+    chosen by the running daemon's backend (read from the sidecar via the
+    adapter's `isolated_session` ClassVar): on an **isolated** backend
+    (tmux — `list_panes` only ever shows broker-owned panes) every pane is
+    closed regardless of `kind`, so generic `spawn_pane` panes (e.g. the
+    attention watcher) are cleaned up too; on a **global-mux** backend
+    (wezterm — `list_panes` also returns unrelated panes) the close is
+    limited to `claude` / `codex` agent children to avoid collateral
+    kills. The broker's own `close_pane` still enforces the `last_pane`
+    guard and logical-pane refusal. Absent sidecar is a no-op.
   - All entry paths absolutize their `state_dir` / `root_cwd` up front
     (`sidecar.absolutize`, combining `posixpath.isabs` to avoid the Windows
     `isabs` trap). `broker serve` is unchanged.

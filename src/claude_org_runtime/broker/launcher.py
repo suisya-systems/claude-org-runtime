@@ -45,7 +45,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from ..terminal import default_backend
+from ..terminal import TmuxAdapter, WezTermAdapter, default_backend
 from . import sidecar, surface
 
 DEFAULT_STATE_DIR = ".state/broker"
@@ -511,18 +511,45 @@ def org_up(
 
 _AGENT_PANE_KINDS = {"claude", "codex"}
 
+# backend 名 → adapter クラス (isolated_session ClassVar を **非インスタンス化**で
+# 読むため。インスタンス化は backend バイナリ解決を伴うので避ける)。
+_BACKEND_ADAPTER_CLASS = {"tmux": TmuxAdapter, "wezterm": WezTermAdapter}
 
-def _close_managed_panes(host: str, port: int, token: str) -> list:
-    """走行中 broker の残存エージェントペイン (claude/codex 子) を close する。
+
+def _backend_is_isolated(backend: str | None) -> bool:
+    """sidecar の backend 名から isolated_session 能力フラグを引く。
+
+    isolated-socket backend (tmux) は自分が spawn した pane のみ list_panes に
+    見せる (= 載っている pane は全て broker 所有)。global-mux backend (wezterm) は
+    無関係 pane も見せる。adapter クラスの ``isolated_session`` ClassVar を
+    インスタンス化せず読むことで、能力判定の単一の出所を adapter に保つ
+    (launcher 側で bool をハードコードして drift させない)。未知 / None は False
+    (保守的に「管理外 pane が混じり得る」側に倒す)。
+    """
+    cls = _BACKEND_ADAPTER_CLASS.get(backend or "")
+    return bool(getattr(cls, "isolated_session", False)) if cls is not None else False
+
+
+def _close_managed_panes(
+    host: str, port: int, token: str, *, isolated: bool,
+) -> list:
+    """走行中 broker の残存 broker ペインを close する (backend 別判定)。
 
     secretary tier の制御 token で list_panes → close_pane を呼ぶ。close_pane が
     内部で token revoke / last-pane ガード / 論理ペイン拒否 / isolated_session の
-    backend 別判定を行うので、down は薄く呼ぶだけ (制御面ロジックを再実装しない)。
+    last-pane カウントを行うので、down は薄く呼ぶだけ (制御面ロジックは再実装しない)。
 
-    close 対象は **claude/codex の子ペイン** に限定する: list_panes は backend に
-    よっては broker 管理外の pane (global-mux の無関係 wezterm pane など) も返す
-    ため、kind で broker が spawn した org エージェントだけを選ぶ (無関係 pane の
-    巻き添え kill を避ける)。接続不可は URLError を送出する (呼び元が握る)。
+    **backend 別の close 範囲 (Issue #63 ユーザー判断: 案 B)**:
+    - ``isolated`` (tmux, isolated-socket): list_panes に載るのは **全て broker 所有**
+      なので ``kind`` を問わず close する。これで generic ``spawn_pane`` (attention
+      watcher 等, kind=None) も含めて org のペインを掃除できる。論理ペイン (窓口) は
+      close_pane が ``[logical_pane]`` で拒否し、最後の 1 枚は ``[last_pane]`` で守る
+      ため、全件 close を試みても安全。
+    - ``not isolated`` (wezterm, global-mux): list_panes は broker 管理外の無関係
+      pane も返すため、``kind∈{claude,codex}`` の **org エージェント子のみ** に限定し、
+      無関係 pane の巻き添え kill を避ける。
+
+    接続不可は URLError を送出する (呼び元が握る)。
     """
     client = _McpClient(host, port, token)
     try:
@@ -530,7 +557,8 @@ def _close_managed_panes(host: str, port: int, token: str) -> list:
         panes = client.call_tool("list_panes").get("panes", [])
         closed: list = []
         for pane in panes:
-            if pane.get("kind") not in _AGENT_PANE_KINDS:
+            # global-mux では org エージェント子のみ。isolated では kind 不問で全件。
+            if not isolated and pane.get("kind") not in _AGENT_PANE_KINDS:
                 continue
             res = client.call_tool("close_pane", {"target": str(pane.get("id"))})
             if res.get("ok"):
@@ -576,6 +604,9 @@ def org_down(args: argparse.Namespace) -> int:
     host, port = sc["host"], sc["port"]
     offset = sc.get("journal_offset", 0)
     admin_token = sidecar.read_admin_token(state_dir)
+    # close 範囲は sidecar に記録された backend の isolated_session 能力で決める
+    # (案 B: isolated=tmux は全 broker ペイン / global-mux=wezterm は agent 子のみ)。
+    isolated = _backend_is_isolated(sc.get("backend"))
 
     closed: list = []
     reachable = False
@@ -592,7 +623,9 @@ def org_down(args: argparse.Namespace) -> int:
             ctrl = None
         if ctrl and ctrl.get("ok"):
             try:
-                closed = _close_managed_panes(host, port, ctrl["token"])
+                closed = _close_managed_panes(
+                    host, port, ctrl["token"], isolated=isolated,
+                )
             except urllib.error.URLError:
                 pass  # MCP 面が落ちていても shutdown は試みる
         # graceful shutdown (シグナル非依存)。

@@ -33,6 +33,8 @@ from claude_org_runtime.broker import sidecar
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.terminal import default_backend
 
+from .conftest import FakeAdapter
+
 
 # --------------------------------------------------------------------- helpers
 def _up_args(state_dir, *, backend=None, name="secretary", root_cwd=None,
@@ -373,3 +375,55 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
         if bnd.agent_id.startswith("admin-") and bnd.registered and not bnd.revoked
     ]
     assert registered_admin == []
+
+
+# ============================================ down: pane close 範囲 (backend 別判定)
+def test_backend_is_isolated_mapping():
+    # adapter ClassVar (tmux=True / wezterm=False) を非インスタンス化で引く。
+    assert launcher._backend_is_isolated("tmux") is True
+    assert launcher._backend_is_isolated("wezterm") is False
+    assert launcher._backend_is_isolated(None) is False     # 未知/None は保守的に False
+
+
+def _broker_with_three_panes(tmp_path, *, isolated):
+    """claude / codex / generic の 3 ペインを持つ started Broker を作る。
+
+    論理 root を 1 つ登録しておき、isolated 分岐で全件 close しても last-pane ガードに
+    引っかからないようにする。返り値は (broker, control_token, {kind: pane_id})。
+    """
+    state_dir = str(tmp_path / "broker")
+    b = Broker(state_dir=state_dir, adapter=FakeAdapter(isolated_session=isolated),
+               port=0, admin_token="A")
+    b.start()
+    sec = b.issue_token("sec", "sec", "secretary", auth_role="secretary")
+    b.register_logical_pane(sec)                    # 窓口 (論理ペイン) を +1 計上
+    c = launcher._McpClient(b.host, b.port, sec)
+    c.initialize()
+    claude_id = c.call_tool("spawn_claude_pane", {"direction": "vertical", "name": "w1"})["id"]
+    codex_id = c.call_tool("spawn_codex_pane", {"direction": "vertical", "name": "w2"})["id"]
+    gen_id = c.call_tool("spawn_pane", {"direction": "vertical", "name": "gen",
+                                        "command": "x"})["id"]
+    c.close()
+    ctrl = b.issue_token("ctrl", "ctrl", "secretary", auth_role="secretary")
+    return b, ctrl, {"claude": claude_id, "codex": codex_id, "generic": gen_id}
+
+
+def test_close_managed_panes_isolated_closes_all_kinds(tmp_path):
+    # isolated (tmux): list_panes は全て broker 所有 → kind 不問で generic も close。
+    b, ctrl, ids = _broker_with_three_panes(tmp_path, isolated=True)
+    try:
+        closed = launcher._close_managed_panes(b.host, b.port, ctrl, isolated=True)
+        assert set(closed) == set(ids.values())     # claude / codex / generic 全部
+    finally:
+        b.stop()
+
+
+def test_close_managed_panes_global_mux_limits_to_agent_kinds(tmp_path):
+    # global-mux (wezterm): 無関係 pane 巻き添え回避のため agent 子 (claude/codex) のみ。
+    b, ctrl, ids = _broker_with_three_panes(tmp_path, isolated=False)
+    try:
+        closed = launcher._close_managed_panes(b.host, b.port, ctrl, isolated=False)
+        assert set(closed) == {ids["claude"], ids["codex"]}
+        assert ids["generic"] not in closed         # generic (kind=None) は残す
+    finally:
+        b.stop()
