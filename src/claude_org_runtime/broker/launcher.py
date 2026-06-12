@@ -636,7 +636,7 @@ def org_down(args: argparse.Namespace) -> int:
             pass
 
     if closed:
-        print(f"org down: closed {len(closed)} agent pane(s): {closed}")
+        print(f"org down: closed {len(closed)} broker pane(s): {closed}")
 
     stopped = _wait_for_stop(state_dir, offset)
 
