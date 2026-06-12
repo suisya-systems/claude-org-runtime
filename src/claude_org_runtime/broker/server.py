@@ -22,6 +22,7 @@ terminal adapter / スレッドに依存する nudge 配達を持つ。MCP tool 
 
 from __future__ import annotations
 
+import hmac
 import itertools
 import json
 import secrets
@@ -53,6 +54,7 @@ class Broker(TokenMixin, StoreMixin):
         port: int = 0,
         nudge_defer_interval: float = 2.0,
         nudge_defer_max_tries: int = 30,
+        admin_token: str | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +63,11 @@ class Broker(TokenMixin, StoreMixin):
         self.port = port
         self.nudge_defer_interval = nudge_defer_interval
         self.nudge_defer_max_tries = nudge_defer_max_tries
+        # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
+        # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
+        # の per-agent bearer token (bind 表) とは別系統の認証 (Codex review
+        # Blocker: 走行中 daemon への admin 経路 / Major: 認証付き)。
+        self.admin_token = admin_token
 
         self._lock = threading.Lock()
         self._binds: dict[str, AgentBind] = {}        # token -> bind
@@ -85,6 +92,16 @@ class Broker(TokenMixin, StoreMixin):
         # 専用 Condition を使い、_lock の binds/queues 契約と絡めない。
         self._events: list[dict] = []
         self._events_cv = threading.Condition()
+
+        # graceful shutdown 用シグナル。admin RPC (shutdown) / KeyboardInterrupt の
+        # どちらでも run() の wait_for_shutdown を解除し、run() が唯一の stop()
+        # 呼出元として後始末する。Windows で SIGINT に依存しない停止経路
+        # (Codex review Blocker 2 対応)。
+        self._shutdown_event = threading.Event()
+        # broker_stopped を二重に journal しないための one-shot ガード。run() の
+        # finally が唯一の stop() 呼出元という契約の保険 (down のオフセット
+        # スライスで broker_stopped が厳密に 1 回であることを保証する)。
+        self._stopped = False
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -115,15 +132,86 @@ class Broker(TokenMixin, StoreMixin):
         self._journal("broker_started", host=self.host, port=self.port)
 
     def stop(self) -> None:
+        """HTTP サーバーを停止し journal に ``broker_stopped`` を残す (冪等)。
+
+        ``_stopped`` ガードで ``broker_stopped`` の journal は **厳密に 1 回**。
+        run() の finally が唯一の呼出元だが、二重呼び (admin teardown 等) でも
+        down のオフセットスライスが複数 ``broker_stopped`` を拾わないようにする。
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         if self._server:
             self._server.shutdown()
             self._server.server_close()
             self._server = None
         self._journal("broker_stopped")
 
+    def request_shutdown(self) -> None:
+        """走行中 daemon に graceful shutdown を要求する (admin RPC の実体)。
+
+        ``_shutdown_event`` を立てるだけで、実際の停止 (stop() + sidecar 削除) は
+        :meth:`wait_for_shutdown` を待つ run() 側が行う。HTTP ハンドラスレッドから
+        ``ThreadingHTTPServer.shutdown()`` を直接呼ぶデッドロックを避けるための分離
+        (シグナルに依存しない停止 = Windows 要件)。"""
+        self._shutdown_event.set()
+
+    def wait_for_shutdown(self, timeout: float | None = None) -> bool:
+        """shutdown 要求 (admin RPC) があるまでブロックする。run() の前景ループ。
+
+        返り値は :meth:`threading.Event.wait` 準拠 (要求済み=True / timeout=False)。
+        serve は前景 debug primitive のまま (既存挙動不変) で、ここがその待機点を
+        ``time.sleep`` ループから差し替えたもの。KeyboardInterrupt でも抜ける。"""
+        return self._shutdown_event.wait(timeout)
+
+    # --------------------------------------------------------------- admin RPC
+    def admin_mint_token(self, params: dict) -> dict:
+        """走行中 daemon に対し新規 root token を発行する (admin RPC の実体)。
+
+        Codex review Blocker 1 対応: serve は起動時に token を stdout へ 1 回出す
+        だけで、走行中 daemon への token 発行経路が無かった。本メソッドが tier
+        (``role`` = auth_role) 指定の token を mint する。root token と同様、これは
+        spawn 子ではないため tier 上限切り (``capped_auth_role``) は適用せず、要求
+        どおりの tier で bind する (= secretary 等を直接発行できる)。返り値に
+        ``--mcp-config`` を含め、呼び元 (org up / タスク 2) がそのまま使える。
+
+        ``role`` は :data:`surface.ROOT_ROLE_CHOICES` の集合で検証する (CLI の
+        ``--root-role`` と同じ canonical 集合)。``cwd`` は relative spawn の解決
+        アンカー (Issue #61) として bind に持たせる (任意)。
+        """
+        role = params.get("role", "worker")
+        if role not in surface.ROOT_ROLE_CHOICES:
+            return {
+                "ok": False,
+                "error": (
+                    f"[invalid_role] {role!r} not in "
+                    f"{surface.ROOT_ROLE_CHOICES}"
+                ),
+            }
+        cwd = params.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            return {"ok": False, "error": "[invalid_cwd] cwd must be a string"}
+        name = params.get("name") or "admin-minted"
+        if not isinstance(name, str):
+            return {"ok": False, "error": "[invalid_name] name must be a string"}
+        token = self.issue_token(
+            name, name, role, cwd=cwd, auth_role=role,
+        )
+        return {
+            "ok": True,
+            "token": token,
+            "agent_id": name,
+            "role": role,
+            "mcp_config": self.mcp_config_for(token),
+        }
+
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/mcp"
+
+    @property
+    def admin_url(self) -> str:
+        return f"http://{self.host}:{self.port}/admin"
 
     # ----------------------------------------------------------------- nudge
     def _trigger_nudge(self, target: AgentBind) -> None:
@@ -847,7 +935,58 @@ class _McpHandler(BaseHTTPRequestHandler):
         self.broker._journal("session_closed", agent_id=bind.agent_id)
         self._send_json(200, None)
 
+    def _handle_admin(self):
+        """admin HTTP RPC (token mint / graceful shutdown)。
+
+        per-agent bearer token (bind 表) とは別系統で、``broker.admin_token`` の
+        bearer を要求する (定数時間比較)。admin token 未設定なら経路ごと隠す (404)。
+        body は ``{"method": ..., "params": {...}}`` の小さな JSON-RPC 風。
+        Codex review: admin 経路は認証付き / シグナル非依存の HTTP RPC。
+        """
+        broker = self.broker
+        # admin 面が無効 (serve が admin token を設定していない / 内部テスト用
+        # broker)。経路の存在自体を隠すため 404。
+        if broker.admin_token is None:
+            self._send_json(404, None)
+            return
+        auth = self.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        # 定数時間比較 (token 長/内容のタイミングリークを避ける)。空 token も弾く。
+        if not token or not hmac.compare_digest(token, broker.admin_token):
+            self._send_json(
+                401, {"ok": False, "error": "[admin_unauthorized] invalid admin token"}
+            )
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"ok": False, "error": "[parse_error] invalid json body"})
+            return
+        method = req.get("method", "")
+        params = req.get("params") or {}
+        if not isinstance(params, dict):
+            self._send_json(400, {"ok": False, "error": "[invalid_params] params must be object"})
+            return
+        if method == "mint_token":
+            result = broker.admin_mint_token(params)
+            self._send_json(200 if result.get("ok") else 400, result)
+        elif method == "shutdown":
+            # 応答を先に返してから shutdown を要求する: クライアントは ack を受け
+            # 取れ、実際の停止 (server.shutdown + sidecar 削除) は run() 側が行う
+            # (ハンドラスレッドから ThreadingHTTPServer.shutdown を直接呼ぶ
+            # デッドロックを避ける)。
+            self._send_json(200, {"ok": True, "shutting_down": True})
+            broker.request_shutdown()
+        else:
+            self._send_json(
+                400, {"ok": False, "error": f"[unknown_admin_method] {method!r}"}
+            )
+
     def do_POST(self):
+        if self.path.rstrip("/") == "/admin":
+            self._handle_admin()
+            return
         if self.path.rstrip("/") != "/mcp":
             self._send_json(404, None)
             return

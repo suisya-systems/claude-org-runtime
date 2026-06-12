@@ -17,11 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 
-from ..terminal import VALID_BACKENDS, make_adapter
+from ..terminal import VALID_BACKENDS, default_backend, make_adapter
+from . import sidecar
 from .server import Broker
+from .surface import ROOT_ROLE_CHOICES
 
 DEFAULT_STATE_DIR = ".state/broker"
 DEFAULT_PORT = 48720
@@ -29,7 +32,8 @@ DEFAULT_PORT = 48720
 # root agent (手動検証用 token) を bind する権限 tier。tools/list の公開面は
 # token の auth_role で構造的に絞られる (surface.tools_for)。既定 worker は
 # 現行挙動 (messaging 4 面) を不変に保つ。secretary 起動で 13 面全面になる。
-ROOT_ROLE_CHOICES = ("worker", "curator", "dispatcher", "secretary")
+# 受理集合は surface.ROOT_ROLE_CHOICES を canonical な単一の出所として共有する
+# (admin RPC の mint_token と同じ集合で検証する)。
 DEFAULT_ROOT_ROLE = "worker"
 
 
@@ -118,16 +122,49 @@ def issue_root_token(
 
 
 def run(args: argparse.Namespace) -> int:
-    adapter = None if args.no_nudge else make_adapter(args.backend)
+    # state-dir は入口で絶対化する (sidecar / journal の単一の絶対パス。Windows
+    # isabs の罠を避けるため posixpath 併用。Codex review Minor / #61 の先例)。
+    state_dir = sidecar.absolutize(args.state_dir)
+    # backend は **解決済み** 名を記録する: --backend 省略時は default_backend()、
+    # --no-nudge (adapter 無し) は None。健全性判定 (タスク 2) が「同 backend」を
+    # 照合できるよう要求値ではなく実値を sidecar に残す (Codex review Major)。
+    if args.no_nudge:
+        adapter = None
+        backend_name = None
+    else:
+        backend_name = args.backend or default_backend()
+        adapter = make_adapter(backend_name)
+    # admin HTTP RPC (token mint / graceful shutdown) の認証 token。root token とは
+    # 別系統で生成し sidecar に 0600 で書く (平文 journal 禁止。Codex review)。
+    admin_token = secrets.token_urlsafe(32)
     broker = Broker(
-        state_dir=args.state_dir,
+        state_dir=state_dir,
         adapter=adapter,
         host=args.host,
         port=args.port,
+        admin_token=admin_token,
     )
+    # run スライスの起点: この run の開始前の journal バイト長 (broker.start が
+    # broker_started を append する前に取る)。down はこのオフセット以降だけを見て
+    # broker_stopped を確認する = 全履歴 grep の偽陽性回避 (Codex review Major)。
+    journal_offset = sidecar.journal_offset(state_dir)
+    started_at = time.time()
     broker.start()
+    # daemon sidecar を公開する (発見用メタ + admin token)。停止時に finally で削除。
+    sidecar.write_sidecar(
+        state_dir,
+        pid=os.getpid(),
+        host=args.host,
+        port=broker.port,
+        backend=backend_name,
+        started_at=started_at,
+        journal_offset=journal_offset,
+    )
+    sidecar.write_admin_token(state_dir, admin_token)
     print(f"org-broker listening on {broker.url}")
-    print(f"queue store: {Path(args.state_dir).resolve() / 'queue.jsonl'}")
+    print(f"admin RPC: {broker.admin_url} (token in {state_dir}/{sidecar.ADMIN_TOKEN_NAME})")
+    print(f"daemon sidecar: {state_dir}/{sidecar.SIDECAR_NAME} (backend={backend_name})")
+    print(f"queue store: {Path(state_dir) / 'queue.jsonl'}")
     # 手動検証用の token を 1 本発行して mcp-config を表示する (spike __main__ と同等)。
     # root_cwd 省略時は daemon 起動 cwd (os.getcwd) を anchor に充てる (Issue #61。
     # 運用契約: 本デーモンは session root から起動する。help 参照)。明示指定が
@@ -146,11 +183,18 @@ def run(args: argparse.Namespace) -> int:
     # close_pane が [last_pane] 誤判定せず子を閉じられる。
     root_pane = broker.register_logical_pane(tok)
     print(f"root pane registered (logical, id={root_pane['id']}, role={args.root_role})")
+    # 前景で shutdown 要求まで待つ。要求は (a) admin RPC (shutdown) または
+    # (b) KeyboardInterrupt の二経路。シグナル (SIGINT) に依存しない停止経路を
+    # admin RPC で提供するのが Blocker 2 (Windows 要件)。serve 自体は前景 debug
+    # primitive のまま (既存挙動不変)。run() が **唯一の stop() 呼出元** で、
+    # broker_stopped を journal に 1 回残し sidecar を削除する。
     try:
-        while True:
-            time.sleep(3600)
+        broker.wait_for_shutdown()
     except KeyboardInterrupt:
+        pass
+    finally:
         broker.stop()
+        sidecar.remove_sidecar(state_dir)
     return 0
 
 

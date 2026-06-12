@@ -2,9 +2,9 @@
 """Tests for the broker daemon CLI wiring.
 
 大半は argument parser + top-level CLI 統合を検証する。``run`` 本体は serve
-ループ (``time.sleep`` 無限待ち) でブロックするが、``--root-role`` の配線退行を
-拾うため、末尾の 1 本だけ ``time.sleep`` を即時 KeyboardInterrupt に差し替えて
-``run`` を実運用経路ごと回す。
+ループ (``broker.wait_for_shutdown`` 待機) でブロックするが、``--root-role`` 等の
+配線退行を拾うため、``Broker.wait_for_shutdown`` を即時 KeyboardInterrupt に差し
+替えて ``run`` を実運用経路ごと回す。
 """
 
 from __future__ import annotations
@@ -148,9 +148,9 @@ def test_issue_root_token_secretary_is_full_surface(tmp_path):
 def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
     """run() 実運用経路が args.root_role を token の auth_role まで流すことを検証。
 
-    serve ループ (time.sleep 無限待ち) を即時 KeyboardInterrupt に差し替えて run()
-    を最後まで回す。helper 直叩きでは run() が ``issue_root_token(broker)`` に
-    退行しても素通りするため、この配線は run() 経由で押さえる必要がある。
+    wait_for_shutdown 待機を即時 KeyboardInterrupt に差し替えて run() を最後まで
+    回す。helper 直叩きでは run() が ``issue_root_token(broker)`` に退行しても
+    素通りするため、この配線は run() 経由で押さえる必要がある。
     """
     captured = {}
     real_issue = broker_cli.issue_root_token
@@ -165,7 +165,7 @@ def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(broker_cli, "issue_root_token", spy)
-    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+    monkeypatch.setattr(Broker, "wait_for_shutdown", boom)
 
     parser = broker_cli.build_parser()
     args = parser.parse_args(
@@ -196,7 +196,7 @@ def test_run_wires_explicit_root_cwd_into_bind(tmp_path, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(broker_cli, "issue_root_token", spy)
-    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+    monkeypatch.setattr(Broker, "wait_for_shutdown", boom)
 
     # relative な --root-cwd を渡し、run() が absolute 化して bind に載せることを確認。
     parser = broker_cli.build_parser()
@@ -214,8 +214,8 @@ def test_run_wires_explicit_root_cwd_into_bind(tmp_path, monkeypatch):
 
 def test_run_registers_root_logical_pane(tmp_path, monkeypatch):
     """run() 実運用経路が root token を pane 登録簿に論理ペインとして載せることを
-    検証 (Issue #57)。serve ループを即時 KeyboardInterrupt に差し替えて run() を
-    最後まで回し、register_logical_pane の戻りを spy で捕捉する。"""
+    検証 (Issue #57)。wait_for_shutdown 待機を即時 KeyboardInterrupt に差し替えて
+    run() を最後まで回し、register_logical_pane の戻りを spy で捕捉する。"""
     captured = {}
     real_register = Broker.register_logical_pane
 
@@ -229,7 +229,7 @@ def test_run_registers_root_logical_pane(tmp_path, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(Broker, "register_logical_pane", spy)
-    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+    monkeypatch.setattr(Broker, "wait_for_shutdown", boom)
 
     parser = broker_cli.build_parser()
     args = parser.parse_args(

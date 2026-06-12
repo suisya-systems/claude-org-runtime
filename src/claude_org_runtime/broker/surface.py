@@ -344,6 +344,11 @@ def tools_for(auth_role: str) -> list[dict]:
     return [t for t in TOOLS if t["name"] in allowed]
 
 
+# root / admin 経路が発行できる権限 tier (auth_role) の受理集合。CLI の
+# ``--root-role`` と admin RPC の ``mint_token`` が共有する canonical な集合
+# (二重定義による drift を避ける単一の出所)。
+ROOT_ROLE_CHOICES = ("worker", "curator", "dispatcher", "secretary")
+
 # tier 序列 (権限の強さ)。spawn 子の auth_role を caller tier で上限を切るのに使う。
 _TIER_RANK = {"secretary": 2, "dispatcher": 1}
 
