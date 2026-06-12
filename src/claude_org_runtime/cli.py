@@ -20,6 +20,7 @@ from typing import Optional
 from . import __version__
 from .attention import cli as attention_cli
 from .broker import cli as broker_cli
+from .broker import launcher as broker_launcher
 from .dispatcher import runner as dispatcher_runner
 from .migrate import v1_to_v2 as migrate_v1_to_v2
 from .settings import generator as settings_generator
@@ -104,6 +105,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broker_sub = broker_p.add_subparsers(dest="cmd", required=True)
     broker_cli.add_subparsers(broker_sub)
+
+    # org (up / down launcher — thin wrapper over the broker control plane)
+    org_p = sub.add_parser(
+        "org",
+        help=(
+            "org session launcher: 'up' ensures a broker daemon and launches the "
+            "secretary TUI; 'down' stops the daemon (signal-free) and verifies it."
+        ),
+    )
+    org_sub = org_p.add_subparsers(dest="cmd", required=True)
+    broker_launcher.add_subparsers(org_sub)
 
     # migrate
     migrate_p = sub.add_parser(

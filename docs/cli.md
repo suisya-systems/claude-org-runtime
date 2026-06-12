@@ -165,6 +165,67 @@ dropped from the rendered sandbox object — this handles WSL
 `permissions.deny Read(...) / Write(...)` (Layer 2) is **never**
 suppressed.
 
+## `org up` / `org down`
+
+A thin session launcher over the broker control plane (the `daemon.json`
+sidecar + admin RPC). It does **not** re-implement any control-plane
+logic; it orchestrates the existing primitives.
+
+```sh
+claude-org-runtime org up               # reuse-or-start the daemon, launch secretary TUI
+claude-org-runtime org down             # stop the daemon (signal-free) and verify
+```
+
+`org up`:
+
+1. Reads the `daemon.json` sidecar under `--state-dir` and judges health
+   by **reachability** (not PID liveness): it mints a `secretary`-tier
+   root token via the admin RPC and confirms an MCP `initialize` ->
+   `tools/list` round-trip. Reachable -> reuse; unreachable (stale
+   sidecar) -> start a fresh daemon in the background and discover its
+   port from the newly published sidecar.
+2. A *live* daemon with a different `--backend` than requested is a
+   conflict (run `org down` first); an already-registered `secretary` on a
+   live daemon makes `org up` a no-op ("already up").
+3. Writes the minted secretary's `--mcp-config` to
+   `<state-dir>/secretary-mcp.json` (mode `0600`).
+4. Launches the interactive `claude` TUI. The argv is built only through
+   the billing-neutral builder, so headless flags can never leak in. POSIX
+   `exec`s; Windows launches a subprocess (falling back to printing the
+   command if `claude` is not found).
+
+`org down` discovers the daemon from its sidecar, closes residual
+`claude` / `codex` agent panes, requests a signal-free `shutdown`, and
+verifies `broker_stopped` appears exactly once in this run's
+`journal_offset` slice before cleaning up the sidecar. With no sidecar it
+is a no-op.
+
+### `org up` flags
+
+| Flag | Description |
+|------|-------------|
+| `--state-dir PATH` | Daemon state dir (sidecar / queue). Default: `.state/broker`. |
+| `--backend NAME` | Terminal backend for the daemon (default: OS auto — POSIX=tmux / Windows=wezterm). Must match a running daemon when reusing. |
+| `--root-cwd PATH` | cwd given to the secretary bind = anchor for relative-`cwd` spawns (Issue #61). Default: the directory `org up` runs in. |
+| `--name NAME` | secretary agent id/name to mint. Default: `secretary`. |
+| `--model VALUE` | Forwarded to the secretary TUI as `--model <value>`. |
+| `--permission-mode VALUE` | Forwarded to the secretary TUI as `--permission-mode <value>`. |
+| `--claude-arg ARG` | Extra interactive `claude` flag appended after the structured fields (repeatable). Reserved / headless flags are rejected by the builder. |
+
+### `org down` flags
+
+| Flag | Description |
+|------|-------------|
+| `--state-dir PATH` | Daemon state dir to discover the sidecar. Default: `.state/broker`. |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | up: launched (or already up); down: `broker_stopped` verified (or no sidecar). |
+| `1` | down: shutdown requested but `broker_stopped` not observed / daemon unreachable. |
+| `2` | up: backend conflict with a live daemon, or admin mint / MCP surface unhealthy. |
+
 ## Migration from `claude-org-ja`'s `tools/`
 
 If your `claude-org-ja` checkout was previously calling either of the
