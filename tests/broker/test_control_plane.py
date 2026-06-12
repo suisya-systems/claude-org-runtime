@@ -108,6 +108,27 @@ def test_remove_sidecar_is_idempotent(tmp_path):
     assert sidecar.read_admin_token(tmp_path) is None
 
 
+def test_admin_token_written_atomically_and_0600(tmp_path):
+    # admin.token は temp → rename で atomic publish され、.tmp を残さない。
+    import os
+    import stat
+    path = sidecar.write_admin_token(tmp_path, "SECRET-TOKEN")
+    assert sidecar.read_admin_token(tmp_path) == "SECRET-TOKEN"
+    assert not (tmp_path / (sidecar.ADMIN_TOKEN_NAME + ".tmp")).exists()
+    # 0600 (POSIX のみ実効。Windows は read-only ビットのみで group/other を本当には
+    # 落とせない既知制限のため、owner-read だけ確認する)。
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode & stat.S_IRUSR
+    if os.name != "nt":
+        assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
+
+
+def test_read_admin_token_empty_is_none(tmp_path):
+    # 空ファイル (理論上の torn read / 外部 truncate) は公開済み token と誤認しない。
+    (tmp_path / sidecar.ADMIN_TOKEN_NAME).write_text("", encoding="utf-8")
+    assert sidecar.read_admin_token(tmp_path) is None
+
+
 def test_read_journal_since_avoids_prior_run_false_positive(tmp_path):
     """journal_offset スライスが過去 run の broker_stopped を拾わないことを検証。
 
@@ -167,11 +188,43 @@ def test_admin_mint_token_secretary_is_full_surface(admin_broker):
 
 
 def test_admin_mint_token_carries_cwd(admin_broker, tmp_path):
-    # cwd を渡すと bind に乗る (relative spawn の解決アンカー; Issue #61 parity)。
+    # absolute cwd を渡すと as-is で bind に乗る (relative spawn の解決アンカー)。
     res = _admin_post(admin_broker, {"method": "mint_token",
                                      "params": {"role": "secretary",
                                                 "cwd": str(tmp_path)}}, "ADMIN-SECRET")
     assert admin_broker.get_bind(res["token"]).cwd == str(tmp_path)
+
+
+def test_admin_mint_token_absolutizes_relative_cwd(admin_broker):
+    # relative cwd は daemon 起動 cwd 基準で絶対化される (Issue #61 が admin 経路で
+    # 再発しないこと。Codex review Major)。
+    import os
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary",
+                                                "cwd": "rel/sub"}}, "ADMIN-SECRET")
+    cwd = admin_broker.get_bind(res["token"]).cwd
+    assert os.path.isabs(cwd)
+    assert cwd == os.path.abspath("rel/sub")
+
+
+def test_admin_mint_token_default_agent_id_is_unique(admin_broker):
+    # 既定 (name 省略) で複数回 mint すると別 agent_id になる (固定名による
+    # bind/queue 共有・配送先曖昧化を避ける。Codex review Major)。
+    r1 = _admin_post(admin_broker, {"method": "mint_token",
+                                    "params": {"role": "worker"}}, "ADMIN-SECRET")
+    r2 = _admin_post(admin_broker, {"method": "mint_token",
+                                    "params": {"role": "worker"}}, "ADMIN-SECRET")
+    assert r1["agent_id"] != r2["agent_id"]
+    assert r1["token"] != r2["token"]
+
+
+def test_admin_mint_token_honors_explicit_name(admin_broker):
+    # 明示 name 指定時はそれを agent_id に使う。
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary",
+                                                "name": "org-up-secretary"}}, "ADMIN-SECRET")
+    assert res["agent_id"] == "org-up-secretary"
+    assert admin_broker.get_bind(res["token"]).name == "org-up-secretary"
 
 
 def test_admin_mint_token_rejects_unknown_role(admin_broker):

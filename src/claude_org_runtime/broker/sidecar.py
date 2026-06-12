@@ -114,15 +114,24 @@ def write_admin_token(state_dir: str | os.PathLike[str], token: str) -> Path:
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     path = state_dir / ADMIN_TOKEN_NAME
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = state_dir / (ADMIN_TOKEN_NAME + ".tmp")
+    # 0600 の temp に書いてから atomic rename で公開する。in-place の O_TRUNC 更新だと
+    # 起動監視側が書込途中に空文字列/部分書きを拾い、直後の /admin が 401 になる
+    # フレークを生む (daemon.json と同じ atomic publish に揃える。Codex review Major)。
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(token)
     finally:
         try:
-            os.chmod(path, 0o600)  # 既存ファイル再利用時の best-effort
+            os.chmod(tmp, 0o600)
         except OSError:
             pass
+    os.replace(tmp, path)  # 同一 dir 内 rename = atomic publish (torn read 回避)
+    try:
+        os.chmod(path, 0o600)  # rename 後の最終ファイルにも best-effort で確実化
+    except OSError:
+        pass
     return path
 
 
@@ -136,12 +145,17 @@ def read_sidecar(state_dir: str | os.PathLike[str]) -> dict | None:
 
 
 def read_admin_token(state_dir: str | os.PathLike[str]) -> str | None:
-    """admin.token を読む (無ければ None)。"""
+    """admin.token を読む (無い / 空なら None)。
+
+    空文字列も None 扱いにする (atomic publish 前の理論上の torn read や、外部が
+    truncate したファイルを「公開済み token」と誤認しないため)。
+    """
     path = Path(state_dir) / ADMIN_TOKEN_NAME
     try:
-        return path.read_text(encoding="utf-8").strip()
+        tok = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
+    return tok or None
 
 
 def remove_sidecar(state_dir: str | os.PathLike[str]) -> None:

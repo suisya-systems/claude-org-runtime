@@ -37,7 +37,7 @@ from ..terminal import (
     TerminalAdapter,
     classify_pane_state,
 )
-from . import surface
+from . import sidecar, surface
 from .store import StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
@@ -189,18 +189,28 @@ class Broker(TokenMixin, StoreMixin):
                 ),
             }
         cwd = params.get("cwd")
-        if cwd is not None and not isinstance(cwd, str):
-            return {"ok": False, "error": "[invalid_cwd] cwd must be a string"}
-        name = params.get("name") or "admin-minted"
-        if not isinstance(name, str):
+        if cwd is not None:
+            if not isinstance(cwd, str):
+                return {"ok": False, "error": "[invalid_cwd] cwd must be a string"}
+            # relative cwd は daemon 起動 cwd 基準で絶対化する。serve の --root-cwd と
+            # 同じ正規化 (相対のまま bind に積むと relative spawn の解決アンカーが
+            # 相対になり Issue #61 が admin 経路で再発する。Codex review Major)。
+            cwd = sidecar.absolutize(cwd)
+        name = params.get("name")
+        if name is not None and not isinstance(name, str):
             return {"ok": False, "error": "[invalid_name] name must be a string"}
+        # 既定 agent_id は毎回一意にする: 固定名だと複数回 mint した token が同一
+        # agent として bind/queue を共有し配送先が曖昧化する (agent_id 基準の
+        # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使う。
+        agent_id = name or f"admin-{secrets.token_hex(4)}"
         token = self.issue_token(
-            name, name, role, cwd=cwd, auth_role=role,
+            agent_id, agent_id, role, cwd=cwd, auth_role=role,
         )
         return {
             "ok": True,
             "token": token,
-            "agent_id": name,
+            "agent_id": agent_id,
+            "name": agent_id,
             "role": role,
             "mcp_config": self.mcp_config_for(token),
         }
