@@ -76,7 +76,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
             "本デーモンは session root から起動する運用契約のため、その起動ディレクトリ "
             "が relative spawn の解決アンカーになる。運用上 session root 以外から "
             "起動する場合は本フラグで明示せよ (= 決定的な解決 base。黙って間違った base "
-            "に落とさないための文書化済み既定)。"
+            "に落とさないための文書化済み既定)。relative を渡しても daemon 起動 cwd を "
+            "基準に **absolute 化** して bind に持たせる (解決アンカーは常に absolute)。"
         ),
     )
 
@@ -129,8 +130,12 @@ def run(args: argparse.Namespace) -> int:
     print(f"queue store: {Path(args.state_dir).resolve() / 'queue.jsonl'}")
     # 手動検証用の token を 1 本発行して mcp-config を表示する (spike __main__ と同等)。
     # root_cwd 省略時は daemon 起動 cwd (os.getcwd) を anchor に充てる (Issue #61。
-    # 運用契約: 本デーモンは session root から起動する。help 参照)。
-    root_cwd = args.root_cwd if args.root_cwd is not None else os.getcwd()
+    # 運用契約: 本デーモンは session root から起動する。help 参照)。明示指定が
+    # relative の場合も **absolute 化** する: root の cwd が relative のままだと、
+    # 子 spawn の relative cwd 解決アンカーが relative になり、resolve_spawn_cwd の
+    # join 結果も relative → adapter (daemon base) で再解決され Issue #61 が再発する。
+    # CLI 境界で absolute に固定して解決アンカーを決定的にする (codex review Major)。
+    root_cwd = os.path.abspath(args.root_cwd) if args.root_cwd is not None else os.getcwd()
     tok = issue_root_token(broker, args.root_role, root_cwd)
     print(f"manual test token ({args.root_role}):", tok)
     print(f"root pane cwd (relative spawn anchor): {root_cwd}")

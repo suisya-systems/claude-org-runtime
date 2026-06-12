@@ -179,6 +179,39 @@ def test_run_wires_root_role_into_issued_token(tmp_path, monkeypatch):
     assert captured["cwd"] == os.getcwd()
 
 
+def test_run_wires_explicit_root_cwd_into_bind(tmp_path, monkeypatch):
+    """run() 実運用経路が明示 --root-cwd を bind.cwd まで流し、relative を absolute
+    化することを検証 (codex review Minor / Major)。helper 直叩きや parser 単体では
+    run() が args.root_cwd を無視/相対のまま流す退行を拾えないため run() 経由で押さえる。
+    """
+    captured = {}
+    real_issue = broker_cli.issue_root_token
+
+    def spy(broker, root_role=broker_cli.DEFAULT_ROOT_ROLE, root_cwd=None):
+        tok = real_issue(broker, root_role, root_cwd)
+        captured["cwd"] = broker.get_bind(tok).cwd
+        return tok
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(broker_cli, "issue_root_token", spy)
+    monkeypatch.setattr(broker_cli.time, "sleep", boom)
+
+    # relative な --root-cwd を渡し、run() が absolute 化して bind に載せることを確認。
+    parser = broker_cli.build_parser()
+    args = parser.parse_args(
+        ["serve", "--port", "0", "--no-nudge",
+         "--state-dir", str(tmp_path), "--root-role", "secretary",
+         "--root-cwd", "rel/sub"]
+    )
+    rc = broker_cli.run(args)
+    assert rc == 0
+    # relative → daemon 起動 cwd 基準で absolute 化 (解決アンカーは常に absolute)。
+    assert captured["cwd"] == os.path.abspath("rel/sub")
+    assert os.path.isabs(captured["cwd"])
+
+
 def test_run_registers_root_logical_pane(tmp_path, monkeypatch):
     """run() 実運用経路が root token を pane 登録簿に論理ペインとして載せることを
     検証 (Issue #57)。serve ループを即時 KeyboardInterrupt に差し替えて run() を
