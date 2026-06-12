@@ -24,7 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     conflict (`org down` first) instead of silently spawning a second
     daemon over the same `state_dir`. If a `secretary` is already
     registered on a live daemon, `org up` is a no-op ("already up") rather
-    than launching a second, mis-named secretary.
+    than launching a second, mis-named secretary. The reuse health probe
+    mints an **unnamed** (auto-unique) token for its `initialize` ->
+    `tools/list` round-trip — never the named `secretary` — so a
+    backend-conflict or unhealthy-MCP failure can never leave a
+    `name="secretary"` orphan that would brick the next `org up` with
+    `name_taken`; the probe session is de-registered via the MCP `DELETE`
+    when done. (Known limitation: the probe leaves a de-registered,
+    not-revoked bind in the daemon's in-memory table, cleared on daemon
+    shutdown — the control plane exposes no token-revoke RPC and this
+    launcher does not add one.)
   - The minted secretary's `--mcp-config` is written to
     `<state-dir>/secretary-mcp.json` with mode `0600` (atomic
     temp -> `os.replace`, mirroring the `admin.token` publish). The

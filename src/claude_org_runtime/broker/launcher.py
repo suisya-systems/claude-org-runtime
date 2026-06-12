@@ -162,17 +162,44 @@ class _McpClient:
         except (json.JSONDecodeError, TypeError):
             return {"raw": text, "isError": result.get("isError", False)}
 
+    def close(self) -> None:
+        """MCP セッションを DELETE で閉じる (best-effort)。
+
+        bind の ``session_id`` を落とし ``registered=False`` にする (server の
+        do_DELETE)。健全性 probe で使い捨てた token を list_peers / 配送先から
+        de-register し、走行中 daemon に idle な登録を残さないための後始末。
+        初期化前 / 既に閉じている等は無視する (制御面は変更しない薄い掃除)。
+        """
+        if self.session_id is None:
+            return
+        req = urllib.request.Request(
+            self.url,
+            headers={"Authorization": f"Bearer {self.token}",
+                     "Mcp-Session-Id": self.session_id},
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout):
+                pass
+        except (urllib.error.URLError, urllib.error.HTTPError):
+            pass
+        self.session_id = None
+
 
 def _mcp_surface_ok(host: str, port: int, token: str) -> bool:
     """minted token で MCP initialize → tools/list が往復し公開面が返ることを確認。
 
     secretary tier の token なので全 13 面が見える前提。往復できれば daemon の
     MCP 面は健全 (admin 面だけでなく per-agent 面も生きている)。接続不可は
-    URLError を送出する (呼び元が握る)。
+    URLError を送出する (呼び元が握る)。確認後はセッションを DELETE で閉じ、
+    使い捨て probe token を走行中 daemon に登録したまま残さない。
     """
     client = _McpClient(host, port, token)
-    client.initialize()
-    return len(client.tools_list()) > 0
+    try:
+        client.initialize()
+        return len(client.tools_list()) > 0
+    finally:
+        client.close()
 
 
 # ===========================================================================
@@ -498,16 +525,19 @@ def _close_managed_panes(host: str, port: int, token: str) -> list:
     巻き添え kill を避ける)。接続不可は URLError を送出する (呼び元が握る)。
     """
     client = _McpClient(host, port, token)
-    client.initialize()
-    panes = client.call_tool("list_panes").get("panes", [])
-    closed: list = []
-    for pane in panes:
-        if pane.get("kind") not in _AGENT_PANE_KINDS:
-            continue
-        res = client.call_tool("close_pane", {"target": str(pane.get("id"))})
-        if res.get("ok"):
-            closed.append(pane.get("id"))
-    return closed
+    try:
+        client.initialize()
+        panes = client.call_tool("list_panes").get("panes", [])
+        closed: list = []
+        for pane in panes:
+            if pane.get("kind") not in _AGENT_PANE_KINDS:
+                continue
+            res = client.call_tool("close_pane", {"target": str(pane.get("id"))})
+            if res.get("ok"):
+                closed.append(pane.get("id"))
+        return closed
+    finally:
+        client.close()  # 使い捨て control token を de-register (down 直前の掃除)
 
 
 def _wait_for_stop(

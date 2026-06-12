@@ -326,3 +326,50 @@ def test_org_down_cleans_stale_sidecar_when_unreachable(tmp_path, monkeypatch):
     assert rc == 1
     assert sidecar.read_sidecar(state_dir) is None       # stale → 後始末済み
     assert sidecar.read_admin_token(state_dir) is None
+
+
+def test_org_down_keeps_sidecar_when_admin_token_missing(tmp_path, monkeypatch):
+    """admin.token が無く shutdown を要求できない場合は、生存 daemon を孤立させない
+    よう sidecar を残す (daemon.json のみで誤って discovery 経路を消さない)。"""
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59997,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    # admin.token は書かない。
+    monkeypatch.setattr(launcher, "STOP_WAIT_TIMEOUT", 0.3)
+    rc = launcher.org_down(_down_args(state_dir))
+    assert rc == 1
+    assert sidecar.read_sidecar(state_dir) is not None    # discovery 経路を残す
+
+
+# =================================================== up: unhealthy live daemon
+def test_org_up_errors_when_mcp_surface_unhealthy(live_daemon, monkeypatch):
+    """admin は応答するが MCP 面が健全でない生存 daemon は unhealthy エラー。"""
+    b, state_dir = live_daemon
+    monkeypatch.setattr(launcher, "_mcp_surface_ok", lambda *a, **k: False)
+    launched = []
+    rc = launcher.org_up(
+        _up_args(state_dir),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        launch=lambda argv: launched.append(argv) or 0,
+    )
+    assert rc == 2
+    assert launched == []
+
+
+def test_reuse_probe_session_is_deregistered(live_daemon):
+    """健全性 probe の使い捨て無名 token は MCP DELETE で de-register され、
+    list_peers (registered bind) に残らない (probe orphan の蓄積を抑える)。"""
+    b, state_dir = live_daemon
+    launcher.org_up(
+        _up_args(state_dir),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        launch=lambda argv: 0,
+    )
+    # admin-* の probe bind は close() で registered=False に落ちている。
+    registered_admin = [
+        bnd for bnd in b._binds.values()
+        if bnd.agent_id.startswith("admin-") and bnd.registered and not bnd.revoked
+    ]
+    assert registered_admin == []
