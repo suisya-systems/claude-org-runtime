@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `org up` / `org down`: a thin session launcher wrapped around the broker
+  control plane (sidecar contract + admin RPC from PR #67). It re-uses the
+  control-plane logic rather than re-implementing it.
+  - `org up` decides whether to **reuse** a running daemon on
+    *reachability*, not PID liveness: it reads the `daemon.json` sidecar,
+    mints a `secretary`-tier root token over the admin RPC, and confirms an
+    MCP `initialize` -> `tools/list` round-trip. If the admin port is
+    unreachable (stale sidecar) it starts a fresh daemon in the background
+    (POSIX: detached session; Windows: `CREATE_NEW_PROCESS_GROUP |
+    DETACHED_PROCESS`), discovering the actual port from the freshly
+    published sidecar (the child's stdout is never depended on). A *live*
+    daemon whose backend differs from the requested one is reported as a
+    conflict (`org down` first) instead of silently spawning a second
+    daemon over the same `state_dir`. If a `secretary` is already
+    registered on a live daemon, `org up` is a no-op ("already up") rather
+    than launching a second, mis-named secretary. The reuse health probe
+    mints an **unnamed** (auto-unique) token for its `initialize` ->
+    `tools/list` round-trip — never the named `secretary` — so a
+    backend-conflict or unhealthy-MCP failure can never leave a
+    `name="secretary"` orphan that would brick the next `org up` with
+    `name_taken`; the probe session is de-registered via the MCP `DELETE`
+    when done. (Known limitation: the probe leaves a de-registered,
+    not-revoked bind in the daemon's in-memory table, cleared on daemon
+    shutdown — the control plane exposes no token-revoke RPC and this
+    launcher does not add one.)
+  - The minted secretary's `--mcp-config` is written to
+    `<state-dir>/secretary-mcp.json` with mode `0600` (atomic
+    temp -> `os.replace`, mirroring the `admin.token` publish). The
+    interactive `claude` TUI argv is built **only** through the existing
+    billing-neutral `surface.build_claude_argv`, so headless flags
+    (`-p` / `--print` / ...) cannot leak into the launch. POSIX `exec`s the
+    TUI; Windows launches it as a subprocess and falls back to printing the
+    one-line command when the `claude` binary is not found.
+  - `org down` discovers the daemon from its sidecar, mints its **own**
+    auto-unique control token (never `name="secretary"`, which would
+    collide with the live secretary it is tearing down), closes residual
+    broker panes, requests a **signal-free** `shutdown` over the admin RPC,
+    and verifies `broker_stopped` appears exactly once in the
+    `journal_offset` slice for this run (avoiding whole-history grep false
+    positives) before cleaning up the sidecar. The pane-close scope is
+    chosen by the running daemon's backend (read from the sidecar via the
+    adapter's `isolated_session` ClassVar): on an **isolated** backend
+    (tmux — `list_panes` only ever shows broker-owned panes) every pane is
+    closed regardless of `kind`, so generic `spawn_pane` panes (e.g. the
+    attention watcher) are cleaned up too; on a **global-mux** backend
+    (wezterm — `list_panes` also returns unrelated panes) the close is
+    limited to `claude` / `codex` agent children to avoid collateral
+    kills. The broker's own `close_pane` still enforces the `last_pane`
+    guard and logical-pane refusal. Absent sidecar is a no-op.
+  - All entry paths absolutize their `state_dir` / `root_cwd` up front
+    (`sidecar.absolutize`, combining `posixpath.isabs` to avoid the Windows
+    `isabs` trap). `broker serve` is unchanged.
+
 ## [0.1.20] - 2026-06-12
 
 ### Fixed
