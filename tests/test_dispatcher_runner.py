@@ -12,6 +12,8 @@ from claude_org_runtime.dispatcher.runner import (
     ActionPlan,
     LocaleConfig,
     Pane,
+    _parse_pane_id,
+    _parse_panes,
     build_plan,
     choose_split,
     main,
@@ -74,6 +76,57 @@ def test_rect_adjacent_no_overlap() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Pane id parsing (renga numeric vs tmux %N -- Issue #60)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (1, 1),            # renga: native int
+        (0, 0),
+        ("2", 2),          # renga: numeric string
+        ("%0", 0),         # tmux/broker pane_id
+        ("%1", 1),
+        ("%12", 12),
+        ("  %3  ", 3),     # surrounding whitespace tolerated
+        (" 4 ", 4),
+    ],
+)
+def test_parse_pane_id_accepts_both_formats(raw: object, expected: int) -> None:
+    assert _parse_pane_id(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "%", "%x", "abc", "1.0", "%-1", None, True])
+def test_parse_pane_id_rejects_malformed(raw: object) -> None:
+    with pytest.raises(ValueError):
+        _parse_pane_id(raw)
+
+
+def test_parse_panes_rejects_malformed_id_as_systemexit() -> None:
+    # A malformed pane id is structural input invalidity: _parse_panes must
+    # translate the helper's ValueError into a clean SystemExit (exit 1 + a
+    # contextual message), matching the not-a-list path, rather than letting a
+    # bare traceback escape the CLI input-parse boundary.
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%x", "name": "dispatcher", "role": "dispatcher",
+             "x": 0, "y": 0, "width": 200, "height": 50},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_parses_tmux_pane_ids() -> None:
+    panes = _parse_panes([
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+        {"id": "%1", "name": "worker-x", "role": "worker",
+         "x": 200, "y": 0, "width": 100, "height": 50},
+    ])
+    assert [p.id for p in panes] == [0, 1]
+
+
 def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:
     # Curator too small to split (would fall under MIN_PANE_HEIGHT after
     # halving). The dispatcher is the primary split target (top priority) and
@@ -100,6 +153,38 @@ def test_choose_split_dispatcher_first_outranks_larger_pane() -> None:
         _pane(2, name="dispatcher", role="dispatcher", x=100, y=0, w=200, h=50),
         _pane(3, name="secretary", role="secretary", x=0, y=50, w=300, h=100),
     ]
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.target_name == "dispatcher"
+    assert choice.role == "dispatcher"
+    assert choice.direction == "vertical"
+    assert choice.new_w == 100
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        pytest.param((1, 2, 3), id="renga-numeric"),
+        pytest.param(("%0", "%1", "%2"), id="tmux-pane-id"),
+    ],
+)
+def test_choose_split_identical_under_renga_and_tmux_ids(
+    ids: tuple[object, object, object],
+) -> None:
+    # Issue #60: the broker/tmux backend emits %N pane ids. The same layout
+    # parsed from numeric (renga) ids and from %N (tmux) ids must yield the
+    # identical balanced-split decision. The winner here is the dispatcher by
+    # role priority (not the id tie-breaker), so the choice is unambiguous and
+    # cannot diverge merely because tmux is 0-based and renga is 1-based.
+    cur, disp, sec = ids
+    panes = _parse_panes([
+        {"id": cur, "name": "curator", "role": "curator",
+         "x": 0, "y": 0, "width": 100, "height": 50},
+        {"id": disp, "name": "dispatcher", "role": "dispatcher",
+         "x": 100, "y": 0, "width": 200, "height": 50},
+        {"id": sec, "name": "secretary", "role": "secretary",
+         "x": 0, "y": 50, "width": 300, "height": 100},
+    ])
     choice = choose_split(panes)
     assert choice is not None
     assert choice.target_name == "dispatcher"
@@ -597,6 +682,38 @@ def test_cli_delegate_plan_writes_state_files(tmp_path: Path) -> None:
     assert (
         state_dir / "dispatcher" / "outbox" / "cli-demo-instruction.md"
     ).exists()
+
+
+def test_cli_delegate_plan_accepts_tmux_pane_ids(tmp_path: Path) -> None:
+    # Issue #60 end-to-end: a panes.json carrying broker/tmux %N pane ids must
+    # drive the automated spawn path (rc 0 + state files written), not crash on
+    # int() and force the dispatcher into the manual fallback.
+    task = {
+        "task_id": "broker-demo",
+        "worker_dir": str(tmp_path),
+        "instruction": "from broker",
+        "task_description": "smoke",
+    }
+    panes = [
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+        {"id": "%1", "name": "curator", "role": "curator",
+         "x": 200, "y": 0, "width": 100, "height": 50},
+    ]
+    task_path = tmp_path / "task.json"
+    panes_path = tmp_path / "panes.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+
+    state_dir = tmp_path / ".state"
+    rc = main([
+        "delegate-plan",
+        "--task-json", str(task_path),
+        "--panes-json", str(panes_path),
+        "--state-dir", str(state_dir),
+    ])
+    assert rc == 0
+    assert (state_dir / "workers" / "worker-broker-demo.md").exists()
 
 
 def test_cli_delegate_plan_dry_run_writes_nothing(tmp_path: Path) -> None:

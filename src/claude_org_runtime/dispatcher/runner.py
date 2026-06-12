@@ -205,6 +205,37 @@ _DEFAULT_LOCALE = LocaleConfig.english()
 # ----------------------------------------------------------------------------
 
 
+def _parse_pane_id(raw: Any) -> int:
+    """Normalise a pane id to an int, accepting both transports' formats.
+
+    renga emits numeric pane ids (``1``, ``"2"``); the broker/tmux backend
+    emits tmux ``pane_id`` strings of the form ``%N`` (``"%0"``, ``"%1"``).
+    Both are accepted and reduced to the integer ``N`` -- the value is used
+    only as the deterministic tie-breaker in :func:`choose_split` (the spawn
+    itself targets by ``target_name``), so the leading ``%`` carries no
+    information worth preserving and a single integer key keeps the sort total.
+
+    A single ``delegate-plan`` call only ever sees panes from one transport,
+    so the fact that tmux ``%1`` and renga ``1`` collapse to the same int is
+    harmless -- they never coexist in one ``panes`` list.
+    """
+    if isinstance(raw, bool):
+        # bool is an int subclass; reject it explicitly so ``True``/``False``
+        # in the JSON don't silently become pane ids 1/0.
+        raise ValueError(f"pane id must be an int or string, got bool {raw!r}")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        body = s[1:] if s.startswith("%") else s
+        if body.isdigit():
+            return int(body)
+    raise ValueError(
+        f"unrecognised pane id {raw!r}: expected a renga numeric id "
+        f"(e.g. 1, \"2\") or a tmux pane_id (e.g. \"%0\", \"%1\")"
+    )
+
+
 @dataclass
 class Pane:
     id: int
@@ -219,7 +250,7 @@ class Pane:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Pane":
         return cls(
-            id=int(d["id"]),
+            id=_parse_pane_id(d["id"]),
             name=d.get("name"),
             role=d.get("role"),
             focused=bool(d.get("focused", False)),
@@ -754,7 +785,19 @@ def _parse_panes(panes_data: Any) -> list[Pane]:
         panes_list = panes_data
     if not isinstance(panes_list, list):
         raise SystemExit("panes JSON must be a list or {panes: [...]} object")
-    return [Pane.from_dict(d) for d in panes_list]
+    panes: list[Pane] = []
+    for i, d in enumerate(panes_list):
+        try:
+            panes.append(Pane.from_dict(d))
+        except (ValueError, KeyError, TypeError) as exc:
+            # A malformed pane entry -- a bad/missing id (including an
+            # unrecognised tmux pane_id), missing geometry, or a non-int
+            # field -- is structural input invalidity. Surface it the same way
+            # as the not-a-list case above (clean message + exit 1) instead of
+            # letting the bare ValueError/KeyError escape as a traceback, so
+            # the CLI honours its input-error contract at the parse boundary.
+            raise SystemExit(f"panes[{i}] is invalid: {exc}") from None
+    return panes
 
 
 def _load_locale(path: Optional[str]) -> Optional[LocaleConfig]:
