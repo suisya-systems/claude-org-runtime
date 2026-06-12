@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-06-12
+
+### Fixed
+
+- `org up`: the interactive secretary TUI is now launched with
+  `ORG_TRANSPORT=broker` injected into its child environment, so the
+  secretary (and everything it spawns) resolves the broker transport
+  surface instead of silently falling back to the default `renga`.
+  Closes `claude-org-runtime#70` (PR #72).
+
+### Documentation
+
+- README: documented `org up` / `org down` and the broker control
+  plane. Refs `claude-org-runtime#63` (PR #71).
+
 ## [0.1.21] - 2026-06-12
 
 ### Added
