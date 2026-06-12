@@ -57,6 +57,15 @@ DEFAULT_ROOT_NAME = "secretary"
 SIDECAR_WAIT_TIMEOUT = 20.0
 # shutdown 要求後に daemon が finally (stop → sidecar 削除) を終えるのを待つ上限。
 STOP_WAIT_TIMEOUT = 15.0
+# daemon.json は見えているが admin.token がまだ無いときに、その公開 window
+# (serve は write_sidecar → write_admin_token の順で連続して書く) を乗り切るための
+# 短い猶予。これを越えても admin.token が現れなければ「半公開 / クラッシュ」と判断し、
+# **新規起動はしない** (生存 daemon が同 state_dir を所有している可能性があるため
+# 二重 daemon = split-brain を避ける)。
+ADMIN_TOKEN_GRACE = 3.0
+# admin HTTP RPC 1 回あたりの上限。dead port への connect が refuse されず timeout
+# まで張り付く環境 (一部 Windows) でも org down が無限待ちしないための上限。
+ADMIN_RPC_TIMEOUT = 10.0
 _POLL_INTERVAL = 0.05
 
 
@@ -66,7 +75,7 @@ _POLL_INTERVAL = 0.05
 
 def _admin_rpc(
     host: str, port: int, admin_token: str, method: str,
-    params: dict | None = None, *, timeout: float = 10.0,
+    params: dict | None = None, *, timeout: float | None = None,
 ) -> dict | None:
     """admin HTTP RPC を 1 回叩く。返り値は応答 JSON (本体なしは None)。
 
@@ -74,6 +83,8 @@ def _admin_rpc(
     (= 呼び元が「到達不能 = 要起動」の判定に使う)。HTTP エラー応答 (401/400/404)
     は本体を parse して返す (RPC レベルの拒否は例外にしない)。
     """
+    if timeout is None:
+        timeout = ADMIN_RPC_TIMEOUT
     url = f"http://{host}:{port}/admin"
     body = json.dumps({"method": method, "params": params or {}}).encode("utf-8")
     req = urllib.request.Request(
@@ -199,7 +210,7 @@ def _spawn_daemon(state_dir: str, backend: str, root_cwd: str) -> tuple[str, int
 
 
 def _wait_for_sidecar(
-    state_dir: str, timeout: float = SIDECAR_WAIT_TIMEOUT,
+    state_dir: str, timeout: float | None = None,
 ) -> tuple[dict, str]:
     """daemon.json と admin.token の双方が公開されるまで poll する。
 
@@ -207,6 +218,8 @@ def _wait_for_sidecar(
     publish。:func:`sidecar.read_admin_token` は空文字列を None 扱いにするため
     部分書きを拾わない)。タイムアウトは RuntimeError。
     """
+    if timeout is None:
+        timeout = SIDECAR_WAIT_TIMEOUT
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         sc = sidecar.read_sidecar(state_dir)
@@ -301,6 +314,83 @@ def _launch_claude(argv: list[str]) -> int:
         return 0
 
 
+def _read_admin_token_with_grace(
+    state_dir: str, grace: float | None = None,
+) -> str | None:
+    """admin.token を読む。無ければ公開 window を乗り切るため短時間だけ poll する。
+
+    serve は ``write_sidecar`` (daemon.json) の **後** に ``write_admin_token`` を
+    書くため、daemon.json が見えていても admin.token が一瞬遅れる window がある。
+    その間に「token 不在」を即断すると新規 daemon を二重起動しかねない (split-brain)。
+    grace 内に現れれば返し、現れなければ None (= 半公開 / クラッシュの疑い)。
+    """
+    if grace is None:
+        grace = ADMIN_TOKEN_GRACE
+    deadline = time.monotonic() + grace
+    while True:
+        tok = sidecar.read_admin_token(state_dir)
+        if tok is not None:
+            return tok
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_INTERVAL)
+
+
+def _resolve_existing_daemon(
+    state_dir: str, requested_backend: str, name: str, root_cwd: str,
+) -> dict:
+    """既存 sidecar から走行中 daemon を解決し、org up の分岐を 1 つ決める。
+
+    返り値 ``{"kind": ...}``:
+    - ``cold``      — daemon 不在 / 到達不能 (stale) → 新規起動する。
+    - ``token_missing`` — daemon.json はあるが admin.token が grace 内に現れない
+      (半公開 / クラッシュ疑い)。生存 daemon が同 state_dir を所有しているかも
+      しれないため **新規起動しない** (split-brain 回避)。
+    - ``unhealthy`` — admin は応答するが mint / MCP 面が健全でない。
+    - ``conflict``  — 生存かつ健全だが backend が要求と不一致 (down してからやり直す)。
+    - ``already_up``— 生存・健全・backend 一致だが secretary が既に登録済み (no-op)。
+    - ``reuse``     — 再利用可。``mint`` (secretary mint 結果) / ``host`` / ``port`` を伴う。
+
+    **重要 (Codex review Major 対応)**: 生存/MCP 健全性は **無名 (auto-unique)** の
+    probe token で確認し、backend 整合も済ませた **後で初めて** 名前付き
+    ``secretary`` を mint する。健全性確認や backend 判定の失敗パスで
+    ``name="secretary"`` の orphan bind を残さない (= 次回の正常な org up が
+    ``name_taken`` で "already up" 扱いになり起動不能になる事故を防ぐ)。
+    """
+    sc = sidecar.read_sidecar(state_dir)
+    if sc is None:
+        return {"kind": "cold"}
+    # daemon.json がこの dir を主張している。admin.token を (公開 window を
+    # 乗り切りつつ) 読む。
+    admin_token = _read_admin_token_with_grace(state_dir)
+    host, port = sc["host"], sc["port"]
+    if admin_token is None:
+        return {"kind": "token_missing", "host": host}
+    # 生存 + MCP 健全性を **無名 probe token** で確認する (失敗しても named secretary を
+    # 汚さない)。到達不能 = stale sidecar → 新規起動。
+    try:
+        probe = _admin_rpc(host, port, admin_token, "mint_token", {"role": "secretary"})
+    except urllib.error.URLError:
+        return {"kind": "cold"}
+    if not (probe and probe.get("ok")):
+        return {"kind": "unhealthy", "host": host}
+    try:
+        if not _mcp_surface_ok(host, port, probe["token"]):
+            return {"kind": "unhealthy", "host": host}
+    except urllib.error.URLError:
+        return {"kind": "unhealthy", "host": host}
+    # daemon は生存・健全。ここで初めて backend を判定し、その後 named secretary を
+    # mint する (どちらの失敗パスも named orphan を残さない)。
+    if sc.get("backend") != requested_backend:
+        return {"kind": "conflict", "backend": sc.get("backend")}
+    res = _mint_secretary(host, port, admin_token, name, root_cwd)
+    if res and res.get("ok"):
+        return {"kind": "reuse", "mint": res, "host": host, "port": port}
+    if res and "name_taken" in (res.get("error") or ""):
+        return {"kind": "already_up"}
+    return {"kind": "unhealthy", "host": host}
+
+
 def org_up(
     args: argparse.Namespace, *,
     spawn_daemon=_spawn_daemon, launch=_launch_claude,
@@ -319,62 +409,45 @@ def org_up(
     host = port = None
     reused = False
 
-    # --- 健全性判定 (到達性ベース) ---------------------------------------
-    sc = sidecar.read_sidecar(state_dir)
-    admin_token = sidecar.read_admin_token(state_dir)
-    if sc is not None and admin_token is not None:
-        try:
-            res = _mint_secretary(sc["host"], sc["port"], admin_token, name, root_cwd)
-        except urllib.error.URLError:
-            res = None  # 到達不能 = stale sidecar → 新規起動へ
-        if res is not None:
-            # daemon は **生存** している (admin RPC が応答した)。
-            if res.get("ok"):
-                # 生存 daemon の backend 不一致は競合 (新規起動で二重 daemon を
-                # 作らない)。明示的にエラーで止める (down してから up しなおす)。
-                if sc.get("backend") != requested_backend:
-                    print(
-                        f"org up: a daemon is already running with backend "
-                        f"{sc.get('backend')!r}, but backend {requested_backend!r} "
-                        f"was requested. Run 'org down' first, or omit --backend.",
-                        file=sys.stderr,
-                    )
-                    return 2
-                # admin 面に加え per-agent MCP 面の健全性も確認する。
-                try:
-                    if not _mcp_surface_ok(sc["host"], sc["port"], res["token"]):
-                        print(
-                            "org up: daemon admin is up but its MCP surface returned "
-                            "no tools (unhealthy). Run 'org down' first.",
-                            file=sys.stderr,
-                        )
-                        return 2
-                except urllib.error.URLError:
-                    print(
-                        "org up: daemon admin is up but its MCP port is unreachable "
-                        "(unhealthy). Run 'org down' first.",
-                        file=sys.stderr,
-                    )
-                    return 2
-                mint = res
-                host, port = sc["host"], sc["port"]
-                reused = True
-            elif "name_taken" in (res.get("error") or ""):
-                # 生存 daemon に secretary が既に登録済み = もう up している。
-                # 二人目の (誤名の) secretary を起動せず no-op で報告する。
-                print(
-                    f"org up: a secretary ({name!r}) is already registered on the "
-                    f"running daemon - org is already up. Use 'org down' to stop it."
-                )
-                return 0
-            else:
-                print(
-                    f"org up: admin mint_token failed: {res.get('error')}",
-                    file=sys.stderr,
-                )
-                return 2
+    # --- 健全性判定 (到達性ベース。失敗パスで named secretary を汚さない) -----
+    decision = _resolve_existing_daemon(state_dir, requested_backend, name, root_cwd)
+    kind = decision["kind"]
+    if kind == "conflict":
+        print(
+            f"org up: a daemon is already running with backend "
+            f"{decision['backend']!r}, but backend {requested_backend!r} was "
+            f"requested. Run 'org down' first, or omit --backend.",
+            file=sys.stderr,
+        )
+        return 2
+    if kind == "token_missing":
+        print(
+            f"org up: a daemon sidecar (daemon.json) exists at {decision['host']} "
+            f"but its admin.token never appeared (daemon booting or crashed "
+            f"mid-publish). Not starting a second daemon over the same state_dir; "
+            f"run 'org down' to clean up, then retry.",
+            file=sys.stderr,
+        )
+        return 2
+    if kind == "unhealthy":
+        print(
+            "org up: a daemon is reachable but unhealthy (admin mint or MCP surface "
+            "did not respond as expected). Run 'org down' first.",
+            file=sys.stderr,
+        )
+        return 2
+    if kind == "already_up":
+        print(
+            f"org up: a secretary ({name!r}) is already registered on the running "
+            f"daemon - org is already up. Use 'org down' to stop it."
+        )
+        return 0
+    if kind == "reuse":
+        mint = decision["mint"]
+        host, port = decision["host"], decision["port"]
+        reused = True
 
-    # --- 新規起動 (sidecar 不在 / 到達不能 = stale) ----------------------
+    # --- 新規起動 (kind == "cold": sidecar 不在 / 到達不能 = stale) ----------
     if not reused:
         host, port, admin_token = spawn_daemon(state_dir, requested_backend, root_cwd)
         try:
@@ -438,7 +511,7 @@ def _close_managed_panes(host: str, port: int, token: str) -> list:
 
 
 def _wait_for_stop(
-    state_dir: str, offset: int, timeout: float = STOP_WAIT_TIMEOUT,
+    state_dir: str, offset: int, timeout: float | None = None,
 ) -> bool:
     """daemon の停止を待ち、journal_offset スライスで broker_stopped を検証する。
 
@@ -447,6 +520,8 @@ def _wait_for_stop(
     ``offset`` (= この run の起点) 以降のスライスのみを見て当該 run の
     broker_stopped を確認する (全履歴 grep の偽陽性回避。Codex review Major)。
     """
+    if timeout is None:
+        timeout = STOP_WAIT_TIMEOUT
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         sliced = sidecar.read_journal_since(state_dir, offset)
@@ -474,6 +549,7 @@ def org_down(args: argparse.Namespace) -> int:
 
     closed: list = []
     reachable = False
+    attempted_admin = admin_token is not None
     if admin_token is not None:
         # pane 操作には pane 権限を持つ token が要る。down は **無名 (auto-unique)**
         # の制御 token を mint する: name="secretary" だと停止対象の生存 secretary と
@@ -500,21 +576,36 @@ def org_down(args: argparse.Namespace) -> int:
         print(f"org down: closed {len(closed)} agent pane(s): {closed}")
 
     stopped = _wait_for_stop(state_dir, offset)
-    # sidecar 後始末 (daemon の finally と冪等。daemon が既に消していれば no-op)。
-    sidecar.remove_sidecar(state_dir)
 
+    # sidecar の削除は **daemon が止まった/死んでいる確証があるときだけ** 行う。
+    # broker_stopped 未確認のまま無条件に消すと、停止に失敗した **生存** daemon の
+    # 唯一の discovery / admin 経路を奪い、以後 org down で回収できなくする
+    # (Codex review Blocker 対応)。
     if stopped:
+        # clean stop。daemon の finally が既に消している場合が多いが冪等に後始末する。
+        sidecar.remove_sidecar(state_dir)
         print(f"org down: broker_stopped verified at http://{host}:{port}; "
               f"sidecar removed.")
         return 0
-    if not reachable:
-        # sidecar はあったが daemon に到達できず broker_stopped も確認できない
-        # (clean stop 後に sidecar だけ残った等)。後始末は済ませ警告で返す。
-        print("org down: daemon was unreachable and broker_stopped could not be "
-              "confirmed; cleaned up stale sidecar.", file=sys.stderr)
+    if attempted_admin and not reachable:
+        # admin に一度も到達できなかった = daemon は死んでいる。sidecar は stale
+        # なので安全に後始末する。
+        sidecar.remove_sidecar(state_dir)
+        print("org down: daemon was unreachable (dead); cleaned up stale sidecar.",
+              file=sys.stderr)
         return 1
+    if not attempted_admin:
+        # admin.token が無く shutdown を要求できない。daemon が生存している可能性が
+        # あるため sidecar は **残す** (誤って生存 daemon を孤立させない)。
+        print("org down: no admin.token found, so shutdown could not be requested; "
+              "the daemon may still be live. Leaving the sidecar in place — "
+              "investigate the daemon, then retry.", file=sys.stderr)
+        return 1
+    # admin には到達できたが broker_stopped が timeout 内に観測できない。daemon は
+    # まだ停止中 / 生存しているかもしれないので sidecar は残し、再試行に委ねる。
     print("org down: shutdown was requested but broker_stopped was not observed "
-          "within the timeout.", file=sys.stderr)
+          "within the timeout; the daemon may still be stopping. Leaving the "
+          "sidecar in place for a retry.", file=sys.stderr)
     return 1
 
 

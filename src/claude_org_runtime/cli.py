@@ -6,6 +6,8 @@ Subcommands:
 - ``settings generate ...`` -> :mod:`claude_org_runtime.settings.generator`
 - ``migrate ...`` -> :mod:`claude_org_runtime.migrate.v1_to_v2`
 - ``attention scan|watch ...`` -> :mod:`claude_org_runtime.attention.cli`
+- ``broker serve ...`` -> :mod:`claude_org_runtime.broker.cli`
+- ``org up|down ...`` -> :mod:`claude_org_runtime.broker.launcher`
 
 The subcommands re-use the same parser builders the per-module CLIs
 expose, so flags stay in lock-step.

@@ -253,3 +253,76 @@ def test_org_down_verifies_broker_stopped_via_offset_slice(tmp_path):
 def test_org_down_no_sidecar_is_noop(tmp_path):
     rc = launcher.org_down(_down_args(str(tmp_path / "broker")))
     assert rc == 0
+
+
+# =================================================== up: split-brain guard (Blocker)
+def test_org_up_does_not_cold_start_when_admin_token_missing(tmp_path, monkeypatch):
+    """daemon.json はあるが admin.token が (grace 内に) 現れない半公開状態では、
+    新規 daemon を二重起動してはならない (split-brain 回避。Codex review Blocker)。"""
+    state_dir = str(tmp_path / "broker")
+    # daemon.json のみ書く (admin.token は書かない = 公開途中 / クラッシュを模す)。
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59999,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    # grace を短縮してテストを速くする。
+    monkeypatch.setattr(launcher, "ADMIN_TOKEN_GRACE", 0.2)
+    launched = []
+
+    def fake_spawn(*a, **k):
+        raise AssertionError("must not spawn a second daemon over a claimed state_dir")
+
+    rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
+                         launch=lambda argv: launched.append(argv) or 0)
+    assert rc == 2                                 # token_missing → 明示エラー
+    assert launched == []                          # TUI も起動しない
+    assert not os.path.exists(os.path.join(state_dir, "secretary-mcp.json"))
+
+
+# ================================================ down: keep sidecar if not stopped (Blocker)
+def test_org_down_keeps_sidecar_when_stop_unconfirmed(tmp_path, monkeypatch):
+    """shutdown を要求しても broker_stopped を確認できない (= 生存中かもしれない)
+    daemon の sidecar は **消さない** (孤立させない。Codex review Blocker)。
+
+    run() ループを持たない started Broker を使う: shutdown RPC は _shutdown_event を
+    立てるが待つ側がいないので broker_stopped は書かれず、daemon は生き続ける。
+    """
+    state_dir = str(tmp_path / "broker")
+    b = Broker(state_dir=state_dir, adapter=None, port=0, admin_token="ADMIN-SECRET")
+    b.start()
+    sidecar.write_sidecar(
+        state_dir, pid=os.getpid(), host=b.host, port=b.port,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    sidecar.write_admin_token(state_dir, "ADMIN-SECRET")
+    monkeypatch.setattr(launcher, "STOP_WAIT_TIMEOUT", 0.3)
+    try:
+        rc = launcher.org_down(_down_args(state_dir))
+        assert rc == 1                             # 停止未確認
+        # 生存 daemon の discovery / admin 経路は残す。
+        assert sidecar.read_sidecar(state_dir) is not None
+        assert sidecar.read_admin_token(state_dir) is not None
+    finally:
+        b.stop()
+
+
+def test_org_down_cleans_stale_sidecar_when_unreachable(tmp_path, monkeypatch):
+    """daemon に一度も到達できない (dead) ときは stale sidecar を後始末して返す。"""
+    import urllib.error
+
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59998,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    sidecar.write_admin_token(state_dir, "STALE-ADMIN")
+    # admin RPC を確定的に「到達不能」にする (OS の connect-timeout 挙動に依存しない)。
+    monkeypatch.setattr(
+        launcher, "_admin_rpc",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("refused")),
+    )
+    monkeypatch.setattr(launcher, "STOP_WAIT_TIMEOUT", 0.3)
+    rc = launcher.org_down(_down_args(state_dir))
+    assert rc == 1
+    assert sidecar.read_sidecar(state_dir) is None       # stale → 後始末済み
+    assert sidecar.read_admin_token(state_dir) is None
