@@ -172,7 +172,11 @@ def run(args: argparse.Namespace) -> int:
     # 子 spawn の relative cwd 解決アンカーが relative になり、resolve_spawn_cwd の
     # join 結果も relative → adapter (daemon base) で再解決され Issue #61 が再発する。
     # CLI 境界で absolute に固定して解決アンカーを決定的にする (codex review Major)。
-    root_cwd = os.path.abspath(args.root_cwd) if args.root_cwd is not None else os.getcwd()
+    # absolutize は posix-absolute (``/repo``) を as-is で保持する: spawn cwd 契約は
+    # absolute passthrough で、state_dir 等 他経路も absolutize に揃えている。
+    # os.path.abspath だと Windows daemon で posix-absolute に drive letter を前置して
+    # しまい契約からずれる (codex review round 2 Minor: CLI だけ解釈ずれ)。
+    root_cwd = sidecar.absolutize(args.root_cwd) if args.root_cwd is not None else os.getcwd()
     tok = issue_root_token(broker, args.root_role, root_cwd)
     print(f"manual test token ({args.root_role}):", tok)
     print(f"root pane cwd (relative spawn anchor): {root_cwd}")

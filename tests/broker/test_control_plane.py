@@ -227,6 +227,19 @@ def test_admin_mint_token_honors_explicit_name(admin_broker):
     assert admin_broker.get_bind(res["token"]).name == "org-up-secretary"
 
 
+def test_admin_mint_token_rejects_duplicate_explicit_name(admin_broker):
+    # 同一 explicit name で再 mint すると拒否される (queue 共有・誤配送を防ぐ。
+    # Codex review round 2 Major: 明示 name の重複防御)。
+    r1 = _admin_post(admin_broker, {"method": "mint_token",
+                                    "params": {"role": "worker", "name": "dup"}}, "ADMIN-SECRET")
+    assert r1["ok"] is True
+    r2 = _admin_post(admin_broker, {"method": "mint_token",
+                                    "params": {"role": "worker", "name": "dup"}}, "ADMIN-SECRET",
+                     expect_status=400)
+    assert r2["ok"] is False
+    assert "name_taken" in r2["error"]
+
+
 def test_admin_mint_token_rejects_unknown_role(admin_broker):
     res = _admin_post(admin_broker, {"method": "mint_token",
                                      "params": {"role": "admin"}}, "ADMIN-SECRET",

@@ -82,6 +82,7 @@ class TokenMixin:
         cwd: str | None = None,
         kind: str | None = None,
         auth_role: str | None = None,
+        unique: bool = False,
     ) -> str:
         """spawn 時の per-agent token 発行 (設計書 §4.4)。
 
@@ -92,9 +93,22 @@ class TokenMixin:
         表示 role を書き換えても ``auth_role`` は不変 (tier gating の根拠を
         昇格不能にする)。``cwd`` / ``kind`` は list_peers / list_panes 出力の
         cwd parity (§3.3-4) に使う。
+
+        ``unique=True`` は同 ``agent_id`` / ``name`` の active bind が既に在れば
+        ``ValueError`` を投げる (admin mint の重複防御。queue は ``agent_id`` 単位で
+        共有され配送解決も ``agent_id`` / ``name`` の先着 1 件に当たるため、重複名で
+        再発行すると queue 共有・誤配送が起きる)。検査と insert を **同一ロック
+        スコープ**で原子的に行い TOCTOU を閉じる (ThreadingHTTPServer 配下の並行
+        admin 要求でも安全)。
         """
         token = secrets.token_urlsafe(32)
         with self._lock:
+            if unique:
+                for b in self._binds.values():
+                    if not b.revoked and (b.agent_id == agent_id or b.name == name):
+                        raise ValueError(
+                            f"[name_taken] agent id/name {name!r} is already in use"
+                        )
             self._binds[token] = AgentBind(
                 token=token, agent_id=agent_id, name=name, role=role,
                 auth_role=auth_role or role, pane_id=pane_id, cwd=cwd, kind=kind,

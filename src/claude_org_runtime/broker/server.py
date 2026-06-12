@@ -201,11 +201,16 @@ class Broker(TokenMixin, StoreMixin):
             return {"ok": False, "error": "[invalid_name] name must be a string"}
         # 既定 agent_id は毎回一意にする: 固定名だと複数回 mint した token が同一
         # agent として bind/queue を共有し配送先が曖昧化する (agent_id 基準の
-        # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使う。
+        # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使うが、
+        # その場合も unique=True で重複 (root token や別 mint との衝突) を原子的に
+        # 拒否する (Codex review round 2 Major: 明示 name の重複未防御)。
         agent_id = name or f"admin-{secrets.token_hex(4)}"
-        token = self.issue_token(
-            agent_id, agent_id, role, cwd=cwd, auth_role=role,
-        )
+        try:
+            token = self.issue_token(
+                agent_id, agent_id, role, cwd=cwd, auth_role=role, unique=True,
+            )
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
         return {
             "ok": True,
             "token": token,
