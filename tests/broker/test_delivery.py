@@ -177,6 +177,30 @@ def test_pull_mode_disables_claim_issuance(tmp_path):
     assert [m["message"] for m in b.drain(dst)] == ["m1"]
 
 
+def test_poll_claims_gated_on_registered_owner(tmp_path):
+    """Codex Major: 未登録 (initialize 前 / DELETE 後) の owner には claim を発行しない。
+
+    死にかけ session への emit->confirm で DELIVERED-but-lost になる窓を閉じる。行は
+    UNDELIVERED のまま残り、registered に戻れば claim され、check_messages でも拾える。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    # full token は発行するが register しない (= initialize 前 / DELETE 後を模す)。
+    full = b.issue_token("dst", "dst", "worker")
+    src = _registered(b, "src")
+    # registered な src 経由で enqueue (宛先解決のため dst を一時 register して戻す)。
+    b.register_local(full)
+    b.enqueue(src, "dst", "do-not-lose-me")
+    # ここで dst が DELETE された状況を模す (registered=False)。
+    b.get_bind(full).registered = False
+    res = b.poll_claims("dst")
+    assert res["error"] == "owner_unregistered" and res["rows"] == []
+    assert _row_states(b, "dst") == [UNDELIVERED]   # 行は残る (喪失しない)
+    # re-initialize (registered に戻る) で claim 可能になる。
+    b.get_bind(full).registered = True
+    res2 = b.poll_claims("dst")
+    assert [r["entry"]["message"] for r in res2["rows"]] == ["do-not-lose-me"]
+
+
 def test_poll_claims_only_returns_owner_rows(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     src = _registered(b, "src")

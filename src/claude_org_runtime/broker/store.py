@@ -113,6 +113,20 @@ class StoreMixin:
         """agent の mode-epoch (既定 0)。**caller が _lock を保持中に呼ぶ**。"""
         return self._epochs.get(agent_id, 0)
 
+    def _owner_registered_locked(self, owner: str) -> bool:
+        """owner に live (registered) な full bind があるか。**_lock 保持中に呼ぶ**。
+
+        push 配送は **live session にのみ** emit する。MCP initialize 前 / do_DELETE 後の
+        owner には claim を発行しないことで、死にかけ session へ emit->confirm して
+        ``DELIVERED``-but-lost にする配送喪失窓を閉じる (§9.3 claim-issuance ゲートの
+        precondition)。enqueue の「registered な宛先にのみ」と同じ live 判定。
+        """
+        for b in self._binds.values():
+            if (b.agent_id == owner and b.scope == "full"
+                    and b.registered and not b.revoked):
+                return True
+        return False
+
     # --------------------------------------------------------------- reaping
     def _reap_locked(self) -> list[tuple[str, int]]:
         """lease 失効した ``CLAIMED`` 行を ``UNDELIVERED`` へ戻す (sidecar 死亡回復)。
@@ -223,6 +237,12 @@ class StoreMixin:
             epoch = self._epoch_of(owner)
             if mode != PUSH:
                 return {"error": "push_disabled", "rows": [], "epoch": epoch}
+            if not self._owner_registered_locked(owner):
+                # 受信側 session が live でない (initialize 前 / do_DELETE 後)。claim を
+                # 発行せず行を UNDELIVERED のまま残す: re-initialize で registered に
+                # 戻れば次 poll で claim され、フォールバックの check_messages も同行を
+                # 拾える。死にかけ session への emit->confirm 喪失窓を閉じる (Codex Major)。
+                return {"error": "owner_unregistered", "rows": [], "epoch": epoch}
             reaped = self._reap_locked()
             now = time.time()
             claimed: list[dict] = []
