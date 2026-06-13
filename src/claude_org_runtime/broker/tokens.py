@@ -14,6 +14,7 @@ broker.server.Broker` に mix-in される。``_binds`` / ``_lock`` の実体は
 from __future__ import annotations
 
 import secrets
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -51,6 +52,14 @@ class AgentBind:
     session_id: str | None = None
     summary: str = ""
     revoked: bool = False
+    # credential scope (§9.4 delivery-scoped token)。
+    # - ``full``: agent / admin。全ツール面 + tier に従う MCP 操作が可能。
+    # - ``delivery``: channel sidecar 専用。``/poll-claims`` と ``/confirm-delivered``
+    #   ・``agent_id == owner`` の行のみ許可し、MCP ツール面 (/mcp) を**構造的に拒否**
+    #   する (least-privilege)。registered=False のまま発行され list_peers / 配送先
+    #   解決 / find_registered には現れない (real bind と agent_id を共有しても衝突
+    #   しないのはこの registered=False 由来)。
+    scope: str = "full"
 
     def __post_init__(self) -> None:
         # auth_role 未指定なら発行時 role を権限 tier の初期値にする。以後
@@ -63,15 +72,13 @@ class TokenMixin:
     """bind 表 (token 発行 / pane bind / 登録検知 / mcp-config 生成)。
 
     共有状態の前提 (Broker.__init__ が確立):
-    - ``self._lock``: binds / queues を一括ガードする単一 Lock。
+    - ``self._lock``: binds / rows / delivery-mode を一括ガードする単一 Lock。
     - ``self._binds``: ``token -> AgentBind``。
-    - ``self._queues``: ``agent_id -> list[dict]`` (issue 時に setdefault する)。
     """
 
     # 型注釈のみ (実体は Broker.__init__)。mixin の自己文書化。
     _lock: threading.Lock
     _binds: dict[str, AgentBind]
-    _queues: dict[str, list[dict]]
 
     def issue_token(
         self,
@@ -113,9 +120,62 @@ class TokenMixin:
                 token=token, agent_id=agent_id, name=name, role=role,
                 auth_role=auth_role or role, pane_id=pane_id, cwd=cwd, kind=kind,
             )
-            self._queues.setdefault(agent_id, [])
         self._journal("token_issued", agent_id=agent_id, role=role, pane_id=pane_id)
         return token
+
+    def issue_delivery_cred(self, owner: str) -> str:
+        """channel sidecar 用の delivery-scoped credential を発行する (§9.4)。
+
+        agent の full token とは **別物**。``scope="delivery"`` / ``agent_id=owner``
+        (= 配送対象) で bind し、``registered=False`` のまま置く。これにより
+        list_peers / 配送先解決 / find_registered には現れず (real bind と agent_id
+        を共有しても registered=False で衝突しない)、MCP ツール面 (/mcp) は server が
+        scope で構造的に拒否する。``/poll-claims`` / ``/confirm-delivered`` のみ、かつ
+        ``to_id == owner`` の行のみ操作できる (least-privilege)。
+        """
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._binds[token] = AgentBind(
+                token=token, agent_id=owner, name="", role="",
+                auth_role="", scope="delivery",
+            )
+        self._journal("delivery_cred_issued", owner=owner)
+        return token
+
+    def revoke_delivery_creds(self, owner: str) -> int:
+        """owner 宛の delivery-scoped credential を全て revoke する (切戻し §5.5)。
+
+        per-pane channel sidecar の reap に伴い当該 agent の配送 credential を失効
+        させる (orphan 化させない)。revoke 件数を返す (冪等; 既 revoked は数えない)。
+        """
+        n = 0
+        with self._lock:
+            for b in self._binds.values():
+                if b.scope == "delivery" and b.agent_id == owner and not b.revoked:
+                    b.revoked = True
+                    n += 1
+        if n:
+            self._journal("delivery_cred_revoked", owner=owner, count=n)
+        return n
+
+    def channel_server_config(self, delivery_cred: str, owner: str) -> dict:
+        """spawn 時に子の --mcp-config へ加える channel sidecar の stdio server 定義。
+
+        channel sidecar (:mod:`claude_org_runtime.broker.channel_sidecar`) を stdio
+        MCP サーバーとして子 claude に load させる。token は env に**リテラルで**載せる
+        (``${VAR}`` 参照は config parse 時の失敗リスクのため使わない。既存の
+        :meth:`mcp_config_for` と同方針)。daemon URL は base (``/mcp`` 無し) で渡し、
+        sidecar が ``/poll-claims`` / ``/confirm-delivered`` を叩く。
+        """
+        return {
+            "command": sys.executable,
+            "args": ["-m", "claude_org_runtime.broker.channel_sidecar"],
+            "env": {
+                "ORG_BROKER_CHANNEL_DAEMON_URL": self.base_url,
+                "ORG_BROKER_CHANNEL_CRED": delivery_cred,
+                "ORG_BROKER_CHANNEL_OWNER": owner,
+            },
+        }
 
     def bind_pane(self, token: str, pane_id: PaneId) -> None:
         with self._lock:
@@ -161,5 +221,6 @@ class TokenMixin:
 
     if TYPE_CHECKING:  # 他 mixin / server が供給するメンバ (型チェッカ向け宣言)
         url: str
+        base_url: str
 
         def _journal(self, event: str, **fields: object) -> None: ...

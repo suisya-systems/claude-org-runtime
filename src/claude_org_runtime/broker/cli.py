@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import secrets
+import signal
 import time
 from pathlib import Path
 
@@ -121,6 +122,35 @@ def issue_root_token(
     )
 
 
+def _install_signal_handlers(broker: Broker) -> None:
+    """SIGTERM (+ Windows SIGBREAK) で graceful shutdown を要求する (Closes #74)。
+
+    ハンドラは ``request_shutdown()`` (shutdown event を立てるだけ) を呼び、実際の
+    停止 (stop() による ``broker_stopped`` の journal + sidecar 削除) は run() の
+    finally が **唯一の呼出元** として行う (server.stop の ``_stopped`` one-shot
+    ガードで broker_stopped は厳密に 1 回)。ハンドラ内で journal しないのは、
+    シグナルコンテキストでの I/O / lock 取得を避けるため。
+
+    制約 (意図的): ``signal.signal`` は **main thread でしか登録できない** (テストが
+    run() を別スレッドで回すと ValueError)。Windows の SIGTERM は TerminateProcess
+    でハンドラが走らない (= POSIX 用の停止経路) が、Windows は admin RPC shutdown が
+    既に停止経路を持つため degrade しない。登録不能な環境では黙って skip する。
+    """
+    def _handler(signum, frame):  # noqa: ANN001 - signal handler signature
+        broker.request_shutdown()
+
+    for signame in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue  # SIGBREAK は Windows のみ / SIGTERM は POSIX 既定で存在
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # main thread 以外 / 登録不能環境では skip (KeyboardInterrupt + admin
+            # RPC shutdown が停止経路として残る)。
+            pass
+
+
 def run(args: argparse.Namespace) -> int:
     # state-dir は入口で絶対化する (sidecar / journal の単一の絶対パス。Windows
     # isabs の罠を避けるため posixpath 併用。Codex review Minor / #61 の先例)。
@@ -150,6 +180,10 @@ def run(args: argparse.Namespace) -> int:
     journal_offset = sidecar.journal_offset(state_dir)
     started_at = time.time()
     broker.start()
+    # SIGTERM (+ Windows SIGBREAK) を graceful shutdown 経路に配線する (Closes #74)。
+    # admin RPC shutdown / KeyboardInterrupt と同じ request_shutdown を立てるだけで、
+    # broker_stopped の emit は finally の stop() に集約する。
+    _install_signal_handlers(broker)
     # daemon sidecar を公開する (発見用メタ + admin token)。停止時に finally で削除。
     sidecar.write_sidecar(
         state_dir,

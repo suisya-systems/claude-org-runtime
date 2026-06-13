@@ -16,7 +16,8 @@ shape と**同名・同形 (drop-in 形差ゼロ)** の MCP 面を broker 上に
 - pane target は handle / stable name / 'focused' の三系統で解決する
   (:meth:`Broker.resolve_target`)。
 - list_peers / list_panes は cwd を含める (Set D cwd parity, §3.3-4)。
-  receive_mode は broker では全 pull 統一のため定数 "pull"、kind は bind 由来。
+  receive_mode は broker では push 一次のため定数 "push" (fallback=pull)、kind は
+  bind 由来。
 - set_pane_identity は renga 同形の three-state (omit=据置 / null=クリア /
   str=設定)。auth tier は不変 ``auth_role`` のみで決める (表示 role 非関与)。
 
@@ -48,9 +49,15 @@ if TYPE_CHECKING:  # 循環 import 回避 (server -> surface -> server を型の
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "org-broker", "version": "0.1.0"}
 
-# broker では配達は全 pull (check_messages) 統一なので receive_mode は定数。
-# renga の push/poll 区別は概念が異なるため定数化する (Set D amendment, §3.3-4)。
-RECEIVE_MODE = "pull"
+# broker の受信モデルは push 一次 (channel sidecar) + pull フォールバック (§9.6)。
+# list_peers / list_panes が peer に報告する receive_mode は **push** = 一次配送が
+# channel push であることの signal (D2: poll/pull -> push)。フォールバック層
+# (check_messages の役割 cadence) は :data:`FALLBACK_RECEIVE_MODE`。push mode が
+# 失効した agent (sidecar 不在 / channel 非対応 codex peer) はフォールバックに degrade
+# するが、その per-agent な実状態は delivery_mode (store) が持ち、本定数は transport の
+# capability surface としての一次手段を表す (§9.7 既定 renga 経路は不変)。
+RECEIVE_MODE = "push"
+FALLBACK_RECEIVE_MODE = "pull"
 
 # pane addressing: 全桁数字 → handle 確定 (renga と同契約; "7" という名前の
 # pane は名前で引けず id で引く)。'focused' はリテラル。
@@ -387,6 +394,10 @@ _CLAUDE_VALUE_FLAGS = {
     "--mcp-config", "--model", "--permission-mode", "--add-dir", "--settings",
     "--append-system-prompt", "--setting-sources", "--session-id",
     "--permission-prompt-tool", "--mcp-config-file",
+    # push 一次配送 (§9.5): channel sidecar を load する dev-channel flag。値は
+    # ``server:org-broker-channel``。renga と同形の対話 flag (renga も
+    # ``--dangerously-load-development-channels server:renga-peers`` を使う)。
+    "--dangerously-load-development-channels",
 }
 _CLAUDE_BOOL_FLAGS = {
     "--strict-mcp-config", "--continue", "--verbose", "--debug", "--ide",
@@ -397,9 +408,11 @@ _CLAUDE_HEADLESS_BLACKLIST = {
     "--include-partial-messages", "--replay-user-messages",
 }
 # caller の args[] に持たせてはいけない (broker 構造化フィールドと衝突)。
+# dev-channel flag は broker が channel sidecar 用に注入する唯一の出所なので、caller
+# が args[] で第二/別の dev-channel を持ち込むのを禁じる (§9.5/§9.7 単一注入経路)。
 _CLAUDE_RESERVED_IN_ARGS = {
     "--mcp-config", "--model", "--permission-mode", "--strict-mcp-config",
-    "--mcp-config-file",
+    "--mcp-config-file", "--dangerously-load-development-channels",
 }
 
 # --- Codex (interactive TUI) ---
@@ -470,12 +483,18 @@ def build_claude_argv(
     model: str | None = None,
     permission_mode: str | None = None,
     extra_args: list[str] | None = None,
+    channel_server: str | None = None,
 ) -> list[str]:
     """spawn_claude_pane の対話 TUI argv を組む (renga の dev-channel 合成の代替)。
 
     broker が --mcp-config を注入し (token 入り JSON)、model / permission_mode は
-    構造化フィールドから一度だけ描画する。caller の extra_args は構造化フィールドと
-    衝突する予約 flag を持てない (renga parity)。最後に default-deny guard を通す。
+    構造化フィールドから一度だけ描画する。``channel_server`` を渡すと push 一次配送
+    (§9.5) の dev-channel flag (``--dangerously-load-development-channels
+    server:<channel_server>``) を加える (channel sidecar の load + 3-3b 機械承認の
+    再導入)。**broker 枝のみ**で渡され、renga 枝 (org up / build_up_argv) は渡さない
+    ため第二の dev-channel を emit しない (§9.7 launcher argv の bit 等価)。caller の
+    extra_args は構造化フィールドと衝突する予約 flag を持てない。最後に default-deny
+    guard を通す。
     """
     extra_args = list(extra_args or [])
     _reject_reserved_claude_args(extra_args)
@@ -484,6 +503,8 @@ def build_claude_argv(
         argv += ["--permission-mode", permission_mode]
     if model:
         argv += ["--model", model]
+    if channel_server:
+        argv += ["--dangerously-load-development-channels", f"server:{channel_server}"]
     argv += extra_args
     _guard_interactive_claude_argv(argv)
     return argv
