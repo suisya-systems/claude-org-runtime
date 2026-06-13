@@ -164,7 +164,8 @@ def test_list_peers_includes_cwd_and_receive_mode(tmp_path):
     out = dispatch_tool(b, src, "list_peers", {})
     peers = {p["id"]: p for p in json.loads(out["content"][0]["text"])["peers"]}
     assert peers["worker-x"]["cwd"] == "/tmp/x"
-    assert peers["worker-x"]["receive_mode"] == "pull"
+    # D2: broker は push 一次 (channel sidecar)。報告 receive_mode は "push"。
+    assert peers["worker-x"]["receive_mode"] == "push"
 
 
 # --------------------------------------------------------------- claude builder
@@ -178,6 +179,32 @@ def test_build_claude_argv_injects_mcp_config_and_structured_fields():
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
     assert "--add-dir" in argv
+
+
+def test_build_claude_argv_channel_server_emits_one_dev_channel():
+    """D2 / §9.7: channel_server を渡したときだけ dev-channel を **1 つ** emit する。
+
+    push 一次配送 (broker 枝) の spawn は channel sidecar の dev-channel を 1 本だけ
+    注入し、それ以外の caller (renga 枝の build_up_argv 等、channel_server 無し) は
+    **第二の dev-channel を一切 emit しない** = launcher argv の bit 等価 (§9.7)。
+    """
+    # channel_server 無し: dev-channel flag はゼロ (renga/no-channel caller 経路)。
+    plain = build_claude_argv(mcp_config_json="{}")
+    assert "--dangerously-load-development-channels" not in plain
+    # channel_server 有り: ちょうど 1 本、指定 server を指す。
+    withch = build_claude_argv(mcp_config_json="{}", channel_server="org-broker-channel")
+    assert withch.count("--dangerously-load-development-channels") == 1
+    idx = withch.index("--dangerously-load-development-channels")
+    assert withch[idx + 1] == "server:org-broker-channel"
+
+
+def test_build_claude_argv_rejects_caller_dev_channel():
+    """caller は args[] で第二/別の dev-channel を持ち込めない (単一注入経路, §9.5)。"""
+    with pytest.raises(ToolArgError):
+        build_claude_argv(
+            mcp_config_json="{}",
+            extra_args=["--dangerously-load-development-channels", "server:evil"],
+        )
 
 
 def test_build_claude_argv_rejects_reserved_args():

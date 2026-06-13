@@ -38,7 +38,7 @@ from ..terminal import (
     classify_pane_state,
 )
 from . import sidecar, surface
-from .store import StoreMixin
+from .store import QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
 
@@ -55,6 +55,8 @@ class Broker(TokenMixin, StoreMixin):
         nudge_defer_interval: float = 2.0,
         nudge_defer_max_tries: int = 30,
         admin_token: str | None = None,
+        lease_seconds: float = 30.0,
+        reclaim_warn_threshold: int = 3,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -63,6 +65,11 @@ class Broker(TokenMixin, StoreMixin):
         self.port = port
         self.nudge_defer_interval = nudge_defer_interval
         self.nudge_defer_max_tries = nudge_defer_max_tries
+        # push 一次配送 (§9.3): claim lease の長さと flapping 印字閾値。lease は
+        # worst-case emit+confirm 往復より保守的に取る (sidecar 死亡時の reap 遅延と
+        # の trade-off)。reclaim_warn_threshold 超で reclaim された行は印字する。
+        self.lease_seconds = lease_seconds
+        self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
         # の per-agent bearer token (bind 表) とは別系統の認証 (Codex review
@@ -71,7 +78,12 @@ class Broker(TokenMixin, StoreMixin):
 
         self._lock = threading.Lock()
         self._binds: dict[str, AgentBind] = {}        # token -> bind
-        self._queues: dict[str, list[dict]] = {}      # agent_id -> messages
+        # push 一次配送の三状態ライフサイクル (§9.3)。row id -> QueueRow。
+        # 旧 agent_id 別 inbox (``_queues``) を行モデルへ置換 (.state/broker schema
+        # 改訂)。配送解決は row.to_id で行う。
+        self._rows: dict[str, QueueRow] = {}          # row id -> QueueRow
+        self._delivery_modes: dict[str, str] = {}     # agent_id -> PUSH/PULL (既定 PUSH)
+        self._epochs: dict[str, int] = {}             # agent_id -> mode-epoch (既定 0)
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -225,6 +237,14 @@ class Broker(TokenMixin, StoreMixin):
         return f"http://{self.host}:{self.port}/mcp"
 
     @property
+    def base_url(self) -> str:
+        """``/mcp`` を含まない daemon の base URL (channel sidecar の delivery 経路)。
+
+        channel sidecar はここに ``/poll-claims`` / ``/confirm-delivered`` を付けて
+        叩く (MCP 面とは別系統の delivery endpoint)。"""
+        return f"http://{self.host}:{self.port}"
+
+    @property
     def admin_url(self) -> str:
         return f"http://{self.host}:{self.port}/admin"
 
@@ -256,9 +276,16 @@ class Broker(TokenMixin, StoreMixin):
     def _nudge_worker(self, target: AgentBind) -> None:
         pane_id = target.pane_id
         assert pane_id is not None and self.adapter is not None
+        from .store import CLAIMED, UNDELIVERED
         for attempt in range(1, self.nudge_defer_max_tries + 1):
             with self._lock:
-                pending = bool(self._queues.get(target.agent_id))
+                # UNDELIVERED または (まだ生きている) CLAIMED 行が残っていれば pending。
+                # push 経路が claim 中でも fallback nudge は冪等 (claim-respecting
+                # check_messages が二重配達を防ぐ)。drain/confirm 済なら再ナッジ不要。
+                pending = any(
+                    r.to_id == target.agent_id and r.state in (UNDELIVERED, CLAIMED)
+                    for r in self._rows.values()
+                )
             if not pending:
                 return  # 配達前に drain 済み (再ナッジ不要)
             try:
@@ -350,7 +377,7 @@ class Broker(TokenMixin, StoreMixin):
         geometry / focused は adapter (native: pane_id/left/top/width/height/
         active) から、name/role/cwd/kind は broker の pane 登録簿から取る
         (cwd は tmux capture に無いため bind/登録簿が唯一の出所 — §3.3-4)。
-        receive_mode は全 pull 統一の定数 (Set D amendment)。
+        receive_mode は push 一次の定数 (D2: §9.6 push primary / pull fallback)。
         """
         panes = self._adapter_panes()
         with self._lock:  # _pane_meta の一貫スナップショット (iteration 中 mutation 回避)
@@ -533,6 +560,14 @@ class Broker(TokenMixin, StoreMixin):
                 b = self._binds[tok]
                 b.revoked = True
                 b.registered = False
+        # 切戻し §5.5 第 6 ステップ: per-pane channel sidecar の reap に伴う
+        # delivery-scoped credential revoke + delivery_mode/epoch reset。pane kill で
+        # sidecar プロセスは道連れに落ちるが、daemon 側の delivery cred / mode は
+        # 明示的に掃除して orphan 化させない (revoke / reset は自前で _lock を取るため
+        # 上の registry スコープの外で呼ぶ — 非再入 Lock の二重取得回避)。
+        if agent_id:
+            self.revoke_delivery_creds(agent_id)
+            self.reset_delivery_state(agent_id)
         self._emit_event({"type": "pane_exited", "pane_id": handle, "agent_id": agent_id})
         self._journal("pane_closed", pane_id=handle, agent_id=agent_id)
         return _ok({"ok": True, "closed": handle})
@@ -725,6 +760,7 @@ class Broker(TokenMixin, StoreMixin):
         if (err := self._reserve_name(name)) is not None:
             return _err(err)
         token: str | None = None  # generic spawn では None のまま
+        delivery_cred: str | None = None  # channel sidecar 用 (§9.4)。失敗時 revoke
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("claude")
@@ -732,18 +768,31 @@ class Broker(TokenMixin, StoreMixin):
                 agent_id, name or agent_id, role or "", cwd=cwd, kind="claude",
                 auth_role=auth_role,
             )
+            # push 一次配送の spawn 儀式 (§9.5): full token の --mcp-config (daemon)
+            # に加えて、(a) channel sidecar を stdio MCP として同 config に積み、
+            # (b) delivery-scoped credential を sidecar env に注入し、(c) dev-channel
+            # flag で sidecar を load させる。delivery cred は full token とは別物
+            # (least-privilege)。子 claude が sidecar を subprocess として起こす
+            # ため broker は sidecar を直接 spawn しない (pane kill で道連れに落ちる)。
+            delivery_cred = self.issue_delivery_cred(agent_id)
+            mcp_config = self.mcp_config_for(token)
+            mcp_config["mcpServers"]["org-broker-channel"] = (
+                self.channel_server_config(delivery_cred, agent_id)
+            )
             argv = surface.build_claude_argv(
-                mcp_config_json=json.dumps(self.mcp_config_for(token)),
+                mcp_config_json=json.dumps(mcp_config),
                 model=model, permission_mode=permission_mode, extra_args=extra,
+                channel_server="org-broker-channel",
             )
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
         except BaseException:
-            # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
-            # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
+            # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
+            # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
             # discard を原子的に行う (spawn 成功後〜meta 登録前に同名 spawn が
             # 再予約できる窓を作らない)。token は generic spawn では None。
             self._release_name(name)
             self._revoke_token(token)
+            self._revoke_token(delivery_cred)
             raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token)
@@ -986,6 +1035,22 @@ class _McpHandler(BaseHTTPRequestHandler):
         if method == "mint_token":
             result = broker.admin_mint_token(params)
             self._send_json(200 if result.get("ok") else 400, result)
+        elif method == "flip_mode":
+            # per-agent delivery_mode の PUSH<->PULL flip (§9.3 mode-epoch fencing)。
+            # owner (= 対象 agent_id) と mode を取り、横断状態を触るため admin scope。
+            owner = params.get("owner")
+            mode = params.get("mode")
+            if not isinstance(owner, str) or not isinstance(mode, str):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "[invalid_params] flip_mode requires string owner and mode",
+                })
+            else:
+                result = broker.flip_mode(owner, mode)
+                self._send_json(200 if result.get("ok") else 400, result)
+        elif method == "delivery_dump":
+            # 配送ライフサイクルの横断スナップショット (owner/state を晒すため admin)。
+            self._send_json(200, {"ok": True, **broker.delivery_dump()})
         elif method == "shutdown":
             # 応答を先に返してから shutdown を要求する: クライアントは ack を受け
             # 取れ、実際の停止 (server.shutdown + sidecar 削除) は run() 側が行う
@@ -998,11 +1063,56 @@ class _McpHandler(BaseHTTPRequestHandler):
                 400, {"ok": False, "error": f"[unknown_admin_method] {method!r}"}
             )
 
+    def _handle_delivery(self, path: str):
+        """delivery endpoint (``/poll-claims`` / ``/confirm-delivered``) — §9.3 / §9.4。
+
+        channel sidecar 専用。**delivery-scoped credential** (``scope == "delivery"``)
+        の bearer のみ受理し、operate できるのは ``to_id == bind.agent_id (= owner)``
+        の行に限る (poll_claims / confirm_delivered が owner で構造的に絞る)。full
+        token (agent / admin) はこの経路を使えない (least-privilege の双方向遮断)。
+        body は ``{"id", "epoch"}`` (confirm) の小さな JSON。MCP ではなく素の HTTP RPC。
+        """
+        broker = self.broker
+        auth = self.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        bind = broker.get_bind(token)
+        if bind is None or bind.scope != "delivery":
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "[parse_error] invalid json body"})
+            return
+        if not isinstance(req, dict):
+            self._send_json(400, {"error": "[invalid_body] body must be a json object"})
+            return
+        owner = bind.agent_id
+        if path == "/poll-claims":
+            self._send_json(200, broker.poll_claims(owner))
+            return
+        # /confirm-delivered
+        rid = req.get("id")
+        if not isinstance(rid, str):
+            self._send_json(400, {"ok": False, "error": "[invalid_id] id must be a string"})
+            return
+        try:
+            epoch = int(req.get("epoch", -1))
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "[invalid_epoch] epoch must be an int"})
+            return
+        self._send_json(200, broker.confirm_delivered(owner, rid, epoch))
+
     def do_POST(self):
-        if self.path.rstrip("/") == "/admin":
+        path = self.path.rstrip("/")
+        if path == "/admin":
             self._handle_admin()
             return
-        if self.path.rstrip("/") != "/mcp":
+        if path in ("/poll-claims", "/confirm-delivered"):
+            self._handle_delivery(path)
+            return
+        if path != "/mcp":
             self._send_json(404, None)
             return
         # --- 認証 (per-agent token, 設計書 §4.4) -------------------------
@@ -1016,6 +1126,23 @@ class _McpHandler(BaseHTTPRequestHandler):
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {"code": -32001, "message": "[token_invalid] unauthorized"},
+                },
+            )
+            return
+        # delivery-scoped credential は MCP ツール面を**構造的に**持たない (§9.4
+        # least-privilege)。/mcp (initialize / tools/*) は full scope のみ。delivery
+        # cred は /poll-claims / /confirm-delivered からのみ daemon を操作できる。
+        if bind.scope != "full":
+            self._send_json(
+                403,
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32001,
+                        "message": "[scope_forbidden] delivery-scoped credential "
+                        "cannot use the MCP tool surface",
+                    },
                 },
             )
             return

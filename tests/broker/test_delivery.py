@@ -1,0 +1,425 @@
+# -*- coding: utf-8 -*-
+"""push 一次配送 (R3/R4) のライフサイクル + trust 境界テスト。
+
+設計 SoT: broker-native-roles.md §9.3 (三状態) / §9.4 (delivery-scoped token) /
+§9.5 (spawn 儀式) / §5.5 (切戻し第 6 ステップ)。canonical 実装: transport-lab
+spike/k1_daemon.py (PR #24 merge 28a4cb2 で idle-wake 実機 PASS) のライフサイクル
+不変条件を runtime store + delivery endpoint で固定する。
+
+被覆 (full 受入):
+- claim-then-confirm: UNDELIVERED -> CLAIMED -> DELIVERED、id 冪等。
+- claim-respecting check_messages: live claim を二重配達しない / 並行ドレインしない。
+- lease-reap recovery: sidecar 死亡 (confirm せず) でも message を喪失せず再配達。
+- mode-epoch fencing: flip 後の stale epoch confirm を拒否し行を再 eligible 化。
+- claim-issuance ゲート: PULL mode で poll_claims を拒否 (check_messages は不変)。
+- delivery-scoped credential: /mcp 拒否 / endpoint は owner 行のみ / full token 遮断。
+- spawn 儀式: dev-channel flag + channel server config + delivery cred 発行。
+- 切戻し: close_pane が delivery cred revoke + delivery_mode reset。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import pytest
+
+from claude_org_runtime.broker.server import Broker
+from claude_org_runtime.broker.store import CLAIMED, DELIVERED, PULL, PUSH, UNDELIVERED
+from claude_org_runtime.broker.surface import dispatch_tool
+
+from .conftest import FakeAdapter
+
+
+# --------------------------------------------------------------------- helpers
+def _registered(b: Broker, agent_id: str, pane_id=None):
+    tok = b.issue_token(agent_id, agent_id, "worker", pane_id=pane_id)
+    b.register_local(tok)
+    return b.get_bind(tok)
+
+
+def _ops(b: Broker, agent_id="d", role="dispatcher"):
+    tok = b.issue_token(agent_id, agent_id, role)
+    b.register_local(tok)
+    return b.get_bind(tok)
+
+
+def _text(out):
+    return json.loads(out["content"][0]["text"])
+
+
+def _row_states(b: Broker, to_id: str) -> list[str]:
+    return [r.state for r in b._rows.values() if r.to_id == to_id]
+
+
+# ===================================================================== R4 store
+def test_claim_then_confirm_lifecycle(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "hello")
+    assert _row_states(b, "dst") == [UNDELIVERED]
+
+    res = b.poll_claims("dst")
+    assert len(res["rows"]) == 1 and res["epoch"] == 0
+    rid = res["rows"][0]["id"]
+    assert res["rows"][0]["entry"]["message"] == "hello"
+    assert _row_states(b, "dst") == [CLAIMED]
+
+    conf = b.confirm_delivered("dst", rid, res["epoch"])
+    assert conf["ok"] is True
+    assert _row_states(b, "dst") == [DELIVERED]
+    # id 冪等: 二度目の confirm は idempotent。
+    assert b.confirm_delivered("dst", rid, res["epoch"]) == {"ok": True, "idempotent": True}
+
+
+def test_check_messages_respects_live_claim(tmp_path):
+    """live な sidecar claim 中の行は check_messages が返さない (二重配達なし)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "m1")
+    b.poll_claims("dst")  # CLAIMED, lease 30s (まだ live)
+    # check_messages は live claim を見送る (空)。
+    assert b.drain(dst) == []
+    assert _row_states(b, "dst") == [CLAIMED]
+
+
+def test_check_messages_drains_unclaimed(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "m1")
+    b.enqueue(src, "dst", "m2")
+    msgs = b.drain(dst)
+    assert [m["message"] for m in msgs] == ["m1", "m2"]
+    assert _row_states(b, "dst") == [DELIVERED, DELIVERED]
+    assert b.drain(dst) == []  # at-most-once on DELIVERED
+
+
+def test_lease_reap_recovers_dead_sidecar(tmp_path):
+    """confirm されないまま lease 失効した行は再 eligible 化し喪失しない (§9.3)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "survive-me")
+    res = b.poll_claims("dst")  # CLAIMED (sidecar が死んで confirm しないと仮定)
+    assert _row_states(b, "dst") == [CLAIMED]
+    time.sleep(0.1)  # lease 失効を待つ
+    # check_messages (pull fallback) が reap して再配達する = 喪失しない。
+    msgs = b.drain(dst)
+    assert [m["message"] for m in msgs] == ["survive-me"]
+    # reclaim_count が増えている。
+    row = next(iter(b._rows.values()))
+    assert row.reclaim_count == 1
+
+
+def test_confirm_after_lease_expiry_rejected(tmp_path):
+    """lease 失効後の confirm は not_claimed で拒否 (reap で UNDELIVERED へ戻る)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "x")
+    res = b.poll_claims("dst")
+    rid = res["rows"][0]["id"]
+    time.sleep(0.1)
+    conf = b.confirm_delivered("dst", rid, res["epoch"])
+    assert conf["ok"] is False and conf["error"] == "not_claimed"
+
+
+def test_mode_epoch_fencing_rejects_stale_confirm(tmp_path):
+    """flip で epoch が進み、旧 epoch の confirm は stale_epoch で拒否される。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "x")
+    res = b.poll_claims("dst")  # epoch 0, CLAIMED
+    rid = res["rows"][0]["id"]
+    flip = b.flip_mode("dst", PULL)  # epoch -> 1、CLAIMED -> UNDELIVERED
+    assert flip["epoch"] == 1 and flip["mode"] == PULL
+    assert _row_states(b, "dst") == [UNDELIVERED]
+    conf = b.confirm_delivered("dst", rid, res["epoch"])  # epoch 0 (stale)
+    assert conf["ok"] is False and conf["error"] == "stale_epoch" and conf["epoch"] == 1
+
+
+def test_pull_mode_disables_claim_issuance(tmp_path):
+    """PULL mode は poll_claims を拒否するが check_messages は不変 (§9.3)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.flip_mode("dst", PULL)
+    b.enqueue(src, "dst", "m1")
+    res = b.poll_claims("dst")
+    assert res["error"] == "push_disabled" and res["rows"] == []
+    # check_messages は mode に依らず claim-respecting drain (フォールバック健在)。
+    assert [m["message"] for m in b.drain(dst)] == ["m1"]
+
+
+def test_poll_claims_only_returns_owner_rows(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src = _registered(b, "src")
+    _registered(b, "dst")
+    _registered(b, "dst2")
+    b.enqueue(src, "dst", "for-dst")
+    b.enqueue(src, "dst2", "for-dst2")
+    res = b.poll_claims("dst")
+    assert [r["entry"]["message"] for r in res["rows"]] == ["for-dst"]
+
+
+def test_confirm_not_owner_rejected(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src = _registered(b, "src")
+    _registered(b, "dst")
+    _registered(b, "other")
+    b.enqueue(src, "dst", "x")
+    res = b.poll_claims("dst")
+    rid = res["rows"][0]["id"]
+    # 別 owner は他人宛の行を confirm できない。
+    assert b.confirm_delivered("other", rid, res["epoch"])["error"] == "not_owner"
+
+
+def test_flip_mode_invalid(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.flip_mode("dst", "SHOVE")
+    assert res["ok"] is False and "invalid_mode" in res["error"]
+
+
+# ============================================================ R4 HTTP endpoints
+def _post(url: str, token: str, payload: dict):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return e.code, (json.loads(body) if body else {})
+
+
+def test_delivery_endpoints_require_delivery_scope(broker):
+    """/poll-claims・/confirm-delivered は delivery cred のみ。full token は 401。"""
+    full = broker.issue_token("agent", "agent", "worker")
+    delivery = broker.issue_delivery_cred("agent")
+    # full token は delivery endpoint に入れない (least-privilege の双方向遮断)。
+    status, _ = _post(broker.base_url + "/poll-claims", full, {})
+    assert status == 401
+    # delivery cred は通る。
+    status, body = _post(broker.base_url + "/poll-claims", delivery, {})
+    assert status == 200 and body["rows"] == []
+
+
+def test_delivery_cred_cannot_use_mcp_surface(broker):
+    """delivery-scoped credential は /mcp (initialize/tools) を構造的に使えない。"""
+    delivery = broker.issue_delivery_cred("agent")
+    req = urllib.request.Request(
+        broker.url,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"protocolVersion": "2025-06-18"}}).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {delivery}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 403  # scope_forbidden
+
+
+def test_delivery_endpoint_roundtrip_over_http(broker):
+    """enqueue -> /poll-claims -> /confirm-delivered を HTTP 越しに往復する。"""
+    src = broker.issue_token("src", "src", "worker")
+    broker.register_local(src)
+    dst = broker.issue_token("dst", "dst", "worker")
+    broker.register_local(dst)
+    broker.enqueue(broker.get_bind(src), "dst", "wire-hello")
+    delivery = broker.issue_delivery_cred("dst")
+
+    status, body = _post(broker.base_url + "/poll-claims", delivery, {})
+    assert status == 200 and len(body["rows"]) == 1
+    row = body["rows"][0]
+    assert row["entry"]["message"] == "wire-hello"
+
+    status, conf = _post(broker.base_url + "/confirm-delivered", delivery,
+                         {"id": row["id"], "epoch": row["epoch"]})
+    assert status == 200 and conf["ok"] is True
+
+
+def test_confirm_invalid_id_400(broker):
+    delivery = broker.issue_delivery_cred("dst")
+    status, body = _post(broker.base_url + "/confirm-delivered", delivery,
+                         {"id": 123, "epoch": 0})
+    assert status == 400 and "invalid_id" in body["error"]
+
+
+# ================================================================ R3 spawn 儀式
+def test_spawn_claude_injects_channel_sidecar_and_dev_channel(tmp_path, fake_adapter):
+    """spawn_claude が channel sidecar + dev-channel flag + delivery cred を仕込む。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {
+        "direction": "vertical", "name": "worker-foo", "cwd": "/repo",
+    })
+    assert _text(out)["agent_id"] == "worker-foo"
+    argv = fake_adapter.spawned[-1]["argv"]
+    # dev-channel flag (3-3b 機械承認の再導入) が channel sidecar を指す。
+    assert "--dangerously-load-development-channels" in argv
+    assert argv[argv.index("--dangerously-load-development-channels") + 1] == \
+        "server:org-broker-channel"
+    # mcp-config に daemon (org-broker) と channel (org-broker-channel) の両方。
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    servers = cfg["mcpServers"]
+    assert "org-broker" in servers and "org-broker-channel" in servers
+    ch = servers["org-broker-channel"]
+    assert ch["args"] == ["-m", "claude_org_runtime.broker.channel_sidecar"]
+    assert ch["env"]["ORG_BROKER_CHANNEL_OWNER"] == "worker-foo"
+    assert ch["env"]["ORG_BROKER_CHANNEL_DAEMON_URL"] == b.base_url
+    # delivery cred が発行され、その token が sidecar env に載っている。
+    cred = ch["env"]["ORG_BROKER_CHANNEL_CRED"]
+    cred_bind = b.get_bind(cred)
+    assert cred_bind is not None and cred_bind.scope == "delivery"
+    assert cred_bind.agent_id == "worker-foo" and cred_bind.registered is False
+
+
+def test_delivery_cred_not_in_list_peers(tmp_path, fake_adapter):
+    """delivery cred は registered=False で list_peers / 配送先に現れない。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    peers = _text(dispatch_tool(b, disp, "list_peers", {}))["peers"]
+    # spawn された worker 自体は (register 前なので) peer に出ない; delivery cred も出ない。
+    assert all(p["id"] != "" for p in peers)
+    # delivery cred bind は存在するが registered=False。
+    creds = [bd for bd in b._binds.values() if bd.scope == "delivery"]
+    assert len(creds) == 1 and creds[0].registered is False
+
+
+def test_close_pane_revokes_delivery_cred_and_resets_mode(tmp_path, fake_adapter):
+    """切戻し §5.5 第 6: close_pane が delivery cred revoke + delivery_mode reset。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    pane_id = out["id"]
+    # 配送状態を作る (mode flip)。
+    b.flip_mode("w", PULL)
+    assert "w" in b._delivery_modes
+    cred = [bd for bd in b._binds.values() if bd.scope == "delivery"][0]
+    assert cred.revoked is False
+    # close_pane で reap。
+    dispatch_tool(b, disp, "close_pane", {"target": str(pane_id)})
+    assert cred.revoked is True               # delivery cred revoke
+    assert "w" not in b._delivery_modes       # delivery_mode reset
+    assert "w" not in b._epochs
+
+
+def test_spawn_failure_revokes_delivery_cred(tmp_path):
+    """spawn (adapter) 失敗時に発行済み delivery cred も掃除される (orphan なし)。"""
+    class BoomAdapter(FakeAdapter):
+        def spawn(self, argv, cwd=None, new_window=True):
+            raise RuntimeError("boom")
+
+    adapter = BoomAdapter()
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    with pytest.raises(RuntimeError):
+        dispatch_tool(b, disp, "spawn_claude_pane",
+                      {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    # full token も delivery cred も revoke 済 (active な bind が残らない)。
+    live = [bd for bd in b._binds.values() if not bd.revoked and bd.agent_id == "w"]
+    assert live == []
+
+
+# ============================ R3<->R4 cross-process integration (real sidecar)
+def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
+    """実 channel sidecar を subprocess で起こし、poll->emit->confirm の往復を検証。
+
+    実 claude を起こす idle-wake 自体は K1 spike (実機 PASS) が証明済み。本テストは
+    runtime の R3 sidecar <-> R4 daemon endpoint を **別プロセス + 実 HTTP** で結線
+    して、(a) sidecar が daemon から claim し、(b) ``notifications/claude/channel`` を
+    stdout に emit し、(c) ``/confirm-delivered`` で daemon 側が DELIVERED 化する
+    ことを end-to-end で固定する (confirm-only-after-emit の実証)。
+    """
+    b = Broker(state_dir=tmp_path / "broker", adapter=None, port=0, lease_seconds=30.0)
+    b.start()
+    try:
+        src = b.issue_token("src", "src", "worker")
+        b.register_local(src)
+        dst = b.issue_token("dst", "dst", "worker")
+        b.register_local(dst)
+        b.enqueue(b.get_bind(src), "dst", "push-over-the-wire")
+        delivery = b.issue_delivery_cred("dst")
+
+        env = {
+            **os.environ,
+            "ORG_BROKER_CHANNEL_DAEMON_URL": b.base_url,
+            "ORG_BROKER_CHANNEL_CRED": delivery,
+            "ORG_BROKER_CHANNEL_OWNER": "dst",
+            "ORG_BROKER_CHANNEL_POLL_INTERVAL": "0.2",
+            "PYTHONPATH": os.pathsep.join(sys.path),
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "claude_org_runtime.broker.channel_sidecar"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            # MCP handshake: initialize -> initialized (push loop が起動する)。
+            proc.stdin.write(
+                (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {"protocolVersion": "2025-06-18"}}) + "\n").encode()
+            )
+            proc.stdin.write(
+                (json.dumps({"jsonrpc": "2.0",
+                             "method": "notifications/initialized"}) + "\n").encode()
+            )
+            proc.stdin.flush()
+
+            # stdout を別スレッドで読み、channel notification を待つ (deadline 付き)。
+            found: dict = {}
+
+            def _reader():
+                for raw in proc.stdout:
+                    try:
+                        msg = json.loads(raw.decode("utf-8").strip())
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if msg.get("method") == "notifications/claude/channel":
+                        found["msg"] = msg
+                        return
+
+            rt = threading.Thread(target=_reader, daemon=True)
+            rt.start()
+            rt.join(timeout=15.0)
+
+            assert "msg" in found, "sidecar never emitted notifications/claude/channel"
+            params = found["msg"]["params"]
+            assert params["content"] == "push-over-the-wire"
+            assert params["meta"]["from_id"] == "src"
+            assert "msg_id" in params["meta"]
+
+            # daemon 側で confirm が届き DELIVERED になるまで待つ (emit の後に confirm)。
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                states = _row_states(b, "dst")
+                if states == [DELIVERED]:
+                    break
+                time.sleep(0.1)
+            assert _row_states(b, "dst") == [DELIVERED]
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        b.stop()
