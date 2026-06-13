@@ -62,10 +62,14 @@ def test_channel_payload_maps_entry_to_content_and_meta():
     assert content == "DELEGATE: do the thing"
     assert meta["from_id"] == "dispatcher"
     assert meta["from_name"] == "dispatcher"
-    assert meta["sent_at"] == 1781353457.69
+    # #80: 数値 sent_at は string 化して載せる (host schema は string 必須)。
+    assert meta["sent_at"] == "1781353457.69"
+    assert isinstance(meta["sent_at"], str)
     assert meta["msg_id"] == "abc123"  # daemon 行 id = at-least-once dedup key
 
 
 def test_channel_payload_tolerates_missing_entry_fields():
     content, meta = cs._channel_payload({"id": "x", "entry": {}})
+    # 欠落 sent_at は degenerate なので空文字 (None を載せて schema 違反にしない)。
     assert content == "" and meta["msg_id"] == "x" and meta["from_id"] is None
+    assert meta["sent_at"] == ""

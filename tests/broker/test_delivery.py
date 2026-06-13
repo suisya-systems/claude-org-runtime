@@ -523,6 +523,9 @@ def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
             assert params["content"] == "push-over-the-wire"
             assert params["meta"]["from_id"] == "src"
             assert "msg_id" in params["meta"]
+            # #80: emit/wire 境界で sent_at が string であること (host schema は string
+            # 必須。float のままだと ZodError -> STDIO drop で本文喪失する)。
+            assert isinstance(params["meta"]["sent_at"], str)
 
             # daemon 側で confirm が届き DELIVERED になるまで待つ (emit の後に confirm)。
             deadline = time.time() + 10

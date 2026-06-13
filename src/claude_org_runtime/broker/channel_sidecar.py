@@ -96,13 +96,23 @@ def _channel_payload(row: dict) -> tuple[str, dict]:
     ``content`` = 本文、``meta`` = 帰属 (from_id/from_name/sent_at) + dedup key
     (``msg_id`` = daemon 行 id)。msg_id は emit/confirm 残余 window や epoch flip での
     再配達を受信側が識別できる dedup key (at-least-once + 冪等表示の前提を実体化)。
+
+    ``meta.sent_at`` は **必ず string 化**して載せる (#80)。store.enqueue は
+    ``entry.sent_at`` を ``time.time()`` の **float** で打つが、host claude の
+    ``notifications/claude/channel`` スキーマは ``sent_at`` を **string** で要求する。
+    float のまま載せると host 側で ZodError になり、通知ごと STDIO で drop されて
+    本文がセッションに注入されない (= push 一次配送の silent-drop)。entry 自体の
+    数値 sent_at は pull 経路 (check_messages の tools/call result) では schema 対象外
+    なので触らず、channel push に載せる射影だけを string 化する。None (欠落) は
+    degenerate なので空文字にする (どちらも schema 上 valid string)。
     """
     entry = dict(row.get("entry") or {})
     content = entry.get("message", "")
+    sent_at = entry.get("sent_at")
     meta = {
         "from_id": entry.get("from_id"),
         "from_name": entry.get("from_name"),
-        "sent_at": entry.get("sent_at"),
+        "sent_at": "" if sent_at is None else str(sent_at),
         "msg_id": row["id"],
     }
     return content, meta
