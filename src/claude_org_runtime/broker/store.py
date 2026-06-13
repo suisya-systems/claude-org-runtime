@@ -261,8 +261,14 @@ class StoreMixin:
             elif row.to_id != owner:
                 result = {"ok": False, "error": "not_owner"}
             elif epoch != cur_epoch:
-                # stale epoch (PUSH<->PULL flip があった) -> 再 eligible にして拒否。
-                if row.state == CLAIMED:
+                # stale epoch (PUSH<->PULL flip があった) -> 拒否。再 eligible 化は
+                # **この stale confirm に対応する claim だけ** に限る: 行が既に新しい
+                # epoch で再 claim されている (claim_epoch != epoch) 場合に剥がすと、
+                # 現 sidecar の live claim を壊して不要な再配送を誘発する (Codex review
+                # Major)。owner / claim_epoch が stale confirm と一致する CLAIMED 行のみ
+                # UNDELIVERED へ戻す (= 古い claim だけを fence する)。
+                if (row.state == CLAIMED and row.owner == owner
+                        and row.claim_epoch == epoch):
                     row.state = UNDELIVERED
                     row.owner = None
                 journal = ("confirm_stale_epoch",
@@ -312,6 +318,28 @@ class StoreMixin:
         if journal is not None:
             self._journal(journal[0], **journal[1])
         return result
+
+    def discard_agent_rows(self, owner: str) -> int:
+        """owner 宛の全 queue 行を破棄する (pane close = agent 死亡時の queue purge)。
+
+        切戻し §5.5 (5)「.state/broker の未読・bind が残らないこと」の row 版。pane が
+        閉じると当該 bind は revoke されるが、revoked bind は uniqueness 判定から
+        除外されるため同じ ``agent_id``/``name`` を **再利用** して再 spawn できる。その
+        とき未配達のまま残った旧セッション宛の行を新しい同名 agent が drain/claim すると
+        **クロスセッションの誤配送**になる (Codex review Major)。close 時に owner 宛の行を
+        全削除してこの leak を閉じる。破棄件数を返す。
+
+        **do_DELETE (session close) では呼ばない**: あちらは bind を revoke せず
+        ``registered=False`` にするだけで、同一 agent が後で re-initialize して自分の
+        queue を読み続ける正規ケース (= 行は本人のもの。purge は誤り)。
+        """
+        with self._lock:
+            doomed = [rid for rid, r in self._rows.items() if r.to_id == owner]
+            for rid in doomed:
+                del self._rows[rid]
+        if doomed:
+            self._journal("agent_rows_discarded", owner=owner, count=len(doomed))
+        return len(doomed)
 
     def reset_delivery_state(self, owner: str) -> None:
         """agent の delivery_mode / epoch を既定に戻す (切戻し §5.5 第 6 ステップ)。

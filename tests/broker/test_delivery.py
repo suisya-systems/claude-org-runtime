@@ -142,6 +142,29 @@ def test_mode_epoch_fencing_rejects_stale_confirm(tmp_path):
     assert conf["ok"] is False and conf["error"] == "stale_epoch" and conf["epoch"] == 1
 
 
+def test_stale_confirm_does_not_strip_newer_claim(tmp_path):
+    """Codex Major: stale epoch の confirm が新しい epoch の live claim を剥がさない。
+
+    epoch 0 claim -> PULL -> PUSH (epoch 2) -> epoch 2 で再 claim。古い epoch 0 confirm が
+    来ても epoch 2 の claim は無傷で、現 sidecar の epoch 2 confirm が成功する。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.enqueue(src, "dst", "x")
+    first = b.poll_claims("dst")          # epoch 0, CLAIMED
+    rid = first["rows"][0]["id"]
+    b.flip_mode("dst", PULL)              # epoch 1, row -> UNDELIVERED
+    b.flip_mode("dst", PUSH)             # epoch 2
+    second = b.poll_claims("dst")         # epoch 2, 再 CLAIMED
+    assert second["epoch"] == 2 and len(second["rows"]) == 1
+    # 古い epoch 0 confirm: 拒否されるが epoch 2 の claim は剥がさない。
+    stale = b.confirm_delivered("dst", rid, first["epoch"])
+    assert stale["error"] == "stale_epoch"
+    assert _row_states(b, "dst") == [CLAIMED]   # 新 claim 無傷
+    # 現 sidecar の epoch 2 confirm は成功する (剥がされていない証拠)。
+    assert b.confirm_delivered("dst", rid, second["epoch"])["ok"] is True
+
+
 def test_pull_mode_disables_claim_issuance(tmp_path):
     """PULL mode は poll_claims を拒否するが check_messages は不変 (§9.3)。"""
     b = Broker(state_dir=tmp_path, adapter=None)
@@ -319,6 +342,24 @@ def test_close_pane_revokes_delivery_cred_and_resets_mode(tmp_path, fake_adapter
     assert cred.revoked is True               # delivery cred revoke
     assert "w" not in b._delivery_modes       # delivery_mode reset
     assert "w" not in b._epochs
+
+
+def test_close_pane_purges_undelivered_rows(tmp_path, fake_adapter):
+    """Codex Major: close_pane が未配達行を purge し、同名 re-spawn への誤配送を断つ。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    pane_id = out["id"]
+    # spawn 直後は未 register なので enqueue 解決のため register_local しておく。
+    b.register_local([t for t, bd in b._binds.items()
+                      if bd.agent_id == "w" and bd.scope == "full"][0])
+    b.enqueue(disp, "w", "stale-secret")
+    assert _row_states(b, "w") == [UNDELIVERED]
+    dispatch_tool(b, disp, "close_pane", {"target": str(pane_id)})
+    # 旧セッション宛の行は消える (同名 re-spawn が拾えない)。
+    assert _row_states(b, "w") == []
 
 
 def test_spawn_failure_revokes_delivery_cred(tmp_path):

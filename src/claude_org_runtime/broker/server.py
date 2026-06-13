@@ -568,6 +568,10 @@ class Broker(TokenMixin, StoreMixin):
         if agent_id:
             self.revoke_delivery_creds(agent_id)
             self.reset_delivery_state(agent_id)
+            # 未配達行も破棄する: revoked bind は uniqueness から除外され同名 re-spawn が
+            # 可能なため、残すと旧セッション宛の行を新しい同名 agent が drain/claim する
+            # クロスセッション誤配送になる (Codex review Major / 切戻し §5.5(5))。
+            self.discard_agent_rows(agent_id)
         self._emit_event({"type": "pane_exited", "pane_id": handle, "agent_id": agent_id})
         self._journal("pane_closed", pane_id=handle, agent_id=agent_id)
         return _ok({"ok": True, "closed": handle})
