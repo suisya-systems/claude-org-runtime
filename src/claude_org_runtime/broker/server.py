@@ -1112,9 +1112,12 @@ class _McpHandler(BaseHTTPRequestHandler):
         if not isinstance(req, dict):
             self._send_json(400, {"error": "[invalid_body] body must be a json object"})
             return
-        owner = bind.agent_id
+        # owner は store 側が token から **_lock 下で**再解決+検証する (revoke を
+        # claim/confirm に対する原子的 fence にするため owner ではなく token を渡す。
+        # ここでの get_bind は早期 401 の cheap gate で、authoritative な liveness 検査は
+        # poll_claims / confirm_delivered の _lock スコープ内 — Codex review Major)。
         if path == "/poll-claims":
-            self._send_json(200, broker.poll_claims(owner))
+            self._send_json(200, broker.poll_claims(token))
             return
         # /confirm-delivered
         rid = req.get("id")
@@ -1126,7 +1129,7 @@ class _McpHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_json(400, {"ok": False, "error": "[invalid_epoch] epoch must be an int"})
             return
-        self._send_json(200, broker.confirm_delivered(owner, rid, epoch))
+        self._send_json(200, broker.confirm_delivered(token, rid, epoch))
 
     def do_POST(self):
         path = self.path.rstrip("/")

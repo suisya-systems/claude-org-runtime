@@ -62,20 +62,21 @@ def _row_states(b: Broker, to_id: str) -> list[str]:
 def test_claim_then_confirm_lifecycle(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
     b.enqueue(src, "dst", "hello")
     assert _row_states(b, "dst") == [UNDELIVERED]
 
-    res = b.poll_claims("dst")
+    res = b.poll_claims(dc)
     assert len(res["rows"]) == 1 and res["epoch"] == 0
     rid = res["rows"][0]["id"]
     assert res["rows"][0]["entry"]["message"] == "hello"
     assert _row_states(b, "dst") == [CLAIMED]
 
-    conf = b.confirm_delivered("dst", rid, res["epoch"])
+    conf = b.confirm_delivered(dc, rid, res["epoch"])
     assert conf["ok"] is True
     assert _row_states(b, "dst") == [DELIVERED]
     # id 冪等: 二度目の confirm は idempotent。
-    assert b.confirm_delivered("dst", rid, res["epoch"]) == {"ok": True, "idempotent": True}
+    assert b.confirm_delivered(dc, rid, res["epoch"]) == {"ok": True, "idempotent": True}
 
 
 def test_check_messages_respects_live_claim(tmp_path):
@@ -83,7 +84,7 @@ def test_check_messages_respects_live_claim(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.enqueue(src, "dst", "m1")
-    b.poll_claims("dst")  # CLAIMED, lease 30s (まだ live)
+    b.poll_claims(b.issue_delivery_cred("dst"))  # CLAIMED, lease 30s (まだ live)
     # check_messages は live claim を見送る (空)。
     assert b.drain(dst) == []
     assert _row_states(b, "dst") == [CLAIMED]
@@ -105,7 +106,7 @@ def test_lease_reap_recovers_dead_sidecar(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.enqueue(src, "dst", "survive-me")
-    res = b.poll_claims("dst")  # CLAIMED (sidecar が死んで confirm しないと仮定)
+    res = b.poll_claims(b.issue_delivery_cred("dst"))  # CLAIMED (sidecar 死亡で confirm せず)
     assert _row_states(b, "dst") == [CLAIMED]
     time.sleep(0.1)  # lease 失効を待つ
     # check_messages (pull fallback) が reap して再配達する = 喪失しない。
@@ -120,11 +121,12 @@ def test_confirm_after_lease_expiry_rejected(tmp_path):
     """lease 失効後の confirm は not_claimed で拒否 (reap で UNDELIVERED へ戻る)。"""
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims("dst")
+    res = b.poll_claims(dc)
     rid = res["rows"][0]["id"]
     time.sleep(0.1)
-    conf = b.confirm_delivered("dst", rid, res["epoch"])
+    conf = b.confirm_delivered(dc, rid, res["epoch"])
     assert conf["ok"] is False and conf["error"] == "not_claimed"
 
 
@@ -132,13 +134,14 @@ def test_mode_epoch_fencing_rejects_stale_confirm(tmp_path):
     """flip で epoch が進み、旧 epoch の confirm は stale_epoch で拒否される。"""
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims("dst")  # epoch 0, CLAIMED
+    res = b.poll_claims(dc)  # epoch 0, CLAIMED
     rid = res["rows"][0]["id"]
     flip = b.flip_mode("dst", PULL)  # epoch -> 1、CLAIMED -> UNDELIVERED
     assert flip["epoch"] == 1 and flip["mode"] == PULL
     assert _row_states(b, "dst") == [UNDELIVERED]
-    conf = b.confirm_delivered("dst", rid, res["epoch"])  # epoch 0 (stale)
+    conf = b.confirm_delivered(dc, rid, res["epoch"])  # epoch 0 (stale)
     assert conf["ok"] is False and conf["error"] == "stale_epoch" and conf["epoch"] == 1
 
 
@@ -150,19 +153,20 @@ def test_stale_confirm_does_not_strip_newer_claim(tmp_path):
     """
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
     b.enqueue(src, "dst", "x")
-    first = b.poll_claims("dst")          # epoch 0, CLAIMED
+    first = b.poll_claims(dc)             # epoch 0, CLAIMED
     rid = first["rows"][0]["id"]
     b.flip_mode("dst", PULL)              # epoch 1, row -> UNDELIVERED
     b.flip_mode("dst", PUSH)             # epoch 2
-    second = b.poll_claims("dst")         # epoch 2, 再 CLAIMED
+    second = b.poll_claims(dc)            # epoch 2, 再 CLAIMED
     assert second["epoch"] == 2 and len(second["rows"]) == 1
     # 古い epoch 0 confirm: 拒否されるが epoch 2 の claim は剥がさない。
-    stale = b.confirm_delivered("dst", rid, first["epoch"])
+    stale = b.confirm_delivered(dc, rid, first["epoch"])
     assert stale["error"] == "stale_epoch"
     assert _row_states(b, "dst") == [CLAIMED]   # 新 claim 無傷
     # 現 sidecar の epoch 2 confirm は成功する (剥がされていない証拠)。
-    assert b.confirm_delivered("dst", rid, second["epoch"])["ok"] is True
+    assert b.confirm_delivered(dc, rid, second["epoch"])["ok"] is True
 
 
 def test_pull_mode_disables_claim_issuance(tmp_path):
@@ -171,7 +175,7 @@ def test_pull_mode_disables_claim_issuance(tmp_path):
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.flip_mode("dst", PULL)
     b.enqueue(src, "dst", "m1")
-    res = b.poll_claims("dst")
+    res = b.poll_claims(b.issue_delivery_cred("dst"))
     assert res["error"] == "push_disabled" and res["rows"] == []
     # check_messages は mode に依らず claim-respecting drain (フォールバック健在)。
     assert [m["message"] for m in b.drain(dst)] == ["m1"]
@@ -186,18 +190,19 @@ def test_poll_claims_gated_on_registered_owner(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     # full token は発行するが register しない (= initialize 前 / DELETE 後を模す)。
     full = b.issue_token("dst", "dst", "worker")
+    dc = b.issue_delivery_cred("dst")
     src = _registered(b, "src")
     # registered な src 経由で enqueue (宛先解決のため dst を一時 register して戻す)。
     b.register_local(full)
     b.enqueue(src, "dst", "do-not-lose-me")
     # ここで dst が DELETE された状況を模す (registered=False)。
     b.get_bind(full).registered = False
-    res = b.poll_claims("dst")
+    res = b.poll_claims(dc)
     assert res["error"] == "owner_unregistered" and res["rows"] == []
     assert _row_states(b, "dst") == [UNDELIVERED]   # 行は残る (喪失しない)
     # re-initialize (registered に戻る) で claim 可能になる。
     b.get_bind(full).registered = True
-    res2 = b.poll_claims("dst")
+    res2 = b.poll_claims(dc)
     assert [r["entry"]["message"] for r in res2["rows"]] == ["do-not-lose-me"]
 
 
@@ -208,7 +213,7 @@ def test_poll_claims_only_returns_owner_rows(tmp_path):
     _registered(b, "dst2")
     b.enqueue(src, "dst", "for-dst")
     b.enqueue(src, "dst2", "for-dst2")
-    res = b.poll_claims("dst")
+    res = b.poll_claims(b.issue_delivery_cred("dst"))
     assert [r["entry"]["message"] for r in res["rows"]] == ["for-dst"]
 
 
@@ -218,10 +223,31 @@ def test_confirm_not_owner_rejected(tmp_path):
     _registered(b, "dst")
     _registered(b, "other")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims("dst")
+    res = b.poll_claims(b.issue_delivery_cred("dst"))
     rid = res["rows"][0]["id"]
-    # 別 owner は他人宛の行を confirm できない。
-    assert b.confirm_delivered("other", rid, res["epoch"])["error"] == "not_owner"
+    # 別 owner の cred は他人宛の行を confirm できない (owner=cred.agent_id で判定)。
+    other_cred = b.issue_delivery_cred("other")
+    assert b.confirm_delivered(other_cred, rid, res["epoch"])["error"] == "not_owner"
+
+
+def test_revoked_delivery_cred_cannot_claim_or_confirm(tmp_path):
+    """Codex Major (revocation fence): revoke 済 delivery cred は claim/confirm 不可。
+
+    owner の full bind が registered でも、cred 自体が revoke 済なら poll_claims /
+    confirm_delivered は unauthorized を返し行に触れない (owner だけで claim できた
+    TOCTOU を、token を _lock 下で再検証することで原子的 fence にする)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    b.enqueue(src, "dst", "x")
+    b.revoke_delivery_creds("dst")  # close_pane の revoke_delivery_creds 相当
+    res = b.poll_claims(dc)
+    assert res["error"] == "unauthorized" and res["rows"] == []
+    assert _row_states(b, "dst") == [UNDELIVERED]   # revoked cred では claim されない
+    assert b.confirm_delivered(dc, "anyid", 0)["error"] == "unauthorized"
+    # 完全に未知の token も同様。
+    assert b.poll_claims("bogus-token")["error"] == "unauthorized"
 
 
 def test_flip_mode_invalid(tmp_path):

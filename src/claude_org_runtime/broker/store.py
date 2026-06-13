@@ -113,6 +113,21 @@ class StoreMixin:
         """agent の mode-epoch (既定 0)。**caller が _lock を保持中に呼ぶ**。"""
         return self._epochs.get(agent_id, 0)
 
+    def _delivery_owner_locked(self, token: str) -> str | None:
+        """delivery cred token を owner へ解決し **liveness を検証** する。
+
+        **_lock 保持中に呼ぶ**。revoked / 非 delivery scope / 未知 token は None。
+        これを claim/confirm の row mutation と **同一 _lock スコープ** で行うことで、
+        delivery cred の revoke (close_pane の revoke_delivery_creds が _lock 下で
+        ``revoked=True`` にする) を claim 発行に対する **原子的な fence** にする
+        (Codex review Major: get_bind の一度きり検査では revoke 後に in-flight request
+        が遅延再開すると owner だけで claim でき、revoke が fence にならない TOCTOU)。
+        """
+        bind = self._binds.get(token)
+        if bind is None or bind.revoked or bind.scope != "delivery":
+            return None
+        return bind.agent_id
+
     def _owner_registered_locked(self, owner: str) -> bool:
         """owner に live (registered) な full bind があるか。**_lock 保持中に呼ぶ**。
 
@@ -225,14 +240,19 @@ class StoreMixin:
         return out
 
     # ----------------------------------------------------------- poll-claims
-    def poll_claims(self, owner: str) -> dict:
+    def poll_claims(self, token: str) -> dict:
         """delivery-scoped credential で owner 宛 ``UNDELIVERED`` 行を claim して返す。
 
+        ``token`` は **delivery cred** で、owner は token から **_lock 下で**解決+検証
+        する (revoke を claim 発行に対する原子的 fence にする。Codex review Major)。
         §9.3 claim-with-lease: 各行を ``CLAIMED(lease=now+T, owner, epoch=現 mode-epoch)``
         にして返す。PUSH->PULL flip 後 (mode != PUSH) は **新規 claim の発行を拒否**
         する (claim-issuance ゲート)。返す各行は ``{id, entry, epoch}``。
         """
         with self._lock:
+            owner = self._delivery_owner_locked(token)
+            if owner is None:
+                return {"error": "unauthorized", "rows": []}
             mode = self._mode_of(owner)
             epoch = self._epoch_of(owner)
             if mode != PUSH:
@@ -264,15 +284,20 @@ class StoreMixin:
         return {"rows": claimed, "epoch": epoch}
 
     # ------------------------------------------------------- confirm-delivered
-    def confirm_delivered(self, owner: str, rid: str, epoch: int) -> dict:
+    def confirm_delivered(self, token: str, rid: str, epoch: int) -> dict:
         """emit が resolve した行を ``DELIVERED`` に確定する (id で冪等、§9.3)。
 
+        ``token`` は **delivery cred** で、owner は token から **_lock 下で**解決+検証
+        する (revoke を confirm に対する原子的 fence にする。Codex review Major)。
         confirm は **live な claim** に紐づくことを daemon が強制する: 未 claim /
         lease reap 後 / 別 owner・別 epoch の claim は確定できない。stale epoch
         (mode flip があった) は当該行を再 eligible 化して拒否する (mode-epoch fencing)。
         """
         journal: tuple[str, dict] | None = None
         with self._lock:
+            owner = self._delivery_owner_locked(token)
+            if owner is None:
+                return {"ok": False, "error": "unauthorized"}
             reaped = self._reap_locked()
             cur_epoch = self._epoch_of(owner)
             row = self._rows.get(rid)
