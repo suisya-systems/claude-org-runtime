@@ -410,8 +410,12 @@ _CLAUDE_HEADLESS_BLACKLIST = {
 # caller の args[] に持たせてはいけない (broker 構造化フィールドと衝突)。
 # dev-channel flag は broker が channel sidecar 用に注入する唯一の出所なので、caller
 # が args[] で第二/別の dev-channel を持ち込むのを禁じる (§9.5/§9.7 単一注入経路)。
+# NOTE (#76): --strict-mcp-config は **broker が常に注入する** ようになったため
+# reserved から外す。caller が冪等に args[] へ付与しても reject せず (builder が
+# 重複を畳む)、bare check_messages の ambient renga-peers への誤ルートを防ぐ strict
+# 隔離を弱めない。
 _CLAUDE_RESERVED_IN_ARGS = {
-    "--mcp-config", "--model", "--permission-mode", "--strict-mcp-config",
+    "--mcp-config", "--model", "--permission-mode",
     "--mcp-config-file", "--dangerously-load-development-channels",
 }
 
@@ -427,6 +431,30 @@ _CODEX_BOOL_FLAGS = {"--oss", "--search", "--full-auto"}
 
 def _basename(path: str) -> str:
     return os.path.basename(path.replace("\\", "/"))
+
+
+def _drop_redundant_strict(args: list[str]) -> list[str]:
+    """caller の **standalone** な --strict-mcp-config だけを畳む (broker が注入済み)。
+
+    値位置 (例 ``["--add-dir", "--strict-mcp-config"]``) に現れた --strict-mcp-config
+    は value-flag の引数なので落とすと arity が壊れる。value-flag (space 区切り形) の
+    次トークンは値として保持し、standalone の --strict-mcp-config のみ除去する。
+    ``--flag=value`` 結合形は自己完結なのでそのまま通す。
+    """
+    out: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        tok = args[i]
+        if tok in _CLAUDE_VALUE_FLAGS and i + 1 < n:
+            out.extend((tok, args[i + 1]))  # 次は値: 解釈せず保持
+            i += 2
+            continue
+        if tok == "--strict-mcp-config":
+            i += 1  # broker 注入済みの重複: 畳む
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def _reject_reserved_claude_args(args: list[str]) -> None:
@@ -495,17 +523,25 @@ def build_claude_argv(
     ため第二の dev-channel を emit しない (§9.7 launcher argv の bit 等価)。caller の
     extra_args は構造化フィールドと衝突する予約 flag を持てない。最後に default-deny
     guard を通す。
+
+    ``--strict-mcp-config`` を**常に注入**する (#76): これにより spawn された pane は
+    ``--mcp-config`` で渡した broker MCP **のみ** を load し、ambient な .mcp.json
+    (renga<->broker 併存中に居る renga-peers 等) を無視する。bare 'check_messages'
+    が ambient renga-peers の同名ツールへ誤ルートして broker queue が silent drop
+    する事象 (#76) を、NUDGE_TEXT の FQ 化とは独立に防ぐ防御多重。caller が
+    extra_args に冪等で --strict-mcp-config を付けても重複は畳む。
     """
     extra_args = list(extra_args or [])
     _reject_reserved_claude_args(extra_args)
-    argv = ["claude", "--mcp-config", mcp_config_json]
+    argv = ["claude", "--mcp-config", mcp_config_json, "--strict-mcp-config"]
     if permission_mode:
         argv += ["--permission-mode", permission_mode]
     if model:
         argv += ["--model", model]
     if channel_server:
         argv += ["--dangerously-load-development-channels", f"server:{channel_server}"]
-    argv += extra_args
+    # caller が冪等に付与した standalone --strict-mcp-config は畳む (上で注入済み)。
+    argv += _drop_redundant_strict(extra_args)
     _guard_interactive_claude_argv(argv)
     return argv
 

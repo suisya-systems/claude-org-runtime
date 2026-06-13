@@ -44,7 +44,11 @@ if TYPE_CHECKING:  # 実体は wezterm / tmux (循環 import 回避で遅延)
 PaneId = Union[int, str]
 
 # ナッジ定型 1 行 (docs/design/renga-decoupling.md §4.3)。本文は PTY を通さない。
-NUDGE_TEXT = "📨 新着あり。check_messages を実行"
+# ツール名は **FQ (fully-qualified)** で直書きする (SoT 5.2: Claude prose は FQ
+# ツール名を書く)。renga<->broker 併存下では ambient renga-peers も同名 bare
+# 'check_messages' を公開するため、bare 名だと nudge が renga-peers 側へ誤ルートして
+# broker queue が silent drop する (#76)。FQ 名なら宛先 server が一意に解決する。
+NUDGE_TEXT = "📨 新着あり。mcp__org-broker__check_messages を実行"
 
 
 @dataclass
