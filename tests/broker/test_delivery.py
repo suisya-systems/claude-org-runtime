@@ -339,6 +339,32 @@ def test_spawn_failure_revokes_delivery_cred(tmp_path):
     assert live == []
 
 
+def test_spawn_rejects_collision_with_bind_only_agent(tmp_path, fake_adapter):
+    """cross-agent 配送横取りの防御: 既存 active bind (pane を持たない bind-only agent =
+    admin mint された secretary 等) と agent_id 衝突する spawn は拒否され、被害 agent の
+    agent_id を owner とする delivery cred を一切 mint しない (unique=True 防御)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    # admin mint 相当: pane を持たない registered な bind-only agent "secretary"。
+    victim = b.issue_token("secretary", "secretary", "secretary")
+    b.register_local(victim)
+    b.enqueue(b.get_bind(victim), "secretary", "secret-for-the-real-secretary")
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane",
+                        {"direction": "vertical", "name": "secretary", "cwd": "/repo"})
+    # 衝突は name_taken で拒否される。
+    assert out.get("isError") and "name_taken" in out["content"][0]["text"]
+    # 被害 agent_id を owner とする delivery cred は存在しない (横取り経路が開かない)。
+    creds = [bd for bd in b._binds.values()
+             if bd.scope == "delivery" and not bd.revoked]
+    assert creds == []
+    # 被害者の queue は無傷 (本人の check_messages で読める)。
+    assert [m["message"] for m in b.drain(b.get_bind(victim))] == \
+        ["secret-for-the-real-secretary"]
+    # spawn 自体に到達していない (adapter.spawn 未呼出)。
+    assert fake_adapter.spawned == []
+
+
 # ============================ R3<->R4 cross-process integration (real sidecar)
 def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
     """実 channel sidecar を subprocess で起こし、poll->emit->confirm の往復を検証。

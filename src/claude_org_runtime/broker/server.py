@@ -764,10 +764,22 @@ class Broker(TokenMixin, StoreMixin):
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("claude")
-            token = self.issue_token(
-                agent_id, name or agent_id, role or "", cwd=cwd, kind="claude",
-                auth_role=auth_role,
-            )
+            try:
+                token = self.issue_token(
+                    agent_id, name or agent_id, role or "", cwd=cwd, kind="claude",
+                    auth_role=auth_role, unique=True,
+                )
+            except ValueError as e:
+                # agent_id/name が既存 active bind と衝突する場合は **delivery cred を
+                # 発行する前に** 原子的に拒否する。queue / delivery 解決は agent_id を
+                # キーにするため、衝突した子の channel sidecar が被害 agent の queue を
+                # claim->confirm して横取り + 沈黙喪失する (cross-agent 配送横取り)。
+                # _reserve_name は _pane_meta 名前空間しか見ず、pane を持たない
+                # bind-only agent (admin_mint_token で mint された secretary/dispatcher
+                # 等) を取りこぼすため、admin_mint_token と同じ unique=True 防御を
+                # spawn 経路へ拡張する。予約名は解放してから返す。
+                self._release_name(name)
+                return _err(str(e))
             # push 一次配送の spawn 儀式 (§9.5): full token の --mcp-config (daemon)
             # に加えて、(a) channel sidecar を stdio MCP として同 config に積み、
             # (b) delivery-scoped credential を sidecar env に注入し、(c) dev-channel
@@ -832,10 +844,18 @@ class Broker(TokenMixin, StoreMixin):
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("codex")
-            token = self.issue_token(
-                agent_id, name or agent_id, role or "", cwd=cwd, kind="codex",
-                auth_role=auth_role,
-            )
+            try:
+                token = self.issue_token(
+                    agent_id, name or agent_id, role or "", cwd=cwd, kind="codex",
+                    auth_role=auth_role, unique=True,
+                )
+            except ValueError as e:
+                # spawn_claude と同じ agent_id 衝突防御 (unique=True)。codex は channel
+                # sidecar を持たない (pull peer) が、agent_id 共有は check_messages 経由の
+                # queue 共有・誤配送 (spike broker.py L458 のハザード) を招くため同様に
+                # 原子的に拒否する。予約名は解放してから返す。
+                self._release_name(name)
+                return _err(str(e))
             ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は

@@ -172,6 +172,14 @@ class StoreMixin:
                 id=rid, to_id=target.agent_id, entry=entry,
                 enqueued_at=entry["sent_at"],
             )
+        # NOTE: 行の可視化 (上の lock 内) と message_enqueued の journal はこの順 (lock
+        # 解放後に journal) が **非再入 Lock + 自己ロック _journal の契約上必須** (lock 内
+        # で _journal すると自己デッドロック)。そのため並行 poll_claims が行を claim して
+        # "claimed" を先に journal しうる = audit log 上で claimed が enqueue を追い越す
+        # 順序窓が開く。これは **診断専用で良性**: journal の唯一の consumer は
+        # broker_started/broker_stopped のオフセットスライス (launcher) のみで、_rows は
+        # in-memory・journal replay で再構築しない (crash recovery なし)。将来 journal
+        # replay で状態再構築を入れる場合は順序保証を別途設計すること。
         self._journal(
             "message_enqueued",
             from_id=from_bind.agent_id,
