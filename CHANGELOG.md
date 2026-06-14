@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-06-15
+
+### Fixed
+
+- `dispatcher`: `delegate-plan` / balanced-split now ingests a
+  broker-native `list_panes` snapshot without a hand remap. Two
+  broker/renga incompatibilities are reconciled at the pane-parse
+  boundary: `Pane.from_dict` accepts the broker's `w` / `h` as aliases
+  for renga's `width` / `height` (a key missing under both names still
+  raises the malformed-geometry input error), and `_parse_panes` skips a
+  broker logical pane — matched by the exact shape the broker emits for
+  human-driven surfaces (non-numeric string `id` handle, explicit
+  `kind=null`, and the integer `w=h=0` sentinel geometry) — instead of
+  crashing the whole snapshot. All four markers are required, so
+  genuinely malformed input still raises a clean `exit 1`. Closes
+  `claude-org-runtime#89`. Refs `suisya-systems/claude-org-ja#580`.
+- `broker`: the `org-broker-channel` push primary-delivery sidecar is now
+  wired into the `secretary` (root) launch path, not only the child
+  (dispatcher / worker) spawn path. `admin_mint_token` gains a strictly
+  bool-validated `channel` parameter that, when true, adds an
+  owner-scoped `org-broker-channel` entry to the returned `mcp_config`
+  and issues a delivery-scoped credential; the control-plane probe /
+  `down` tokens leave `channel` unrequested so throwaway tokens never
+  leak an unused credential. `_mint_secretary` requests `channel=true`
+  and `build_up_argv` appends the dev-channel flag whenever the config
+  carries `org-broker-channel`, keeping the flag subordinate to the
+  config to prevent drift. Push primary now reaches the secretary
+  directly instead of only via the `check_messages` queue drain. Closes
+  `claude-org-runtime#90`.
+
 ## [0.1.26] - 2026-06-14
 
 ### Changed
