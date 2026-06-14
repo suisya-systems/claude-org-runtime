@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-06-14
+
+### Changed
+
+- `terminal`: the WezTerm backend now consolidates child panes
+  (dispatcher / worker) into tabs of a single anchor window instead of
+  opening a standalone window per child. The first child opens a new
+  window and `WezTermAdapter` records its `window_id` as the anchor;
+  subsequent children spawn as tabs into that window
+  (`wezterm cli spawn --window-id <anchor>`, which is mutually exclusive
+  with `--new-window`). If the anchor window is killed, the next spawn
+  fails the liveness check and falls back to `--new-window`, re-anchoring
+  on the new window. `new_window=False` callers are unaffected. Keeps the
+  worker fleet from scattering windows during real-machine dogfood.
+  Closes `claude-org-runtime#86`. Refs `suisya-systems/claude-org-ja#576`.
+
 ## [0.1.25] - 2026-06-14
 
 ### Fixed

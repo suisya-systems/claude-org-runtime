@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import ClassVar
@@ -33,6 +34,7 @@ from typing import ClassVar
 # 非依存で base に集約した (Phase 2)。
 from .base import (  # noqa: F401
     NUDGE_TEXT,
+    PaneId,
     PaneRef,
     classify_pane_state,
     wait_for_state,
@@ -64,6 +66,24 @@ class WezTermAdapter:
 
     exe: str = field(default_factory=find_wezterm)
     timeout: float = 15.0
+
+    # 子ペイン (dispatcher / worker) を集約するアンカーウィンドウの window_id。
+    # 最初の子 spawn でそのウィンドウを記録し、以降の子はこのウィンドウへ
+    # タブとして spawn する (--window-id)。worker 増加でウィンドウが散らかる
+    # のを防ぐ (Issue #86, #576 実機 dogfood)。アンカーが kill された場合は
+    # 次 spawn で生存確認に失敗し --new-window へフォールバックして再確定する。
+    # 構築引数ではなく内部状態なので init=False。
+    _anchor_window_id: PaneId | None = field(default=None, init=False)
+
+    # spawn() のアンカー判定 (check) -> spawn -> 記録 (set) を直列化する lock。
+    # broker は ThreadingHTTPServer 配下で spawn を _lock 外 (slow adapter I/O を
+    # broker lock に載せない契約) から並行に呼ぶため、これが無いと 2 つの spawn
+    # が同時に _anchor_window_id is None を見て両方 --new-window を発行し、集約
+    # 目的が並行 worker 起動時に破れる (Codex review Major)。spawn は低頻度なので
+    # 全体を直列化してよい。repr には出さない (テストの assertion 出力を汚さない)。
+    _spawn_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     # ------------------------------------------------------------------ util
     def _cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -97,6 +117,10 @@ class WezTermAdapter:
     def pane_exists(self, pane_id: int) -> bool:
         return any(p["pane_id"] == pane_id for p in self.list_panes())
 
+    def _window_alive(self, window_id: PaneId) -> bool:
+        """window_id を持つ pane が 1 つでも生存しているか (アンカー生存確認)。"""
+        return any(p["window_id"] == window_id for p in self.list_panes())
+
     # ----------------------------------------------------------------- spawn
     def spawn(
         self,
@@ -106,25 +130,54 @@ class WezTermAdapter:
     ) -> PaneRef:
         """新しい pane を spawn し PaneRef を返す。
 
-        spike は別 WezTerm ウィンドウで検証する (renga の現行組織ペインに
-        触らない) ため new_window=True が既定。
+        new_window=True (既定) は子ペイン (dispatcher / worker) を単一の
+        アンカーウィンドウに集約する (Issue #86):
+        - 最初の子 (アンカー未確定) はウィンドウを新規に開き、その window_id を
+          アンカーとして記録する。
+        - 以降の子はアンカーへ新規タブとして spawn する (--window-id <anchor>)。
+          --window-id と --new-window は排他なので、この時は --new-window を
+          付けない。
+        - アンカーが kill された場合は生存確認に失敗し --new-window へフォール
+          バックして新しいアンカーを再確定する。
+
+        new_window=False は集約を行わず、現在ペインのウィンドウへ spawn する
+        (--new-window も --window-id も付けない既存挙動)。
+
+        並行 spawn 時もアンカー判定〜記録が直列化されるよう _spawn_lock 下で
+        実行する (Codex review Major、_spawn_lock 参照)。
         """
-        args = ["spawn"]
-        if new_window:
-            args.append("--new-window")
-        if cwd:
-            args += ["--cwd", cwd]
-        args += ["--", *argv]
-        proc = self._cli(*args)
-        pane_id = int(proc.stdout.strip())
-        ref = PaneRef(pane_id=pane_id)
-        # window_id / tab_id を list から補完して保持する (確定事項 (4))
-        for p in self.list_panes():
-            if p["pane_id"] == pane_id:
-                ref.tab_id = p["tab_id"]
-                ref.window_id = p["window_id"]
-                break
-        return ref
+        with self._spawn_lock:
+            args = ["spawn"]
+            # アンカーへタブとして開いた spawn かどうか。新規ウィンドウを開いた
+            # 場合のみ後段でアンカーを (再) 確定する。
+            opened_new_window = False
+            if new_window:
+                if self._anchor_window_id is not None and self._window_alive(
+                    self._anchor_window_id
+                ):
+                    # アンカー生存 -> 新規タブとして集約 (--new-window は付けない)
+                    args += ["--window-id", str(self._anchor_window_id)]
+                else:
+                    # 最初の子、またはアンカー死亡 -> 新規ウィンドウで開き再確定
+                    args.append("--new-window")
+                    opened_new_window = True
+            if cwd:
+                args += ["--cwd", cwd]
+            args += ["--", *argv]
+            proc = self._cli(*args)
+            pane_id = int(proc.stdout.strip())
+            ref = PaneRef(pane_id=pane_id)
+            # window_id / tab_id を list から補完して保持する (確定事項 (4))
+            for p in self.list_panes():
+                if p["pane_id"] == pane_id:
+                    ref.tab_id = p["tab_id"]
+                    ref.window_id = p["window_id"]
+                    break
+            # 新規ウィンドウを開いた集約 spawn なら、その window_id を以降の子の
+            # アンカーとして記録する。
+            if opened_new_window and ref.window_id is not None:
+                self._anchor_window_id = ref.window_id
+            return ref
 
     # ------------------------------------------------------------- send-text
     def send_text(self, pane_id: int, text: str, no_paste: bool = False) -> None:

@@ -167,6 +167,129 @@ def test_spawn_without_new_window(adapter: WezTermAdapter) -> None:
     assert "--new-window" not in _args(adapter._fake.calls[0])
 
 
+# --------------------------------------------------------------------------
+# anchor-window tab consolidation (Issue #86)
+# --------------------------------------------------------------------------
+
+def test_first_child_spawns_new_window_and_anchors(adapter: WezTermAdapter) -> None:
+    # The very first child (no anchor yet) opens a new window and records its
+    # window_id as the anchor for subsequent children.
+    assert adapter._anchor_window_id is None
+    adapter._fake.queue(
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+    )
+    adapter.spawn(["claude"])
+    assert "--new-window" in _args(adapter._fake.calls[0])
+    assert adapter._anchor_window_id == 1
+
+
+def test_second_child_spawns_tab_into_anchor(adapter: WezTermAdapter) -> None:
+    # Chain two real spawns: the first backfills window_id=1 and anchors; the
+    # second reads that anchor, confirms it is alive, and spawns a tab via
+    # --window-id 1 (and must NOT pass --new-window — they are exclusive).
+    adapter._fake.queue(
+        # first spawn (new window) + its backfill list
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+        # second spawn: alive-check list, spawn id, backfill list
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+        (0, "6\n", ""),
+        (0, json.dumps([{"pane_id": 6, "tab_id": 3, "window_id": 1}]), ""),
+    )
+    adapter.spawn(["claude"])
+    ref = adapter.spawn(["claude"])
+    # calls: [0]=spawn1, [1]=backfill1, [2]=alive-check, [3]=spawn2, [4]=backfill2
+    tab_spawn = _args(adapter._fake.calls[3])
+    assert "--new-window" not in tab_spawn
+    idx = tab_spawn.index("--window-id")
+    assert tab_spawn[idx:idx + 2] == ["--window-id", "1"]
+    assert ref.window_id == 1
+
+
+def test_spawn_falls_back_to_new_window_when_anchor_dead(
+    adapter: WezTermAdapter,
+) -> None:
+    # If the anchor window has been killed, the alive-check list omits it and
+    # the next child opens a fresh window (--new-window, no --window-id) and
+    # re-anchors on the new window_id.
+    adapter._fake.queue(
+        # first spawn (new window, anchors window 1) + backfill
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+        # second spawn: alive-check list NO LONGER shows window 1
+        (0, json.dumps([{"pane_id": 9, "tab_id": 0, "window_id": 2}]), ""),
+        (0, "10\n", ""),
+        (0, json.dumps([{"pane_id": 10, "tab_id": 0, "window_id": 3}]), ""),
+    )
+    adapter.spawn(["claude"])
+    adapter.spawn(["claude"])
+    # calls: [0]=spawn1, [1]=backfill1, [2]=alive-check, [3]=spawn2, [4]=backfill2
+    fallback_spawn = _args(adapter._fake.calls[3])
+    assert "--new-window" in fallback_spawn
+    assert "--window-id" not in fallback_spawn
+    assert adapter._anchor_window_id == 3  # re-anchored on the new window
+
+
+def test_spawn_without_new_window_ignores_anchor(adapter: WezTermAdapter) -> None:
+    # new_window=False is a pure passthrough: no consolidation, no anchor read
+    # or write, and neither --new-window nor --window-id is emitted.
+    adapter._anchor_window_id = 1
+    adapter._fake.queue(
+        (0, "7\n", ""),
+        (0, json.dumps([{"pane_id": 7, "tab_id": 0, "window_id": 9}]), ""),
+    )
+    adapter.spawn(["cat"], new_window=False)
+    spawn_args = _args(adapter._fake.calls[0])
+    assert "--new-window" not in spawn_args
+    assert "--window-id" not in spawn_args
+    assert adapter._anchor_window_id == 1  # untouched
+
+
+def test_concurrent_spawns_establish_single_anchor(
+    adapter: WezTermAdapter,
+) -> None:
+    # The broker calls spawn() concurrently from ThreadingHTTPServer handlers
+    # outside its own lock. Without the adapter's _spawn_lock, two spawns could
+    # both observe _anchor_window_id is None and both emit --new-window. The
+    # lock serialises the check->spawn->set so exactly one window is opened and
+    # the rest become tabs. FakeRun's queue is consumed FIFO under the lock, so
+    # whichever thread wins the lock first takes the new-window shape (2
+    # responses) and the other takes the tab shape (3 responses).
+    import threading as _t
+
+    adapter._fake.queue(
+        # first (lock winner): new window + backfill
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+        # second: alive-check, spawn, backfill
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+        (0, "6\n", ""),
+        (0, json.dumps([{"pane_id": 6, "tab_id": 3, "window_id": 1}]), ""),
+    )
+    start = _t.Barrier(2)
+
+    def _spawn() -> None:
+        start.wait()
+        adapter.spawn(["claude"])
+
+    threads = [_t.Thread(target=_spawn) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    spawn_cmds = [
+        a for c in adapter._fake.calls if (a := _args(c))[0] == "spawn"
+    ]
+    assert len(spawn_cmds) == 2
+    new_window = [a for a in spawn_cmds if "--new-window" in a]
+    tabbed = [a for a in spawn_cmds if "--window-id" in a]
+    assert len(new_window) == 1  # exactly one real window opened
+    assert len(tabbed) == 1  # the other consolidated into a tab
+    assert adapter._anchor_window_id == 1
+
+
 def test_pane_exists(adapter: WezTermAdapter) -> None:
     payload = json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}])
     adapter._fake.queue((0, payload, ""))
