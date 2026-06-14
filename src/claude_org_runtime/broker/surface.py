@@ -519,10 +519,12 @@ def build_claude_argv(
     構造化フィールドから一度だけ描画する。``channel_server`` を渡すと push 一次配送
     (§9.5) の dev-channel flag (``--dangerously-load-development-channels
     server:<channel_server>``) を加える (channel sidecar の load + 3-3b 機械承認の
-    再導入)。**broker 枝のみ**で渡され、renga 枝 (org up / build_up_argv) は渡さない
-    ため第二の dev-channel を emit しない (§9.7 launcher argv の bit 等価)。caller の
-    extra_args は構造化フィールドと衝突する予約 flag を持てない。最後に default-deny
-    guard を通す。
+    再導入)。``channel_server`` を渡した経路だけが dev-channel flag を emit する:
+    子 (spawn_claude) は常に渡し、root (org up / build_up_argv) は secretary mint が
+    channel sidecar を載せたとき (= mcp_config に org-broker-channel がある) のみ渡す。
+    どの呼び元も channel_server は高々 1 回しか渡さないため第二の dev-channel を
+    emit しない (§9.7 launcher argv の bit 等価)。caller の extra_args は構造化
+    フィールドと衝突する予約 flag を持てない。最後に default-deny guard を通す。
 
     ``--strict-mcp-config`` を**常に注入**する (#76): これにより spawn された pane は
     ``--mcp-config`` で渡した broker MCP **のみ** を load し、ambient な .mcp.json

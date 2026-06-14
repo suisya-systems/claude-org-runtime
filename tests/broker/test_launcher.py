@@ -213,6 +213,61 @@ def test_up_argv_rejects_headless_extra():
         launcher.build_up_argv({"mcpServers": {}}, extra=["-p"])
 
 
+# ============================================== up: channel 配線 (dev-channel flag)
+def test_up_argv_adds_dev_channel_flag_when_config_has_channel():
+    # mcp_config に org-broker-channel sidecar があれば、子経路と同じ dev-channel
+    # flag が argv に乗る (secretary 起動経路の push 一次配送 = 本タスクの本丸)。
+    cfg = {"mcpServers": {
+        "org-broker": {"type": "http", "url": "http://x",
+                       "headers": {"Authorization": "Bearer T"}},
+        "org-broker-channel": {"command": "py", "args": ["-m", "x"], "env": {}},
+    }}
+    argv = launcher.build_up_argv(cfg)
+    assert "--dangerously-load-development-channels" in argv
+    i = argv.index("--dangerously-load-development-channels")
+    assert argv[i + 1] == "server:org-broker-channel"
+
+
+def test_up_argv_no_dev_channel_flag_without_channel():
+    # channel sidecar が無い mcp_config では dev-channel flag を出さない
+    # (flag は config 実体に従属。drift しない)。
+    cfg = {"mcpServers": {"org-broker": {"type": "http", "url": "http://x",
+                                         "headers": {"Authorization": "Bearer T"}}}}
+    argv = launcher.build_up_argv(cfg)
+    assert "--dangerously-load-development-channels" not in argv
+
+
+def test_org_up_wires_channel_into_secretary(live_daemon):
+    # end-to-end: org up の secretary mint が secretary-mcp.json に org-broker-channel を
+    # 書き、launch argv に dev-channel flag を付ける (root も子と同じ channel 配線)。
+    b, state_dir = live_daemon
+    captured = {}
+
+    def fake_launch(argv):
+        captured["argv"] = argv
+        return 0
+
+    rc = launcher.org_up(
+        _up_args(state_dir, name="secretary"),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        launch=fake_launch,
+    )
+    assert rc == 0
+    # 書き出された 0600 mcp-config に channel sidecar が積まれている。
+    cfg_path = os.path.join(state_dir, "secretary-mcp.json")
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    assert "org-broker-channel" in cfg["mcpServers"]
+    assert cfg["mcpServers"]["org-broker-channel"]["env"][
+        "ORG_BROKER_CHANNEL_OWNER"] == "secretary"
+    # secretary 宛の delivery-scoped credential が daemon 側に発行されている。
+    assert any(bnd.scope == "delivery" and bnd.agent_id == "secretary"
+               for bnd in b._binds.values())
+    # launch argv に dev-channel flag が乗る (子経路ミラー)。
+    argv = captured["argv"]
+    assert "--dangerously-load-development-channels" in argv
+    assert "server:org-broker-channel" in argv
+
+
 # ===================================================================== down
 def test_org_down_verifies_broker_stopped_via_offset_slice(tmp_path):
     """run() を thread で起動し、org down が shutdown → offset スライスで
