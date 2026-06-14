@@ -334,6 +334,19 @@ def _launch_claude(argv: list[str]) -> int:
     ルールで renga 経路に落ち、``RENGA_PANE_ID`` 不在で停止する。org up は broker
     制御面を起動しているので、子は常に broker transport を使う。fallback の表示
     コマンドにも env 前置を含め、手で起動しても同じ transport になるようにする。
+
+    **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
+    secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
+    出すが、本関数はそこへ Enter を**送らない**。exec/subprocess で launcher 自身が
+    secretary プロセスになる/それにブロックされるため、その PTY に後から打鍵できる
+    別プロセスが構造的に存在しない (= 残存ギャップは genuine-user 検出ではなく純構造)。
+    段2/段3 は daemon-spawned pane なので呼び出し元 agent が send_keys で承認できる
+    (wire seam は tests/broker/test_bootstrap_folder_trust.py が FakeAdapter で固定。
+    実プロンプトが CR を受理することは ja#515 dogfood = 実端末で実証済、本コードでは
+    再証明しない)。段1 は human が org up 実行直後に 1 回 Enter する production path と
+    し、blind Enter をここに足さない (表示前取りこぼし + 二重 Enter の空 turn 暴発を
+    防ぐ。理由と将来の sanctioned mechanism = faithful POSIX PTY-wrapper は
+    docs/broker-bootstrap-stage1-folder-trust-design.md)。
     """
     env = {**os.environ, "ORG_TRANSPORT": "broker"}
     if os.name != "nt":
