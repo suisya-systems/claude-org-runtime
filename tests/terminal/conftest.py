@@ -26,15 +26,17 @@ class FakeRun:
 
     Each call pops the next canned ``(returncode, stdout, stderr)`` triple
     from ``responses`` (defaulting to a clean success) and records the full
-    argv plus selected kwargs for assertions.
+    argv plus the keyword arguments for assertions.
     """
 
     responses: list[tuple[int, str, str]] = field(default_factory=list)
     calls: list[list[str]] = field(default_factory=list)
+    kwargs: list[dict] = field(default_factory=list)
     _idx: int = 0
 
     def __call__(self, cmd, *args, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(cmd))
+        self.kwargs.append(dict(kwargs))
         if self._idx < len(self.responses):
             rc, out, err = self.responses[self._idx]
         else:
@@ -46,6 +48,10 @@ class FakeRun:
     @property
     def last(self) -> list[str]:
         return self.calls[-1]
+
+    @property
+    def last_kwargs(self) -> dict:
+        return self.kwargs[-1]
 
     def queue(self, *responses: tuple[int, str, str]) -> "FakeRun":
         self.responses.extend(responses)

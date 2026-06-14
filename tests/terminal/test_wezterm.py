@@ -10,6 +10,7 @@ construction: the always-present ``--pane-id`` target, the bracketed-paste vs
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -29,6 +30,38 @@ def adapter(monkeypatch: pytest.MonkeyPatch, fake_run) -> WezTermAdapter:
 def _args(call: list[str]) -> list[str]:
     assert call[:3] == ["wezterm", "cli", "--no-auto-start"]
     return call[3:]
+
+
+# --------------------------------------------------------------------------
+# CREATE_NO_WINDOW guard (Windows window-flicker fix)
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not hasattr(subprocess, "CREATE_NO_WINDOW"),
+    reason="CREATE_NO_WINDOW is a Windows-only subprocess constant",
+)
+def test_cli_passes_create_no_window_on_windows(
+    adapter: WezTermAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # wezterm.exe is a GUI-subsystem binary, so every `cli` call (fired on each
+    # monitoring poll / message exchange) flashes a console window on Windows.
+    # CREATE_NO_WINDOW must be passed to subprocess.run to suppress it.
+    monkeypatch.setattr(wez_mod.os, "name", "nt")
+    adapter.get_text(5)
+    assert (
+        adapter._fake.last_kwargs.get("creationflags")
+        == subprocess.CREATE_NO_WINDOW
+    )
+
+
+def test_cli_omits_creationflags_on_posix(
+    adapter: WezTermAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On POSIX there is no window to suppress; creationflags must not be passed
+    # (CREATE_NO_WINDOW is a Windows-only constant).
+    monkeypatch.setattr(wez_mod.os, "name", "posix")
+    adapter.get_text(5)
+    assert "creationflags" not in adapter._fake.last_kwargs
 
 
 # --------------------------------------------------------------------------

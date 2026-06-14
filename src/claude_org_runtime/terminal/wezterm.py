@@ -68,12 +68,18 @@ class WezTermAdapter:
     # ------------------------------------------------------------------ util
     def _cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         cmd = [self.exe, "cli", "--no-auto-start", *args]
+        run_kwargs: dict = {}
+        if os.name == "nt":
+            # wezterm.exe は GUI サブシステムバイナリなので cli 起動のたびに
+            # ウィンドウが点滅する。monitoring/message のたびに _cli が発火するため抑止。
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         proc = subprocess.run(
             cmd,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=self.timeout,
+            **run_kwargs,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(
