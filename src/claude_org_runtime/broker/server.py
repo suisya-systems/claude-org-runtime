@@ -190,6 +190,11 @@ class Broker(TokenMixin, StoreMixin):
         ``role`` は :data:`surface.ROOT_ROLE_CHOICES` の集合で検証する (CLI の
         ``--root-role`` と同じ canonical 集合)。``cwd`` は relative spawn の解決
         アンカー (Issue #61) として bind に持たせる (任意)。
+
+        ``channel`` (任意、既定 False): True なら mint した token の ``mcp_config`` に
+        push 一次配送の channel sidecar (``org-broker-channel``, OWNER=この agent) を
+        積み delivery-scoped credential を発行する (spawn_claude の子経路ミラー)。
+        secretary(窓口) 起動経路がこれで dev-channel sidecar を持ち push が届く。
         """
         role = params.get("role", "worker")
         if role not in surface.ROOT_ROLE_CHOICES:
@@ -211,6 +216,11 @@ class Broker(TokenMixin, StoreMixin):
         name = params.get("name")
         if name is not None and not isinstance(name, str):
             return {"ok": False, "error": "[invalid_name] name must be a string"}
+        # channel は厳密に bool。truthy 文字列/数値で credential 発行が誤発火しない
+        # ように、非 bool は [invalid_params] で拒否する (cwd/name と同じ検証方針)。
+        channel = params.get("channel", False)
+        if not isinstance(channel, bool):
+            return {"ok": False, "error": "[invalid_params] channel must be a boolean"}
         # 既定 agent_id は毎回一意にする: 固定名だと複数回 mint した token が同一
         # agent として bind/queue を共有し配送先が曖昧化する (agent_id 基準の
         # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使うが、
@@ -223,13 +233,25 @@ class Broker(TokenMixin, StoreMixin):
             )
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+        mcp_config = self.mcp_config_for(token)
+        # channel 配線 (push 一次配送 §9.5): ``channel`` 要求時のみ org-broker-channel
+        # sidecar (OWNER=この agent) を mcp_config に積み delivery-scoped credential を
+        # 発行する。secretary(窓口) mint 経路が子 (spawn_claude) と同じ channel sidecar を
+        # 持ち、root Claude Code にも push 一次が届くようにする (本タスクの本丸)。
+        # control-plane の probe / down ctrl token は channel を要求しないため、使い捨て
+        # token に未使用 delivery cred を leak させない。
+        if channel:
+            delivery_cred = self.issue_delivery_cred(agent_id)
+            mcp_config["mcpServers"]["org-broker-channel"] = (
+                self.channel_server_config(delivery_cred, agent_id)
+            )
         return {
             "ok": True,
             "token": token,
             "agent_id": agent_id,
             "name": agent_id,
             "role": role,
-            "mcp_config": self.mcp_config_for(token),
+            "mcp_config": mcp_config,
         }
 
     @property

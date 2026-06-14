@@ -241,6 +241,53 @@ def test_admin_mint_token_rejects_duplicate_explicit_name(admin_broker):
     assert "name_taken" in r2["error"]
 
 
+def test_admin_mint_token_channel_wires_sidecar(admin_broker):
+    # channel=True で mint した secretary の mcp_config に org-broker-channel sidecar が
+    # 積まれ (OWNER=この agent)、delivery-scoped credential が発行される。これが
+    # secretary(窓口) 起動経路の push 一次配送 channel 配線 (本タスクの本丸)。
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary",
+                                                "name": "secretary",
+                                                "channel": True}}, "ADMIN-SECRET")
+    assert res["ok"] is True
+    servers = res["mcp_config"]["mcpServers"]
+    # full token 用の org-broker と channel sidecar の両方が載る。
+    assert "org-broker" in servers
+    assert "org-broker-channel" in servers
+    chan = servers["org-broker-channel"]
+    env = chan["env"]
+    assert env["ORG_BROKER_CHANNEL_OWNER"] == "secretary"
+    # delivery cred は full token とは別物 (least-privilege)。
+    delivery_cred = env["ORG_BROKER_CHANNEL_CRED"]
+    assert delivery_cred != res["token"]
+    dbind = admin_broker.get_bind(delivery_cred)
+    assert dbind is not None and dbind.scope == "delivery"
+    assert dbind.agent_id == "secretary"
+
+
+def test_admin_mint_token_without_channel_has_no_sidecar(admin_broker):
+    # channel 既定 (省略) では org-broker-channel を積まず、delivery cred も leak
+    # しない (control-plane の probe / down ctrl token がこの経路)。
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary"}}, "ADMIN-SECRET")
+    assert "org-broker-channel" not in res["mcp_config"]["mcpServers"]
+    # delivery-scoped bind が新たに発行されていない。
+    assert not any(b.scope == "delivery" for b in admin_broker._binds.values())
+
+
+def test_admin_mint_token_rejects_non_bool_channel(admin_broker):
+    # channel は厳密 bool。truthy 文字列で credential 発行が誤発火しないよう
+    # 非 bool は [invalid_params] で拒否する。
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary",
+                                                "channel": "true"}}, "ADMIN-SECRET",
+                      expect_status=400)
+    assert res["ok"] is False
+    assert "invalid_params" in res["error"]
+    # 拒否時は delivery cred を発行しない。
+    assert not any(b.scope == "delivery" for b in admin_broker._binds.values())
+
+
 def test_admin_mint_token_rejects_unknown_role(admin_broker):
     res = _admin_post(admin_broker, {"method": "mint_token",
                                      "params": {"role": "admin"}}, "ADMIN-SECRET",

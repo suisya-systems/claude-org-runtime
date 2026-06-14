@@ -268,10 +268,17 @@ def _mint_secretary(
     ``{ok: False, error}``)。``cwd`` (= root_cwd) を bind に持たせて relative-spawn
     の解決アンカーにする (Issue #61。serve の --root-cwd と同じ役割)。接続不可は
     URLError を送出する (呼び元が「到達不能」を判定)。
+
+    ``channel: True`` を要求し、返る ``mcp_config`` に push 一次配送の channel
+    sidecar (``org-broker-channel``, OWNER=secretary) を載せさせる。これにより
+    root(窓口) Claude Code も子 (dispatcher/worker) と同じく dev-channel sidecar を
+    持ち push が届く (本タスク: secretary 起動経路の channel 配線欠落の修正)。
+    control-plane の probe / down ctrl token は別経路 (channel 非要求) なので
+    使い捨て token に未使用 delivery cred を leak しない。
     """
     return _admin_rpc(
         host, port, admin_token, "mint_token",
-        {"role": "secretary", "name": name, "cwd": root_cwd},
+        {"role": "secretary", "name": name, "cwd": root_cwd, "channel": True},
     )
 
 
@@ -314,10 +321,23 @@ def build_up_argv(
     argv に混入しない。inline JSON は spawn_claude_pane が子に渡すのと同じ契約
     (token は localhost-only daemon の前提で許容。0600 file は再接続/検査用の
     durable artifact として別に残す)。
+
+    ``mcp_config`` に channel sidecar (``org-broker-channel``) が積まれていれば、
+    子経路 (spawn_claude) と同じく dev-channel flag
+    (``--dangerously-load-development-channels server:org-broker-channel``) を argv に
+    付ける。flag は config の実体に**従属**させる (config に channel があるときだけ
+    flag を出す) ことで、両者が必ず一致し drift しない (secretary mint が channel を
+    載せれば root も push 一次配送 sidecar を load する)。
     """
+    channel_server = (
+        "org-broker-channel"
+        if "org-broker-channel" in mcp_config.get("mcpServers", {})
+        else None
+    )
     return surface.build_claude_argv(
         mcp_config_json=json.dumps(mcp_config),
         model=model, permission_mode=permission_mode, extra_args=extra,
+        channel_server=channel_server,
     )
 
 
