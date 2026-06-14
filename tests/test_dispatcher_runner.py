@@ -104,17 +104,130 @@ def test_parse_pane_id_rejects_malformed(raw: object) -> None:
         _parse_pane_id(raw)
 
 
-def test_parse_panes_rejects_malformed_id_as_systemexit() -> None:
-    # A malformed pane id is structural input invalidity: _parse_panes must
-    # translate the helper's ValueError into a clean SystemExit (exit 1 + a
-    # contextual message), matching the not-a-list path, rather than letting a
-    # bare traceback escape the CLI input-parse boundary.
+def test_parse_panes_skips_logical_non_numeric_id_pane() -> None:
+    # A broker logical pane -- non-numeric id *and* degenerate (zero) geometry,
+    # e.g. the secretary handle "manual-test" with kind=null and w=h=0 -- is a
+    # non-addressable, non-renderable entry that can never be a balanced-split
+    # target. It is dropped from the parsed list and the rest of the snapshot
+    # still parses, so the snapshot is no longer rejected wholesale (Refs
+    # suisya-systems/claude-org-ja#580).
+    panes = _parse_panes([
+        {"id": "manual-test", "name": "secretary", "role": "secretary",
+         "x": 0, "y": 0, "w": 0, "h": 0, "kind": None},
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+    ])
+    assert [p.id for p in panes] == [0]
+
+
+def test_parse_panes_rejects_non_numeric_id_with_real_geometry() -> None:
+    # The skip is narrow: a real-pane-shaped entry with positive geometry but a
+    # genuinely malformed id is NOT a logical pane, so it must stay an input
+    # error (clean SystemExit) rather than being silently dropped -- silent
+    # drops would mask malformed input and bypass duplicate detection.
     with pytest.raises(SystemExit) as exc:
         _parse_panes([
-            {"id": "%x", "name": "dispatcher", "role": "dispatcher",
-             "x": 0, "y": 0, "width": 200, "height": 50},
+            {"id": "%x", "name": "worker-demo", "role": "worker",
+             "x": 0, "y": 0, "w": 220, "h": 50, "kind": "claude"},
         ])
     assert "panes[0] is invalid" in str(exc.value)
+
+
+@pytest.mark.parametrize("w, h", [(0, 50), (220, 0)])
+def test_parse_panes_rejects_non_numeric_id_partial_geometry(w: int, h: int) -> None:
+    # Only the broker logical-pane sentinel (w==h==0) is treated as a skippable
+    # logical pane. A partially-degenerate entry (one zero dimension) with a
+    # bad id is NOT a logical pane, so it stays an input error rather than being
+    # silently dropped (Refs suisya-systems/claude-org-ja#580).
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%x", "name": "worker-demo", "role": "worker",
+             "x": 0, "y": 0, "w": w, "h": h},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_rejects_missing_id_even_with_zero_geometry() -> None:
+    # The logical-pane skip requires a present *string* id handle. A pane with
+    # the id key missing entirely is structural malformity, so it must stay a
+    # clean SystemExit even when its geometry is the w=h=0 sentinel -- it must
+    # not be mistaken for a broker logical pane and silently dropped (Refs
+    # suisya-systems/claude-org-ja#580).
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"name": "worker-demo", "role": "worker",
+             "x": 0, "y": 0, "w": 0, "h": 0, "kind": None},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_rejects_bad_id_zero_geometry_with_non_null_kind() -> None:
+    # The logical-pane skip requires an explicit kind=null (the broker emits
+    # null for human-driven surfaces). A bad-id, w=h=0 entry that carries a real
+    # kind (e.g. a "claude" worker) is NOT a logical pane, so it must stay an
+    # input error rather than being dropped -- otherwise it would bypass
+    # build_plan's duplicate-name detection (Refs suisya-systems/claude-org-ja#580).
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%x", "name": "worker-demo", "role": "worker",
+             "x": 0, "y": 0, "w": 0, "h": 0, "kind": "claude"},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_rejects_bad_id_non_int_geometry() -> None:
+    # The w=h=0 sentinel is matched strictly as integer 0; a non-int geometry
+    # (e.g. 0.5) must not be coerced via int() into the sentinel and skipped --
+    # it is malformed input and stays a clean SystemExit (Refs
+    # suisya-systems/claude-org-ja#580).
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%x", "name": "worker-demo", "role": "worker",
+             "x": 0, "y": 0, "w": 0.5, "h": 0.5, "kind": None},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_keeps_zero_geometry_numeric_pane() -> None:
+    # A zero-area pane with a *numeric* id is kept in the parsed list (unlike a
+    # logical pane, it is addressable). choose_split excludes it as a split
+    # candidate on its own (_split_options floors), and keeping it preserves
+    # build_plan's duplicate-name detection -- so it must NOT be dropped at
+    # parse time (Refs suisya-systems/claude-org-ja#580).
+    panes = _parse_panes([
+        {"id": "%9", "name": "worker-demo", "role": "worker",
+         "x": 0, "y": 0, "w": 0, "h": 0},
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "w": 200, "h": 50},
+    ])
+    assert [p.id for p in panes] == [9, 0]
+    # The zero-geometry worker is retained but never chosen as a split target.
+    choice = choose_split(panes)
+    assert choice is not None and choice.target_id == 0
+
+
+def test_parse_panes_rejects_bad_geometry_on_addressable_pane() -> None:
+    # A numeric-id pane with missing/non-int geometry is a genuinely malformed
+    # real pane (distinct from a logical pane): _parse_panes must still
+    # translate it into a clean SystemExit (exit 1 + contextual message) rather
+    # than silently skipping it or letting a bare traceback escape.
+    with pytest.raises(SystemExit) as exc:
+        _parse_panes([
+            {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+             "x": 0, "y": 0, "width": "wide", "height": 50},
+        ])
+    assert "panes[0] is invalid" in str(exc.value)
+
+
+def test_parse_panes_accepts_broker_wh_geometry_aliases() -> None:
+    # The broker's list_panes emits geometry as w/h; renga emits width/height.
+    # _parse_panes must accept the w/h aliases without a hand remap (Refs
+    # suisya-systems/claude-org-ja#580).
+    panes = _parse_panes([
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "w": 220, "h": 50},
+    ])
+    assert (panes[0].width, panes[0].height) == (220, 50)
 
 
 def test_parse_panes_parses_tmux_pane_ids() -> None:
@@ -609,6 +722,29 @@ def test_build_plan_input_invalid_duplicate_pane(tmp_path: Path) -> None:
     assert any("already exists" in e for e in plan.errors)
 
 
+def test_build_plan_zero_geometry_pane_still_detected_as_duplicate(
+    tmp_path: Path,
+) -> None:
+    # A zero-area pane that carries a numeric id and an existing worker name
+    # must still block a same-named task: because _parse_panes keeps it (rather
+    # than dropping it on geometry), build_plan's duplicate-name guard sees it
+    # and refuses, instead of letting a second worker-demo spawn (Refs
+    # suisya-systems/claude-org-ja#580).
+    panes = _parse_panes([
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "w": 200, "h": 50},
+        {"id": "%9", "name": "worker-demo", "role": "worker",
+         "x": 0, "y": 0, "w": 0, "h": 0},
+    ])
+    plan = build_plan(
+        {"task_id": "demo", "worker_dir": str(tmp_path)},
+        panes,
+        tmp_path / ".state",
+    )
+    assert plan.status == "input_invalid"
+    assert any("already exists" in e for e in plan.errors)
+
+
 def test_build_plan_input_invalid_existing_state_file(tmp_path: Path) -> None:
     state_dir = tmp_path / ".state"
     seed = state_dir / "workers" / "worker-demo.md"
@@ -714,6 +850,62 @@ def test_cli_delegate_plan_accepts_tmux_pane_ids(tmp_path: Path) -> None:
     ])
     assert rc == 0
     assert (state_dir / "workers" / "worker-broker-demo.md").exists()
+
+
+def test_cli_delegate_plan_accepts_broker_native_snapshot(tmp_path: Path) -> None:
+    # End-to-end (Refs suisya-systems/claude-org-ja#580): a broker-native
+    # list_panes snapshot -- w/h geometry plus a logical secretary entry whose
+    # id is a non-numeric handle ("manual-test", kind=null, w=h=0) -- must drive
+    # the automated spawn path (rc 0 + state files) without a hand remap. The
+    # split target is chosen from the real %0/%1 panes; manual-test is dropped.
+    task = {
+        "task_id": "broker-native",
+        "worker_dir": str(tmp_path),
+        "instruction": "from broker",
+        "task_description": "smoke",
+    }
+    panes = [
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "focused": False, "x": 0, "y": 0, "w": 220, "h": 50,
+         "cwd": str(tmp_path), "kind": "claude"},
+        {"id": "%1", "name": "worker-prev", "role": "worker",
+         "focused": False, "x": 220, "y": 0, "w": 220, "h": 50,
+         "cwd": str(tmp_path), "kind": "claude"},
+        {"id": "manual-test", "name": "secretary", "role": "secretary",
+         "focused": False, "x": 0, "y": 0, "w": 0, "h": 0,
+         "cwd": None, "kind": None},
+    ]
+    task_path = tmp_path / "task.json"
+    panes_path = tmp_path / "panes.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+
+    state_dir = tmp_path / ".state"
+    rc = main([
+        "delegate-plan",
+        "--task-json", str(task_path),
+        "--panes-json", str(panes_path),
+        "--state-dir", str(state_dir),
+    ])
+    assert rc == 0
+    assert (state_dir / "workers" / "worker-broker-native.md").exists()
+
+
+def test_choose_split_excludes_skipped_logical_secretary() -> None:
+    # The broker logical secretary (non-numeric id, zero geometry) is filtered
+    # at parse time, so choose_split never sees it and targets the dispatcher.
+    panes = _parse_panes([
+        {"id": "%0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "w": 220, "h": 50},
+        {"id": "%1", "name": "worker-prev", "role": "worker",
+         "x": 220, "y": 0, "w": 220, "h": 50},
+        {"id": "manual-test", "name": "secretary", "role": "secretary",
+         "x": 0, "y": 0, "w": 0, "h": 0, "kind": None},
+    ])
+    choice = choose_split(panes)
+    assert choice is not None
+    assert choice.role == "dispatcher"
+    assert choice.target_id == 0  # the dispatcher %0, not the worker %1
 
 
 def test_cli_delegate_plan_dry_run_writes_nothing(tmp_path: Path) -> None:

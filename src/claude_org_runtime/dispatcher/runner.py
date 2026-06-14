@@ -236,6 +236,48 @@ def _parse_pane_id(raw: Any) -> int:
     )
 
 
+def _pane_id_parseable(raw: Any) -> bool:
+    """Return True if ``raw`` is a numeric pane id (renga ``N`` or tmux ``%N``).
+
+    Used by :func:`_parse_panes` to tell a non-addressable logical pane (whose
+    id is not a numeric pane id -- e.g. the broker's human-driven secretary
+    surface ``"manual-test"``) apart from a genuinely malformed entry, so the
+    former can be skipped rather than rejecting the whole snapshot.
+    """
+    try:
+        _parse_pane_id(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_int_zero(v: Any) -> bool:
+    """Return True iff ``v`` is the integer ``0`` (and not a bool or float).
+
+    ``int(0.5)`` would round a malformed float geometry down to ``0``, so the
+    sentinel check below must reject non-int values rather than coerce them --
+    a non-int geometry is malformed input, not the broker's ``0`` sentinel.
+    """
+    return isinstance(v, int) and not isinstance(v, bool) and v == 0
+
+
+def _has_logical_pane_geometry(d: dict[str, Any]) -> bool:
+    """Return True iff ``d``'s geometry is the broker's logical-pane sentinel.
+
+    The broker's list_panes emits integer ``w=h=0`` (both dimensions zero) for
+    a non-renderable logical pane (e.g. the human-driven secretary surface).
+    Used by :func:`_parse_panes` to confine the non-numeric-id skip to exactly
+    that shape: a partially-degenerate pane (``w=0,h>0`` or ``w>0,h=0``), or one
+    whose geometry is missing or non-int (e.g. ``0.5``), is *not* a logical pane
+    and is left to be surfaced as an input error rather than silently skipped.
+    Accepts the broker's ``w``/``h`` as aliases for renga's ``width``/``height``
+    (see :meth:`Pane.from_dict`).
+    """
+    return _is_int_zero(d.get("width", d.get("w"))) and _is_int_zero(
+        d.get("height", d.get("h"))
+    )
+
+
 @dataclass
 class Pane:
     id: int
@@ -249,6 +291,12 @@ class Pane:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Pane":
+        # Geometry field names differ by transport: renga emits
+        # ``width``/``height``, the broker's list_panes emits ``w``/``h``.
+        # Accept ``w``/``h`` as aliases so a broker-native snapshot is taken
+        # without a hand remap (Refs suisya-systems/claude-org-ja#580). A
+        # missing key under both names yields ``None`` -> ``int(None)`` raises
+        # TypeError, preserving the "malformed geometry is input error" contract.
         return cls(
             id=_parse_pane_id(d["id"]),
             name=d.get("name"),
@@ -256,8 +304,8 @@ class Pane:
             focused=bool(d.get("focused", False)),
             x=int(d["x"]),
             y=int(d["y"]),
-            width=int(d["width"]),
-            height=int(d["height"]),
+            width=int(d.get("width", d.get("w"))),
+            height=int(d.get("height", d.get("h"))),
         )
 
 
@@ -789,15 +837,39 @@ def _parse_panes(panes_data: Any) -> list[Pane]:
     panes: list[Pane] = []
     for i, d in enumerate(panes_list):
         try:
-            panes.append(Pane.from_dict(d))
+            pane = Pane.from_dict(d)
         except (ValueError, KeyError, TypeError) as exc:
-            # A malformed pane entry -- a bad/missing id (including an
-            # unrecognised tmux pane_id), missing geometry, or a non-int
-            # field -- is structural input invalidity. Surface it the same way
-            # as the not-a-list case above (clean message + exit 1) instead of
-            # letting the bare ValueError/KeyError escape as a traceback, so
-            # the CLI honours its input-error contract at the parse boundary.
+            # A non-addressable logical pane is the exact shape the broker's
+            # list_panes emits for human-driven surfaces: a present *string* id
+            # handle that is not a numeric pane id (the secretary handle
+            # ``"manual-test"``), an explicit ``kind=null``, *and* the broker's
+            # integer w=h=0 sentinel geometry. It can never be a balanced-split
+            # target, so skip it rather than rejecting the whole snapshot (Refs
+            # suisya-systems/claude-org-ja#580). The guard matches all four
+            # markers so genuinely malformed input is NOT silently dropped: a
+            # missing/non-string id, a non-null ``kind`` (e.g. a real worker),
+            # a positive- or partially-degenerate-geometry pane, a non-int
+            # geometry, or a non-dict entry all still raise a clean SystemExit
+            # (exit 1), matching the not-a-list path above instead of letting a
+            # bare traceback escape -- and so still participate in downstream
+            # duplicate detection.
+            if (
+                isinstance(d, dict)
+                and isinstance(d.get("id"), str)
+                and not _pane_id_parseable(d["id"])
+                and "kind" in d
+                and d["kind"] is None
+                and _has_logical_pane_geometry(d)
+            ):
+                continue
             raise SystemExit(f"panes[{i}] is invalid: {exc}") from None
+        # A zero-area pane that *does* carry a numeric id is kept rather than
+        # dropped here: it can never host a split child, but ``choose_split``
+        # already excludes it as a candidate (``_split_options`` yields nothing
+        # below the MIN_PANE_* floors). Keeping it in the list preserves
+        # ``build_plan``'s existing-worker-name duplicate detection, which scans
+        # this same list -- dropping it would let a same-named worker slip past.
+        panes.append(pane)
     return panes
 
 
