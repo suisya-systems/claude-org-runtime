@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-06-14
+
+### Fixed
+
+- `terminal`: the WezTerm backend no longer flashes a console window on
+  Windows. `wezterm.exe` is a GUI-subsystem binary, so every `wezterm cli`
+  invocation — fired on each monitoring poll and message exchange — spawned
+  a flickering window. `WezTermAdapter._cli` now passes
+  `creationflags=subprocess.CREATE_NO_WINDOW` on Windows (`os.name == "nt"`)
+  to suppress it.
+
 ## [0.1.24] - 2026-06-14
 
 ### Fixed
