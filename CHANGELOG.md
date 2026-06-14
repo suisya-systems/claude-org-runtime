@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-06-14
+
+### Fixed
+
+- `broker`: channel `meta.sent_at` is now stringified before it reaches
+  the host channel schema, stopping a silent-drop where the float epoch
+  failed the host's string-typed `sent_at` validation and the channel
+  message was dropped without surfacing an error. Closes
+  `claude-org-runtime#80` (PR #82).
+
 ## [0.1.23] - 2026-06-13
 
 ### Added
