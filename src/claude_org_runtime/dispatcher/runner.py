@@ -686,7 +686,8 @@ def build_plan(
             "tool": "send_keys",
             "target": worker_name,
             "enter": True,
-            "reason": "approve 'Load development channel?' Y/n prompt",
+            "reason": ("approve the spawn-ritual prompt (renga: 'Load "
+                       "development channel?' Y/n / broker: folder-trust)"),
         },
         {
             "tool": "list_peers",
