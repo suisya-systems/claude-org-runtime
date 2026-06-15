@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-06-16
+
+Epic `suisya-systems/claude-org-ja#586` keystone release: the default
+transport flips to `broker` and a transport-neutral `broker send` notify
+CLI lands.
+
+### Added
+
+- `broker`: `claude-org-runtime broker send --to <agent_id> --message
+  <text>` -- a transport-neutral, best-effort notify CLI that enqueues one
+  message to a running broker daemon from a plain subprocess (the
+  `mcp__org-broker__send_message` MCP tool is callable only inside a Claude
+  Code session, so the CLI discovers the daemon, mints a throwaway admin
+  token, and drives a single MCP send). Frozen CLI contract (depended on by
+  `suisya-systems/claude-org-ja#590`): `exit 0` = enqueued, non-`0` =
+  undelivered (sidecar absent / auth fail / peer not found / unreachable).
+  Never raises; emits only short ASCII stderr diagnostics and never echoes
+  the message body. Sidecar-absent is a no-op non-`0`, symmetric to the
+  `renga` `RENGA_SOCKET`-unset no-op. The shared localhost HTTP client is
+  factored out of `broker/launcher.py` into `broker/rpc.py` so the control
+  plane and the notify helper reuse one implementation. Closes
+  `claude-org-runtime#93` (PR `claude-org-runtime#94`). Refs
+  `suisya-systems/claude-org-ja#590`.
+
 ### Changed
 
 - `transport`: the default transport is promoted from `renga` to `broker`
@@ -16,10 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `transport_allowlist`) resolves to the `mcp__org-broker__*` tier
   surface. `renga` is **not** removed: set `ORG_TRANSPORT=renga` to fall
   back to the bit-equivalent `mcp__renga-peers__*` surface (opt-in
-  fallback). No version bump / release tag accompanies this change; the
-  release is gated separately after human review. Refs Epic
-  `suisya-systems/claude-org-ja#586` (Phase 2 / PR-2), contract amendment
-  ratified in `suisya-systems/claude-org-ja#588`.
+  fallback). Refs Epic
+  `suisya-systems/claude-org-ja#586` (Phase 2 / PR-2), implemented in PR
+  `claude-org-runtime#92`, contract amendment ratified in
+  `suisya-systems/claude-org-ja#588`.
 
 ## [0.1.27] - 2026-06-15
 
