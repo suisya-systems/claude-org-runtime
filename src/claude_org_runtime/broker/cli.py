@@ -8,8 +8,8 @@ canonical 実装: claude-org-transport-lab spike/broker.py の ``__main__``
 
 state-dir の既定は ``.state/broker`` (CWD 相対)。spike は自己完結のため
 ``spike/broker-state/`` を既定にしていたが、runtime では設計上の本番置き場
-``.state/broker/`` を既定にする (本フェーズでは flag 既定 renga で不活性、
-runtime 内部テストのみで使用)。
+``.state/broker/`` を既定にする (Epic #586 Phase 2 で broker が既定 transport に
+昇格。ORG_TRANSPORT=renga で renga へ opt-in 切戻し可能)。
 """
 
 from __future__ import annotations

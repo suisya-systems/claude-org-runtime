@@ -102,7 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
         "broker",
         help=(
             "org-broker daemon (localhost MCP server + queue store + nudge "
-            "delivery). Flag-gated; inactive by default (renga)."
+            "delivery). Default transport since Epic #586 Phase 2; set "
+            "ORG_TRANSPORT=renga to fall back to renga."
         ),
     )
     broker_sub = broker_p.add_subparsers(dest="cmd", required=True)

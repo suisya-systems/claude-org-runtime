@@ -55,7 +55,7 @@ SERVER_INFO = {"name": "org-broker", "version": "0.1.0"}
 # (check_messages の役割 cadence) は :data:`FALLBACK_RECEIVE_MODE`。push mode が
 # 失効した agent (sidecar 不在 / channel 非対応 codex peer) はフォールバックに degrade
 # するが、その per-agent な実状態は delivery_mode (store) が持ち、本定数は transport の
-# capability surface としての一次手段を表す (§9.7 既定 renga 経路は不変)。
+# capability surface としての一次手段を表す (§9.7 renga 経路 = opt-in fallback は不変)。
 RECEIVE_MODE = "push"
 FALLBACK_RECEIVE_MODE = "pull"
 

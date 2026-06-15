@@ -5,7 +5,7 @@ Covers:
 - descriptor golden for both flags (server / prefix / inject / role->tools),
 - drift lock: broker tier sets are derived from ``broker.surface.tools_for``,
 - renga required-14 == ``tools/check_renga_compat`` REQUIRED_MCP_TOOLS surface,
-- flag resolution (explicit > env > default renga),
+- flag resolution (explicit > env > default broker; ORG_TRANSPORT=renga fallback),
 - bit-equivalence anchor: renga surface == bundled schema's shared renga 14.
 """
 
@@ -189,8 +189,9 @@ def test_renga_required_matches_known_required_set() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_default_is_renga() -> None:
-    assert td.resolve_transport(env={}) == "renga"
+def test_resolve_default_is_broker() -> None:
+    # Epic #586 Phase 2: 既定 transport を broker に昇格。
+    assert td.resolve_transport(env={}) == "broker"
 
 
 def test_resolve_env() -> None:
@@ -198,9 +199,14 @@ def test_resolve_env() -> None:
     assert td.resolve_transport(env={"ORG_TRANSPORT": "renga"}) == "renga"
 
 
+def test_resolve_env_renga_fallback() -> None:
+    # renga は削除されず ORG_TRANSPORT=renga で opt-in 切戻し可能 (§5.1)。
+    assert td.resolve_transport(env={"ORG_TRANSPORT": "renga"}) == "renga"
+
+
 def test_resolve_empty_env_is_default() -> None:
-    # 空文字列は未設定扱い (既定 renga)。
-    assert td.resolve_transport(env={"ORG_TRANSPORT": ""}) == "renga"
+    # 空文字列は未設定扱い (既定 broker)。
+    assert td.resolve_transport(env={"ORG_TRANSPORT": ""}) == "broker"
 
 
 def test_resolve_explicit_overrides_env() -> None:
@@ -218,9 +224,9 @@ def test_resolve_unknown_raises() -> None:
 
 def test_get_surface_default_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ORG_TRANSPORT", raising=False)
-    assert td.get_surface().flag == "renga"
-    monkeypatch.setenv("ORG_TRANSPORT", "broker")
     assert td.get_surface().flag == "broker"
+    monkeypatch.setenv("ORG_TRANSPORT", "renga")
+    assert td.get_surface().flag == "renga"
 
 
 # ---------------------------------------------------------------------------

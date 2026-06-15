@@ -127,9 +127,10 @@ def load_schema(path: Path | None = None) -> dict:
 # from the single SoT :mod:`claude_org_runtime.transport.descriptor`, so the
 # runtime generator and the ja-side generators
 # (``tools/gen_delegate_payload.py`` / worker_brief) never drift. The
-# transport is flag-aware: ``ORG_TRANSPORT`` selects ``renga`` (default,
-# bit-equivalent with the current ``mcp__renga-peers__*`` surface) or
-# ``broker`` (``mcp__org-broker__*``, role-tier differentiated).
+# transport is flag-aware: ``ORG_TRANSPORT`` selects ``broker`` (default
+# since Epic #586 Phase 2, ``mcp__org-broker__*``, role-tier
+# differentiated) or ``renga`` (opt-in fallback via ``ORG_TRANSPORT=renga``,
+# bit-equivalent with the current ``mcp__renga-peers__*`` surface).
 
 
 def transport_allowlist(
@@ -142,11 +143,12 @@ def transport_allowlist(
 
     Reads the transport surface descriptor (the single SoT). ``transport``
     is resolved as: explicit arg > ``ORG_TRANSPORT`` env > default
-    ``renga`` (§5.1). With the default ``renga`` flag the returned entries
-    are bit-equivalent with the current shared ``mcp__renga-peers__*``
-    surface (§5.3 non-breaking guarantee); with ``broker`` they become the
+    ``broker`` (§5.1; promoted from ``renga`` in Epic #586 Phase 2). With
+    the default ``broker`` flag the returned entries are the
     tier-appropriate ``mcp__org-broker__*`` set derived structurally from
-    :mod:`claude_org_runtime.broker.surface`.
+    :mod:`claude_org_runtime.broker.surface`; with ``renga``
+    (``ORG_TRANSPORT=renga`` opt-in fallback) they are bit-equivalent with
+    the current shared ``mcp__renga-peers__*`` surface (§5.3).
 
     ``role`` is a runtime role name (``secretary`` / ``dispatcher`` /
     ``curator`` / ``worker`` / ``user_common``). Under ``renga`` every role

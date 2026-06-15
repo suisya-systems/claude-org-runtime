@@ -51,10 +51,10 @@ from ..broker import surface as _broker_surface
 #: 環境変数キー (§5.1: 初期は env のみ。永続ファイル化は Set C 改訂を伴うため別 Issue)。
 ENV_KEY = "ORG_TRANSPORT"
 
-#: 既定 transport。**無設定時は renga = 現行挙動不変 (非破壊)**。完全移行後の
-#: broker 反転は dogfood ゲート (§8 Issue G) 通過後の人間判断であり、runtime の
-#: 既定値はここでは反転させない (§5.1)。
-DEFAULT_TRANSPORT = "renga"
+#: 既定 transport。**無設定時は broker** (Epic #586 Phase 2 / PR-2 で renga→broker
+#: に昇格。ja contract amendment は ratified 済み = ja PR #588)。renga は削除せず
+#: ``ORG_TRANSPORT=renga`` で opt-in fallback として切戻し可能 (§5.1)。
+DEFAULT_TRANSPORT = "broker"
 
 #: 受理する transport flag (org 全体で 1 値, §5.1)。
 TRANSPORTS = ("renga", "broker")
@@ -204,8 +204,9 @@ def resolve_transport(
 ) -> str:
     """有効な transport flag を決定する。
 
-    優先順: 明示引数 > ``ORG_TRANSPORT`` env > 既定 (``renga``)。空文字列・
+    優先順: 明示引数 > ``ORG_TRANSPORT`` env > 既定 (``broker``)。空文字列・
     未知値は ``ValueError``。``env=None`` は ``os.environ`` を読む。
+    ``ORG_TRANSPORT=renga`` で renga へ切戻せる (opt-in fallback)。
     """
     if explicit is not None:
         candidate = explicit
@@ -228,7 +229,7 @@ def get_surface(
 ) -> TransportSurface:
     """transport flag の :class:`TransportSurface` を返す。
 
-    ``flag=None`` のとき :func:`resolve_transport` (env -> 既定 renga) で解決。
+    ``flag=None`` のとき :func:`resolve_transport` (env -> 既定 broker) で解決。
     """
     resolved = resolve_transport(flag, env=env)
     return _SURFACES[resolved]

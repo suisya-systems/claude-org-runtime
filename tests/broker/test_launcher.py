@@ -488,8 +488,9 @@ def test_close_managed_panes_global_mux_limits_to_agent_kinds(tmp_path):
 def test_launch_claude_posix_exec_injects_broker_transport(monkeypatch):
     """POSIX exec 経路: execvpe に渡る子環境に ORG_TRANSPORT=broker が含まれる。
 
-    これが無いと secretary TUI の /org-start が「env 未設定 = 既定 renga」の正規
-    ルールで renga 経路に落ち、RENGA_PANE_ID 不在で停止する (Issue #70)。
+    既定 transport は broker に昇格済み (Epic #586 Phase 2) だが、この明示注入は
+    ORG_TRANSPORT=renga の opt-in fallback が子へ漏れて renga 経路 (RENGA_PANE_ID
+    不在で停止) に落ちるのを防ぐ二重の安全弁として維持する (Issue #70)。
     """
     monkeypatch.setattr(launcher.os, "name", "posix")
     captured = {}
