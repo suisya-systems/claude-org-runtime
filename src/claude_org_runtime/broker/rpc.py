@@ -150,6 +150,9 @@ class _McpClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout):
                 pass
-        except (urllib.error.URLError, urllib.error.HTTPError):
+        except Exception:  # noqa: BLE001 - close は純粋な best-effort cleanup。
+            # URLError/HTTPError だけでなく read timeout (TimeoutError/OSError) 等も
+            # 握る: cleanup の失敗が呼び元の結果 (例: notify の enqueue 成功 exit code)
+            # を上書きしてはならない。
             pass
         self.session_id = None

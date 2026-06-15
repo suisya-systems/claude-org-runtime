@@ -50,10 +50,14 @@ _SENDER_ROLE = "worker"
 def _fail(reason: str) -> int:
     """短い 1 行診断を stderr に出して非0 (未配送) を返す。
 
-    診断は ASCII のみ (cp932 コンソール対策)。呼び元 (ja#590) は returncode のみを
-    見て delivered を判定するため、stderr は人間のトラブルシュート用に留める。
+    ``reason`` は state_dir パス・broker 由来の error 文字列・``--to`` 値など外部由来の
+    断片を含みうるため、cp932 コンソールでも壊れないよう **ASCII に正規化**してから
+    出す (非 ASCII は ``\\xNN`` にエスケープ)。凍結契約「stderr は短い ASCII 診断のみ」を
+    入力内容に依らず構造的に満たす。呼び元 (ja#590) は returncode のみで delivered を
+    判定するため、stderr は人間のトラブルシュート用に留める。
     """
-    print(f"broker send: {reason}", file=sys.stderr)
+    safe = reason.encode("ascii", "backslashreplace").decode("ascii")
+    print(f"broker send: {safe}", file=sys.stderr)
     return 1
 
 
@@ -110,7 +114,15 @@ def _broker_send(args: argparse.Namespace) -> int:
     except urllib.error.URLError:
         return _fail(f"broker MCP surface unreachable at {host}:{port}")
     finally:
-        client.close()  # 使い捨て token を de-register (idle な登録を残さない)
+        # 使い捨て token を de-register (idle な登録を残さない)。cleanup の失敗は
+        # **配送結果 (exit code) を上書きしない**: enqueue 成功後に close() が例外を
+        # 出しても catch-all に落として未配送 exit に反転させてはならない (凍結契約
+        # exit 0 = enqueue 成功)。rpc._McpClient.close は best-effort で全例外を握るが、
+        # 境界でも二重に保証する。
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - cleanup は配送結果を上書きしない
+            pass
 
     if result.get("ok") is True:
         # 配送 (enqueue) 成功。stdout は静かに保つ (CLI は returncode が唯一の契約)。

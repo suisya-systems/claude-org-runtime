@@ -88,6 +88,33 @@ def test_send_delivers_unicode_body(live_daemon):
     assert [m["message"] for m in drained] == [body]
 
 
+def test_send_close_failure_does_not_invert_success(live_daemon, monkeypatch):
+    # Blocker 回帰: enqueue 成功後に de-register (close) が非 URLError (TimeoutError 等)
+    # を投げても、cleanup 失敗が配送結果 (exit 0) を上書きしてはならない。
+    b, state_dir = live_daemon
+    recip_tok = _register_recipient(b, "alice")
+
+    def boom(self):
+        raise TimeoutError("cleanup blew up")
+
+    monkeypatch.setattr(notify._McpClient, "close", boom)
+    rc = notify.broker_send(_send_args(state_dir, to="alice", message="ping"))
+    assert rc == 0
+    assert [m["message"] for m in b.drain(b.get_bind(recip_tok))] == ["ping"]
+
+
+def test_send_diagnostic_is_ascii_even_with_unicode_path(tmp_path, capsys):
+    # Major 回帰: state_dir 等 外部由来の非 ASCII 断片が stderr に混じっても、診断は
+    # ASCII (cp932 安全) に正規化される。
+    nonascii_dir = tmp_path / "ブローカー"  # 非 ASCII パス
+    rc = notify.broker_send(_send_args(nonascii_dir, to="alice", message="x"))
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert err.strip()  # 何か診断は出ている
+    err.encode("ascii")  # 非 ASCII が残れば例外
+    err.encode("cp932")
+
+
 def test_send_unknown_recipient_is_undelivered(live_daemon):
     b, state_dir = live_daemon
     rc = notify.broker_send(_send_args(state_dir, to="nobody", message="ping"))

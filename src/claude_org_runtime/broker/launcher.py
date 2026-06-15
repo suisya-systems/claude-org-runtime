@@ -46,7 +46,7 @@ from pathlib import Path
 
 from ..terminal import TmuxAdapter, WezTermAdapter, default_backend
 from . import sidecar, surface
-from .rpc import _McpClient, _admin_rpc
+from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
 
 DEFAULT_STATE_DIR = ".state/broker"
 SECRETARY_MCP_NAME = "secretary-mcp.json"
