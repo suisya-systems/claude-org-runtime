@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `transport`: the default transport is promoted from `renga` to `broker`
+  (`claude_org_runtime.transport.DEFAULT_TRANSPORT`). With no
+  `ORG_TRANSPORT` set, `resolve_transport(env={})` now returns `broker`
+  and every transport-aware surface (e.g. `settings.generator`'s
+  `transport_allowlist`) resolves to the `mcp__org-broker__*` tier
+  surface. `renga` is **not** removed: set `ORG_TRANSPORT=renga` to fall
+  back to the bit-equivalent `mcp__renga-peers__*` surface (opt-in
+  fallback). No version bump / release tag accompanies this change; the
+  release is gated separately after human review. Refs Epic
+  `suisya-systems/claude-org-ja#586` (Phase 2 / PR-2), contract amendment
+  ratified in `suisya-systems/claude-org-ja#588`.
+
 ## [0.1.27] - 2026-06-15
 
 ### Fixed

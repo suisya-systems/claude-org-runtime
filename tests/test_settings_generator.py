@@ -2629,11 +2629,26 @@ def test_rendered_default_worker_settings_include_git_fetch_colon_star(
 # ---------------------------------------------------------------------------
 
 
-def test_transport_allowlist_default_is_renga(monkeypatch: pytest.MonkeyPatch) -> None:
-    """既定 (ORG_TRANSPORT 無設定) は renga surface を projektする。"""
+def test_transport_allowlist_default_is_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """既定 (ORG_TRANSPORT 無設定) は broker surface を projektする。
+
+    Epic #586 Phase 2: 既定 transport を renga→broker に昇格。worker tier は
+    messaging-only の 4 面。
+    """
     monkeypatch.delenv("ORG_TRANSPORT", raising=False)
     entries = generator.transport_allowlist("worker")
     assert entries
+    assert all(e.startswith("mcp__org-broker__") for e in entries)
+    assert "mcp__org-broker__send_message" in entries
+    assert len(entries) == 4  # worker tier = messaging-only 4
+
+
+def test_transport_allowlist_default_renga_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ORG_TRANSPORT=renga で renga surface へ opt-in 切戻し可能 (§5.1)。"""
+    monkeypatch.setenv("ORG_TRANSPORT", "renga")
+    entries = generator.transport_allowlist("worker")
     assert all(e.startswith("mcp__renga-peers__") for e in entries)
     assert "mcp__renga-peers__send_message" in entries
     assert len(entries) == 14  # 全ロール一様 required 14
@@ -2642,7 +2657,8 @@ def test_transport_allowlist_default_is_renga(monkeypatch: pytest.MonkeyPatch) -
 def test_transport_allowlist_renga_bit_equivalent_to_schema() -> None:
     """**bit 等価回帰**: flag=renga の共有 surface == 現行 schema の renga 14。
 
-    既定 renga で現行と byte 同一 (非破壊) であることの回帰固定 (§5.3)。
+    renga fallback (ORG_TRANSPORT=renga) で現行と byte 同一 (非破壊) である
+    ことの回帰固定 (§5.3)。
     """
     schema = generator.load_schema()
     schema_renga = [

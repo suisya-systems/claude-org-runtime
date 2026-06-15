@@ -349,11 +349,14 @@ def _launch_claude(argv: list[str]) -> int:
     起動し前景で待つ。claude バイナリが見つからない場合は 1 行コマンドを表示して
     人間に委ねる fallback (課金中立 argv はそのまま手で起動できる)。
 
-    どの経路でも子環境に ``ORG_TRANSPORT=broker`` を注入する (Issue #70)。これが
-    無いと secretary TUI の ``/org-start`` が「env 未設定 = 既定 renga」の正規
-    ルールで renga 経路に落ち、``RENGA_PANE_ID`` 不在で停止する。org up は broker
-    制御面を起動しているので、子は常に broker transport を使う。fallback の表示
-    コマンドにも env 前置を含め、手で起動しても同じ transport になるようにする。
+    どの経路でも子環境に ``ORG_TRANSPORT=broker`` を注入する (Issue #70)。Epic
+    #586 Phase 2 で既定 transport は broker に昇格したため env 未設定でも broker に
+    解決されるが、この明示注入は (a) 既定変更に依らず broker 経路を保証し、(b)
+    ``ORG_TRANSPORT=renga`` の opt-in fallback が org up 配下の子へ漏れて renga 経路
+    (``RENGA_PANE_ID`` 不在で停止) に落ちるのを防ぐ二重の安全弁として維持する。org
+    up は broker 制御面を起動しているので、子は常に broker transport を使う。
+    fallback の表示コマンドにも env 前置を含め、手で起動しても同じ transport に
+    なるようにする。
 
     **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
     secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
