@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from ..terminal import VALID_BACKENDS, default_backend, make_adapter
-from . import sidecar
+from . import notify, sidecar
 from .server import Broker
 from .surface import ROOT_ROLE_CHOICES
 
@@ -88,13 +88,17 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
-    """top-level CLI (``claude-org-runtime broker ...``) に serve を生やす。"""
+    """top-level CLI (``claude-org-runtime broker ...``) に serve / send を生やす。"""
     serve_p = subparsers.add_parser(
         "serve",
         help="org-broker daemon を localhost で起動する (Ctrl+C で停止)。",
     )
     add_arguments(serve_p)
     serve_p.set_defaults(func=run)
+
+    # send: transport-neutral notify helper (Issue #93)。素の CLI subprocess から
+    # 走行中 daemon の queue へ 1 通 enqueue する (best-effort)。実体は notify.py。
+    notify.add_subparsers(subparsers)
 
 
 def issue_root_token(
