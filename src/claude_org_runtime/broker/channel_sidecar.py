@@ -4,9 +4,9 @@
 push 一次配送の per-session 配送トランスデューサ。**ツール宣言ゼロ**で
 ``experimental{claude/channel}`` のみを宣言する stdio MCP サーバー。org-broker
 daemon を ~1s で claim->push し、受信を ``notifications/claude/channel`` でセッションへ
-in-band 注入する (idle セッションも起こす)。canonical 実装: claude-org-transport-lab
-spike/channel_sidecar.py (PR #24 merge 28a4cb2、tool-less channel-only idle-wake が
-実機 PASS) の faithful port。spike の K1 env (``K1_*``) を runtime env
+in-band 注入する (idle セッションも起こす)。現行 canonical は本モジュール。歴史的 origin:
+claude-org-transport-lab spike/channel_sidecar.py (PR #24 merge 28a4cb2、tool-less
+channel-only idle-wake が実機 PASS) の faithful port。spike の K1 env (``K1_*``) を runtime env
 (``ORG_BROKER_CHANNEL_*``) へ rename し、daemon の delivery endpoint
 (``/poll-claims`` / ``/confirm-delivered``) と queue row 形 (``{id, entry, epoch}``)
 に合わせたもの。

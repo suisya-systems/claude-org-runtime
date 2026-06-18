@@ -3,8 +3,9 @@
 
 ``claude-org-runtime broker serve`` (top-level CLI 経由) と
 ``python -m claude_org_runtime.broker`` (__main__) の双方から使う。
-canonical 実装: claude-org-transport-lab spike/broker.py の ``__main__``
-ブロックを faithful port し、queue 書込先を ``.state/broker/`` に化したもの。
+現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/broker.py の ``__main__`` ブロックを faithful port し、queue 書込先を
+``.state/broker/`` に化したもの。
 
 state-dir の既定は ``.state/broker`` (CWD 相対)。spike は自己完結のため
 ``spike/broker-state/`` を既定にしていたが、runtime では設計上の本番置き場

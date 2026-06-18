@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-06-18
+
+Hard rename of the tmux backend's dedicated tmux socket (and its generated
+session / buffer names) from the historical `claude-org-spike` to
+`claude-org-broker`, plus the backend-selection env var `SPIKE_BACKEND` ->
+`ORG_BACKEND`, retiring the last `spike`-era naming debt. No backward
+compatibility, no env fallback.
+
+### BREAKING
+
+- `terminal.tmux`: the dedicated tmux socket is renamed from
+  `claude-org-spike` to `claude-org-broker` (`tmux -L claude-org-broker`),
+  and the module constant `SPIKE_SOCKET` is renamed to `BROKER_SOCKET`. A
+  `TmuxAdapter` built by this release talks to a different socket than a
+  `0.1.28` adapter, so a `0.1.28` process and a `0.1.29` process **do not
+  share a tmux server** and cannot see each other's panes. Generated names
+  follow: detached sessions are now `claude-org-broker-{pid}-{n}` (was
+  `spike-{pid}-{n}`) and paste buffers are `claude-org-broker-buf-{pid}-{n}`
+  (was `spike-buf-{pid}-{n}`). Importers of
+  `claude_org_runtime.terminal.tmux.SPIKE_SOCKET` must switch to
+  `BROKER_SOCKET`. Consumers in `claude-org-ja` (e.g. `org-attach`) are
+  migrated in a follow-up task pinned to this version.
+- `terminal.base`: the backend-selection env var is renamed from
+  `SPIKE_BACKEND` to `ORG_BACKEND` (aligned with `ORG_TRANSPORT`), with no
+  fallback. `default_backend()` now reads `ORG_BACKEND`; `SPIKE_BACKEND` is no
+  longer consulted, so a caller that set `SPIKE_BACKEND` to force a backend
+  silently falls back to the OS default until they switch to `ORG_BACKEND`.
+
+### Changed
+
+- `terminal` / `broker`: module-header provenance comments are de-inverted to
+  reflect the real source of truth -- the runtime modules are the current
+  canonical implementation, and `claude-org-transport-lab spike/*` is recorded
+  as the historical origin they were ported from (was phrased as if the spike
+  were the canonical implementation). Comment-only; no behavior change.
+
 ## [0.1.28] - 2026-06-16
 
 Epic `suisya-systems/claude-org-ja#586` keystone release: the default

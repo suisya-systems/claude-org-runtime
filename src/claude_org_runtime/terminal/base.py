@@ -3,8 +3,8 @@
 
 設計 SoT: docs/design/ja-migration-plan.md §4 (runtime 抽出設計) /
 docs/design/renga-decoupling.md §4.7 (adapter 境界と能力表)。
-canonical 実装: claude-org-transport-lab spike/terminal_adapter.py
-(Phase 1-5 で検証済。本 subpackage への faithful port)。
+現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/terminal_adapter.py (Phase 1-5 で検証され本 subpackage に faithful port された)。
 
 Phase 1 (WezTerm / Windows) で確立した adapter 面を backend 非依存に抽象化し、
 Phase 2 で tmux (POSIX 正準 backend) を第二実装として追加した。broker / harness は
@@ -73,7 +73,7 @@ class TerminalAdapter(Protocol):
 
     能力フラグ ``isolated_session`` (bool, ClassVar): backend が「自分が spawn
     した pane だけ」を ``list_panes()`` で見せるか (= dedicated session 分離) を
-    表す。tmux (専用 socket -L claude-org-spike) は True (人間の窓口 pane は別
+    表す。tmux (専用 socket -L claude-org-broker) は True (人間の窓口 pane は別
     サーバーにあり出ない)、wezterm (cli list, global mux) は False (窓口の実
     pane も匿名で出る)。broker の close_pane が論理ペイン (人間駆動の窓口) を
     last-pane ガードに +1 計上してよいかの判断に使う (isolated な時だけ窓口は
@@ -185,9 +185,9 @@ def default_backend() -> str:
 
     - Windows (native): WezTerm (tmux はネイティブ Windows で動かない)。
     - POSIX (Linux / macOS / WSL2): tmux (POSIX 正準 backend)。
-    明示の `--backend` / 環境変数 SPIKE_BACKEND が優先される。
+    明示の `--backend` / 環境変数 ORG_BACKEND が優先される。
     """
-    env = os.environ.get("SPIKE_BACKEND")
+    env = os.environ.get("ORG_BACKEND")
     if env:
         return env
     if os.name == "nt" or sys.platform.startswith("win"):

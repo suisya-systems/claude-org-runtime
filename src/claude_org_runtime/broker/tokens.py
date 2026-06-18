@@ -2,8 +2,8 @@
 """token ↔ agent/pane bind の保持 (broker の認証/登録状態)。
 
 設計 SoT: docs/design/renga-decoupling.md §4.4 (per-agent token + static
-headers)。canonical 実装: claude-org-transport-lab spike/broker.py の
-faithful port。
+headers)。現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/broker.py の faithful port。
 
 :class:`AgentBind` は broker のみが保持する bind レコード。:class:`TokenMixin`
 は bind 表 (``_binds``) を操作するメソッド群で、:class:`~claude_org_runtime.

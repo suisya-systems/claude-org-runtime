@@ -140,7 +140,7 @@ ambient 端末も同様に daemon からは駆動できない (§3)。
 backend を問わず成立しない:
 
 - **tmux (isolated_session=True)**: daemon の adapter は専用 socket
-  (`-L <SPIKE_SOCKET>`) で `list-panes` する (`terminal/tmux.py:81,84,94,113-115`)。
+  (`-L <BROKER_SOCKET>`) で `list-panes` する (`terminal/tmux.py:81,84,94,113-115`)。
   human の ambient 端末は**その socket から見えない** = 解決不能 = send_keys 不能。
 - **wezterm (isolated_session=False)**: `wezterm cli list` は global mux を返すので
   human の ambient pane は**見えるが匿名** (name/role=None)。secretary bind との

@@ -2,9 +2,9 @@
 """org-broker サーバー本体 (orchestrator)。
 
 設計 SoT: docs/design/renga-decoupling.md §4 (broker/adapter 設計)・§4.3
-(ナッジ配達)。canonical 実装: claude-org-transport-lab spike/broker.py
-(Phase 4/5 で確定した MCP surface + allowlist guard + session 検証) の
-faithful port。
+(ナッジ配達)。現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/broker.py (Phase 4/5 で MCP surface + allowlist guard + session 検証を確定) を
+faithful port したもの。
 
 :class:`Broker` は単一 stateful クラスで、token bind (:class:`~claude_org_runtime.
 broker.tokens.TokenMixin`) と queue store (:class:`~claude_org_runtime.broker.
@@ -554,7 +554,7 @@ class Broker(TokenMixin, StoreMixin):
         # 窓口を adapter の外に隠し、かつ (b) 閉じる対象が broker 管理 pane** の時に
         # 限る (= 窓口が adapter から見えない backend で、自分が spawn した pane を
         # 閉じる時だけ窓口を +1)。
-        #   - isolated-socket backend (tmux, -L claude-org-spike, isolated_session=
+        #   - isolated-socket backend (tmux, -L claude-org-broker, isolated_session=
         #     True): adapter.list_panes() に窓口が出ないため、子 1 つだけでも窓口を
         #     +1 して [last_pane] 誤判定を防ぐ (= Issue #57 の本丸)。窓口は別 socket
         #     に常駐するので +1 は常に妥当 (stale にならない)。
