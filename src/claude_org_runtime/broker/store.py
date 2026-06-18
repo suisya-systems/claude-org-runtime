@@ -2,7 +2,8 @@
 """queue store + journal — daemon 所有の三状態配送ライフサイクル (push 一次配送)。
 
 設計 SoT: docs/design/broker-native-roles.md §9.3 (配送ライフサイクル) / §9.4
-(delivery-scoped token) / Set D 2.3 (drain semantics の amend)。canonical 実装:
+(delivery-scoped token) / Set D 2.3 (drain semantics の amend)。現行 canonical は
+本モジュール。歴史的 origin:
 claude-org-transport-lab spike/k1_daemon.py (PR #24 merge 28a4cb2、tool-less
 channel-only idle-wake が実機 PASS) の三状態モデルを、既存の broker queue store
 (spike/broker.py 由来の agent_id 別 inbox) へ **加算移植** したもの。

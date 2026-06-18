@@ -3,8 +3,8 @@
 
 設計 SoT: docs/design/ja-migration-plan.md §4 (runtime 抽出設計) /
 docs/design/renga-decoupling.md §4.7 (adapter 境界と能力表)。
-canonical 実装: claude-org-transport-lab spike/wezterm_adapter.py
-(Phase 1 で検証済。本 subpackage への faithful port)。
+現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/wezterm_adapter.py (Phase 1 で検証され本 subpackage に faithful port された)。
 
 スパイク要求面 (事前 codex design review 確定事項 (1)):
   spawn / send-text / get-text / list の 4 面。
@@ -15,7 +15,7 @@ canonical 実装: claude-org-transport-lab spike/wezterm_adapter.py
 - adapter は spawn した pane の window_id / tab_id / pane_id を保持する。
 - 承認打鍵 (Enter 相当) は send-text --no-paste + CR で行う (確定事項 (1))。
   send-text 既定は bracketed paste 動作のため CR が Enter として解釈されない。
-- spike は自分が spawn した pane のみ操作する。既存 pane (renga 等) には触らない。
+- 本 backend は自分が spawn した pane のみ操作する。既存 pane (renga 等) には触らない。
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ class WezTermAdapter:
 
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: int) -> None:
-        """spawn した検証 pane の後始末 (kill-pane)。spike 内部用。"""
+        """spawn した検証 pane の後始末 (kill-pane)。本 backend 内部用。"""
         self._cli("kill-pane", "--pane-id", str(pane_id), check=False)
 
 

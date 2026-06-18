@@ -17,7 +17,7 @@ from claude_org_runtime.terminal import tmux as tmux_mod
 from claude_org_runtime.terminal.tmux import TmuxAdapter
 
 # A full list-panes -F record (11 tab fields in _LIST_FIELDS order).
-_PANE_LINE = "%1\t@0\tspike-1-1\t0\t0\t220\t50\t5\t10\t1\t12345"
+_PANE_LINE = "%1\t@0\tclaude-org-broker-1-1\t0\t0\t220\t50\t5\t10\t1\t12345"
 
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def adapter(monkeypatch: pytest.MonkeyPatch, fake_run) -> TmuxAdapter:
 
 def _args(call: list[str]) -> list[str]:
     # Strip the [exe, "-L", socket] prefix the adapter always prepends.
-    assert call[:3] == ["tmux", "-L", "claude-org-spike"]
+    assert call[:3] == ["tmux", "-L", "claude-org-broker"]
     return call[3:]
 
 
@@ -93,7 +93,7 @@ def test_get_text_with_escapes(adapter: TmuxAdapter) -> None:
 # --------------------------------------------------------------------------
 
 def test_spawn_constructs_new_session(adapter: TmuxAdapter) -> None:
-    adapter._fake.queue((0, "%2\t@1\tspike-9-1", ""))
+    adapter._fake.queue((0, "%2\t@1\tclaude-org-broker-9-1", ""))
     ref = adapter.spawn(["claude", "--flag"], cwd="/work/dir")
     assert (ref.pane_id, ref.window_id, ref.tab_id) == ("%2", "@1", "@1")
     args = _args(adapter._fake.last)
@@ -107,7 +107,7 @@ def test_spawn_constructs_new_session(adapter: TmuxAdapter) -> None:
 
 
 def test_spawn_without_cwd_omits_c_flag(adapter: TmuxAdapter) -> None:
-    adapter._fake.queue((0, "%3\t@2\tspike-9-2", ""))
+    adapter._fake.queue((0, "%3\t@2\tclaude-org-broker-9-2", ""))
     adapter.spawn(["cat"])
     assert "-c" not in _args(adapter._fake.last)
 
@@ -123,7 +123,7 @@ def test_list_panes_parses_record(adapter: TmuxAdapter) -> None:
     rec = panes[0]
     assert rec["pane_id"] == "%1"
     assert rec["window_id"] == "@0"
-    assert rec["session"] == "spike-1-1"
+    assert rec["session"] == "claude-org-broker-1-1"
     # geometry / cursor / pid coerced to int
     for k in ("left", "top", "width", "height", "cursor_x", "cursor_y", "pane_pid"):
         assert isinstance(rec[k], int)
@@ -189,6 +189,6 @@ def test_find_tmux_raises_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_tmux_is_isolated_session() -> None:
-    # dedicated socket (-L claude-org-spike) で分離するため isolated_session=True。
+    # dedicated socket (-L claude-org-broker) で分離するため isolated_session=True。
     # broker の last-pane ガードが論理ペイン (窓口) を計上してよい backend である根拠。
     assert TmuxAdapter.isolated_session is True

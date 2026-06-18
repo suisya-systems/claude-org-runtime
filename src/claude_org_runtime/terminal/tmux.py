@@ -3,8 +3,8 @@
 
 設計 SoT: docs/design/ja-migration-plan.md §4 (runtime 抽出設計) /
 docs/design/renga-decoupling.md §4.7 (adapter 境界と能力表)。
-canonical 実装: claude-org-transport-lab spike/tmux_adapter.py
-(Phase 2 で検証済。本 subpackage への faithful port)。
+現行 canonical は本モジュール。歴史的 origin: claude-org-transport-lab
+spike/tmux_adapter.py (Phase 2 で検証され本 subpackage に faithful port された)。
 
 WezTerm adapter (Phase 1) と同一の `TerminalAdapter` 面を実装し、AC-1 / AC-2
 ハーネスを backend 非依存に green にする。
@@ -20,8 +20,8 @@ tmux が WezTerm より素直な点 (Issue #2 が活かせと言う点):
   GUI / ディスプレイ無しで spawn → capture-pane が成立する (WSL2 / CI 向き)。
 
 分離 (設計書 §7.5 / Phase 1 README の本体非干渉方針の踏襲):
-- 専用 socket (`-L claude-org-spike`) 上に session を作り、既存 tmux サーバー
-  (もし renga 等が使っていても) と完全に分離する。spike は自分が作った session の
+- 専用 socket (`-L claude-org-broker`) 上に session を作り、既存 tmux サーバー
+  (もし renga 等が使っていても) と完全に分離する。本 backend は自分が作った session の
   pane (`%N`) のみ操作する。
 - session 名は pid + 連番でユニーク化し、並走・再実行で衝突しない。
 
@@ -44,7 +44,7 @@ from typing import ClassVar
 from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
 
 # 専用 socket 名: 既存 tmux サーバーと分離する (本体非干渉)。
-SPIKE_SOCKET = "claude-org-spike"
+BROKER_SOCKET = "claude-org-broker"
 
 # detached session の仮想端末サイズ。80x24 だと Claude TUI が折返し過多で
 # プロンプト / ヒント行の検出が不安定になるため広めに取る。
@@ -74,14 +74,14 @@ def find_tmux() -> str:
 
 @dataclass
 class TmuxAdapter:
-    # 専用 socket (-L claude-org-spike) で既存サーバーと完全分離するため、
+    # 専用 socket (-L claude-org-broker) で既存サーバーと完全分離するため、
     # list_panes() は自分が spawn した pane のみ見せる (人間の窓口 pane は出ない)。
     # broker の last-pane ガードが論理ペイン (窓口) を +1 計上してよい backend。
     # backend 固定の能力なので ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = True
 
     exe: str = field(default_factory=find_tmux)
-    socket: str = SPIKE_SOCKET
+    socket: str = BROKER_SOCKET
     timeout: float = 15.0
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
@@ -107,7 +107,7 @@ class TmuxAdapter:
         return proc
 
     def _new_session_name(self) -> str:
-        return f"spike-{os.getpid()}-{next(self._counter)}"
+        return f"claude-org-broker-{os.getpid()}-{next(self._counter)}"
 
     # ------------------------------------------------------------------ list
     def list_panes(self) -> list[dict]:
@@ -158,7 +158,7 @@ class TmuxAdapter:
     ) -> PaneRef:
         """新しい detached session に argv を起動し PaneRef を返す。
 
-        tmux の「ウィンドウ」相当は session (spike は常に専用 socket 上の
+        tmux の「ウィンドウ」相当は session (本 backend は常に専用 socket 上の
         新規 session で検証する)。new_window は WezTerm 面との互換のため受けるが、
         tmux では常に新 session を作る (既存 renga 等の pane には触らない)。
         """
@@ -194,7 +194,7 @@ class TmuxAdapter:
         複数行の改行が行ごとの submit に化けないよう bracketed paste を使う
         (`set-buffer` → `paste-buffer -p`)。-d で paste 後にバッファを掃除する。
         """
-        buf = f"spike-buf-{os.getpid()}-{next(self._counter)}"
+        buf = f"claude-org-broker-buf-{os.getpid()}-{next(self._counter)}"
         self._tmux("set-buffer", "-b", buf, "--", text)
         self._tmux("paste-buffer", "-t", str(pane_id), "-b", buf, "-p", "-d")
 
@@ -222,11 +222,11 @@ class TmuxAdapter:
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: str) -> None:
         """spawn した検証 pane の後始末 (kill-pane)。単一 pane の session なら
-        session ごと消える。spike 内部用。"""
+        session ごと消える。本 backend 内部用。"""
         self._tmux("kill-pane", "-t", str(pane_id), check=False)
 
     def kill_server(self) -> None:
-        """専用 socket のサーバーごと落とす (全 spike session の一括後始末)。"""
+        """専用 socket のサーバーごと落とす (本 backend が作った全 session の一括後始末)。"""
         self._tmux("kill-server", check=False)
 
 

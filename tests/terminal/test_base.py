@@ -117,20 +117,20 @@ def test_wait_for_state_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------
 
 def test_default_backend_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SPIKE_BACKEND", "wezterm")
+    monkeypatch.setenv("ORG_BACKEND", "wezterm")
     monkeypatch.setattr(base.os, "name", "posix")
     assert default_backend() == "wezterm"
 
 
 def test_default_backend_posix_is_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SPIKE_BACKEND", raising=False)
+    monkeypatch.delenv("ORG_BACKEND", raising=False)
     monkeypatch.setattr(base.os, "name", "posix")
     monkeypatch.setattr(base.sys, "platform", "linux")
     assert default_backend() == "tmux"
 
 
 def test_default_backend_windows_is_wezterm(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SPIKE_BACKEND", raising=False)
+    monkeypatch.delenv("ORG_BACKEND", raising=False)
     monkeypatch.setattr(base.os, "name", "nt")
     monkeypatch.setattr(base.sys, "platform", "win32")
     assert default_backend() == "wezterm"
@@ -175,7 +175,7 @@ def test_make_adapter_wezterm_branch(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_make_adapter_uses_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     from claude_org_runtime.terminal import tmux as tmux_mod
 
-    monkeypatch.setenv("SPIKE_BACKEND", "tmux")
+    monkeypatch.setenv("ORG_BACKEND", "tmux")
     monkeypatch.setattr(tmux_mod.shutil, "which", lambda _n: "/fake/bin/tmux")
     assert isinstance(make_adapter(), tmux_mod.TmuxAdapter)
 
