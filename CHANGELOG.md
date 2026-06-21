@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-06-22
+
+### Fixed
+
+- `settings`: `generator.py` now emits `sandbox.filesystem.denyRead` /
+  `denyWrite` as the contract's list-of-strings (absolute path or glob)
+  instead of the internal structured-dict shape. Claude Code's settings
+  schema rejected the dict form, so `/doctor` reported "Expected string,
+  but received object" for every anchor entry. A new
+  `_kept_entry_string()` helper folds a *kept* entry's resolved anchor +
+  substituted path into a concrete absolute path/glob at emit time (raw
+  strings pass through; a malformed `anchor='absolute'` + relative path
+  is left as the dict for launcher / drift CI to surface). No deny is
+  lost: `layer2Fallback` is already mirrored into `permissions.deny`, and
+  the internal dict model (suppression metadata, `--explain`, `$comment`)
+  is preserved untouched. Conforms to
+  `docs/contracts/sandbox-launcher-contract.md` §2.1 / §6.4. Closes
+  `claude-org-runtime#97`.
+
 ## [0.1.29] - 2026-06-18
 
 Hard rename of the tmux backend's dedicated tmux socket (and its generated
