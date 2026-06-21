@@ -480,6 +480,54 @@ class RenderResult:
     sandbox: SandboxMetadata
 
 
+def _kept_entry_string(
+    entry: Any, anchor_base: str, substituted_path: str
+) -> Any:
+    """Normalize a *kept* deny entry to the contract's string form.
+
+    ``sandbox.filesystem.denyRead`` / ``denyWrite`` are a list of
+    strings (absolute path or glob) per
+    ``docs/contracts/sandbox-launcher-contract.md`` §2.1 / §6.4: the
+    bwrap launcher consumes the rendered ``settings.local.json``
+    directly, and Claude Code's settings schema rejects a structured
+    object in these arrays. Emitting the internal structured-dict shape
+    there is the bug this normalization fixes -- it made ``/doctor``
+    report "Expected string, but received object" for every dict entry.
+
+    A kept structured-dict entry is resolved to its concrete absolute
+    path / glob by joining the (already anchor-resolved) ``anchor_base``
+    with the (already substituted) ``substituted_path``. The dict's
+    authoring-only metadata is intentionally dropped from the emitted
+    file: ``anchor`` is folded into the absolute path, ``layer2Fallback``
+    is already mirrored into ``permissions.deny`` (so no deny is lost),
+    and a *suppressed* entry still surfaces its anchor in the ``$comment``
+    note via :func:`_format_entry_for_comment`. The internal model
+    (suppression metadata, schema input) keeps the dict untouched.
+
+    Pass-throughs (returned unchanged):
+
+    - Raw-string entries -- already contract-compliant, so
+      operator-authored strings and pre-existing fixtures stay
+      byte-stable.
+    - Malformed structured entries with no concrete absolute rendering
+      (``anchor='absolute'`` paired with a *relative* path, i.e. an
+      empty ``anchor_base``) -- kept as the original dict so the
+      launcher / drift CI surfaces the operator error rather than this
+      code silently anchoring the path against the wrong base.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    if substituted_path.startswith("/"):
+        # Already absolute (anchor='absolute', or an absolute path under
+        # any anchor): emit verbatim.
+        return substituted_path
+    if not anchor_base:
+        # anchor='absolute' with a relative path -- malformed, no base
+        # to join against; keep the original dict (see docstring).
+        return entry
+    return os.path.join(anchor_base, substituted_path)
+
+
 def _evaluate_sandbox_suppressions(
     sandbox: dict,
     ctx: GeneratorContext,
@@ -546,7 +594,9 @@ def _evaluate_sandbox_suppressions(
                 # Absolute pure-glob (e.g. ``/*``) -- without fnmatch'ing
                 # the actual filesystem we can't compute reachability,
                 # so keep the entry as-is.
-                kept.append(entry)
+                kept.append(
+                    _kept_entry_string(entry, anchor_base, substituted_path)
+                )
                 continue
             if literal is None:
                 # Pure-glob anchored at the entry's anchor (worker_dir
@@ -555,7 +605,11 @@ def _evaluate_sandbox_suppressions(
                 if normalized.anchor == "absolute":
                     # No anchor base to fall back on; can't reason
                     # about reachability without literal -> keep.
-                    kept.append(entry)
+                    kept.append(
+                        _kept_entry_string(
+                            entry, anchor_base, substituted_path
+                        )
+                    )
                     continue
                 target_literal = anchor_base
                 anchored_relative_glob = True
@@ -574,16 +628,26 @@ def _evaluate_sandbox_suppressions(
                     # (no anchor base to join against). Resolving it
                     # against CWD would produce surprising suppressions,
                     # so keep-as-is and let the launcher / drift CI
-                    # surface the issue.
-                    kept.append(entry)
+                    # surface the issue. ``_kept_entry_string`` returns
+                    # the original dict here (empty anchor_base), so the
+                    # malformed entry is preserved verbatim.
+                    kept.append(
+                        _kept_entry_string(
+                            entry, anchor_base, substituted_path
+                        )
+                    )
                     continue
 
             target_rp = realpath_fn(target_literal)
             if _is_inside_root(target_rp, read_roots):
-                kept.append(entry)
+                kept.append(
+                    _kept_entry_string(entry, anchor_base, substituted_path)
+                )
                 continue
             if not normalized.suppress_on_symlink_escape:
-                kept.append(entry)
+                kept.append(
+                    _kept_entry_string(entry, anchor_base, substituted_path)
+                )
                 continue
             if anchored_relative_glob:
                 reason = (
