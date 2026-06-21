@@ -1044,8 +1044,14 @@ def _structured(
     }
 
 
-def test_structured_entry_round_trip_preserved_in_kept_output(tmp_path: Path) -> None:
-    """Structured entries that survive suppression round-trip unchanged."""
+def test_structured_entry_rendered_as_string_in_kept_output(tmp_path: Path) -> None:
+    """A surviving structured entry is normalized to its absolute-path string.
+
+    ``sandbox.filesystem.denyRead`` is a list-of-strings per
+    sandbox-launcher-contract.md §2.1, so a kept ``{anchor, path}`` entry
+    renders as ``<worker_dir>/secrets.env`` -- emitting the dict here is
+    what tripped Claude Code's settings schema / ``/doctor``.
+    """
     worker_dir = str(tmp_path / "wd")
     os.makedirs(worker_dir, exist_ok=True)
     entry = _structured("worker_dir", "secrets.env")
@@ -1062,7 +1068,51 @@ def test_structured_entry_round_trip_preserved_in_kept_output(tmp_path: Path) ->
         wsl_detector=lambda: False,
     )
     assert result.sandbox.suppressions == []
-    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [entry]
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [
+        os.path.join(worker_dir, "secrets.env")
+    ]
+
+
+def test_kept_structured_entries_emit_only_strings(tmp_path: Path) -> None:
+    """Regression: the emitted denyRead is all strings, never a dict.
+
+    Mirrors the real worker profile that made ``/doctor`` reject the
+    settings with "Expected string, but received object": worker_dir-
+    anchored credential globs that survive suppression must serialize as
+    absolute-path/glob strings so Claude Code's settings schema accepts
+    them. Each ``{anchor, path}`` resolves against worker_dir.
+    """
+    worker_dir = str(tmp_path / "wd")
+    os.makedirs(worker_dir, exist_ok=True)
+    entries = [
+        _structured("worker_dir", ".env"),
+        _structured("worker_dir", ".env.*"),
+        _structured("worker_dir", "**/credentials*"),
+        _structured("worker_dir", "**/*.pem"),
+    ]
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(deny_read=entries),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path=str(tmp_path / "co"),
+        realpath_fn=lambda p: p,
+        wsl_detector=lambda: False,
+    )
+    assert result.sandbox.suppressions == []
+    deny_read = result.settings["sandbox"]["filesystem"]["denyRead"]
+    # The whole point of the fix: no structured dict leaks into the file.
+    assert all(isinstance(e, str) for e in deny_read)
+    assert deny_read == [
+        os.path.join(worker_dir, ".env"),
+        os.path.join(worker_dir, ".env.*"),
+        os.path.join(worker_dir, "**/credentials*"),
+        os.path.join(worker_dir, "**/*.pem"),
+    ]
 
 
 def test_legacy_string_and_structured_entry_coexist(tmp_path: Path) -> None:
@@ -1088,9 +1138,10 @@ def test_legacy_string_and_structured_entry_coexist(tmp_path: Path) -> None:
     )
     assert result.sandbox.suppressions == []
     kept = result.settings["sandbox"]["filesystem"]["denyRead"]
+    # Legacy strings pass through unchanged; structured entries are
+    # normalized to their absolute-path string (contract §2.1).
     assert kept[0] == "secrets.env"
-    assert kept[1]["anchor"] == "worker_dir"
-    assert kept[1]["path"] == "private.key"
+    assert kept[1] == os.path.join(worker_dir, "private.key")
 
 
 def test_home_anchor_realpath_evaluated_against_home() -> None:
@@ -1172,10 +1223,11 @@ def test_absolute_anchor_literal_path_round_trip() -> None:
         realpath_fn=lambda p: p,
         wsl_detector=lambda: False,
     )
-    # /etc/shadow is inside additionalDirectories=/etc -> kept.
+    # /etc/shadow is inside additionalDirectories=/etc -> kept. anchor=
+    # absolute renders verbatim as the contract string (no base join).
     assert result.sandbox.suppressions == []
     assert (
-        result.settings["sandbox"]["filesystem"]["denyRead"][0]["path"]
+        result.settings["sandbox"]["filesystem"]["denyRead"][0]
         == "/etc/shadow"
     )
 
@@ -1231,8 +1283,11 @@ def test_suppress_on_symlink_escape_false_keeps_entry() -> None:
         wsl_detector=lambda: True,
     )
     assert result.sandbox.suppressions == []
+    # The entry is kept (escape suppression opted out) and normalized to
+    # its absolute-path string; suppressOnSymlinkEscape is authoring-only
+    # metadata that does not appear in the emitted list-of-strings.
     kept = result.settings["sandbox"]["filesystem"]["denyRead"][0]
-    assert kept["suppressOnSymlinkEscape"] is False
+    assert kept == os.path.join(worker_dir, "secrets.env")
 
 
 def test_pattern_b_substitution_in_entry_path_and_additional_directories() -> None:
@@ -1266,8 +1321,9 @@ def test_pattern_b_substitution_in_entry_path_and_additional_directories() -> No
     assert fs["additionalDirectories"] == [f"{base_clone}/.git"]
     # The rendered entry carries the substituted path -- the bwrap
     # launcher consumes the rendered settings.local.json directly so
-    # concrete paths (not templates) must appear in the output.
-    assert fs["denyRead"][0]["path"] == f"{base_clone}/.git/config"
+    # concrete paths (not templates) must appear in the output, and as a
+    # contract-§2.1 string rather than a structured dict.
+    assert fs["denyRead"][0] == f"{base_clone}/.git/config"
     # Reachability evaluation used the substituted path, so the entry
     # is kept (it is inside the substituted additionalDirectory).
     assert result.sandbox.suppressions == []
