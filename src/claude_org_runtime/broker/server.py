@@ -586,7 +586,14 @@ class Broker(TokenMixin, StoreMixin):
                 b = self._binds[tok]
                 b.revoked = True
                 b.registered = False
-        if agent_id:
+        # delivery 掃除は **token-backed pane** に限る (tok が真の時のみ)。generic
+        # spawn_pane は token=None で登録され、channel sidecar も delivery cred も queue
+        # 行も持たない。その meta agent_id は bind-only の別 live agent (admin_mint_token
+        # で mint された同名 channel agent 等) と衝突しうる (名前空間が非交差) ため、
+        # token 無し pane の reap/close で無関係な live agent の delivery state
+        # (cred / mode / 未配達行) を巻き込むと誤って配送を壊す (Codex review P2)。
+        # token 有り pane では agent_id == token の owner なので従来どおり full 掃除する。
+        if tok and agent_id:
             self.revoke_delivery_creds(agent_id)
             self.reset_delivery_state(agent_id)
             # 未配達行も破棄する: revoked bind は uniqueness から除外され同名 re-spawn が

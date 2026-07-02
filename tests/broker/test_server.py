@@ -847,3 +847,35 @@ def test_close_pane_still_full_cleanup_after_helper_refactor(tmp_path, fake_adap
     events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
     assert any(e["event"] == "pane_closed" and e.get("pane_id") == h for e in events)
     assert not any(e["event"] == "pane_reaped" and e.get("pane_id") == h for e in events)
+
+
+def test_reap_of_tokenless_generic_pane_spares_live_namesake_delivery(tmp_path):
+    """generic spawn_pane (token=None) の自己終了 reap は、同名の bind-only live
+    agent (admin-mint された channel agent 等) の delivery state を巻き込まない。
+
+    generic pane は channel sidecar / delivery cred / queue 行を持たず、その meta
+    agent_id は別 live agent と名前空間非交差で衝突しうる。token 無し pane の掃除で
+    無関係 agent の配送を壊さないことを固定する (Codex review P2)。"""
+    from claude_org_runtime.broker.store import QueueRow
+
+    fake_adapter = FakeAdapter()
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)   # focused host pane
+    sec = _ops(b, agent_id="sec", role="secretary")
+    # live な bind-only channel agent "foo" (delivery cred + 未配達行 + PULL state)。
+    b.issue_token("foo", "foo", "worker")
+    cred = b.issue_delivery_cred("foo")
+    b._rows["r1"] = QueueRow(id="r1", to_id="foo", entry={"message": "keep me"})
+    b._delivery_modes["foo"] = "PULL"
+    # 同名の generic pane を spawn (token=None、名前空間は _pane_meta 側のみ)。
+    dispatch_tool(b, sec, "spawn_pane", {"direction": "vertical", "name": "foo"})
+    h = fake_adapter.spawned[-1]["handle"]
+    assert b._meta_for(h)["token"] is None
+    # generic pane が自己終了 -> 入口 reap。
+    fake_adapter.terminate(h)
+    assert b.resolve_target("focused") is not None   # reap を駆動
+    assert b._meta_for(h) is None                    # 死んだ generic pane の meta は落ちる
+    # だが同名 live agent "foo" の delivery state は無傷。
+    assert b.get_bind(cred) is not None              # delivery cred は revoke されない
+    assert "r1" in b._rows                            # 未配達行は残る
+    assert b._delivery_modes.get("foo") == "PULL"    # delivery state は維持
