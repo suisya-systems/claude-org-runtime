@@ -92,6 +92,17 @@ class FakeAdapter:
         self._screens.pop(pane_id, None)
         self.killed.append(pane_id)
 
+    # simulate a pane that exits on its own (self-termination) --------------
+    def terminate(self, pane_id) -> None:
+        """Drop a pane WITHOUT going through ``kill_pane``.
+
+        Models a managed pane whose process exited by itself: it vanishes from
+        ``list_panes`` but the broker never called ``kill_pane`` (not recorded
+        in ``self.killed``). Used to exercise the opportunistic reap path.
+        """
+        self._panes.pop(pane_id, None)
+        self._screens.pop(pane_id, None)
+
 
 @pytest.fixture
 def fake_adapter():

@@ -369,6 +369,11 @@ class Broker(TokenMixin, StoreMixin):
             return None
         # adapter I/O は lock 外で先に済ませる (lock 下で I/O しない契約)。
         panes = self._adapter_panes()
+        # registry を信じる入口の opportunistic reap: adapter snapshot に無い自己終了
+        # managed pane をここで掃除し、表示 (list_panes_view) と解決・予約の非対称を
+        # 埋める。取得済み snapshot を渡して二重 list_panes を避ける。解決ロジック自体
+        # (下の三系統マッチ) は不変で、入口で共通 cleanup helper を呼ぶ形に留める。
+        self._reap_stale_managed_panes(panes)
         if target == "focused":
             for p in panes:
                 if p.get("active"):
@@ -547,6 +552,92 @@ class Broker(TokenMixin, StoreMixin):
                 self.adapter.send_interrupt(handle)
         return _ok({"ok": True, "target": target})
 
+    # ---------------------------------------------------- pane: 共通 cleanup / reap
+    def _cleanup_pane(self, handle: "PaneId") -> tuple[str | None, bool]:
+        """pane の bookkeeping を掃除する — close_pane と自己終了 reap の共通経路。
+
+        明示 close (:meth:`close_pane_target`) と入口 opportunistic reap
+        (:meth:`_reap_stale_managed_panes`) の両方から呼ぶ単一 helper。**adapter I/O
+        (kill_pane) は呼ばない**: close は呼び元が明示 kill し、reap 対象は既に消えた
+        pane なので kill 不要。掃除内容は切戻し §5.5 と同一:
+
+          1. ``_pane_meta`` から pop (org メタの単一出所を落とす)
+          2. bind の full revoke (``revoked=True`` / ``registered=False``) —
+             spawn 直後の ``issue_token(unique=True)`` が未 revoke bind を見て
+             ``[name_taken]`` を返す幽霊 binding を断つ (本 Issue の本丸)
+          3. delivery-scoped credential の revoke
+          4. delivery_mode / epoch のリセット
+          5. 未配達 queue 行の破棄 (revoked bind は uniqueness から外れ同名 re-spawn
+             できるため、残すとクロスセッション誤配送になる)
+
+        lock 規律: meta pop と bind revoke は ``_lock`` 下で原子的に、自前で ``_lock``
+        を取る delivery 掃除 (revoke/reset/discard) は lock 解放後に呼ぶ (非再入 Lock
+        の二重取得回避 — 既存 close 経路と同じ順序)。``pane_exited`` event 発行と
+        journal は経路別 (pane_closed / pane_reaped) に呼び元が行う。
+
+        返り値 ``(agent_id, found)``: ``found=False`` は既に掃除済み (並行 close/reap
+        に先を越された二重掃除) を表す。
+        """
+        with self._lock:
+            meta = self._pane_meta.pop(str(handle), None)
+            agent_id = meta.get("agent_id") if meta else None
+            tok = meta.get("token") if meta else None
+            if tok and tok in self._binds:
+                b = self._binds[tok]
+                b.revoked = True
+                b.registered = False
+        if agent_id:
+            self.revoke_delivery_creds(agent_id)
+            self.reset_delivery_state(agent_id)
+            # 未配達行も破棄する: revoked bind は uniqueness から除外され同名 re-spawn が
+            # 可能なため、残すと旧セッション宛の行を新しい同名 agent が drain/claim する
+            # クロスセッション誤配送になる (Codex review Major / 切戻し §5.5(5))。
+            self.discard_agent_rows(agent_id)
+        return agent_id, meta is not None
+
+    def _reap_stale_managed_panes(self, panes: list[dict] | None = None) -> None:
+        """adapter snapshot に無い broker 管理 pane (自己終了) を掃除する。
+
+        registry を信じる入口 (:meth:`resolve_target` / :meth:`_reserve_name`、後者
+        経由で spawn 群 / 前者経由で set_pane_identity・close・inspect・send_keys) から
+        共有で呼ぶ opportunistic reap。``list_panes_view`` は既に「adapter snapshot に
+        いる pane のみ live」と判定しているが (表示面)、予約・解決の入口はそれを見て
+        いなかった — その非対称 (表示と予約の不一致) が幽霊 binding の根本。ここで両者を
+        揃える。
+
+        検知は background polling 常駐ではなく adapter snapshot による最小構成:
+        ``_pane_meta`` の非 logical entry で、handle が adapter の live 集合に**いない**
+        ものを stale (= pane 自己終了) とみなし、close と同じ :meth:`_cleanup_pane` で
+        掃除する。**logical pane (human-driven の窓口、adapter 実体を持たない) は reap
+        対象外** — adapter snapshot に永遠に出ないため、reap すると窓口が消える。
+
+        adapter I/O (list_panes) は lock 外。呼び元が既に snapshot を持つ場合は
+        ``panes`` で渡して二重 I/O を避ける (resolve_target の hot path 用)。close と
+        違い adapter.kill_pane は呼ばない (対象は既に消えている)。reap した pane には
+        ``pane_exited`` event を発行し ``pane_reaped`` を journal する (明示 close は
+        ``pane_closed``。dispatcher の poll_events(pane_exited) 依存に合わせ event type
+        は close と揃え、journal 語彙のみ検知経路で区別する — Surface 3)。
+        """
+        if self.adapter is None:
+            return
+        if panes is None:
+            panes = self._adapter_panes()
+        live = {str(p.get("pane_id")) for p in panes}
+        with self._lock:  # stale 抽出のみ lock 下 (cleanup 自体は _cleanup_pane が再取得)
+            stale = [
+                m["handle"]
+                for hk, m in self._pane_meta.items()
+                if hk not in live and not m.get("logical")
+            ]
+        for handle in stale:
+            agent_id, found = self._cleanup_pane(handle)
+            if not found:
+                continue  # 並行 close/reap が先に掃除した
+            self._emit_event(
+                {"type": "pane_exited", "pane_id": handle, "agent_id": agent_id}
+            )
+            self._journal("pane_reaped", pane_id=handle, agent_id=agent_id)
+
     def close_pane_target(self, target: str) -> dict:
         """pane を閉じる (renga close_pane 同形)。token を revoke しイベントを emit。"""
         if self.adapter is None:
@@ -594,27 +685,11 @@ class Broker(TokenMixin, StoreMixin):
         if effective_count <= 1:
             return _err("[last_pane] cannot close the last pane of the only tab")
         self.adapter.kill_pane(handle)
-        # registry の pop と token revoke を 1 ロックスコープで原子的に行う。
-        with self._lock:
-            meta = self._pane_meta.pop(str(handle), None)
-            agent_id = meta.get("agent_id") if meta else None
-            tok = meta.get("token") if meta else None
-            if tok and tok in self._binds:
-                b = self._binds[tok]
-                b.revoked = True
-                b.registered = False
-        # 切戻し §5.5 第 6 ステップ: per-pane channel sidecar の reap に伴う
-        # delivery-scoped credential revoke + delivery_mode/epoch reset。pane kill で
-        # sidecar プロセスは道連れに落ちるが、daemon 側の delivery cred / mode は
-        # 明示的に掃除して orphan 化させない (revoke / reset は自前で _lock を取るため
-        # 上の registry スコープの外で呼ぶ — 非再入 Lock の二重取得回避)。
-        if agent_id:
-            self.revoke_delivery_creds(agent_id)
-            self.reset_delivery_state(agent_id)
-            # 未配達行も破棄する: revoked bind は uniqueness から除外され同名 re-spawn が
-            # 可能なため、残すと旧セッション宛の行を新しい同名 agent が drain/claim する
-            # クロスセッション誤配送になる (Codex review Major / 切戻し §5.5(5))。
-            self.discard_agent_rows(agent_id)
+        # bookkeeping 掃除は自己終了 reap と共通の helper に寄せる (meta pop / token
+        # full revoke / delivery cred revoke / delivery state reset / 未配達行破棄)。
+        # close は明示 kill 済みなので found に関係なく pane_exited を emit し
+        # pane_closed を journal する (reap 経路は pane_reaped で区別する)。
+        agent_id, _found = self._cleanup_pane(handle)
         self._emit_event({"type": "pane_exited", "pane_id": handle, "agent_id": agent_id})
         self._journal("pane_closed", pane_id=handle, agent_id=agent_id)
         return _ok({"ok": True, "closed": handle})
@@ -636,6 +711,9 @@ class Broker(TokenMixin, StoreMixin):
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
         # resolve_target は内部で _lock を取るため lock 外で先に呼ぶ (非再入)。
+        # resolve_target が入口 opportunistic reap を兼ねるため、自己終了した managed
+        # pane はここで meta が落ち [pane_not_found] になる (死んだ pane に identity を
+        # 設定できない = 正しい)。set_pane_identity 自身での明示 reap は不要。
         handle = self.resolve_target(target)
         if handle is None:
             return _err(f"[pane_not_found] no pane for target {target!r}")
@@ -739,6 +817,12 @@ class Broker(TokenMixin, StoreMixin):
         TOCTOU で重複 name が通るのを防ぐ (in-flight 予約を含めて検査)。"""
         if name is None:
             return None
+        # 予約前に自己終了 managed pane を reap する: これをしないと spawn 直後の
+        # issue_token(unique=True) が (reap 前の) 未 revoke bind を見て再び
+        # [name_taken] を返し、幽霊 binding で同名 re-spawn が永久に塞がる (本 Issue
+        # の中核。resolve_target 経由の split target 解決でも既に reap 済みだが、
+        # name=None spawn 等で resolve を経ない経路の保険として入口で明示 reap する)。
+        self._reap_stale_managed_panes()
         with self._lock:
             taken = name in self._reserved_names or any(
                 m.get("name") == name for m in self._pane_meta.values()
