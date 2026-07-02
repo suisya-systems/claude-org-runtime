@@ -696,3 +696,186 @@ def test_logical_pane_on_global_mux_does_not_empty_when_root_pane_gone(tmp_path)
     assert "[last_pane]" in out["content"][0]["text"]
     child_h = glob.spawned[-1]["handle"]
     assert child_h not in glob.killed     # mux を空にしない
+
+
+# ================================================ self-termination reap (#103)
+# broker が spawn した pane が自己終了 (プロセス自死) した際、registry を信じる入口
+# (_reserve_name / resolve_target) で adapter snapshot による opportunistic reap を
+# 行い、name binding / token / delivery cred / delivery state / 未配達行を close_pane
+# と共通の helper で掃除することを固定する。幽霊 binding ([name_taken]) の除去が本丸。
+
+def _managed_meta(b, handle):
+    return b._meta_for(handle)
+
+
+def test_self_terminated_pane_reaped_on_respawn_frees_name(tmp_path, fake_adapter):
+    """核心 (#103): 自己終了した managed pane の name は次の同名 spawn で解放される。
+
+    reap 前は issue_token(unique=True) が未 revoke bind を見て [name_taken] を返し、
+    幽霊 binding で同名 re-spawn が永久に塞がる。入口 reap でこれを断つ。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)   # host pane (reap 対象外)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h1 = fake_adapter.spawned[-1]["handle"]
+    tok1 = b._meta_for(h1)["token"]
+    # pane が自己終了する (broker は kill_pane していない = self.killed に載らない)。
+    fake_adapter.terminate(h1)
+    assert h1 not in fake_adapter.killed
+    # 同名で再 spawn: 入口 (_reserve_name / split target 解決) の reap で幽霊 binding が
+    # 掃除され、[name_taken] にならず成功する。
+    out = dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    assert "isError" not in out or out.get("isError") is not True
+    res = _text(out)
+    assert res["agent_id"] == "w"
+    h2 = fake_adapter.spawned[-1]["handle"]
+    assert h2 != h1
+    # 旧 binding は revoke され、旧 meta は落ちている。新 meta は生きている。
+    assert b._binds[tok1].revoked is True
+    assert b._meta_for(h1) is None
+    assert b._meta_for(h2) is not None
+
+
+def test_reap_full_cleanup_via_resolve_entry(tmp_path, fake_adapter):
+    """入口 reap は close_pane と同じ full cleanup を行う: meta pop / token revoke /
+    delivery cred revoke / delivery state reset / 未配達行 discard。"""
+    from claude_org_runtime.broker.store import QueueRow
+
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)   # focused host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = fake_adapter.spawned[-1]["handle"]
+    agent_id = b._meta_for(h)["agent_id"]
+    tok = b._meta_for(h)["token"]
+    # channel sidecar の delivery cred + 未配達 row + PULL flip 済み delivery state を模す。
+    cred = b.issue_delivery_cred(agent_id)
+    b._rows["r1"] = QueueRow(id="r1", to_id=agent_id, entry={"message": "hi"})
+    b._delivery_modes[agent_id] = "PULL"
+    b._epochs[agent_id] = 3
+    # pane 自己終了 -> 入口 (resolve_target) が opportunistic reap する。
+    fake_adapter.terminate(h)
+    assert b.resolve_target("focused") is not None   # host pane 解決 = reap を駆動
+    assert b._meta_for(h) is None                    # meta pop
+    assert b._binds[tok].revoked is True             # token full revoke
+    assert b.get_bind(cred) is None                  # delivery cred revoke
+    assert "r1" not in b._rows                        # 未配達行 discard
+    assert agent_id not in b._delivery_modes          # delivery state reset
+    assert agent_id not in b._epochs
+
+
+def test_reap_emits_pane_exited_and_journals_pane_reaped(tmp_path, fake_adapter):
+    """reap は close と同じ pane_exited event を emit しつつ、journal は pane_reaped で
+    区別する (dispatcher の poll_events(pane_exited) 依存に合わせ event type は統一、
+    検知経路は journal 語彙で分離)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = fake_adapter.spawned[-1]["handle"]
+    agent_id = b._meta_for(h)["agent_id"]
+    base = b.poll_events(None, 0, None)["next_since"]
+    fake_adapter.terminate(h)
+    # 入口 (_reserve_name) 経由で reap を駆動する別 spawn。
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "other"})
+    evs = b.poll_events(base, 0, ["pane_exited"])["events"]
+    exited = [e for e in evs if e.get("pane_id") == h]
+    assert len(exited) == 1
+    assert exited[0]["agent_id"] == agent_id
+    # journal は pane_reaped (pane_closed ではない)。
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert len(reaped) == 1
+    assert reaped[0]["agent_id"] == agent_id
+    assert not any(e["event"] == "pane_closed" and e.get("pane_id") == h for e in events)
+
+
+def test_live_managed_pane_not_reaped(tmp_path, fake_adapter):
+    """生きている managed pane は入口 reap で掃除されない (false-positive reap 回避)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "live"})
+    h = fake_adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    # reap を何度か駆動しても生存 pane は無傷。
+    b.resolve_target("focused")
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "sib"})
+    assert b._meta_for(h) is not None
+    assert b._binds[tok].revoked is False
+    assert h not in fake_adapter.killed
+
+
+def test_logical_pane_is_not_reaped(tmp_path, fake_adapter):
+    """logical pane (human-driven 窓口) は adapter 実体を持たないため reap 対象外。
+
+    adapter snapshot に永遠に出ないので、reap すると窓口が消える。除外を固定する。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    tok, sec = _secretary_with_logical_pane(b)
+    # 子を spawn (= _reserve_name で reap 駆動)。窓口の logical meta は残る。
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    assert b._pane_meta.get("manual-test") is not None
+    assert b._binds[tok].revoked is False
+    # resolve_target 経由でも reap されない。
+    assert b.resolve_target("manual-test") == "manual-test"
+    assert b._pane_meta.get("manual-test") is not None
+
+
+def test_close_pane_still_full_cleanup_after_helper_refactor(tmp_path, fake_adapter):
+    """close_pane を共通 helper に寄せた後も従来どおり full cleanup + pane_closed
+    journal を行う (reap への切り出しで close 経路を退行させない)。"""
+    from claude_org_runtime.broker.store import QueueRow
+
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = fake_adapter.spawned[-1]["handle"]
+    agent_id = b._meta_for(h)["agent_id"]
+    tok = b._meta_for(h)["token"]
+    cred = b.issue_delivery_cred(agent_id)
+    b._rows["r1"] = QueueRow(id="r1", to_id=agent_id, entry={"message": "hi"})
+    out = dispatch_tool(b, disp, "close_pane", {"target": "w"})
+    assert _text(out)["closed"] == h
+    assert h in fake_adapter.killed          # 明示 close は kill する (reap と違う点)
+    assert b._binds[tok].revoked is True
+    assert b._meta_for(h) is None
+    assert b.get_bind(cred) is None
+    assert "r1" not in b._rows
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    assert any(e["event"] == "pane_closed" and e.get("pane_id") == h for e in events)
+    assert not any(e["event"] == "pane_reaped" and e.get("pane_id") == h for e in events)
+
+
+def test_reap_of_tokenless_generic_pane_spares_live_namesake_delivery(tmp_path):
+    """generic spawn_pane (token=None) の自己終了 reap は、同名の bind-only live
+    agent (admin-mint された channel agent 等) の delivery state を巻き込まない。
+
+    generic pane は channel sidecar / delivery cred / queue 行を持たず、その meta
+    agent_id は別 live agent と名前空間非交差で衝突しうる。token 無し pane の掃除で
+    無関係 agent の配送を壊さないことを固定する (Codex review P2)。"""
+    from claude_org_runtime.broker.store import QueueRow
+
+    fake_adapter = FakeAdapter()
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)   # focused host pane
+    sec = _ops(b, agent_id="sec", role="secretary")
+    # live な bind-only channel agent "foo" (delivery cred + 未配達行 + PULL state)。
+    b.issue_token("foo", "foo", "worker")
+    cred = b.issue_delivery_cred("foo")
+    b._rows["r1"] = QueueRow(id="r1", to_id="foo", entry={"message": "keep me"})
+    b._delivery_modes["foo"] = "PULL"
+    # 同名の generic pane を spawn (token=None、名前空間は _pane_meta 側のみ)。
+    dispatch_tool(b, sec, "spawn_pane", {"direction": "vertical", "name": "foo"})
+    h = fake_adapter.spawned[-1]["handle"]
+    assert b._meta_for(h)["token"] is None
+    # generic pane が自己終了 -> 入口 reap。
+    fake_adapter.terminate(h)
+    assert b.resolve_target("focused") is not None   # reap を駆動
+    assert b._meta_for(h) is None                    # 死んだ generic pane の meta は落ちる
+    # だが同名 live agent "foo" の delivery state は無傷。
+    assert b.get_bind(cred) is not None              # delivery cred は revoke されない
+    assert "r1" in b._rows                            # 未配達行は残る
+    assert b._delivery_modes.get("foo") == "PULL"    # delivery state は維持
