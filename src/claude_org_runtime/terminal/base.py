@@ -177,7 +177,7 @@ def wait_for_state(
 # backend ファクトリ
 # ---------------------------------------------------------------------------
 
-VALID_BACKENDS = ("wezterm", "tmux")
+VALID_BACKENDS = ("wezterm", "tmux", "herdr")
 
 
 def default_backend() -> str:
@@ -186,6 +186,9 @@ def default_backend() -> str:
     - Windows (native): WezTerm (tmux はネイティブ Windows で動かない)。
     - POSIX (Linux / macOS / WSL2): tmux (POSIX 正準 backend)。
     明示の `--backend` / 環境変数 ORG_BACKEND が優先される。
+
+    herdr は POSIX 限定の opt-in backend で、既定には選ばれない (Herdr server の
+    常駐が前提のため。`--backend herdr` / `ORG_BACKEND=herdr` で明示選択する)。
     """
     env = os.environ.get("ORG_BACKEND")
     if env:
@@ -210,6 +213,10 @@ def make_adapter(backend: str | None = None) -> TerminalAdapter:
         from .wezterm import WezTermAdapter
 
         return WezTermAdapter()
+    if backend == "herdr":
+        from .herdr import HerdrAdapter
+
+        return HerdrAdapter()
     raise ValueError(
         f"unknown backend {backend!r} (valid: {', '.join(VALID_BACKENDS)})"
     )
