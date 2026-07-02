@@ -83,6 +83,31 @@ py -3 tools/dispatcher_runner.py delegate-plan \
   --panes-json {JSON snapshot from list_panes}
 ```
 
+> **Transport-aware capacity (runtime Issue #99).** The helper resolves the
+> capacity backend from `--transport`, else `ORG_TRANSPORT`, else the
+> descriptor default (**broker**). This decides both the spawn shape and the
+> concurrent-worker ceiling, so it also decides **which MCP server you route
+> the plan to** — read the pane snapshot from, and issue the `spawn` /
+> `after_spawn` calls against, the **same** transport the helper resolved:
+>
+> - **broker** (default): pass the snapshot from
+>   `mcp__org-broker__list_panes` and issue the spawn against
+>   `mcp__org-broker__spawn_claude_pane`. Capacity is the explicit
+>   `--max-concurrent-workers N|unlimited` ceiling (default `8`; `0` disables
+>   spawning). The plan's `spawn.target` is a stable fixed value
+>   (`"focused"`), not a geometry-derived pane, because broker panes are
+>   independent detached sessions. The plan's `capacity` field reports
+>   `free_worker_slots`.
+> - **renga** (`--transport renga` / `ORG_TRANSPORT=renga`): pass the snapshot
+>   from `mcp__renga-peers__list_panes` and spawn against
+>   `mcp__renga-peers__spawn_claude_pane`. Capacity is the rect-based balanced
+>   split; `--max-concurrent-workers` is ignored; `capacity` is absent.
+>
+> The `mcp__renga-peers__*` tool names elsewhere in this prompt describe the
+> renga flow; under the broker default read them as the `mcp__org-broker__*`
+> equivalents. A full transport-neutral rewrite of the monitoring/lifecycle
+> sections below is tracked as a separate broker-migration task.
+
 Minimum fields the task JSON must carry:
 
 ```json
@@ -100,22 +125,29 @@ spawn payload (the auto classifier is unstable on Sonnet, so workers are
 pinned to Opus by default). Override with `"model": "..."` only for
 deliberate special cases.
 
-The panes JSON is the `structuredContent.panes` payload from
-`mcp__renga-peers__list_panes`, passed through verbatim.
+The panes JSON is the `structuredContent.panes` payload from the active
+transport's `list_panes` (`mcp__org-broker__list_panes` by default;
+`mcp__renga-peers__list_panes` under renga), passed through verbatim.
 
 ### Reading the helper's output
 
 The helper returns one of three results, distinguishable by exit code:
 
 - **exit 0 / `status: "ready_to_spawn"`** — Pass the `spawn` field straight
-  into `mcp__renga-peers__spawn_claude_pane`, then run `after_spawn[]` in
-  order: `poll_events` → `send_keys(enter)` → wait on `list_peers` → final
+  into the active transport's `spawn_claude_pane`
+  (`mcp__org-broker__spawn_claude_pane` by default;
+  `mcp__renga-peers__spawn_claude_pane` under renga), then run `after_spawn[]`
+  in order: `poll_events` → `send_keys(enter)` → wait on `list_peers` → final
   `send_message`. The `send_message` body comes from reading the
-  `message_file` named in the action.
+  `message_file` named in the action. Do not second-guess `spawn.target` /
+  `spawn.direction`: under broker they are stable fixed values the adapter
+  resolves, not a geometry choice.
 - **exit 2 / `status: "split_capacity_exceeded"`** — Send the `escalate`
-  field to the secretary (same shape as the prose Step 3-1c
-  `SPLIT_CAPACITY_EXCEEDED` message). Cancel only this single dispatch;
-  the monitoring loop continues.
+  field to the secretary verbatim. Under broker the reason is the
+  `max_concurrent_workers` ceiling (the message reports `active_workers` /
+  `free_worker_slots=0`), **not** a rect/MIN_PANE shortage — forward the
+  helper's message rather than the prose Step 3-1c wording. Cancel only this
+  single dispatch; the monitoring loop continues.
 - **exit 1 / `status: "input_invalid"`** — Forward the `errors[]` to the
   secretary so the Lead can decide (missing cwd, duplicate `task_id`,
   pane-name collisions, etc.).

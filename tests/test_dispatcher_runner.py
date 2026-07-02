@@ -9,14 +9,20 @@ import pytest
 
 from claude_org_runtime.dispatcher import runner
 from claude_org_runtime.dispatcher.runner import (
+    DEFAULT_MAX_CONCURRENT_WORKERS,
     ActionPlan,
+    CapacityPolicy,
     LocaleConfig,
     Pane,
+    _BROKER_SPAWN_DIRECTION,
+    _BROKER_SPAWN_TARGET,
     _parse_pane_id,
     _parse_panes,
     build_plan,
     choose_split,
+    count_active_workers,
     main,
+    parse_capacity_policy,
     rect_adjacent,
     validate_cwd,
     validate_instruction_vars,
@@ -1229,3 +1235,363 @@ def test_action_plan_dataclass_default() -> None:
     assert plan.spawn is None
     assert plan.after_spawn == []
     assert plan.warnings == []
+    assert plan.capacity is None
+
+
+# ---------------------------------------------------------------------------
+# Backend-aware capacity policy (runtime Issue #99)
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_policy_default_is_finite_eight() -> None:
+    p = CapacityPolicy.default()
+    assert p.max_concurrent_workers == DEFAULT_MAX_CONCURRENT_WORKERS == 8
+    assert not p.is_unlimited
+
+
+def test_capacity_policy_unlimited() -> None:
+    p = CapacityPolicy.unlimited()
+    assert p.is_unlimited
+    assert p.max_concurrent_workers is None
+
+
+def test_capacity_policy_rejects_negative_and_bool() -> None:
+    with pytest.raises(ValueError):
+        CapacityPolicy(max_concurrent_workers=-1)
+    # bool is an int subclass; reject it so True/False don't become 1/0.
+    with pytest.raises(ValueError):
+        CapacityPolicy(max_concurrent_workers=True)  # type: ignore[arg-type]
+
+
+def test_capacity_policy_zero_is_valid() -> None:
+    # 0 is a valid (spawn-disabling) ceiling, not an error.
+    assert CapacityPolicy(max_concurrent_workers=0).max_concurrent_workers == 0
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("unlimited", None),
+        ("UNLIMITED", None),
+        ("  unlimited  ", None),
+        ("0", 0),
+        ("8", 8),
+        ("16", 16),
+    ],
+)
+def test_parse_capacity_policy_ok(raw: str, expected) -> None:
+    assert parse_capacity_policy(raw).max_concurrent_workers == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "abc", "", "3.5", "eight"])
+def test_parse_capacity_policy_rejects(raw: str) -> None:
+    with pytest.raises(ValueError):
+        parse_capacity_policy(raw)
+
+
+def test_count_active_workers_counts_worker_role() -> None:
+    panes = [
+        _pane(1, name="dispatcher", role="dispatcher"),
+        _pane(2, name="worker-a", role="worker"),
+        _pane(3, name="worker-b", role="worker"),
+    ]
+    assert count_active_workers(panes) == 2
+
+
+def test_count_active_workers_reconciles_live_names() -> None:
+    panes = [
+        _pane(2, name="worker-a", role="worker"),
+        _pane(3, name="worker-stale", role="worker"),
+    ]
+    # Only worker-a is live per the registry; the stale pane is ignored so it
+    # does not permanently consume a capacity slot.
+    assert count_active_workers(panes, live_worker_names={"worker-a"}) == 1
+
+
+# -- build_plan broker path --------------------------------------------------
+
+
+def _broker_task(tmp_path: Path) -> dict:
+    return {"task_id": "demo", "worker_dir": str(tmp_path)}
+
+
+def test_build_plan_broker_ready_bypasses_choose_split(tmp_path: Path) -> None:
+    # No splittable pane at all: the rect path would escalate, but the broker
+    # path bypasses choose_split and spawns against a stable fixed target.
+    plan = build_plan(
+        _broker_task(tmp_path), [], tmp_path / ".state", transport="broker",
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn is not None
+    assert plan.spawn["target"] == _BROKER_SPAWN_TARGET == "focused"
+    assert plan.spawn["direction"] == _BROKER_SPAWN_DIRECTION == "vertical"
+    assert plan.capacity == {
+        "transport": "broker",
+        "max_concurrent_workers": 8,
+        "active_workers": 0,
+        "free_worker_slots": 8,
+    }
+
+
+def test_build_plan_broker_ignores_choose_split_selectable_pane(tmp_path: Path) -> None:
+    # Contract #4: the broker path bypasses choose_split *unconditionally*. Feed
+    # a wide dispatcher that choose_split WOULD pick (see the renga default test)
+    # and assert the spawn still addresses the fixed broker target, not the
+    # geometry-derived "dispatcher". This distinguishes a true bypass from a
+    # "fall back to focused only when choose_split returns None" regression.
+    panes = _ok_panes()  # includes a 200x50 dispatcher choose_split selects
+    assert choose_split(panes).target_name == "dispatcher"  # guard the premise
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state", transport="broker",
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["target"] == "focused"
+    assert plan.spawn["direction"] == "vertical"
+
+
+def test_build_plan_renga_ignores_capacity_policy(tmp_path: Path) -> None:
+    # Contract #3: capacity_policy is a broker-only input. Under renga even a
+    # spawn-disabling policy (0) must not gate the rect path, and no capacity
+    # report is emitted.
+    plan = build_plan(
+        _broker_task(tmp_path), _ok_panes(), tmp_path / ".state",
+        transport="renga", capacity_policy=CapacityPolicy(max_concurrent_workers=0),
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["target"] == "dispatcher"
+    assert plan.capacity is None
+
+
+def test_build_plan_broker_capacity_exceeded(tmp_path: Path) -> None:
+    panes = [
+        _pane(1, name="worker-a", role="worker"),
+        _pane(2, name="worker-b", role="worker"),
+    ]
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state",
+        transport="broker", capacity_policy=CapacityPolicy(max_concurrent_workers=2),
+    )
+    # Status name is preserved for contract compatibility...
+    assert plan.status == "split_capacity_exceeded"
+    assert plan.escalate is not None
+    assert plan.escalate["to_id"] == "secretary"
+    # ...but the reason is max_concurrent_workers, not rect/MIN_PANE/adjacency.
+    msg = plan.escalate["message"]
+    assert "max_concurrent_workers=2" in msg
+    assert "active_workers=2" in msg
+    assert "free_worker_slots=0" in msg
+    assert "transport=broker" in msg
+    assert "MIN_PANE" not in msg and "adjacency" not in msg
+    assert plan.capacity == {
+        "transport": "broker",
+        "max_concurrent_workers": 2,
+        "active_workers": 2,
+        "free_worker_slots": 0,
+    }
+
+
+def test_build_plan_broker_zero_disables_spawn(tmp_path: Path) -> None:
+    plan = build_plan(
+        _broker_task(tmp_path), [], tmp_path / ".state",
+        transport="broker", capacity_policy=CapacityPolicy(max_concurrent_workers=0),
+    )
+    assert plan.status == "split_capacity_exceeded"
+    assert "max_concurrent_workers=0" in plan.escalate["message"]
+
+
+def test_build_plan_broker_unlimited(tmp_path: Path) -> None:
+    panes = [_pane(i, name=f"worker-{i}", role="worker") for i in range(20)]
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state",
+        transport="broker", capacity_policy=CapacityPolicy.unlimited(),
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.capacity["max_concurrent_workers"] == "unlimited"
+    assert plan.capacity["free_worker_slots"] == "unlimited"
+    assert plan.capacity["active_workers"] == 20
+
+
+def test_build_plan_broker_live_names_free_a_slot(tmp_path: Path) -> None:
+    # Two worker panes but one is stale (not live): with a ceiling of 2 the
+    # stale pane would block spawning; reconciling against liveness frees it.
+    panes = [
+        _pane(1, name="worker-a", role="worker"),
+        _pane(2, name="worker-stale", role="worker"),
+    ]
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state",
+        transport="broker", capacity_policy=CapacityPolicy(max_concurrent_workers=2),
+        live_worker_names={"worker-a"},
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.capacity["active_workers"] == 1
+    assert plan.capacity["free_worker_slots"] == 1
+
+
+def test_build_plan_broker_default_ceiling_is_eight(tmp_path: Path) -> None:
+    # Exactly 8 workers with the default policy -> exceeded.
+    panes = [_pane(i, name=f"worker-{i}", role="worker") for i in range(8)]
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state", transport="broker",
+    )
+    assert plan.status == "split_capacity_exceeded"
+    assert "max_concurrent_workers=8" in plan.escalate["message"]
+
+
+def test_build_plan_rejects_unknown_transport(tmp_path: Path) -> None:
+    plan = build_plan(
+        _broker_task(tmp_path), [], tmp_path / ".state", transport="tmux",
+    )
+    assert plan.status == "input_invalid"
+    assert any("unknown transport" in e for e in plan.errors)
+
+
+def test_build_plan_renga_path_unchanged_rect_message(tmp_path: Path) -> None:
+    # Explicit renga transport keeps the rect-based escalation wording.
+    panes = [_pane(1, name="curator", role="curator", w=10, h=2)]
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state", transport="renga",
+    )
+    assert plan.status == "split_capacity_exceeded"
+    assert "MIN_PANE" in plan.escalate["message"]
+    assert "max_concurrent_workers" not in plan.escalate["message"]
+    assert plan.capacity is None
+
+
+def test_build_plan_renga_default_targets_dispatcher(tmp_path: Path) -> None:
+    # Default transport is renga at the API layer: rect balanced split picks
+    # the dispatcher, capacity report stays None.
+    plan = build_plan(_broker_task(tmp_path), _ok_panes(), tmp_path / ".state")
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["target"] == "dispatcher"
+    assert plan.capacity is None
+
+
+# -- CLI transport / capacity wiring -----------------------------------------
+
+
+def _write_cli_inputs(tmp_path: Path, panes: list[dict]) -> tuple[Path, Path]:
+    task = {"task_id": "cli", "worker_dir": str(tmp_path), "instruction": "x"}
+    task_path = tmp_path / "task.json"
+    panes_path = tmp_path / "panes.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+    return task_path, panes_path
+
+
+def _run_cli(tmp_path: Path, task_path: Path, panes_path: Path, *extra: str) -> int:
+    return main([
+        "delegate-plan",
+        "--task-json", str(task_path),
+        "--panes-json", str(panes_path),
+        "--state-dir", str(tmp_path / ".state"),
+        "--dry-run",
+        *extra,
+    ])
+
+
+def test_cli_default_transport_is_broker(tmp_path: Path, capsys, monkeypatch) -> None:
+    # No --transport and no ORG_TRANSPORT env -> descriptor default (broker):
+    # spawn addresses the fixed broker target rather than a rect pane.
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    task_path, panes_path = _write_cli_inputs(tmp_path, [])
+    rc = _run_cli(tmp_path, task_path, panes_path)
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["spawn"]["target"] == "focused"
+    assert plan["capacity"]["transport"] == "broker"
+
+
+def test_cli_env_transport_renga(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("ORG_TRANSPORT", "renga")
+    panes = [
+        {"id": 1, "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(tmp_path, task_path, panes_path)
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["spawn"]["target"] == "dispatcher"
+    assert plan["capacity"] is None
+
+
+def test_cli_explicit_transport_overrides_env(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("ORG_TRANSPORT", "broker")
+    panes = [
+        {"id": 1, "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(tmp_path, task_path, panes_path, "--transport", "renga")
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["spawn"]["target"] == "dispatcher"
+
+
+def test_cli_max_concurrent_workers_zero_blocks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    task_path, panes_path = _write_cli_inputs(tmp_path, [])
+    rc = _run_cli(
+        tmp_path, task_path, panes_path, "--max-concurrent-workers", "0",
+    )
+    assert rc == 2  # split_capacity_exceeded
+
+
+def test_cli_max_concurrent_workers_unlimited(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    panes = [{"id": i, "name": f"worker-{i}", "role": "worker",
+              "x": 0, "y": 0, "width": 80, "height": 24} for i in range(30)]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(
+        tmp_path, task_path, panes_path, "--max-concurrent-workers", "unlimited",
+    )
+    assert rc == 0
+
+
+def test_cli_max_concurrent_workers_invalid(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    task_path, panes_path = _write_cli_inputs(tmp_path, [])
+    rc = _run_cli(
+        tmp_path, task_path, panes_path, "--max-concurrent-workers", "-4",
+    )
+    assert rc == 1
+    assert "max-concurrent-workers" in capsys.readouterr().err
+
+
+def test_cli_renga_ignores_max_concurrent_workers(tmp_path: Path, monkeypatch) -> None:
+    # Under renga the flag is documented as ignored, so even a malformed value
+    # must not fail the run (it is validated only on the broker path).
+    monkeypatch.setenv("ORG_TRANSPORT", "renga")
+    panes = [
+        {"id": 1, "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(
+        tmp_path, task_path, panes_path, "--max-concurrent-workers", "bogus",
+    )
+    assert rc == 0
+
+
+def test_cli_default_ceiling_is_finite_eight(tmp_path: Path, monkeypatch) -> None:
+    # End-to-end: omitting --max-concurrent-workers on the broker path must
+    # resolve to the finite default 8 (argparse default=None -> build_plan's
+    # CapacityPolicy.default()). 8 live workers therefore exhausts capacity.
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    panes = [{"id": i, "name": f"worker-{i}", "role": "worker",
+              "x": 0, "y": 0, "width": 80, "height": 24} for i in range(8)]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(tmp_path, task_path, panes_path)  # no --max-concurrent-workers
+    assert rc == 2  # split_capacity_exceeded
+
+
+def test_cli_bad_env_transport_returns_one(tmp_path: Path, capsys, monkeypatch) -> None:
+    # A bad ORG_TRANSPORT (env-resolved, no explicit flag) hits the
+    # resolve_transport ValueError branch -> rc 1 with a stderr message,
+    # rather than falling through to build_plan or crashing.
+    monkeypatch.setenv("ORG_TRANSPORT", "tmux")
+    task_path, panes_path = _write_cli_inputs(tmp_path, [])
+    rc = _run_cli(tmp_path, task_path, panes_path)
+    assert rc == 1
+    assert "transport" in capsys.readouterr().err.lower()
