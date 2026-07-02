@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitted, matching current broker capability. **POSIX/WSL only** — Windows
   named pipe is unsupported and raises `adapter_unavailable` at instantiation.
 
+  **Known limitation (parity with tmux, broker-surface follow-up):** Herdr
+  native pane handles are non-digit (e.g. `w1:p2`), like tmux (`%3`). The
+  broker's `resolve_target` only treats all-digit strings as raw handles, so a
+  pane is addressable by its stable *name* or `focused`, but not by its raw
+  non-digit handle. `org down` closes managed panes by the id it lists, so
+  closing herdr panes by raw id has the same gap tmux already has; the adapter
+  is faithful to the tmux precedent. Making `close_pane` resolve non-digit
+  managed handles is a broker-layer change (out of this adapter's scope) that
+  would fix tmux and herdr together.
+
 ## [0.1.30] - 2026-06-22
 
 ### Fixed
