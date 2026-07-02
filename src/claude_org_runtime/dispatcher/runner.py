@@ -28,11 +28,20 @@ Usage::
         --panes-json panes.json \\
         --template-repo /path/to/claude-org-ja
 
+The capacity model is backend-aware (runtime Issue #99). Under ``--transport
+renga`` (the geometry backend) the rect-based balanced split derives both the
+spawn target and the concurrent-worker ceiling. Under ``--transport broker``
+(independent detached sessions, no shared tab geometry) the rect ceiling is
+replaced by an explicit ``--max-concurrent-workers`` policy and the spawn
+addresses a stable adapter-resolvable target. The ``split_capacity_exceeded``
+status is kept for both backends; only the escalation reason differs.
+
 Exit codes:
   0 -- plan emitted OK (status = ``ready_to_spawn``)
   1 -- input validation failed (status = ``input_invalid``)
-  2 -- algorithm produced no candidate and escalation is required
-       (status = ``split_capacity_exceeded``)
+  2 -- capacity exhausted and escalation is required
+       (status = ``split_capacity_exceeded``): renga = no rect balanced-split
+       candidate; broker = max_concurrent_workers reached
 """
 
 from __future__ import annotations
@@ -113,6 +122,139 @@ _DISPATCHER_NARROW_PRIORITY = 0
 # is unstable on sonnet -- opus-only per the claude-org-ja worker-model
 # feedback note.
 DEFAULT_WORKER_MODEL = "opus"
+
+
+# ----------------------------------------------------------------------------
+# Backend-aware capacity policy (runtime Issue #99)
+# ----------------------------------------------------------------------------
+#
+# The rect-based balanced split (choose_split) derives *both* the spawn
+# target/direction *and* the implicit concurrent-worker ceiling from renga's
+# "one terminal tab tiled across every pane" geometry: once no child clears
+# the MIN_PANE_* floors, choose_split returns no candidate and build_plan
+# raises ``split_capacity_exceeded``. That geometry ceiling is a real physical
+# constraint under renga but has *no* physical basis under the broker
+# transport, where every pane is an independent detached session with its own
+# terminal size -- a broker pane's geometry says nothing about how many more
+# workers the operator can usefully run.
+#
+# So capacity is made backend-aware: the renga path keeps the rect ceiling
+# unchanged, while the broker path replaces it with an explicit
+# ``max_concurrent_workers`` policy (:class:`CapacityPolicy`). The transport is
+# passed in explicitly by the caller (``build_plan(..., transport=...)`` / CLI
+# ``--transport``); it is NEVER inferred from the ``list_panes`` snapshot shape,
+# because the broker's logical-pane ``w=h=0`` sentinel is retained for
+# duplicate detection and spawned broker panes carry real session sizes, so a
+# "0 => broker, positive => renga" heuristic would break the moment a worker is
+# live (design-review Blocker).
+
+# Values accepted for the ``transport`` selector. Mirrors
+# ``claude_org_runtime.transport.descriptor.TRANSPORTS`` but is duplicated here
+# as a bare literal to avoid a runner -> descriptor -> broker.surface ->
+# broker/__init__ -> placement -> runner import cycle (the descriptor layer
+# imports the broker surface, whose package init pulls placement, which imports
+# this module). The CLI resolves the env-default transport via
+# ``descriptor.resolve_transport`` in a lazy import instead.
+TRANSPORTS = ("renga", "broker")
+
+# Default concurrent-worker ceiling for the broker path. Finite by default so a
+# misconfigured or missing policy cannot spawn an unbounded worker fleet; a
+# value tuned for the dispatcher's /loop-3m monitoring cadence and the
+# secretary's serialized approval gate (design-review Major #3). ``unlimited``
+# is an explicit opt-in; ``0`` disables spawning entirely.
+DEFAULT_MAX_CONCURRENT_WORKERS = 8
+
+# Broker-path spawn coordinates. Under the broker transport the adapter does
+# not split a specific pane by geometry (it opens a fresh detached session), so
+# choose_split() is bypassed and the spawn addresses a stable, adapter-
+# resolvable target rather than a geometry-derived balanced-split target that
+# would carry no meaning (design-review Major #4). ``"focused"`` is the literal
+# the broker spawn surface always resolves (the dispatcher issuing the spawn);
+# ``direction`` is required by the spawn schema but ignored by the broker
+# adapter, so a stable ``"vertical"`` is emitted.
+_BROKER_SPAWN_TARGET = "focused"
+_BROKER_SPAWN_DIRECTION = "vertical"
+
+
+@dataclass(frozen=True)
+class CapacityPolicy:
+    """Explicit concurrent-worker ceiling for the broker transport.
+
+    ``max_concurrent_workers`` is either a non-negative int (a finite ceiling;
+    ``0`` disables spawning) or ``None`` (unlimited -- explicit opt-in). The
+    renga transport ignores this policy: its ceiling comes from the rect-based
+    :func:`choose_split` geometry instead.
+    """
+
+    max_concurrent_workers: Optional[int]
+
+    def __post_init__(self) -> None:
+        m = self.max_concurrent_workers
+        if m is None:
+            return
+        if isinstance(m, bool) or not isinstance(m, int) or m < 0:
+            raise ValueError(
+                "max_concurrent_workers must be a non-negative int or None "
+                f"(unlimited); got {m!r}"
+            )
+
+    @classmethod
+    def default(cls) -> "CapacityPolicy":
+        """Finite default ceiling (:data:`DEFAULT_MAX_CONCURRENT_WORKERS`)."""
+        return cls(max_concurrent_workers=DEFAULT_MAX_CONCURRENT_WORKERS)
+
+    @classmethod
+    def unlimited(cls) -> "CapacityPolicy":
+        """Unbounded worker fleet (explicit opt-in)."""
+        return cls(max_concurrent_workers=None)
+
+    @property
+    def is_unlimited(self) -> bool:
+        return self.max_concurrent_workers is None
+
+
+def parse_capacity_policy(raw: str) -> CapacityPolicy:
+    """Parse a ``--max-concurrent-workers`` value (``N`` | ``unlimited``).
+
+    ``"unlimited"`` (case-insensitive) yields the unbounded policy; any other
+    value must be a non-negative integer. Raises :class:`ValueError` otherwise.
+    """
+    s = raw.strip()
+    if s.lower() == "unlimited":
+        return CapacityPolicy.unlimited()
+    try:
+        n = int(s)
+    except ValueError:
+        raise ValueError(
+            f"--max-concurrent-workers must be a non-negative int or "
+            f"'unlimited', got {raw!r}"
+        ) from None
+    if n < 0:
+        raise ValueError(
+            f"--max-concurrent-workers must be >= 0 (or 'unlimited'), got {n}"
+        )
+    return CapacityPolicy(max_concurrent_workers=n)
+
+
+def count_active_workers(
+    panes: list["Pane"],
+    live_worker_names: Optional[set[str]] = None,
+) -> int:
+    """Count panes acting as live workers for the broker capacity check.
+
+    By default every pane with ``role == "worker"`` counts. When
+    ``live_worker_names`` is supplied, only worker panes whose ``name`` is in
+    that set count -- this lets the caller reconcile the ``list_panes`` view
+    against registry liveness so a stale worker pane left behind by a dead
+    session does not permanently consume a capacity slot (design-review
+    Minor #5). The reconciliation set is a caller input rather than a registry
+    lookup inside ``build_plan`` so the planner stays a pure function of its
+    arguments.
+    """
+    workers = [p for p in panes if p.role == "worker"]
+    if live_worker_names is None:
+        return len(workers)
+    return sum(1 for p in workers if p.name in live_worker_names)
 
 # Path of the instruction template, relative to the consumer repo root.
 INSTRUCTION_TEMPLATE_PATH = (
@@ -614,6 +756,14 @@ class ActionPlan:
     escalate: Optional[dict[str, Any]] = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Backend-aware capacity report (broker transport only). ``None`` on the
+    # renga path, whose ceiling is the rect geometry rather than a slot count.
+    # Shape: ``{"transport", "max_concurrent_workers", "active_workers",
+    # "free_worker_slots"}`` where ``max_concurrent_workers`` /
+    # ``free_worker_slots`` are ``"unlimited"`` under the unlimited policy. This
+    # is the runtime's first-class free-capacity report; ja's work-discovery
+    # ``--free-panes`` reads it as "free worker slots" (paired ja follow-up).
+    capacity: Optional[dict[str, Any]] = None
 
 
 def build_plan(
@@ -622,9 +772,38 @@ def build_plan(
     state_dir: Path,
     template_repo: Optional[Path] = None,
     locale: Optional[LocaleConfig] = None,
+    *,
+    transport: str = "renga",
+    capacity_policy: Optional[CapacityPolicy] = None,
+    live_worker_names: Optional[set[str]] = None,
 ) -> ActionPlan:
+    """Compute a worker delegation action plan.
+
+    ``transport`` selects the capacity model (design-review Blocker #1): the
+    caller passes the value it already resolved from ``ORG_TRANSPORT`` / the
+    transport descriptor -- it is never inferred from the ``panes`` snapshot.
+    The Python default is ``"renga"`` so existing direct-API callers keep the
+    rect-based behaviour unchanged; production callers (the CLI) resolve the
+    env default (broker) and pass it explicitly.
+
+    - ``transport="renga"``: unchanged rect-based :func:`choose_split`; no
+      candidate -> ``split_capacity_exceeded`` with the geometry message.
+    - ``transport="broker"``: :func:`choose_split` is bypassed. ``capacity_policy``
+      (default :meth:`CapacityPolicy.default`, a finite ceiling of
+      :data:`DEFAULT_MAX_CONCURRENT_WORKERS`) caps concurrent workers; the spawn
+      addresses a stable adapter-resolvable target. ``live_worker_names``, when
+      given, reconciles the active-worker count against registry liveness (see
+      :func:`count_active_workers`).
+    """
     task_id = task.get("task_id", "")
     plan = ActionPlan(status="ready_to_spawn", task_id=task_id)
+
+    if transport not in TRANSPORTS:
+        plan.status = "input_invalid"
+        plan.errors.append(
+            f"unknown transport {transport!r}; expected one of {list(TRANSPORTS)}"
+        )
+        return plan
 
     err = validate_task_id(task_id)
     if err:
@@ -689,20 +868,71 @@ def build_plan(
             )
             return plan
 
-    choice = choose_split(panes)
-    if choice is None:
-        plan.status = "split_capacity_exceeded"
-        plan.escalate = {
-            "tool": "send_message",
-            "to_id": "secretary",
-            "message": (
-                f"SPLIT_CAPACITY_EXCEEDED: no balanced-split target found for "
-                f"task {task_id!r}. The rect-based balanced split's MIN_PANE / "
-                "adjacency constraints produced 0 candidates. Likely terminal "
-                "size shortage or unexpected layout -- human judgment required."
-            ),
+    if transport == "broker":
+        # Broker path: bypass the rect ceiling and choose_split entirely.
+        # Capacity is the explicit max_concurrent_workers policy; the spawn
+        # target/direction are stable adapter-resolvable constants.
+        policy = capacity_policy or CapacityPolicy.default()
+        active = count_active_workers(panes, live_worker_names)
+        if policy.is_unlimited:
+            free_slots: Any = "unlimited"
+            max_repr: Any = "unlimited"
+            exceeded = False
+        else:
+            max_workers = policy.max_concurrent_workers
+            max_repr = max_workers
+            free_slots = max(0, max_workers - active)
+            exceeded = active >= max_workers
+
+        if exceeded:
+            plan.status = "split_capacity_exceeded"
+            plan.capacity = {
+                "transport": "broker",
+                "max_concurrent_workers": max_repr,
+                "active_workers": active,
+                "free_worker_slots": 0,
+            }
+            plan.escalate = {
+                "tool": "send_message",
+                "to_id": "secretary",
+                "message": (
+                    f"SPLIT_CAPACITY_EXCEEDED: worker capacity reached for task "
+                    f"{task_id!r}. transport=broker, "
+                    f"max_concurrent_workers={max_repr}, active_workers={active}, "
+                    "free_worker_slots=0. The broker path does not use rect "
+                    "geometry; this is the explicit max_concurrent_workers "
+                    "ceiling. Raise it via --max-concurrent-workers "
+                    "(N|unlimited), or wait for an active worker to finish -- "
+                    "human judgment required."
+                ),
+            }
+            return plan
+
+        target_name = _BROKER_SPAWN_TARGET
+        direction = _BROKER_SPAWN_DIRECTION
+        plan.capacity = {
+            "transport": "broker",
+            "max_concurrent_workers": max_repr,
+            "active_workers": active,
+            "free_worker_slots": free_slots,
         }
-        return plan
+    else:
+        choice = choose_split(panes)
+        if choice is None:
+            plan.status = "split_capacity_exceeded"
+            plan.escalate = {
+                "tool": "send_message",
+                "to_id": "secretary",
+                "message": (
+                    f"SPLIT_CAPACITY_EXCEEDED: no balanced-split target found for "
+                    f"task {task_id!r}. The rect-based balanced split's MIN_PANE / "
+                    "adjacency constraints produced 0 candidates. Likely terminal "
+                    "size shortage or unexpected layout -- human judgment required."
+                ),
+            }
+            return plan
+        target_name = choice.target_name
+        direction = choice.direction
 
     permission_mode = task.get("permission_mode", "auto")
     model = task.get("model") or DEFAULT_WORKER_MODEL
@@ -710,8 +940,8 @@ def build_plan(
 
     spawn: dict[str, Any] = {
         "tool": "spawn_claude_pane",
-        "target": choice.target_name,
-        "direction": choice.direction,
+        "target": target_name,
+        "direction": direction,
         "name": worker_name,
         "role": "worker",
         "cwd": cwd,
@@ -952,9 +1182,31 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
     )
     locale = _load_locale(args.locale_json)
 
+    # Resolve the transport the same way the rest of the org does: explicit
+    # --transport wins, else ORG_TRANSPORT env, else the descriptor default
+    # (broker). Imported lazily to avoid a module-load import cycle
+    # (descriptor -> broker.surface -> broker/__init__ -> placement -> runner).
+    from ..transport.descriptor import resolve_transport
+    try:
+        transport = resolve_transport(args.transport)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        capacity_policy = (
+            parse_capacity_policy(args.max_concurrent_workers)
+            if args.max_concurrent_workers is not None
+            else None
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     plan = build_plan(
         task, panes, state_dir,
         template_repo=template_repo, locale=locale,
+        transport=transport, capacity_policy=capacity_policy,
     )
 
     if plan.status == "ready_to_spawn" and not args.dry_run:
@@ -1026,6 +1278,23 @@ def add_subparsers(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -
             "claude_md_filename_default / instruction_template); used to "
             "override the runtime's English defaults for non-English "
             "consumers (e.g. claude-org-ja)"
+        ),
+    )
+    dp.add_argument(
+        "--transport", default=None, choices=list(TRANSPORTS),
+        help=(
+            "capacity backend: 'renga' uses the rect-based balanced split; "
+            "'broker' uses the explicit --max-concurrent-workers ceiling. "
+            "Default: resolved from ORG_TRANSPORT env, else the descriptor "
+            "default (broker)"
+        ),
+    )
+    dp.add_argument(
+        "--max-concurrent-workers", default=None, metavar="N|unlimited",
+        help=(
+            "broker-transport worker ceiling: a non-negative int (0 disables "
+            "spawning) or 'unlimited' (explicit opt-in). Ignored under "
+            f"--transport renga. Default when omitted: {DEFAULT_MAX_CONCURRENT_WORKERS}"
         ),
     )
     dp.add_argument(
