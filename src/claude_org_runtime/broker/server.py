@@ -353,6 +353,17 @@ class Broker(TokenMixin, StoreMixin):
 
         三系統 (renga と同契約): 全桁数字 → handle / 非数字 str → stable name /
         'focused' → 現在フォーカス pane。解決不能なら None。
+
+        加えて、非数字の *managed handle* 直指定 (tmux ``"%N"`` / Herdr
+        ``"wN:pN"``) も stable name の後段フォールバックとして解決する。``org
+        down`` の launcher が ``list_panes`` の id (= native handle) を
+        ``close_pane`` に渡す経路で、この id が非数字だと従来は name にも一致せず
+        ``[pane_not_found]`` になっていた (Issue #100)。stable name は許可文字集合
+        ``[A-Za-z0-9_-]`` に閉じ、非数字 handle は ``:`` / ``%`` を必ず含むため
+        両者の文字集合は交わらず、この追加解決は name 解決を shadow しない
+        (安全性はテストで固定する)。auth tier は resolve_target では判定せず
+        caller の bind (``auth_role``) 側で切るため、解決経路の追加は tier 境界を
+        変えない。
         """
         if self.adapter is None:
             return None
@@ -381,6 +392,16 @@ class Broker(TokenMixin, StoreMixin):
             for b in self._binds.values():
                 if not b.revoked and b.name == target and b.pane_id is not None:
                     return b.pane_id
+            # name に一致しなければ、非数字 managed handle の直指定として引く
+            # (org down の list_panes → close_pane 経路。docstring 参照)。
+            meta = self._pane_meta.get(target)
+            if meta is not None:
+                return meta["handle"]
+        # 登録簿 (_pane_meta) に無い adapter pane も native handle で解決する
+        # (全桁数字ブランチと対称。adapter I/O は lock 外で済ませた panes を使う)。
+        for p in panes:
+            if str(p.get("pane_id")) == target:
+                return p.get("pane_id")
         return None
 
     def _adapter_panes(self) -> list[dict]:
