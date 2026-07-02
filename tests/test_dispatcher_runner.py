@@ -1333,6 +1333,35 @@ def test_build_plan_broker_ready_bypasses_choose_split(tmp_path: Path) -> None:
     }
 
 
+def test_build_plan_broker_ignores_choose_split_selectable_pane(tmp_path: Path) -> None:
+    # Contract #4: the broker path bypasses choose_split *unconditionally*. Feed
+    # a wide dispatcher that choose_split WOULD pick (see the renga default test)
+    # and assert the spawn still addresses the fixed broker target, not the
+    # geometry-derived "dispatcher". This distinguishes a true bypass from a
+    # "fall back to focused only when choose_split returns None" regression.
+    panes = _ok_panes()  # includes a 200x50 dispatcher choose_split selects
+    assert choose_split(panes).target_name == "dispatcher"  # guard the premise
+    plan = build_plan(
+        _broker_task(tmp_path), panes, tmp_path / ".state", transport="broker",
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["target"] == "focused"
+    assert plan.spawn["direction"] == "vertical"
+
+
+def test_build_plan_renga_ignores_capacity_policy(tmp_path: Path) -> None:
+    # Contract #3: capacity_policy is a broker-only input. Under renga even a
+    # spawn-disabling policy (0) must not gate the rect path, and no capacity
+    # report is emitted.
+    plan = build_plan(
+        _broker_task(tmp_path), _ok_panes(), tmp_path / ".state",
+        transport="renga", capacity_policy=CapacityPolicy(max_concurrent_workers=0),
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["target"] == "dispatcher"
+    assert plan.capacity is None
+
+
 def test_build_plan_broker_capacity_exceeded(tmp_path: Path) -> None:
     panes = [
         _pane(1, name="worker-a", role="worker"),
@@ -1528,3 +1557,26 @@ def test_cli_max_concurrent_workers_invalid(tmp_path: Path, capsys, monkeypatch)
     )
     assert rc == 1
     assert "max-concurrent-workers" in capsys.readouterr().err
+
+
+def test_cli_default_ceiling_is_finite_eight(tmp_path: Path, monkeypatch) -> None:
+    # End-to-end: omitting --max-concurrent-workers on the broker path must
+    # resolve to the finite default 8 (argparse default=None -> build_plan's
+    # CapacityPolicy.default()). 8 live workers therefore exhausts capacity.
+    monkeypatch.delenv("ORG_TRANSPORT", raising=False)
+    panes = [{"id": i, "name": f"worker-{i}", "role": "worker",
+              "x": 0, "y": 0, "width": 80, "height": 24} for i in range(8)]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(tmp_path, task_path, panes_path)  # no --max-concurrent-workers
+    assert rc == 2  # split_capacity_exceeded
+
+
+def test_cli_bad_env_transport_returns_one(tmp_path: Path, capsys, monkeypatch) -> None:
+    # A bad ORG_TRANSPORT (env-resolved, no explicit flag) hits the
+    # resolve_transport ValueError branch -> rc 1 with a stderr message,
+    # rather than falling through to build_plan or crashing.
+    monkeypatch.setenv("ORG_TRANSPORT", "tmux")
+    task_path, panes_path = _write_cli_inputs(tmp_path, [])
+    rc = _run_cli(tmp_path, task_path, panes_path)
+    assert rc == 1
+    assert "transport" in capsys.readouterr().err.lower()

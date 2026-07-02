@@ -45,6 +45,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   managed handles is a broker-layer change (out of this adapter's scope) that
   would fix tmux and herdr together.
 
+- `dispatcher.runner`: split-capacity is now **backend-aware** (Issue #99).
+  `build_plan(..., transport="renga"|"broker")` and the CLI `--transport`
+  flag select the capacity model; the transport is passed in explicitly
+  (resolved from `ORG_TRANSPORT` / the transport descriptor by the caller)
+  and is **never** inferred from the `list_panes` snapshot shape. Under the
+  broker transport each pane is an independent detached session, so the
+  rect-based `choose_split` geometry ceiling is bypassed and concurrency is
+  capped by an explicit `CapacityPolicy`
+  (`build_plan(..., capacity_policy=)` + CLI
+  `--max-concurrent-workers N|unlimited`). The default is a finite ceiling
+  of `8`; `unlimited` is an explicit opt-in; `0` disables spawning. The
+  broker spawn addresses a stable adapter-resolvable target
+  (`"focused"`/`"vertical"`) instead of a geometry-derived balanced target.
+  `count_active_workers(panes, live_worker_names=)` reconciles the active
+  worker count against registry liveness so a stale pane cannot permanently
+  consume a slot. `ActionPlan.capacity` reports the broker free-slot count.
+
+### Changed
+
+- `dispatcher.runner`: the `split_capacity_exceeded` status name is
+  preserved for both backends, but the **broker** escalation message now
+  reports `max_concurrent_workers` reached (with `active_workers` /
+  `free_worker_slots=0`) instead of the renga rect/MIN_PANE/adjacency
+  reason, which was a misdiagnosis on the broker path. renga behaviour and
+  the `split_capacity_exceeded` contract name are unchanged.
+- `broker.placement`: marked **deprecated / renga-only**. The broker path
+  no longer routes through `choose_split`, so this thin balanced-split
+  wrapper is a renga-only vestige retained for the import-contract test.
+
+### Follow-up (paired ja-side release, out of scope here)
+
+  This runtime change needs a paired `claude-org-ja` documentation update,
+  to ship together with the runtime release:
+  - `.claude/skills/org-delegate/references/pane-layout.md` still describes
+    balanced split as transport-neutral/load-bearing and "no fixed ceiling,
+    split down to MIN_PANE"; under the broker default that prose is stale.
+  - work-discovery `--free-panes` should be read as "free worker slots"
+    (broker: `max_concurrent_workers - active_workers`; renga: rect-derived).
+    The flag name stays for compatibility. Version bump / PyPI publish are
+    **not** part of this task.
+
 ## [0.1.30] - 2026-06-22
 
 ### Fixed
