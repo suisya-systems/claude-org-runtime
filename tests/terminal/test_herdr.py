@@ -386,7 +386,7 @@ def test_list_panes_active_false_for_unfocused(
     assert by_id["w1:p2"]["active"] is False
 
 
-def test_list_panes_workspace_gone_returns_empty(
+def test_list_panes_workspace_gone_returns_empty_and_recovers(
     server: FakeHerdrServer, tmp_path
 ) -> None:
     _wire_spawn(server)
@@ -397,6 +397,41 @@ def test_list_panes_workspace_gone_returns_empty(
         {"error": {"code": "workspace_not_found", "message": "gone"}},
     )
     assert a.list_panes() == []  # benign: our workspace was closed externally
+    # cached workspace state must be cleared so the next spawn re-creates it
+    # (else agent.start targets the vanished workspace forever).
+    assert a._workspace_id is None
+    server.requests.clear()
+    _wire_spawn(server, pane_id="w2:p2")  # re-arm workspace.create/agent.start
+    server.on(
+        "workspace.create",
+        {
+            "workspace": {"workspace_id": "w2", "active_tab_id": "w2:t1"},
+            "root_pane": {"pane_id": "w2:p1"},
+        },
+    )
+    ref = a.spawn(["claude"], cwd=str(tmp_path))
+    assert ref.window_id == "w2"  # a fresh workspace was created
+    assert "workspace.create" in server.methods_called()
+
+
+def test_list_panes_drops_panes_missing_workspace_id(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Strict filter: an unscoped / older-schema pane record with no workspace_id
+    # must NOT leak into list_panes (isolated_session -> org down would close it).
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on(
+        "pane.list",
+        {"panes": [
+            {"pane_id": "w1:p2", "workspace_id": "w1"},
+            {"pane_id": "x:p9"},  # no workspace_id -> must be dropped
+        ]},
+    )
+    server.on("pane.layout", {"layout": {"panes": []}})
+    ids = [p["pane_id"] for p in a.list_panes()]
+    assert ids == ["w1:p2"]
 
 
 def test_list_panes_unreachable_raises_not_empty(tmp_path) -> None:

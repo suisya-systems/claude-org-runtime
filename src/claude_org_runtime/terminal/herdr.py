@@ -427,15 +427,22 @@ class HerdrAdapter:
             # 専用 workspace が外部で閉じられた場合のみ空 (benign)。それ以外
             # (adapter_unavailable 等) は透過して上げる。
             if exc.code == CODE_PANE_NOT_FOUND and exc.raw == "workspace_not_found":
+                # cached workspace state をクリアして次 spawn で再確保させる。
+                # クリアしないと stale な workspace_id/tab_id が残り、次 spawn が
+                # workspace.create を skip して消えた workspace へ agent.start し、
+                # daemon 再起動まで回復不能になる (Codex P2)。
+                self._workspace_id = None
+                self._tab_id = None
+                self._root_pane_id = None
                 return []
             raise
         raw_panes = res.get("panes") or []
-        # workspace_id で厳格フィルタ (無関係 pane 混入防止の二重の砦)。
-        panes = [
-            p
-            for p in raw_panes
-            if p.get("workspace_id") in (None, self._workspace_id)
-        ]
+        # workspace_id が **厳密に一致** する pane のみ通す。isolated_session=True
+        # の本 adapter は org down が list_panes の全 pane を broker 所有として
+        # close しうるため、workspace_id 欠落/不一致の pane (unscoped / 旧 schema
+        # 応答) を通すと無関係 pane の巻き添え close を招く (Codex P2)。pane.list は
+        # server 側で workspace_id scope 済みだが、adapter 側でも厳格に再確認する。
+        panes = [p for p in raw_panes if p.get("workspace_id") == self._workspace_id]
         geom, focused_id = self._layout_geometry(panes)
         out: list[dict] = []
         for p in panes:
