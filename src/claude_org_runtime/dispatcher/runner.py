@@ -1193,15 +1193,20 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    try:
-        capacity_policy = (
-            parse_capacity_policy(args.max_concurrent_workers)
-            if args.max_concurrent_workers is not None
-            else None
-        )
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    # --max-concurrent-workers is a broker-only ceiling; under renga the rect
+    # path ignores it, so don't parse/reject it there (keeps the flag's "ignored
+    # under --transport renga" contract honest -- a value that has no effect
+    # must not fail the run). It is still validated on the broker path.
+    if transport == "broker" and args.max_concurrent_workers is not None:
+        try:
+            capacity_policy: Optional[CapacityPolicy] = parse_capacity_policy(
+                args.max_concurrent_workers
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    else:
+        capacity_policy = None
 
     plan = build_plan(
         task, panes, state_dir,
