@@ -44,7 +44,7 @@ import time
 import urllib.error
 from pathlib import Path
 
-from ..terminal import TmuxAdapter, WezTermAdapter, default_backend
+from ..terminal import HerdrAdapter, TmuxAdapter, WezTermAdapter, default_backend
 from . import sidecar, surface
 from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
 
@@ -445,7 +445,11 @@ _AGENT_PANE_KINDS = {"claude", "codex"}
 
 # backend 名 → adapter クラス (isolated_session ClassVar を **非インスタンス化**で
 # 読むため。インスタンス化は backend バイナリ解決を伴うので避ける)。
-_BACKEND_ADAPTER_CLASS = {"tmux": TmuxAdapter, "wezterm": WezTermAdapter}
+_BACKEND_ADAPTER_CLASS = {
+    "tmux": TmuxAdapter,
+    "wezterm": WezTermAdapter,
+    "herdr": HerdrAdapter,
+}
 
 
 def _backend_is_isolated(backend: str | None) -> bool:

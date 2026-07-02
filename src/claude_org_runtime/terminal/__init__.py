@@ -28,6 +28,7 @@ from .base import (
     make_adapter,
     wait_for_state,
 )
+from .herdr import HerdrAdapter
 from .tmux import TmuxAdapter
 from .wezterm import WezTermAdapter
 
@@ -37,6 +38,7 @@ __all__ = [
     "PaneId",
     "PaneRef",
     "TerminalAdapter",
+    "HerdrAdapter",
     "TmuxAdapter",
     "WezTermAdapter",
     "classify_pane_state",

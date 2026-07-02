@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `terminal.herdr`: new `HerdrAdapter`, a third `TerminalAdapter` backend
+  built on the [Herdr](https://herdr.dev) Socket API (newline-delimited JSON
+  over a Unix domain socket, stdlib only — no new dependency). Selectable via
+  `--backend herdr` / `ORG_BACKEND=herdr`; wired into `VALID_BACKENDS`,
+  `make_adapter()`, the CLI `--backend` choices, and the launcher's
+  `_BACKEND_ADAPTER_CLASS` (`isolated_session=True`, so `org down` treats it
+  like tmux). The adapter holds one **dedicated Herdr workspace** and lists /
+  closes only panes in it (strict `workspace_id` filter), so unrelated Herdr
+  panes never leak into `list_panes`. Raw Herdr error codes are normalized at
+  the adapter boundary into `cwd_invalid` / `name_in_use` / `adapter_unavailable`
+  (Herdr socket unreachable) / `pane_not_found` / `invalid-params` rather than
+  passed through; `cwd` is validated *before* any layout mutation. Geometry for
+  balanced-split comes from `pane.layout` in terminal cell units, so the
+  existing `choose_split` works unchanged.
+
+  **Scope / not yet supported** (follow-ups, see design
+  `herdr-adapter.md`): this is the current minimal `TerminalAdapter` surface
+  only. Events-buffer normalization (poll_events cursor / 30s cap /
+  `events_dropped`) is out of scope — Herdr `events.subscribe` is per-pane and
+  drops silently under backpressure, so it needs per-pane subscribe + polling
+  reconcile plus a broker-surface change; the adapter uses no events. Full
+  raw-key `send_keys` (Shift+Tab / arrows / Home/End …) is also out of scope
+  (needs a broker-surface change); only Enter / Ctrl+C / literal text are
+  emitted, matching current broker capability. **POSIX/WSL only** — Windows
+  named pipe is unsupported and raises `adapter_unavailable` at instantiation.
+
+  **Known limitation (parity with tmux, broker-surface follow-up):** Herdr
+  native pane handles are non-digit (e.g. `w1:p2`), like tmux (`%3`). The
+  broker's `resolve_target` only treats all-digit strings as raw handles, so a
+  pane is addressable by its stable *name* or `focused`, but not by its raw
+  non-digit handle. `org down` closes managed panes by the id it lists, so
+  closing herdr panes by raw id has the same gap tmux already has; the adapter
+  is faithful to the tmux precedent. Making `close_pane` resolve non-digit
+  managed handles is a broker-layer change (out of this adapter's scope) that
+  would fix tmux and herdr together.
+
 ## [0.1.30] - 2026-06-22
 
 ### Fixed

@@ -434,9 +434,13 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
 
 # ============================================ down: pane close 範囲 (backend 別判定)
 def test_backend_is_isolated_mapping():
-    # adapter ClassVar (tmux=True / wezterm=False) を非インスタンス化で引く。
+    # adapter ClassVar (tmux=True / wezterm=False / herdr=True) を非インスタンス化
+    # で引く。org down はこの写像で pane close 範囲を決めるため、herdr の isolated
+    # 経路 (_BACKEND_ADAPTER_CLASS の "herdr" エントリ) を launcher 側で明示検証する
+    # (adapter の ClassVar 直読みだけでは配線 drift を捕まえられない)。
     assert launcher._backend_is_isolated("tmux") is True
     assert launcher._backend_is_isolated("wezterm") is False
+    assert launcher._backend_is_isolated("herdr") is True
     assert launcher._backend_is_isolated(None) is False     # 未知/None は保守的に False
 
 
