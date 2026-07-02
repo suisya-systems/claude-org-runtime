@@ -1559,6 +1559,21 @@ def test_cli_max_concurrent_workers_invalid(tmp_path: Path, capsys, monkeypatch)
     assert "max-concurrent-workers" in capsys.readouterr().err
 
 
+def test_cli_renga_ignores_max_concurrent_workers(tmp_path: Path, monkeypatch) -> None:
+    # Under renga the flag is documented as ignored, so even a malformed value
+    # must not fail the run (it is validated only on the broker path).
+    monkeypatch.setenv("ORG_TRANSPORT", "renga")
+    panes = [
+        {"id": 1, "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+    ]
+    task_path, panes_path = _write_cli_inputs(tmp_path, panes)
+    rc = _run_cli(
+        tmp_path, task_path, panes_path, "--max-concurrent-workers", "bogus",
+    )
+    assert rc == 0
+
+
 def test_cli_default_ceiling_is_finite_eight(tmp_path: Path, monkeypatch) -> None:
     # End-to-end: omitting --max-concurrent-workers on the broker path must
     # resolve to the finite default 8 (argparse default=None -> build_plan's
