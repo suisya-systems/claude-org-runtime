@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-07-03
+
+> A paired `claude-org-ja` follow-up (runtime pin floor bump / `pane-layout.md`
+> + `--free-panes` prose / `max_concurrent_workers` 導線) is running in a
+> separate PR alongside this release.
+
 ### Added
 
 - `terminal.herdr`: new `HerdrAdapter`, a third `TerminalAdapter` backend
