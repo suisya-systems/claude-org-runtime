@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 import threading
 from typing import Any, Callable
 
@@ -157,10 +158,18 @@ class FakeHerdrServer:
 
 
 @pytest.fixture
-def server(tmp_path) -> FakeHerdrServer:
-    srv = FakeHerdrServer(str(tmp_path / "herdr.sock")).start()
+def server() -> FakeHerdrServer:
+    # macOS/BSD cap the AF_UNIX sun_path at ~104 bytes; pytest's tmp_path embeds
+    # the (long) test node id and overflows bind() on macOS runners. Bind under
+    # a short mkdtemp dir instead (socket path stays ~25 bytes). Not tmp_path.
+    sockdir = tempfile.mkdtemp(prefix="hrdr")
+    srv = FakeHerdrServer(os.path.join(sockdir, "s.sock")).start()
     yield srv
-    srv.close()
+    srv.close()  # unlinks the socket file
+    try:
+        os.rmdir(sockdir)  # now-empty dir; harmless if it lingers
+    except OSError:
+        pass
 
 
 def _wire_spawn(server: FakeHerdrServer, *, pane_id: str = "w1:p2") -> None:
@@ -434,10 +443,14 @@ def test_list_panes_drops_panes_missing_workspace_id(
     assert ids == ["w1:p2"]
 
 
-def test_list_panes_unreachable_raises_not_empty(tmp_path) -> None:
+def test_list_panes_unreachable_raises_not_empty() -> None:
     # A dead socket must surface as adapter_unavailable, NOT be flattened to []
-    # (else pane_exists misreads "backend down" as "pane missing").
-    a = HerdrAdapter(socket_path=str(tmp_path / "nope.sock"), timeout=1.0)
+    # (else pane_exists misreads "backend down" as "pane missing"). Short path
+    # so this tests file-not-found, not the macOS AF_UNIX length limit.
+    a = HerdrAdapter(
+        socket_path=os.path.join(tempfile.mkdtemp(prefix="hrdr"), "nope.sock"),
+        timeout=1.0,
+    )
     a._workspace_id = "w1"  # pretend a workspace was bound
     a._tab_id = "w1:t1"
     with pytest.raises(HerdrError) as exc:
@@ -602,8 +615,11 @@ def test_unknown_raw_code_not_adapter_unavailable(server: FakeHerdrServer) -> No
     assert exc.value.raw == "some_new_code"
 
 
-def test_socket_unreachable_is_adapter_unavailable(tmp_path) -> None:
-    a = HerdrAdapter(socket_path=str(tmp_path / "absent.sock"), timeout=1.0)
+def test_socket_unreachable_is_adapter_unavailable() -> None:
+    a = HerdrAdapter(
+        socket_path=os.path.join(tempfile.mkdtemp(prefix="hrdr"), "absent.sock"),
+        timeout=1.0,
+    )
     with pytest.raises(HerdrError) as exc:
         a.get_text("w1:p2")
     assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
