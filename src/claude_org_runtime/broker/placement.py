@@ -1,6 +1,16 @@
 # -*- coding: utf-8 -*-
 """balanced-split placement: broker から dispatcher.choose_split を再利用する境界。
 
+.. deprecated:: runtime Issue #99 (capacity backend-aware 化)
+    この境界は「broker も rect balanced-split を使う」前提で作られたが、Issue #99
+    で broker path は :func:`~claude_org_runtime.dispatcher.runner.build_plan` 内で
+    ``choose_split`` を **バイパス** し、明示的な ``max_concurrent_workers`` policy
+    と安定固定 spawn target に置換された (detached session に split 座標は不要)。
+    したがって rect ベースの ``choose_split`` / :func:`choose_pane_split` は
+    実質 **renga-only** であり、この薄いラッパは方針と逆向きの遺物として残る。
+    削除または renga 専用モジュールへの移設は ja 側追従リリースとペアで行う予定
+    (本 runtime タスクのスコープ外)。当面は import 契約テストの対象として保持する。
+
 設計 SoT: docs/design/ja-migration-plan.md §8 Issue B (broker は terminal/ と
 choose_split を一方向に使う側。ja は broker を import しない)。
 
