@@ -41,8 +41,11 @@ class FakeAdapter:
         self._counter = itertools.count(1)
 
     # bootstrap a pre-existing pane (e.g. the caller pane) ------------------
-    def add_pane(self, active: bool = False, **geom) -> int:
-        handle = next(self._counter)
+    def add_pane(self, active: bool = False, handle=None, **geom):
+        # handle 明示で非数字 native handle (tmux "%N" / Herdr "wN:pN") を模せる。
+        # 既定は数字 counter (既存 WezTerm-style int handle)。
+        if handle is None:
+            handle = next(self._counter)
         rec = {
             "pane_id": handle, "active": active, "left": 0, "top": 0,
             "width": 80, "height": 24, "cursor_x": 0, "cursor_y": 0,

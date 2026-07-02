@@ -88,7 +88,8 @@ class ToolArgError(ValueError):
 _TARGET_SCHEMA = {
     "type": "string",
     "description": (
-        "Pane to address. Numeric id (from list_panes), stable name, or the "
+        "Pane to address. Native id from list_panes (numeric, or a managed "
+        "handle such as tmux '%3' / Herdr 'w1:p2'), stable name, or the "
         "literal 'focused'. All-digit strings are always interpreted as ids."
     ),
 }

@@ -289,6 +289,52 @@ def test_resolve_target_three_ways(tmp_path, fake_adapter):
     assert b.resolve_target("nope") is None
 
 
+@pytest.mark.parametrize("handle", ["%3", "w1:p2"])
+def test_resolve_target_nonnumeric_managed_handle(tmp_path, fake_adapter, handle):
+    """非数字 managed handle (tmux "%N" / Herdr "wN:pN") 直指定を解決する (Issue
+    #100)。native handle 型 (str) を保って返す。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=False, handle=handle)
+    b._register_pane(handle, agent_id="a1", name=None, role="worker",
+                     cwd=None, kind="claude", token=None)
+    assert b.resolve_target(handle) == handle
+    # 全桁数字契約は不変: '%3' は数字 id 3 とは別物で、混同しない。
+    assert b.resolve_target("3") is None
+
+
+def test_resolve_target_name_and_handle_do_not_collide(tmp_path, fake_adapter):
+    """stable name ([A-Za-z0-9_-]) と非数字 handle (':' / '%' を含む) は文字集合が
+    交わらないため、handle 直指定は name 解決を shadow しない — 同一 pane が
+    name / handle 双方で addressable になる。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=False, handle="%7")
+    b._register_pane("%7", agent_id="a1", name="alpha", role="worker",
+                     cwd=None, kind="claude", token=None)
+    assert b.resolve_target("alpha") == "%7"   # stable name (既存の優先経路)
+    assert b.resolve_target("%7") == "%7"       # 非数字 managed handle (追加経路)
+    # 未登録の handle 風文字列は解決しない (誤解決しない)。
+    assert b.resolve_target("%99") is None
+
+
+def test_org_down_closes_nonnumeric_handle_panes(tmp_path, fake_adapter):
+    """org down 統合経路: launcher は list_panes の native handle id をそのまま
+    close_pane に渡す。非数字 handle (tmux "%N") でも close できることを、実際に
+    list_panes_view の id → close_pane_target を通して確認する (Issue #100 の実害)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    for h in ("%3", "%4"):
+        fake_adapter.add_pane(active=False, handle=h)
+        b._register_pane(h, agent_id=f"a{h}", name=None, role="worker",
+                         cwd=None, kind="claude", token=None)
+    ids = [p["id"] for p in b.list_panes_view()]
+    assert set(ids) == {"%3", "%4"}
+    # launcher は str(pane.get("id")) を target に渡す (最後の 1 枚は last_pane 保護)。
+    res = b.close_pane_target(str(ids[0]))
+    assert res.get("isError") is not True
+    assert _text(res)["closed"] == ids[0]
+    assert ids[0] in fake_adapter.killed
+
+
 def test_spawn_codex_via_dispatch_rejects_exec_but_allows_tui(tmp_path, fake_adapter):
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
     fake_adapter.add_pane(active=True)
