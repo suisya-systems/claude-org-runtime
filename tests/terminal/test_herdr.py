@@ -514,6 +514,46 @@ def test_kill_pane_swallows_errors(server: FakeHerdrServer) -> None:
     assert server.params_for("pane.close")["pane_id"] == "w1:p2"
 
 
+def test_kill_pane_last_pane_falls_back_to_workspace_close(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Herdr rejects closing the sole remaining pane of a tab; the adapter must
+    # then close the whole workspace to actually reap the TUI, instead of
+    # silently reporting success while it keeps running (Codex P1).
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "single_pane", "message": "last pane"}})
+    server.on("pane.list", {"panes": [{"pane_id": "w1:p2", "workspace_id": "w1"}]})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    server.on("workspace.close", {"type": "ok"})
+    a.kill_pane("w1:p2")
+    assert "workspace.close" in server.methods_called()
+    assert a._workspace_id is None  # workspace reaped -> state cleared
+
+
+def test_kill_pane_non_last_does_not_close_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # When other panes remain, a pane.close failure must NOT tear down the whole
+    # workspace (only the sole-pane case escalates to workspace.close).
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "boom", "message": "x"}})
+    server.on(
+        "pane.list",
+        {"panes": [
+            {"pane_id": "w1:p2", "workspace_id": "w1"},
+            {"pane_id": "w1:p3", "workspace_id": "w1"},
+        ]},
+    )
+    server.on("pane.layout", {"layout": {"panes": []}})
+    a.kill_pane("w1:p2")
+    assert "workspace.close" not in server.methods_called()
+    assert a._workspace_id == "w1"  # workspace preserved
+
+
 def test_close_workspace(server: FakeHerdrServer, tmp_path) -> None:
     _wire_spawn(server)
     a = _adapter(server)

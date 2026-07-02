@@ -549,15 +549,34 @@ class HerdrAdapter:
 
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: str) -> None:
-        """spawn した pane を閉じる (best-effort)。
+        """spawn した pane を閉じる。
 
-        cleanup 用途なので tmux ``kill_pane`` (check=False) と同型で、Herdr error
-        (既に消えている pane_not_found、socket 不通等) は握り潰す。
+        通常は ``pane.close`` で閉じる。ただし Herdr は tab に残る **最後の pane**
+        の close を拒否しうる (tmux は最後の pane kill で session ごと消えるが、
+        Herdr は明示の ``workspace.close`` が要る。設計書 §3.3: last_pane は Herdr
+        明示コード無し)。本 adapter は初回 agent 起動後に root shell pane を閉じる
+        ため「managed agent pane が 1 枚だけの workspace」が通常状態であり、その
+        最後の 1 枚を close するケースは頻出する。
+
+        ここで close 拒否を握り潰して黙って返すと、broker は「閉じた」と誤認して
+        pane/token を unregister し成功報告する一方、TUI は生き続けて管理不能に
+        なる (Codex P1)。よって close が拒否されたら、対象が専用 workspace に残る
+        **唯一の pane** の場合に限り workspace ごと閉じて確実に reap する。既に
+        消えている (pane_not_found) / socket 不通等の best-effort 断念は tmux
+        ``kill_pane`` (check=False) 同様に握り潰す。
         """
         try:
             self._client.request("pane.close", {"pane_id": pane_id})
+            return
         except HerdrError:
             pass
+        # close 拒否。残存 pane を確認し、対象が唯一なら workspace ごと後始末する。
+        try:
+            remaining = [p["pane_id"] for p in self.list_panes()]
+        except HerdrError:
+            return  # backend 不通等: best-effort 断念 (これ以上は追わない)
+        if remaining == [pane_id]:
+            self.close_workspace()
 
     def close_workspace(self) -> None:
         """専用 workspace ごと後始末する (tmux ``kill_server`` 相当、best-effort)。
