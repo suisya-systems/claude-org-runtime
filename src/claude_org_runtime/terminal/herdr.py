@@ -21,9 +21,12 @@
   のため、採用する場合は per-pane subscribe + polling reconcile が必須。broker
   surface (poll_events) 拡張を伴うため本 adapter では **events 系を一切使わない**
   (最小面は全て one-shot request/response で成立する)。
-- full raw-key ``send_keys`` 語彙 (Shift+Tab / 矢印 / Home/End 等、設計書 §4.1)。
-  broker surface (send_keys_to) 拡張が要る。本 adapter は Enter / Ctrl+C / literal
-  text のみ (現行 broker 能力と同じ)。
+- (Issue #108) raw-key ``send_keys`` 語彙 (Shift+Tab / 矢印 / Ctrl+A-Z 等)。
+  :meth:`HerdrAdapter.send_named_keys` が canonical キー列を Herdr
+  ``pane.send_keys`` token へ写像して batch 送出する。ただし Herdr 0.7.1 の
+  send-keys 語彙は **full ではなく** delete/home/end/pageup/pagedown を欠く実測
+  subset (下記 ``_HERDR_KEY_MAP``)。broker が ``supported_named_keys`` で preflight
+  し、未対応キーを含む場合は text 送信前に ``[key_unsupported]`` を返す。
 
 分離 (isolated_session=True, 設計書 §3.4 / §4.2):
 - 本 adapter は **専用 workspace を 1 つ確保**し、その workspace_id に属する pane
@@ -51,10 +54,12 @@ import shutil
 import socket
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
+from .keys import CTRL_LETTERS
 
 # ---------------------------------------------------------------------------
 # error code 正規化 (設計書 §3.3 の "adapter 出口コード" 列)
@@ -251,6 +256,38 @@ class _HerdrClient:
 
 
 # ---------------------------------------------------------------------------
+# canonical キー -> Herdr pane.send_keys token の明示マップ (Issue #108)
+# ---------------------------------------------------------------------------
+#
+# canonical -> Herdr token。Herdr 0.7.1 (protocol 14) の実 server に対して各 token を
+# 個別に打鍵して**実測した accept/reject** に基づく (tmp probe / E2E)。既存
+# send_enter / send_interrupt が ``["enter"]`` / ``["ctrl+c"]`` を送っている
+# (spike §項目2) のと整合。adapter は canonical のみを受け取り (正規化は broker/surface
+# 側)、ここで token 化する。CI は fake socket で送出 token を pin し、実 binary がある
+# 環境では E2E で裏取りする (Herdr 語彙が版で変わったら本表のみ直せば済む単一箇所)。
+#
+# **重要 (実測)**: Herdr 0.7.1 の send-keys 語彙は **full ではない**。
+# delete / home / end / pageup / pagedown は ``invalid_key`` で拒否されるため
+# **本表から意図的に除外**する (canonical だが Herdr では emit 不能)。これらを含む
+# send_keys は broker preflight が Herdr backend で ``[key_unsupported]`` を返す。
+# backtab は Herdr では ``shift+tab`` token、esc は ``escape`` token で送る。
+# ctrl+a..z は 26 個すべて accept される (実測)。
+_HERDR_KEY_MAP: dict[str, str] = {
+    "enter": "enter",
+    "tab": "tab",
+    "space": "space",
+    "esc": "escape",
+    "backspace": "backspace",
+    "backtab": "shift+tab",
+    "up": "up",
+    "down": "down",
+    "left": "left",
+    "right": "right",
+    **{f"ctrl+{c}": f"ctrl+{c}" for c in CTRL_LETTERS},
+}
+
+
+# ---------------------------------------------------------------------------
 # HerdrAdapter (TerminalAdapter Protocol の第 3 実装)
 # ---------------------------------------------------------------------------
 
@@ -267,6 +304,11 @@ class HerdrAdapter:
     # 専用 workspace で無関係 pane を厳格フィルタするため isolated (設計書 §3.4)。
     # backend 固定の能力なので ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = True
+
+    # Herdr pane.send_keys が emit 可能な canonical 部分集合 (= _HERDR_KEY_MAP の key)。
+    # 実測で delete/home/end/pageup/pagedown を欠く subset (full ではない)。broker は
+    # これを preflight に使い、未対応キーを含む send_keys を [key_unsupported] で弾く。
+    supported_named_keys: ClassVar[frozenset[str]] = frozenset(_HERDR_KEY_MAP)
 
     socket_path: str = field(default_factory=resolve_socket_path)
     timeout: float = 15.0
@@ -536,6 +578,18 @@ class HerdrAdapter:
         self._client.request(
             "pane.send_keys", {"pane_id": pane_id, "keys": ["ctrl+c"]}
         )
+
+    def send_named_keys(self, pane_id: str, keys: Sequence[str]) -> None:
+        """canonical キー列を Herdr token へ写像し 1 回の pane.send_keys で batch 送出。
+
+        broker が preflight 済みの canonical のみを受ける前提。防御的に未知 canonical は
+        :class:`KeyError` を上げ、部分打鍵する前に全体を止める (実運用では到達しない)。
+        Herdr pane.send_keys は keys 配列を順に打鍵するため、順序を保って 1 request で送る。
+        """
+        if not keys:
+            return
+        tokens = [_HERDR_KEY_MAP[k] for k in keys]  # 未知 canonical は KeyError
+        self._client.request("pane.send_keys", {"pane_id": pane_id, "keys": tokens})
 
     def send_line(self, pane_id: str, text: str, settle: float = 0.15) -> None:
         """1 行送出 + Enter (ナッジ注入の正準形)。

@@ -73,6 +73,36 @@ def test_send_line_literal_then_enter(adapter: TmuxAdapter) -> None:
 
 
 # --------------------------------------------------------------------------
+# send_named_keys (raw-key vocabulary, Issue #108)
+# --------------------------------------------------------------------------
+
+def test_send_named_keys_maps_canonical_to_tmux_tokens(adapter: TmuxAdapter) -> None:
+    # representative raw keys: Shift+Tab -> BTab, Esc -> Escape, arrows,
+    # PageUp/Down -> PPage/NPage, Delete -> DC, Ctrl+A -> C-a. Batched in one
+    # send-keys call, order preserved.
+    adapter.send_named_keys(
+        "%1",
+        ["backtab", "esc", "up", "down", "pageup", "pagedown", "delete", "ctrl+a"],
+    )
+    assert _args(adapter._fake.last) == [
+        "send-keys", "-t", "%1",
+        "BTab", "Escape", "Up", "Down", "PPage", "NPage", "DC", "C-a",
+    ]
+
+
+def test_send_named_keys_full_vocabulary_supported(adapter: TmuxAdapter) -> None:
+    from claude_org_runtime.terminal.keys import CANONICAL_KEYS
+
+    # tmux declares the full canonical set and its map covers every key.
+    assert TmuxAdapter.supported_named_keys == CANONICAL_KEYS
+
+
+def test_send_named_keys_empty_is_noop(adapter: TmuxAdapter) -> None:
+    adapter.send_named_keys("%1", [])
+    assert adapter._fake.calls == []
+
+
+# --------------------------------------------------------------------------
 # capture-pane
 # --------------------------------------------------------------------------
 

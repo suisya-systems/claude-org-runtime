@@ -19,6 +19,7 @@ import pytest
 
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.terminal import PaneRef
+from claude_org_runtime.terminal.keys import CANONICAL_KEYS
 
 
 class FakeAdapter:
@@ -29,6 +30,10 @@ class FakeAdapter:
     ``cursor_x`` / ``cursor_y``). ``spawn`` records the built argv so tests can
     assert what the broker's structured builders emitted.
     """
+
+    # full raw-key vocabulary を emit できる backend (tmux / Herdr) を模す。
+    # WezTerm subset を模すテストは別途 supported_named_keys を差し替える。
+    supported_named_keys = frozenset(CANONICAL_KEYS)
 
     def __init__(self, isolated_session: bool = True) -> None:
         # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
@@ -86,6 +91,18 @@ class FakeAdapter:
 
     def send_interrupt(self, pane_id) -> None:
         self._screens[pane_id] = self._screens.get(pane_id, "") + "<C-c>"
+
+    def send_named_keys(self, pane_id, keys) -> None:
+        # canonical キー列を batch 送出する新経路。enter は改行、ctrl+c は既存の
+        # <C-c> マーカーに畳んで従来の send_enter / send_interrupt と観測を揃え、
+        # その他の raw key は <key> マーカーで screen に残す (テストが確認できる形)。
+        for k in keys:
+            if k == "enter":
+                self.send_enter(pane_id)
+            elif k == "ctrl+c":
+                self.send_interrupt(pane_id)
+            else:
+                self._screens[pane_id] = self._screens.get(pane_id, "") + f"<{k}>"
 
     def kill_pane(self, pane_id) -> None:
         self._panes.pop(pane_id, None)

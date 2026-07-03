@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -63,6 +64,13 @@ class WezTermAdapter:
     # として数えられる/不在なら +1 は stale なため)。backend 固定の能力なので
     # ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = False
+
+    # raw-key vocabulary (Issue #108): WezTerm adapter は full gap ではなく
+    # **既存実装で送れる subset** を宣言する (design review 確定事項 (5))。Enter は
+    # send-text --no-paste + CR、Ctrl+C は ETX (\x03) の生キー送出で既に emit できる。
+    # 矢印 / Shift+Tab / Home 等は本 adapter では未実装のため canonical に含めず、
+    # broker preflight が text 送信前に [key_unsupported] で全体を拒否する。
+    supported_named_keys: ClassVar[frozenset[str]] = frozenset({"enter", "ctrl+c"})
 
     exe: str = field(default_factory=find_wezterm)
     timeout: float = 15.0
@@ -206,6 +214,24 @@ class WezTermAdapter:
     def send_interrupt(self, pane_id: int) -> None:
         """Ctrl+C 1 打 (入力欄クリア)。WezTerm では生キー入力で ETX を送る。"""
         self.send_text(pane_id, "\x03", no_paste=True)
+
+    def send_named_keys(self, pane_id: int, keys: Sequence[str]) -> None:
+        """canonical キー列を送出する (WezTerm subset: enter / ctrl+c のみ)。
+
+        broker が :attr:`supported_named_keys` で preflight 済みのため、通常は
+        subset キーしか届かない。防御的に subset 外が来たら :class:`ValueError` を
+        上げ、部分打鍵する前に全体を止める (broker preflight のバグ検出用)。
+        """
+        for k in keys:
+            if k == "enter":
+                self.send_enter(pane_id)
+            elif k == "ctrl+c":
+                self.send_interrupt(pane_id)
+            else:
+                raise ValueError(
+                    f"wezterm adapter cannot emit canonical key {k!r} "
+                    f"(supported subset: {sorted(self.supported_named_keys)})"
+                )
 
     def send_line(self, pane_id: int, text: str, settle: float = 0.15) -> None:
         """1 行送出 + Enter。ナッジ注入の正準形 (本文は通さない)。

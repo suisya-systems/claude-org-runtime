@@ -431,7 +431,8 @@ def test_poll_events_baseline_then_emit_and_filter(tmp_path, fake_adapter):
     assert filtered["events"] == []
 
 
-def test_send_keys_enter_supported_others_flagged(tmp_path, fake_adapter):
+def test_send_keys_full_vocabulary_on_capable_backend(tmp_path, fake_adapter):
+    # FakeAdapter は full raw-key vocabulary を宣言する (tmux / Herdr 相当)。
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
     h0 = fake_adapter.add_pane(active=True)
     disp = _ops(b)
@@ -442,10 +443,37 @@ def test_send_keys_enter_supported_others_flagged(tmp_path, fake_adapter):
     # 未知キー名は -32602 (renga vocab parity)。
     with pytest.raises(ToolArgError):
         dispatch_tool(b, disp, "send_keys", {"target": "focused", "keys": ["Hyper+Z"]})
-    # 有効だが現 adapter 非対応キー (Shift+Tab) は既知制限として明示エラー。
-    out = dispatch_tool(b, disp, "send_keys", {"target": "focused", "keys": ["Shift+Tab"]})
+    # かつて非対応だった Shift+Tab / 矢印 / Esc / Ctrl+A は full backend で送出される
+    # (期待値反転)。canonical 化 (Shift+Tab -> backtab, Esc -> esc) も観測できる。
+    out = dispatch_tool(
+        b, disp, "send_keys",
+        {"target": "focused", "keys": ["Shift+Tab", "Up", "Esc", "Ctrl+A"]},
+    )
+    assert _text(out)["ok"] is True
+    screen = fake_adapter.get_text(h0)
+    for marker in ("<backtab>", "<up>", "<esc>", "<ctrl+a>"):
+        assert marker in screen
+
+
+def test_send_keys_all_or_nothing_preflight_on_subset_backend(tmp_path):
+    # WezTerm 相当の subset backend: Enter / Ctrl+C のみ emit 可能。
+    fake = FakeAdapter()
+    fake.supported_named_keys = frozenset({"enter", "ctrl+c"})
+    b = Broker(state_dir=tmp_path, adapter=fake)
+    h0 = fake.add_pane(active=True)
+    disp = _ops(b)
+    # 未対応キーが 1 つでも混じれば text を送る前に全体を拒否する (all-or-nothing)。
+    out = dispatch_tool(
+        b, disp, "send_keys",
+        {"target": "focused", "text": "abc", "keys": ["Up"]},
+    )
     assert out["isError"] is True
     assert "[key_unsupported]" in out["content"][0]["text"]
+    # text すら送られていない (preflight が type_text より前で弾く)。
+    assert fake.get_text(h0) == ""
+    # subset 内 (Enter) は成功する。
+    out = dispatch_tool(b, disp, "send_keys", {"target": "focused", "enter": True})
+    assert _text(out)["ok"] is True
 
 
 def test_inspect_pane_text_and_grid(tmp_path, fake_adapter):

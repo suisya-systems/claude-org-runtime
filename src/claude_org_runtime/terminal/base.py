@@ -14,7 +14,15 @@ Phase 2 で tmux (POSIX 正準 backend) を第二実装として追加した。b
 intent レベルの面 (broker / harness が実際に使う最小集合):
   spawn / list_panes / pane_exists / get_text /
   type_text (未送信で置く) / send_enter (確定) / send_line (型+確定) /
-  send_interrupt (Ctrl+C) / kill_pane
+  send_interrupt (Ctrl+C) / send_named_keys (canonical raw-key batch) / kill_pane
+
+raw-key vocabulary (Issue #108): 個々の named key は
+:func:`~claude_org_runtime.terminal.keys.normalize_key` で **canonical 形**に畳んで
+から adapter に渡す (正規化は broker/surface 側。adapter は canonical のみ受ける)。
+adapter は :meth:`TerminalAdapter.send_named_keys` で canonical キー列を batch 送出し、
+自 backend が emit 可能な canonical 集合を能力フラグ ``supported_named_keys`` で宣言する
+(broker が text 送信の**前に**全キーを preflight し、途中まで打鍵してからの per-key
+unsupported を避けるための all-or-nothing 契約)。
 
 backend ごとの「打鍵の小細工」の差はここで吸収する:
 - WezTerm: send-text 既定が bracketed paste のため、Enter は `--no-paste + CR`、
@@ -32,6 +40,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Union, runtime_checkable
 
@@ -81,6 +90,17 @@ class TerminalAdapter(Protocol):
     ``issubclass`` 検査に使うため、非メソッド member を**注釈として宣言しない**
     (注釈すると issubclass が TypeError)。concrete adapter が ClassVar として
     持ち、broker は ``getattr(adapter, "isolated_session", False)`` で読む。
+
+    能力フラグ ``supported_named_keys`` (frozenset[str], ClassVar): この backend が
+    :meth:`send_named_keys` で emit 可能な **canonical** キー
+    (:data:`~claude_org_runtime.terminal.keys.CANONICAL_KEYS` の部分集合) を宣言する。
+    tmux は full vocabulary、Herdr は実測 subset (delete/home/end/pageup/pagedown を
+    欠く)、WezTerm は既存実装で送れる最小 subset (``{"enter", "ctrl+c"}``) を宣言する。
+    broker は text を送る**前に**送信予定の全
+    canonical キーをこの集合で preflight し、未対応が 1 つでもあれば全体を
+    ``[key_unsupported]`` で拒否する (all-or-nothing: 途中まで打鍵して壊さない)。
+    ``isolated_session`` と同じ理由で **注釈しない** ClassVar とし、broker は
+    ``getattr(adapter, "supported_named_keys", frozenset())`` で読む。
     """
 
     def spawn(
@@ -100,6 +120,8 @@ class TerminalAdapter(Protocol):
     def send_line(self, pane_id: PaneId, text: str, settle: float = ...) -> None: ...
 
     def send_interrupt(self, pane_id: PaneId) -> None: ...
+
+    def send_named_keys(self, pane_id: PaneId, keys: Sequence[str]) -> None: ...
 
     def kill_pane(self, pane_id: PaneId) -> None: ...
 
