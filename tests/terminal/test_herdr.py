@@ -24,9 +24,14 @@ from claude_org_runtime.terminal import herdr as herdr_mod
 from claude_org_runtime.terminal.herdr import (
     CODE_ADAPTER_UNAVAILABLE,
     CODE_CWD_INVALID,
+    CODE_INTERNAL,
     CODE_INVALID_PARAMS,
     CODE_NAME_IN_USE,
     CODE_PANE_NOT_FOUND,
+    PANE_LIVE_ALIVE,
+    PANE_LIVE_GONE,
+    PANE_LIVE_REUSED,
+    PANE_LIVE_UNKNOWN,
     HerdrAdapter,
     HerdrError,
     resolve_socket_path,
@@ -305,6 +310,238 @@ def test_spawn_cwd_preflight_rejects_before_any_socket_call(
     assert exc.value.code == CODE_CWD_INVALID
     # layout must not be mutated: no request reached the server
     assert server.requests == []
+
+
+# ---------------------------------------------------------------------------
+# placement reconciliation (Issue #114 Fix-C: agent.start ignores workspace param
+# and lands in the focused *user* workspace; spawn must pane.move it back into the
+# dedicated tab, before root cleanup, only when actually diverged)
+# ---------------------------------------------------------------------------
+
+def _wire_spawn_diverged(
+    server: FakeHerdrServer,
+    *,
+    dedicated: str = "w2",
+    tab: str = "w2:t1",
+    root: str = "w2:p1",
+    landed_pane: str = "w1:p2",
+    landed_ws: str = "w1",
+    moved_pane: str = "w2:p2",
+    terminal_id: str = "term_disp",
+) -> None:
+    """Wire the DIVERGED spawn chain (Issue #114): ``agent.start`` reports the pane
+    landed in the focused *user* workspace (``landed_ws``), diverging from the
+    dedicated one (``dedicated``), so spawn must ``pane.move`` it into the dedicated
+    tab and return the post-move id (``moved_pane``)."""
+    server.on(
+        "workspace.create",
+        {
+            "type": "workspace_created",
+            "workspace": {"workspace_id": dedicated, "active_tab_id": tab},
+            "root_pane": {"pane_id": root, "workspace_id": dedicated, "tab_id": tab},
+        },
+    )
+    server.on(
+        "agent.start",
+        lambda params: {
+            "type": "agent_started",
+            "agent": {
+                "pane_id": landed_pane,
+                "workspace_id": landed_ws,
+                "terminal_id": terminal_id,
+                "name": params.get("name"),
+            },
+        },
+    )
+    server.on(
+        "pane.move",
+        {
+            "type": "pane_move",
+            "move_result": {
+                "changed": True,
+                "previous_pane_id": landed_pane,
+                "pane": {
+                    "pane_id": moved_pane,
+                    "workspace_id": dedicated,
+                    "terminal_id": terminal_id,
+                },
+            },
+        },
+    )
+    server.on("pane.close", {"type": "ok"})
+
+
+def test_spawn_diverged_moves_pane_into_dedicated_tab_before_root_cleanup(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_spawn_diverged(server)
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path))
+    # PaneRef reports the POST-move id + dedicated ws + preserved terminal_id.
+    assert ref.pane_id == "w2:p2"
+    assert ref.window_id == "w2"
+    assert ref.terminal_id == "term_disp"
+    # order matters: move must precede root cleanup (else the dedicated ws auto-closes
+    # when its root pane is closed and the move target tab disappears).
+    assert server.methods_called() == [
+        "workspace.create",
+        "agent.start",
+        "pane.move",
+        "pane.close",
+    ]
+    mv = server.params_for("pane.move")
+    assert mv["pane_id"] == "w1:p2"
+    assert mv["destination"] == {"type": "tab", "tab_id": "w2:t1", "split": "down"}
+    # root cleanup closes the dedicated ws's root pane, NOT the moved agent pane.
+    assert server.params_for("pane.close")["pane_id"] == "w2:p1"
+
+
+def test_spawn_not_diverged_skips_move_idempotent(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    """Idempotency (requirement): if a future Herdr honors the workspace param and the
+    pane lands directly in the dedicated ws, spawn must NOT issue a (double) move."""
+    server.on(
+        "workspace.create",
+        {
+            "type": "workspace_created",
+            "workspace": {"workspace_id": "w2", "active_tab_id": "w2:t1"},
+            "root_pane": {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"},
+        },
+    )
+    server.on(
+        "agent.start",
+        lambda params: {
+            "type": "agent_started",
+            "agent": {
+                "pane_id": "w2:p2",
+                "workspace_id": "w2",  # honored: lands in dedicated
+                "terminal_id": "term_ok",
+                "name": params.get("name"),
+            },
+        },
+    )
+    server.on("pane.close", {"type": "ok"})
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path))
+    assert ref.pane_id == "w2:p2"
+    assert ref.terminal_id == "term_ok"
+    assert "pane.move" not in server.methods_called()
+    assert server.methods_called() == ["workspace.create", "agent.start", "pane.close"]
+
+
+def test_spawn_divergence_detected_via_pane_id_prefix_when_workspace_id_absent(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    """If agent.start omits ``workspace_id`` (older/newer schema), divergence is still
+    detected from the ``wN:pM`` pane_id prefix, so the move still fires."""
+    _wire_spawn_diverged(server)
+    # drop workspace_id from the agent response; keep the w1 pane_id prefix.
+    server.on(
+        "agent.start",
+        lambda params: {
+            "type": "agent_started",
+            "agent": {"pane_id": "w1:p2", "terminal_id": "term_disp",
+                      "name": params.get("name")},
+        },
+    )
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path))
+    assert ref.pane_id == "w2:p2"  # moved
+    assert "pane.move" in server.methods_called()
+
+
+def test_spawn_diverged_move_failure_closes_stranded_pane_and_raises(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    """If the corrective move fails, the pane is stranded in the user's workspace
+    (isolation broken). spawn best-effort closes it and propagates the error rather
+    than returning an isolation-broken PaneRef; root cleanup never runs."""
+    _wire_spawn_diverged(server)
+    server.on("pane.move", {"error": {"code": "invalid_request", "message": "nope"}})
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path))
+    assert exc.value.code == CODE_INVALID_PARAMS
+    # the stranded landed pane (w1:p2) is best-effort closed; root (w2:p1) is NOT.
+    closes = [r for r in server.requests
+              if r.get("method") == "pane.close"]
+    assert [c["params"]["pane_id"] for c in closes] == ["w1:p2"]
+
+
+def test_spawn_diverged_move_missing_post_move_id_is_internal(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_spawn_diverged(server)
+    server.on("pane.move", {"type": "pane_move", "move_result": {"changed": True}})
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path))
+    assert exc.value.code == CODE_INTERNAL
+
+
+# ---------------------------------------------------------------------------
+# pane_liveness (Issue #114 Fix-D: workspace-independent authoritative liveness
+# via pane.get + terminal_id reuse guard)
+# ---------------------------------------------------------------------------
+
+def test_pane_liveness_alive_when_present_and_terminal_id_matches(
+    server: FakeHerdrServer,
+) -> None:
+    server.on(
+        "pane.get",
+        {"type": "pane_info",
+         "pane": {"pane_id": "w2:p2", "terminal_id": "term_disp", "workspace_id": "w2"}},
+    )
+    a = _adapter(server)
+    assert a.pane_liveness("w2:p2", "term_disp") == PANE_LIVE_ALIVE
+
+
+def test_pane_liveness_reused_when_terminal_id_differs(
+    server: FakeHerdrServer,
+) -> None:
+    """pane_id resolves but to a DIFFERENT terminal (id reused by a foreign pane):
+    our pane is gone; the broker must reap bookkeeping WITHOUT closing that id."""
+    server.on(
+        "pane.get",
+        {"type": "pane_info",
+         "pane": {"pane_id": "w2:p2", "terminal_id": "term_SOMEONE_ELSE"}},
+    )
+    a = _adapter(server)
+    assert a.pane_liveness("w2:p2", "term_disp") == PANE_LIVE_REUSED
+
+
+def test_pane_liveness_gone_when_pane_not_found(server: FakeHerdrServer) -> None:
+    server.on("pane.get", {"error": {"code": "pane_not_found", "message": "no"}})
+    a = _adapter(server)
+    assert a.pane_liveness("w9:p9", "term_x") == PANE_LIVE_GONE
+
+
+def test_pane_liveness_gone_when_workspace_not_found(server: FakeHerdrServer) -> None:
+    # workspace_not_found normalizes to pane_not_found (CODE_PANE_NOT_FOUND) -> gone.
+    server.on("pane.get", {"error": {"code": "workspace_not_found", "message": "no"}})
+    a = _adapter(server)
+    assert a.pane_liveness("w9:p9", "term_x") == PANE_LIVE_GONE
+
+
+def test_pane_liveness_unknown_when_backend_unreachable(tmp_path) -> None:
+    # no server bound at this path -> socket unreachable -> adapter_unavailable -> unknown
+    # (must NOT be treated as gone: an unreachable backend is not proof of death).
+    a = HerdrAdapter(socket_path=str(tmp_path / "absent.sock"), timeout=0.3)
+    assert a.pane_liveness("w1:p1", "term_x") == PANE_LIVE_UNKNOWN
+
+
+def test_pane_liveness_no_recorded_terminal_id_treats_present_as_alive(
+    server: FakeHerdrServer,
+) -> None:
+    """Old registry entry without a recorded terminal_id: the reuse guard is skipped
+    (can't compare), but workspace-independent liveness still resolves present->alive."""
+    server.on(
+        "pane.get",
+        {"type": "pane_info", "pane": {"pane_id": "w2:p2", "terminal_id": "term_disp"}},
+    )
+    a = _adapter(server)
+    assert a.pane_liveness("w2:p2", None) == PANE_LIVE_ALIVE
 
 
 # ---------------------------------------------------------------------------

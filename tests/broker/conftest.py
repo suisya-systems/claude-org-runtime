@@ -18,7 +18,12 @@ import urllib.request
 import pytest
 
 from claude_org_runtime.broker.server import Broker
-from claude_org_runtime.terminal import PaneRef
+from claude_org_runtime.terminal import (
+    PANE_LIVE_ALIVE,
+    PANE_LIVE_GONE,
+    PANE_LIVE_REUSED,
+    PaneRef,
+)
 from claude_org_runtime.terminal.keys import CANONICAL_KEYS
 
 
@@ -43,6 +48,7 @@ class FakeAdapter:
         reap_min_missing_seconds: float = 0.0,
         detailed_kill: bool = False,
         kill_ineffective: bool = False,
+        authoritative_liveness: bool = False,
     ) -> None:
         # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
         # global-mux backend (wezterm) を模すテストは False を渡す。
@@ -59,6 +65,18 @@ class FakeAdapter:
         self._kill_ineffective = kill_ineffective
         if detailed_kill:
             self.kill_pane_detailed = self._kill_pane_detailed_impl
+        # authoritative_liveness: Herdr のように workspace 非依存の権威 liveness
+        # (pane.get + terminal_id 照合) を持つ backend を模す (Issue #114 Fix-D)。
+        # 束ねた時だけ broker が getattr で見つけ、reap 決定を verdict に委ねる。
+        # 束ねない (既定) 時は tmux/wezterm と同じ従来の物理 close 検証経路を通る。
+        if authoritative_liveness:
+            self.pane_liveness = self._pane_liveness_impl
+        # 権威 liveness を持つ backend (Herdr) は spawn の PaneRef に terminal_id を
+        # 載せる。持たない backend (tmux/wezterm) は None。
+        self._provides_terminal_id = authoritative_liveness
+        # test が pane_id -> verdict を明示指定する override。未指定の pane は
+        # 「_panes に居れば alive、居なければ gone」を既定にする。
+        self._liveness_verdicts: dict = {}
         self._panes: dict[int, dict] = {}
         self._screens: dict[int, str] = {}
         # snapshot ラグ (eventually consistent) を模す: ここに入れた handle は
@@ -92,7 +110,13 @@ class FakeAdapter:
     def spawn(self, argv, cwd=None, new_window=True) -> PaneRef:
         handle = self.add_pane()
         self.spawned.append({"argv": list(argv), "cwd": cwd, "handle": handle})
-        return PaneRef(pane_id=handle)
+        tid = f"term_{handle}" if self._provides_terminal_id else None
+        if tid is not None:
+            # record the pane's current terminal_id so _pane_liveness_impl can mirror
+            # the real HerdrAdapter's terminal_id reuse guard (compare the caller's
+            # threaded terminal_id against the pane's actual one).
+            self._panes[handle]["terminal_id"] = tid
+        return PaneRef(pane_id=handle, terminal_id=tid)
 
     def list_panes(self) -> list[dict]:
         # snapshot ラグ中の pane は list から隠れる (eventually consistent)。
@@ -186,6 +210,52 @@ class FakeAdapter:
     def desync_show(self, pane_id) -> None:
         """Reveal a previously hidden pane again (snapshot caught up)."""
         self._snapshot_hidden.discard(pane_id)
+
+    # workspace 非依存の権威 liveness (Herdr pane.get 相当) -------------------
+    def set_liveness(self, pane_id, verdict) -> None:
+        """Force the authoritative verdict for a pane_id, bypassing the terminal_id
+        comparison (Fix-D tests that want to drive a specific verdict directly).
+
+        Models Herdr's ``pane.get``-backed liveness independent of the
+        workspace-filtered snapshot: a pane can be hidden from ``list_panes``
+        (``desync_hide``) yet still be authoritatively ``alive`` (placement bug),
+        or authoritatively ``gone``/``reused`` regardless of the snapshot.
+        """
+        self._liveness_verdicts[pane_id] = verdict
+
+    def set_pane_terminal_id(self, pane_id, terminal_id) -> None:
+        """Change a present pane's CURRENT terminal_id, modelling ``pane_id`` reuse
+        by a foreign pane (the id resolves but to a different process). Lets a test
+        exercise the real reuse-guard SEAM: the broker threads the pane's *recorded*
+        terminal_id into ``pane_liveness``; if the current one differs, the verdict
+        is ``reused`` — which fails if the broker ever stopped threading it."""
+        if pane_id in self._panes:
+            self._panes[pane_id]["terminal_id"] = terminal_id
+
+    def _pane_liveness_impl(self, pane_id, terminal_id=None) -> str:
+        """Mirror ``HerdrAdapter.pane_liveness`` — bound only when the adapter is
+        built with ``authoritative_liveness=True`` so both the broker's
+        authoritative path (getattr finds it) and its legacy physical-close
+        fallback (getattr returns None) are covered by the same fake class.
+
+        A ``set_liveness`` override wins (for tests that drive a verdict directly).
+        Otherwise this **honours the caller-supplied** ``terminal_id`` exactly like
+        the real adapter, so the broker->adapter threading of the recorded
+        terminal_id (the id-reuse guard) is actually exercised:
+          - not present in ``_panes`` -> gone (workspace-independent: ``_snapshot_hidden``
+            does not affect this, matching a real ``pane.get``).
+          - present but the caller's ``terminal_id`` differs from the pane's current
+            one -> reused (id recycled by a foreign pane).
+          - present and ``terminal_id`` is None (no recorded id) or matches -> alive.
+        """
+        if pane_id in self._liveness_verdicts:
+            return self._liveness_verdicts[pane_id]
+        if pane_id not in self._panes:
+            return PANE_LIVE_GONE
+        current = self._panes[pane_id].get("terminal_id")
+        if terminal_id is not None and current is not None and current != terminal_id:
+            return PANE_LIVE_REUSED
+        return PANE_LIVE_ALIVE
 
 
 @pytest.fixture

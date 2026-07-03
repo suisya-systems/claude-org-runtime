@@ -33,6 +33,10 @@ from pathlib import Path
 
 from ..terminal import (
     NUDGE_TEXT,
+    PANE_LIVE_ALIVE,
+    PANE_LIVE_GONE,
+    PANE_LIVE_REUSED,
+    PANE_LIVE_UNKNOWN,
     PaneId,
     TerminalAdapter,
     classify_pane_state,
@@ -694,24 +698,61 @@ class Broker(TokenMixin, StoreMixin):
                 ):
                     candidates.append(m["handle"])
         for handle in candidates:
+            meta = self._meta_for(handle) or {}
+            # 権威 liveness (Fix-D, 真因A/B): adapter が workspace 非依存の
+            # pane.get liveness を持つ backend (herdr) では、snapshot 欠落から
+            # 「消えた」を即断せず、pane_id を直接引いて terminal_id 照合で生死を
+            # 権威判定してから bookkeeping を落とす。list_panes/pane_exists 由来の
+            # stale snapshot に依存した「盲目的 pane.close して close 成否で判定」の
+            # 反転論理 (生 pane を close して生きていた証拠を得る) を廃する。
+            verdict = self._authoritative_liveness(handle, meta.get("terminal_id"))
+            if verdict is not None:
+                if verdict in (PANE_LIVE_ALIVE, PANE_LIVE_UNKNOWN):
+                    # ALIVE: 我々の pane が生存 (placement 崩れ / snapshot lag で欠落した
+                    # だけ)。誤 reap 禁止。UNKNOWN: backend 不通で判定不能。いずれも
+                    # bookkeeping を保持し defer し、次ラウンドに委ねる。
+                    self._journal(
+                        "pane_reap_deferred", pane_id=handle,
+                        agent_id=meta.get("agent_id"),
+                        kill={"closed_via": "live_" + verdict, "still_present": None},
+                    )
+                    continue
+                # GONE: 権威的に消滅 (close 不要)。REUSED: pane_id が別 pane に再利用され
+                # 我々の pane は消滅。いずれも bookkeeping を掃除するが、**物理 close は
+                # 発行しない**: GONE は既に不在、REUSED はその pane_id が今や無関係 pane で
+                # close すると巻き添える (isolation 保護)。
+                closed_via = (
+                    "already_gone_verified" if verdict == PANE_LIVE_GONE
+                    else "id_reused_skip_close"
+                )
+                agent_id, found = self._cleanup_pane(handle)
+                if not found:
+                    continue  # 並行 close/reap が先に掃除した
+                self._emit_event(
+                    {"type": "pane_exited", "pane_id": handle, "agent_id": agent_id}
+                )
+                self._journal(
+                    "pane_reaped", pane_id=handle, agent_id=agent_id,
+                    kill={"closed_via": closed_via, "still_present": False},
+                )
+                continue
+            # ---- 従来経路 (tmux/wezterm: 権威 liveness を持たない backend) ----
             # 物理 close 検証 (真因A): bookkeeping を落とす前に **必ず物理 close を
-            # 発行**する。herdr の pane_exists は list_panes 由来で stale snapshot と
-            # 同源のため、「消えていそうか」の事前 probe に使うと、生きているのに
-            # snapshot から欠落した pane を「不在」と誤読し、close を発行せず bookkeeping
-            # だけ落として生 TUI を unmanaged 孤児化しうる (Codex round2 P2)。よって
-            # 事前判定はせず常に close する: 既に消えていれば no-op (already_gone)、
+            # 発行**する。list_panes 由来の pane_exists を「消えていそうか」の事前 probe に
+            # 使うと、生きているのに snapshot から欠落した pane を「不在」と誤読し、close を
+            # 発行せず bookkeeping だけ落として生 TUI を孤児化しうる (Codex round2 P2)。
+            # よって事前判定はせず常に close する: 既に消えていれば no-op (already_gone)、
             # snapshot が欠落させていただけで生存していれば実際に閉じる (idempotent)。
             kill_result = self._physically_close_reaped(handle)
             # bookkeeping を落とすのは **close が有効だった (= pane を消せた / 既に消えて
-            # いた) と分かった時だけ**。close が拒否 (herdr "refused") / backend 不通
-            # ("list_failed" / "error") なら pane が生きたまま残りうるので、meta/token を
-            # 保持し欠落状態を持ち越して次ラウンドで再 close を試みる (defer)。判定は
-            # stale な post-close probe (still_present) ではなく close 経路 (closed_via)
-            # で行う — 「close を発行して受理された」事実に基づく (Codex round2 P2)。
+            # いた) と分かった時だけ**。close が拒否 / backend 不通なら pane が生きたまま
+            # 残りうるので meta/token を保持し次ラウンドで再 close を試みる (defer)。判定は
+            # stale な post-close probe (still_present) ではなく close 経路 (closed_via) で
+            # 行う — 「close を発行して受理された」事実に基づく (Codex round2 P2)。
             if not self._reap_close_effective(kill_result):
                 self._journal(
                     "pane_reap_deferred", pane_id=handle,
-                    agent_id=(self._meta_for(handle) or {}).get("agent_id"),
+                    agent_id=meta.get("agent_id"),
                     kill=kill_result,
                 )
                 continue
@@ -735,6 +776,36 @@ class Broker(TokenMixin, StoreMixin):
     def _reap_close_effective(self, kill_result: dict) -> bool:
         """物理 close が pane を消せた/既に不在だったと判断できるか (真因A / P2)。"""
         return kill_result.get("closed_via") in self._REAP_CLOSE_EFFECTIVE
+
+    def _authoritative_liveness(
+        self, handle: "PaneId", terminal_id: "PaneId | None"
+    ) -> str | None:
+        """adapter が workspace 非依存の権威 liveness を持てば verdict を返す (Fix-D)。
+
+        持てば :data:`PANE_LIVE_ALIVE` / :data:`PANE_LIVE_REUSED` /
+        :data:`PANE_LIVE_GONE` / :data:`PANE_LIVE_UNKNOWN` のいずれか、持たなければ
+        ``None`` (呼び元は ``None`` で従来の物理 close 検証経路にフォールバックする)。
+
+        真因A/B: ``list_panes`` / ``pane_exists`` は自 workspace filter 越しの liveness で、
+        placement バグや workspace 消失で生 pane を構造的に欠落させ、それを reaper が
+        「消えた」と誤読して生 pane を close (= 誤 reap) していた。``pane.get`` のような
+        workspace 非依存の直接 probe を持つ backend (herdr) では、これを reap 決定の権威に
+        する。best-effort: adapter が例外を上げたら :data:`PANE_LIVE_UNKNOWN` に倒して
+        defer させる (判定不能時に誤 reap しない安全側)。
+        """
+        fn = getattr(self.adapter, "pane_liveness", None)
+        if not callable(fn):
+            return None
+        try:
+            verdict = fn(handle, terminal_id)
+        except Exception:  # noqa: BLE001 - best-effort; 判定不能は defer 側に倒す
+            return PANE_LIVE_UNKNOWN
+        # adapter が想定外の値を返しても安全側 (UNKNOWN=defer) に正規化する。
+        if verdict in (
+            PANE_LIVE_ALIVE, PANE_LIVE_REUSED, PANE_LIVE_GONE, PANE_LIVE_UNKNOWN
+        ):
+            return verdict
+        return PANE_LIVE_UNKNOWN
 
     def _physically_close_reaped(self, handle: "PaneId") -> dict:
         """reap 候補に物理 close を発行し、close 経路と残存を返す (真因A)。
@@ -892,12 +963,18 @@ class Broker(TokenMixin, StoreMixin):
     def _register_pane(
         self, handle: "PaneId", agent_id: str, name: str | None,
         role: str | None, cwd: str | None, kind: str | None, token: str | None,
+        terminal_id: "PaneId | None" = None,
     ) -> None:
         now = time.time()
         with self._lock:
             self._pane_meta[str(handle)] = {
                 "handle": handle, "agent_id": agent_id, "name": name,
                 "role": role, "cwd": cwd, "kind": kind, "token": token,
+                # workspace 非依存 liveness (Fix-D) の id 再利用ガードに使う backend の
+                # 安定プロセス identity (Herdr terminal_id)。pane_id は移送/再利用で
+                # 変わりうるが terminal_id はプロセスに紐づき不変。持たない backend
+                # (tmux/wezterm) は None (ガードは効かないが従来経路は不変)。
+                "terminal_id": terminal_id,
                 # 決定的 reap モデルの pane 単位 liveness (真因B)。spawn 時刻・最終
                 # 目撃時刻・連続欠落の起点/回数。_reap_stale_managed_panes が snapshot
                 # ごとに更新し、age + 連続欠落の閾値超過でのみ reap 対象にする。
@@ -1111,7 +1188,8 @@ class Broker(TokenMixin, StoreMixin):
             self._revoke_token(delivery_cred)
             raise
         self.bind_pane(token, ref.pane_id)
-        self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token)
+        self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token,
+                            terminal_id=getattr(ref, "terminal_id", None))
         self._emit_event({
             "type": "pane_started", "pane_id": ref.pane_id, "agent_id": agent_id,
         })
@@ -1170,7 +1248,8 @@ class Broker(TokenMixin, StoreMixin):
             self._revoke_token(token)
             raise
         self.bind_pane(token, ref.pane_id)
-        self._register_pane(ref.pane_id, agent_id, name, role, cwd, "codex", token)
+        self._register_pane(ref.pane_id, agent_id, name, role, cwd, "codex", token,
+                            terminal_id=getattr(ref, "terminal_id", None))
         self._emit_event({
             "type": "pane_started", "pane_id": ref.pane_id, "agent_id": agent_id,
         })
@@ -1211,7 +1290,8 @@ class Broker(TokenMixin, StoreMixin):
             self._revoke_token(token)
             raise
         agent_id = name or self._gen_agent_id("pane")
-        self._register_pane(ref.pane_id, agent_id, name, role, cwd, None, None)
+        self._register_pane(ref.pane_id, agent_id, name, role, cwd, None, None,
+                            terminal_id=getattr(ref, "terminal_id", None))
         self._emit_event({"type": "pane_started", "pane_id": ref.pane_id})
         self._journal("pane_spawned", kind="generic", pane_id=ref.pane_id)
         return _ok({

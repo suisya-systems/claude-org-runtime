@@ -1130,6 +1130,175 @@ def test_reap_deferred_when_physical_close_backend_unreachable(tmp_path):
     assert h in adapter.killed
 
 
+# ============ workspace 非依存の権威 liveness (Issue #114 Fix-D) ============
+#
+# adapter が pane_liveness (Herdr pane.get + terminal_id 照合) を持つ backend では、
+# reaper は snapshot 欠落から「消えた」を即断せず verdict に従う: ALIVE/UNKNOWN は
+# defer、GONE/REUSED のみ bookkeeping を掃除、かつ REUSED は物理 close を発行しない。
+
+
+def test_reap_authoritative_alive_never_kills_live_missing_pane(tmp_path):
+    """Issue #114 の核心 (broker 層 false-reap 回帰テスト): 専用 workspace filter 越しの
+    snapshot に **恒常的に載らない** 生 pane (placement バグ由来) でも、権威 liveness が
+    ALIVE を返す限り絶対に reap しない。#112 の閾値ゲートは恒常欠落に無力だったが、
+    Fix-D は「snapshot 欠落」を「消滅」と等値しないことで構造的に断つ。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)   # host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    adapter.desync_hide(h)          # 恒常欠落 (snapshot に一切載らない) を模す
+    for _ in range(5):              # 何度 request-driven に reap を回しても...
+        b.resolve_target("focused")
+    assert b._meta_for(h) is not None       # ...生 pane は reap されない
+    assert b._binds[tok].revoked is False
+    assert h not in adapter.killed          # 生 pane を絶対に物理 kill しない
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        e["event"] == "pane_reap_deferred"
+        and e.get("pane_id") == h
+        and e["kill"]["closed_via"] == "live_alive"
+        for e in events
+    )
+    assert not any(e["event"] == "pane_reaped" and e.get("pane_id") == h for e in events)
+
+
+def test_reap_authoritative_gone_reaps_without_blind_physical_close(tmp_path):
+    """権威 liveness が GONE (pane.get で pane_not_found) を返したら、bookkeeping を掃除
+    する。既に不在なので盲目的な物理 close は発行しない (「close して成否で判定」の反転
+    論理を廃した)。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    agent_id = b._meta_for(h)["agent_id"]
+    tok = b._meta_for(h)["token"]
+    adapter.terminate(h)            # 自己終了で物理消滅 -> pane.get は gone
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None           # bookkeeping 掃除
+    assert b._binds[tok].revoked is True    # 幽霊 binding を残さない (#106/#112)
+    assert h not in adapter.killed          # gone は close 不要 (盲目的 kill しない)
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert len(reaped) == 1
+    assert reaped[0]["agent_id"] == agent_id
+    assert reaped[0]["kill"]["closed_via"] == "already_gone_verified"
+
+
+def test_reap_authoritative_reused_reaps_but_never_closes_foreign_pane(tmp_path):
+    """id 再利用ガード (Fix-D): 死んだ pane の pane_id が別 (ユーザ) pane に再利用された
+    場合、terminal_id 不一致で REUSED と判定し bookkeeping は掃除するが、**その pane_id を
+    物理 close しない** — 無関係 pane の巻き添え close (Issue #114 §1 の id 再利用ハザード)
+    を断つ。同時に幽霊 binding も残さない (defer し続けて #106/#112 を復活させない)。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    adapter.desync_hide(h)              # snapshot 欠落 (候補化)
+    adapter.set_liveness(h, "reused")   # pane_id は解決するが別プロセス (id 再利用)
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None           # 我々の pane は消滅 -> bookkeeping 掃除
+    assert b._binds[tok].revoked is True
+    assert h not in adapter.killed          # *** 別 pane に化けた id を close しない
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert reaped[0]["kill"]["closed_via"] == "id_reused_skip_close"
+
+
+def test_reap_reused_verdict_flows_from_threaded_terminal_id(tmp_path):
+    """Regression guard for the broker->adapter terminal_id **threading** seam (the
+    id-reuse guard, heart of Fix-D). Unlike the test above (which forces REUSED via
+    set_liveness), here the fake derives the verdict from the terminal_id it *receives*
+    vs the pane's current one. So if the broker ever stopped threading the recorded
+    terminal_id into pane_liveness (passed None), the fake would see None -> alive ->
+    defer forever, the ghost binding would never be revoked (#106/#112 regression), and
+    THIS test would fail. The forced-verdict test cannot catch that; this one can."""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    assert b._meta_for(h)["terminal_id"] == f"term_{h}"   # recorded at spawn
+    adapter.desync_hide(h)                                 # snapshot 欠落 (候補化)
+    # foreign pane took over this pane_id: its CURRENT terminal_id differs from the
+    # recorded one. NO set_liveness override -> the verdict must come from comparing
+    # the terminal_id the broker threads (recorded term_h) against the current one.
+    adapter.set_pane_terminal_id(h, "term_FOREIGN")
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None            # reaped: our pane is gone (id reused)
+    assert b._binds[tok].revoked is True     # ghost binding revoked (NOT resurrected)
+    assert h not in adapter.killed           # foreign pane never physically closed
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert reaped[0]["kill"]["closed_via"] == "id_reused_skip_close"
+
+
+def test_reap_authoritative_unknown_defers(tmp_path):
+    """backend 不通で liveness 判定不能 (UNKNOWN) なラウンドは reap を見送る (安全側)。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    adapter.desync_hide(h)
+    adapter.set_liveness(h, "unknown")
+    b.resolve_target("focused")
+    assert b._meta_for(h) is not None       # 判定不能 -> 誤 reap しない
+    assert b._binds[tok].revoked is False
+    assert h not in adapter.killed
+
+
+def test_reap_authoritative_liveness_exception_defers(tmp_path):
+    """pane_liveness が例外を投げても UNKNOWN 相当に倒して defer する (best-effort、
+    判定不能時に生 pane を誤 reap しない)。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    adapter.desync_hide(h)
+    adapter.pane_liveness = lambda pid, tid=None: (_ for _ in ()).throw(RuntimeError("boom"))
+    b.resolve_target("focused")
+    assert b._meta_for(h) is not None       # 例外 -> defer
+    assert h not in adapter.killed
+
+
+def test_spawn_records_terminal_id_in_pane_meta(tmp_path):
+    """spawn の PaneRef.terminal_id が pane_meta に記録され、reaper の id 再利用ガードに
+    渡せる (Fix-D)。terminal_id を持たない backend (tmux/wezterm) は None のまま。"""
+    adapter = FakeAdapter(authoritative_liveness=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    assert b._meta_for(h)["terminal_id"] == f"term_{h}"
+    # 権威 liveness を持たない (= terminal_id を提供しない) backend は None。
+    legacy = FakeAdapter()
+    b2 = Broker(state_dir=tmp_path / "legacy", adapter=legacy)
+    legacy.add_pane(active=True)
+    disp2 = _ops(b2)
+    dispatch_tool(b2, disp2, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h2 = legacy.spawned[-1]["handle"]
+    assert b2._meta_for(h2)["terminal_id"] is None
+
+
 # ================================ same-name respawn burst dampener (真因D)
 
 
