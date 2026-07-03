@@ -1483,3 +1483,37 @@ def test_startup_adopt_registers_panes_so_they_are_visible(
                      org_instance_id=oid, generation=5, state_dir=str(tmp_path))
     assert "w_live:p2" in a._owned_panes                       # registered on adopt
     assert any(p["pane_id"] == "w_live:p2" for p in a.list_panes())  # visible in list
+
+
+def test_reused_pane_liveness_drops_registry_but_does_not_sweep_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (re-review): on PANE_LIVE_REUSED the pane_id now belongs to a different
+    # process; forgetting our registry entry must NOT sweep/close the workspace (that
+    # would kill the reused pane, violating the REUSED hands-off / isolation guard).
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    server.on("pane.get", {"pane": {"pane_id": ref_p.pane_id, "terminal_id": "OTHER"}})
+    server.on("workspace.close", {"type": "ok"})
+    verdict = a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)
+    assert verdict == PANE_LIVE_REUSED
+    assert "workspace.close" not in server.methods_called()   # NOT swept on REUSED
+    assert str(ref_p.pane_id) not in a._owned_panes           # registry entry dropped
+
+
+def test_gone_pane_liveness_sweeps_empty_project_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # The GONE path (pane truly gone) DOES sweep the now-empty project workspace.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    server.on("pane.get", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("workspace.close", {"type": "ok"})
+    verdict = a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)
+    assert verdict == PANE_LIVE_GONE
+    assert "workspace.close" in server.methods_called()       # swept on GONE
+    assert "project:x" not in a._spaces

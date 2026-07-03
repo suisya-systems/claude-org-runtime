@@ -1113,8 +1113,10 @@ class HerdrAdapter:
           - ``pane_not_found`` -> :data:`PANE_LIVE_GONE` (権威的に消滅)。
           - socket 不通等 -> :data:`PANE_LIVE_UNKNOWN` (判定不能、reaper は defer)。
 
-        GONE / REUSED では registry から除去し、その space が空になったプロジェクト
-        スペースなら掃除する (§4.3 の poll 経路 ephemeral cleanup)。
+        **GONE** は registry から除去し、その space が空になったプロジェクトスペースなら掃除する
+        (§4.3 の poll 経路 ephemeral cleanup)。**REUSED** は registry entry を落とすが **掃除は
+        しない** — その pane_id は別プロセスの pane を指すため workspace.close で巻き添える
+        (Codex P2、REUSED の「触るな」不変条件)。
         """
         try:
             res = self._client.request("pane.get", {"pane_id": pane_id})
@@ -1126,20 +1128,24 @@ class HerdrAdapter:
         pane = res.get("pane") or {}
         got_tid = pane.get("terminal_id")
         if terminal_id is not None and got_tid is not None and got_tid != terminal_id:
-            self._forget_pane(pane_id)
+            # REUSED: pane_id は今や別プロセスの pane を指す。bookkeeping だけ落とし、
+            # workspace は掃除しない (sweep=False) — workspace.close するとその再利用先 pane を
+            # 巻き添えに殺す = REUSED の「触るな」不変条件 / isolation 違反 (Codex P2)。
+            self._forget_pane(pane_id, sweep=False)
             return PANE_LIVE_REUSED
         return PANE_LIVE_ALIVE
 
-    def _forget_pane(self, pane_id: str) -> None:
-        """registry から pane を除去し、その project space が空になったら即掃除する。
+    def _forget_pane(self, pane_id: str, *, sweep: bool = True) -> None:
+        """registry から pane を除去し、``sweep`` なら空プロジェクトスペースを即掃除する。
 
         pane が実際に除去された = space が真に空で workspace は auto-close 済みのことが多い
         ので grace を飛ばす (immediate、Codex P2: grace で LIVE 残置すると respawn が死んだ
-        workspace を再利用する)。
+        workspace を再利用する)。``sweep=False`` は REUSED 経路用 — pane_id は別 pane に再利用
+        されており workspace.close で巻き添え close しないため掃除を抑止する。
         """
         with self._lock:
             rec = self._owned_panes.pop(str(pane_id), None)
-        if rec is not None:
+        if rec is not None and sweep:
             self._sweep_if_empty(rec.space_key, immediate=True)
 
     # -------------------------------------------------------------- get-text
