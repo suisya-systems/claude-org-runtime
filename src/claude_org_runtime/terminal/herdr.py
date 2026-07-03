@@ -678,23 +678,25 @@ class HerdrAdapter:
     def _ensure_space(self, space_key: str, cwd: str | None) -> tuple[_Space, bool]:
         """space_key の workspace を get-or-create する (_spawn_lock 下)。
 
-        既存が LIVE なら再利用。DEGRADED なら workspace.list で実在確認し、居れば LIVE へ
-        戻して再利用、消えていれば GONE として捨てて新規作成 (§4.2: 現行 clear 挙動の
-        supersede — workspace_not_found 単発では recreate せず、GONE 確定でのみ作り直す)。
+        既存を再利用する前に **workspace.list で実在確認**する。LIVE でも、worker が
+        kill_pane 外で自己終了 → Herdr が workspace を auto-close → poll/liveness が sweep する
+        前に respawn した場合、キャッシュは LIVE のまま死んだ workspace/tab を指し、その tab へ
+        の pane.move が失敗する (Codex P2)。存在すれば再利用 (DEGRADED は LIVE へ復帰)、消えて
+        いれば GONE として捨てて新規作成する (§4.2: workspace_not_found 単発で eager recreate
+        せず、実在確認で GONE 確定した時のみ作り直す — 孤児増殖アームを開かない)。
         返り値 ``(space, created_now)``。
         """
         with self._lock:
             sp = self._spaces.get(space_key)
-        if sp is not None and sp.state == WS_LIVE:
-            return sp, False
-        if sp is not None and sp.state == WS_DEGRADED:
+        if sp is not None and sp.state in (WS_LIVE, WS_DEGRADED):
             if self._workspace_present(sp.workspace_id):
-                with self._lock:
-                    sp.state = WS_LIVE
-                    sp.missing_since = None
-                    sp.missing_count = 0
+                if sp.state == WS_DEGRADED:
+                    with self._lock:
+                        sp.state = WS_LIVE
+                        sp.missing_since = None
+                        sp.missing_count = 0
                 return sp, False
-            # GONE 確定: owned set から外し、その pane を解放してから新規作成。
+            # 実在せず = auto-close / 消滅確定。owned set から外し pane を解放して新規作成。
             self._drop_space(space_key, WS_GONE)
         return self._create_space(space_key, cwd), True
 
@@ -1357,6 +1359,24 @@ class HerdrAdapter:
         with self._lock:
             sp = self._spaces.get(space_key)
         if sp is None:
+            return
+        # workspace.close の**前に物理的な空を確認**する (Codex P1 / §4.1 isolation)。呼出時点で
+        # 自 registry には本 space の pane が居ない (呼び元 _sweep_if_empty が _spawn_lock 下で
+        # 確認済み) が、workspace に **非 owned pane** (REUSED で pane_id を引き継いだ別プロセス /
+        # 外部) が居る場合、workspace.close は全 pane を巻き込むためその pane を巻き添えに殺す。
+        # よって raw pane.list で空を確証できた時のみ close し、居れば close せず relinquish する。
+        try:
+            res = self._client.request("pane.list", {"workspace_id": sp.workspace_id})
+        except HerdrError as exc:
+            if exc.code == CODE_PANE_NOT_FOUND:
+                self._drop_space(space_key, WS_SWEPT)  # 既に auto-close 済み = 掃除完了
+                return
+            return  # 確認不能 (adapter_unavailable 等): defer (次ラウンドで再試行)
+        if res.get("panes"):
+            # 非 owned pane が居る (reused/foreign)。close すると巻き添えるので閉じない。管理から
+            # 外す (relinquish): 我々の空 project space ではなくなった。閉じられないので leak だが
+            # 巻き添え close よりは安全側 (isolation 優先)。
+            self._drop_space(space_key, WS_GONE)
             return
         try:
             self._client.request(

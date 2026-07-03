@@ -293,14 +293,18 @@ def test_spawn_second_reuses_workspace_no_recreate(
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path))
     server.requests.clear()
+    # the reuse path verifies the cached workspace still exists (§4.2 / Codex P2) via
+    # workspace.list before reusing it — wire it present so reuse proceeds.
+    server.on("workspace.list", {"workspaces": [{"workspace_id": "w1", "label": "l"}]})
     server.on(
         "agent.start",
         {"type": "agent_started", "agent": {"pane_id": "w1:p3", "name": "x"}},
     )
     ref2 = a.spawn(["codex"], cwd=str(tmp_path))
     assert ref2.pane_id == "w1:p3"
-    # no second workspace.create, no root cleanup; just agent.start into w1/t1
-    assert server.methods_called() == ["agent.start"]
+    # no second workspace.create (reuse), no root cleanup; agent.start into the same w1/t1.
+    assert "workspace.create" not in server.methods_called()
+    assert "agent.start" in server.methods_called()
     assert server.params_for("agent.start")["workspace"] == "w1"
     assert server.params_for("agent.start")["split"] == "down"
 
@@ -1386,9 +1390,10 @@ def test_failed_project_sweep_retries_via_pending_and_respawn_creates_fresh(
     a.space_sweep_grace_seconds = 0.0   # sweep immediately when empty
     a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))   # w1
     ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
-    # close the sole project pane; pane.close succeeds; the empty-space sweep fires but
-    # its workspace.close fails (transient/refused).
+    # close the sole project pane; pane.close succeeds; the empty-space sweep verifies the
+    # workspace is physically empty (pane.list -> []) then its workspace.close fails.
     server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
     server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
     a.kill_pane(ref_p.pane_id)
     # removed from owned set (not left as a SWEPT-in-_spaces entry) and retained in
@@ -1456,8 +1461,9 @@ def test_project_space_dropped_immediately_on_last_pane_close_then_respawn_fresh
     a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))   # w1
     ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
     server.on("pane.close", {"type": "ok"})
-    # Herdr auto-closed the workspace when the last pane exited.
-    server.on("workspace.close", {"error": {"code": "workspace_not_found", "message": "auto"}})
+    # Herdr auto-closed the workspace when the last pane exited: the sweep's physical-empty
+    # probe (pane.list) returns workspace_not_found -> the space is dropped as SWEPT.
+    server.on("pane.list", {"error": {"code": "workspace_not_found", "message": "auto"}})
     a.kill_pane(ref_p.pane_id)
     assert "project:x" not in a._spaces          # dropped immediately, no grace linger
     ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w3
@@ -1512,6 +1518,7 @@ def test_gone_pane_liveness_sweeps_empty_project_workspace(
     a.space_sweep_grace_seconds = 0.0
     ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
     server.on("pane.get", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
     server.on("workspace.close", {"type": "ok"})
     verdict = a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)
     assert verdict == PANE_LIVE_GONE
@@ -1530,6 +1537,7 @@ def test_pending_sweep_retried_on_poll_even_with_no_owned_spaces(
     a.space_sweep_grace_seconds = 0.0
     ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
     server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
     server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
     a.kill_pane(ref_p.pane_id)          # sweep fails -> pending; _spaces now empty
     assert a._spaces == {}
@@ -1538,3 +1546,37 @@ def test_pending_sweep_retried_on_poll_even_with_no_owned_spaces(
     server.on("workspace.close", {"type": "ok"})
     assert a.list_panes() == []
     assert ref_p.window_id not in a._pending_sweep    # reclaimed within the generation
+
+
+def test_sweep_does_not_close_workspace_with_non_owned_pane(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P1: _sweep_space verifies physical emptiness before workspace.close. If a
+    # non-owned/reused pane occupies the workspace, it must NOT close it (that would kill
+    # the pane) — it relinquishes the space instead.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    # our pane goes GONE (registry entry dropped) but a foreign pane occupies the workspace.
+    server.on("pane.get", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("pane.list", {"panes": [{"pane_id": "w1:pX", "workspace_id": "w1"}]})
+    server.on("workspace.close", {"type": "ok"})
+    a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)  # GONE -> sweep attempt
+    assert "workspace.close" not in server.methods_called()   # NOT closed (foreign pane)
+    assert "project:x" not in a._spaces                       # relinquished, not swept
+
+
+def test_ensure_space_recreates_when_cached_workspace_auto_closed(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: a worker self-exits outside kill_pane; Herdr auto-closes the workspace but
+    # the cached _Space stays LIVE (sweep hasn't run yet). A respawn must verify existence
+    # and recreate a fresh workspace instead of reusing the dead one.
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("workspace.list", {"workspaces": []})   # w1 no longer exists (auto-closed)
+    ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
+    assert ref_p2.window_id != ref_p.window_id
+    assert a._spaces["project:x"].workspace_id == ref_p2.window_id
