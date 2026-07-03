@@ -241,6 +241,28 @@ def test_windows_is_adapter_unavailable(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(HerdrError) as exc:
         HerdrAdapter(socket_path="/whatever.sock")
     assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
+    # The message comes from the shared SoT helper: ASCII-only (cp932-safe, no
+    # em-dash / Japanese) and actionable (names wezterm as the Windows fallback).
+    msg = str(exc.value)
+    assert "herdr" in msg
+    assert "wezterm" in msg  # names the native-Windows alternative
+    assert "renga" in msg    # and the remote-session escape hatch
+    msg.encode("cp932")  # must not raise UnicodeEncodeError on a cp932 console
+    msg.encode("ascii")
+
+
+def test_make_adapter_herdr_on_windows_is_ascii_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct 'broker serve --backend herdr' path (make_adapter) fails with
+    the same ASCII HerdrError[adapter_unavailable] on native Windows."""
+    from claude_org_runtime.terminal import make_adapter
+
+    monkeypatch.setattr(herdr_mod.os, "name", "nt")
+    with pytest.raises(HerdrError) as exc:
+        make_adapter("herdr")
+    assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
+    str(exc.value).encode("ascii")
 
 
 def test_isolated_session_is_true() -> None:

@@ -69,8 +69,9 @@ See [`docs/cli.md`](docs/cli.md) for the full CLI reference, the `org up` /
 ## Broker
 
 The broker is a renga-free transport for orchestrator sessions: a localhost
-MCP daemon plus a persisted queue and a terminal adapter (tmux / wezterm
-backends). Agents talk to it over plain HTTP MCP instead of a renga tab, so
+MCP daemon plus a persisted queue and a terminal adapter (tmux / wezterm /
+herdr backends; `herdr` is opt-in and **POSIX / WSL-only**, not supported on
+native Windows). Agents talk to it over plain HTTP MCP instead of a renga tab, so
 a session can run without the renga UI. It is billing-neutral by design —
 it only ever launches the interactive Claude Code TUI through a builder
 that rejects headless flags. `org up` / `org down` are a thin launcher over

@@ -44,7 +44,14 @@ import time
 import urllib.error
 from pathlib import Path
 
-from ..terminal import HerdrAdapter, TmuxAdapter, WezTermAdapter, default_backend
+from ..terminal import (
+    VALID_BACKENDS,
+    HerdrAdapter,
+    TmuxAdapter,
+    WezTermAdapter,
+    backend_unavailable_reason,
+    default_backend,
+)
 from . import sidecar, surface
 from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
 
@@ -368,6 +375,25 @@ def org_up(
     host = port = None
     reused = False
 
+    # --- fail-fast: backend x platform validation (before any daemon work) ----
+    # Placed *before* _resolve_existing_daemon so an unusable backend on this
+    # platform surfaces a clear, actionable error instead of being masked by a
+    # stale-sidecar / backend-conflict / token-missing path or degrading into a
+    # 20s no-info sidecar timeout (Issue #120). --backend has no argparse
+    # choices constraint here, so distinguish an unknown backend from one that
+    # is valid but unsupported on this platform.
+    if requested_backend not in VALID_BACKENDS:
+        print(
+            f"org up: unknown backend {requested_backend!r} "
+            f"(valid: {', '.join(VALID_BACKENDS)}).",
+            file=sys.stderr,
+        )
+        return 2
+    unavailable = backend_unavailable_reason(requested_backend)
+    if unavailable:
+        print(f"org up: {unavailable}", file=sys.stderr)
+        return 2
+
     # --- 健全性判定 (到達性ベース。失敗パスで named secretary を汚さない) -----
     decision = _resolve_existing_daemon(state_dir, requested_backend, name, root_cwd)
     kind = decision["kind"]
@@ -621,7 +647,9 @@ def _add_up_arguments(parser: argparse.ArgumentParser) -> None:
         "--backend", default=None,
         help=(
             "terminal backend for the daemon (default: OS auto - POSIX=tmux / "
-            "Windows=wezterm). Must match a running daemon when reusing."
+            "Windows=wezterm). 'herdr' is an opt-in POSIX / WSL-only backend "
+            "(not supported on native Windows). Must match a running daemon "
+            "when reusing."
         ),
     )
     parser.add_argument(

@@ -145,6 +145,55 @@ def test_org_up_errors_on_live_backend_conflict(live_daemon):
     assert launched == []                          # 起動しない
 
 
+# =========================================== up: backend x platform fail-fast (#120)
+def test_org_up_fails_fast_on_herdr_native_windows(tmp_path, monkeypatch, capsys):
+    """herdr on native Windows fails fast (rc 2) *before* any daemon spawn.
+
+    Regression for Issue #120: the daemon used to die on boot (no AF_UNIX socket
+    on native Windows) and org up only surfaced a 20s no-info sidecar timeout.
+    Now the launcher validates backend x platform via the shared SoT helper and
+    returns an ASCII, actionable error naming wezterm - no spawn_daemon call.
+    """
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    state_dir = str(tmp_path / "broker")
+    launched = []
+    rc = launcher.org_up(
+        _up_args(state_dir, backend="herdr"),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("spawn_daemon must not run for an unsupported backend")
+        ),
+        launch=lambda argv: launched.append(argv) or 0,
+    )
+    assert rc == 2
+    assert launched == []                          # secretary TUI not launched
+    err = capsys.readouterr().err
+    assert "herdr" in err
+    # Fully actionable: names all three escape hatches the AC mandates.
+    assert "wezterm" in err                        # native-Windows alternative
+    assert "WSL" in err                            # or run under WSL
+    assert "renga" in err                          # or the renga transport
+    err.encode("cp932")                            # cp932-safe (no em-dash / kanji)
+    err.encode("ascii")                            # strictly ASCII
+
+
+def test_org_up_errors_on_unknown_backend(tmp_path, capsys):
+    """An unknown --backend is rejected distinctly from an unsupported one."""
+    state_dir = str(tmp_path / "broker")
+    launched = []
+    rc = launcher.org_up(
+        _up_args(state_dir, backend="screen"),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("spawn_daemon must not run for an unknown backend")
+        ),
+        launch=lambda argv: launched.append(argv) or 0,
+    )
+    assert rc == 2
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "unknown backend" in err
+    assert "screen" in err
+
+
 # ===================================================================== up: fresh
 def test_org_up_starts_fresh_when_no_daemon(tmp_path):
     """sidecar 不在 → spawn_daemon が呼ばれ、その daemon に mint して起動する。"""
