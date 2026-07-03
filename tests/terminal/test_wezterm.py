@@ -131,6 +131,14 @@ def test_send_named_keys_rejects_out_of_subset_key(adapter: WezTermAdapter) -> N
         adapter.send_named_keys(5, ["up"])
 
 
+def test_send_named_keys_mixed_batch_is_all_or_nothing(adapter: WezTermAdapter) -> None:
+    # A supported key BEFORE an unsupported one must not be emitted: the whole
+    # batch is validated first, so nothing reaches the pty (all-or-nothing).
+    with pytest.raises(ValueError):
+        adapter.send_named_keys(5, ["enter", "up"])
+    assert adapter._fake.calls == []
+
+
 def test_send_line_pastes_then_enters(adapter: WezTermAdapter) -> None:
     adapter.send_line(5, "a line")
     first, second = adapter._fake.calls

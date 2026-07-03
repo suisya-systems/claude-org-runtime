@@ -219,19 +219,23 @@ class WezTermAdapter:
         """canonical キー列を送出する (WezTerm subset: enter / ctrl+c のみ)。
 
         broker が :attr:`supported_named_keys` で preflight 済みのため、通常は
-        subset キーしか届かない。防御的に subset 外が来たら :class:`ValueError` を
-        上げ、部分打鍵する前に全体を止める (broker preflight のバグ検出用)。
+        subset キーしか届かない。防御的に **batch 全体を先に検証**し、subset 外が
+        1 つでもあれば 1 打も送らずに :class:`ValueError` を上げる (all-or-nothing:
+        supported キーを先に打ってから後続で落ちて画面を半分壊さない。tmux / Herdr
+        の ``[_MAP[k] for k in keys]`` 前段検証と同じ契約。broker preflight のバグや
+        直接呼出に対する adapter 層のガード)。
         """
+        unsupported = [k for k in keys if k not in self.supported_named_keys]
+        if unsupported:
+            raise ValueError(
+                f"wezterm adapter cannot emit canonical keys {unsupported!r} "
+                f"(supported subset: {sorted(self.supported_named_keys)})"
+            )
         for k in keys:
             if k == "enter":
                 self.send_enter(pane_id)
             elif k == "ctrl+c":
                 self.send_interrupt(pane_id)
-            else:
-                raise ValueError(
-                    f"wezterm adapter cannot emit canonical key {k!r} "
-                    f"(supported subset: {sorted(self.supported_named_keys)})"
-                )
 
     def send_line(self, pane_id: int, text: str, settle: float = 0.15) -> None:
         """1 行送出 + Enter。ナッジ注入の正準形 (本文は通さない)。
