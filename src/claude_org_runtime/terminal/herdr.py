@@ -1394,15 +1394,17 @@ class HerdrAdapter:
         status = self._close_workspace_if_empty(sp.workspace_id)
         if status in ("closed", "gone"):
             self._drop_space(space_key, WS_SWEPT)
-        elif status == "occupied":
-            # 非 owned pane が居る (reused/foreign) → close せず管理から外す (relinquish)。
-            # 閉じられないので leak だが巻き添え close よりは安全側 (isolation 優先)。
-            self._drop_space(space_key, WS_GONE)
-        elif status == "close_failed":
-            # **owned set から外して** pending_sweep (workspace_id キー) に保持し再試行する (§4.3)。
+        elif status in ("occupied", "close_failed"):
+            # **owned set から外して** pending_sweep (workspace_id キー) に退避し再試行する (§4.3)。
+            #  - close_failed: 空だが workspace.close が transient 失敗 → 再試行で回収。
+            #  - occupied: pane.list が非空。「非 owned pane (reused/foreign)」か「eventually
+            #    consistent な pane.list が直前に閉じた自 pane をまだ見せている lag」かを区別
+            #    できない (Herdr pane.list は eventual consistent、§真因B)。permanently relinquish
+            #    すると lag の場合に snapshot 追いつき後に閉じ損ねて leak する (Codex P2)。よって
+            #    defer し、空を確証できるまで再試行する — foreign なら閉じないまま defer が続き
+            #    isolation を保つ (workspace.close は _close_workspace_if_empty が空を確証した時のみ)。
             # owned set に SWEPT のまま残すと同一 space_key への re-spawn が _ensure_space でこの
-            # エントリを上書きし、閉じ損ねた workspace が pending だけに残って世代内孤児になる
-            # (adversarial review MAJOR)。space は空なので owned pane も一緒に落とす。
+            # エントリを上書きし世代内孤児になる (adversarial review MAJOR) ため必ず外す。
             with self._lock:
                 sp2 = self._spaces.pop(space_key, None)
                 if sp2 is not None:
@@ -1422,14 +1424,15 @@ class HerdrAdapter:
         世代内で** 回収する (起動時 sweep は gen < current のみ対象で次 boot まで待つため)。
         **再試行も物理的な空を確認してから close する** (Codex P2): pending 中に人間 / 別プロセスが
         その workspace へ pane を作成 / 移送しうるため、無条件 close だと非 owned pane を巻き添える。
-        closed / gone (回収完了) / occupied (foreign 占有 → relinquish) で pending から外す。
-        close_failed / unknown は保持して次ラウンドで再試行する。
+        closed / gone (回収完了) でのみ pending から外す。occupied (lag or foreign) /
+        close_failed / unknown は保持して次ラウンドで再試行する (lag なら追いつき後に closed、
+        foreign なら閉じないまま defer が続き isolation を保つ)。
         """
         with self._lock:
             pending = list(self._pending_sweep.values())
         for sp in pending:
             status = self._close_workspace_if_empty(sp.workspace_id)
-            if status in ("closed", "gone", "occupied"):
+            if status in ("closed", "gone"):
                 with self._lock:
                     self._pending_sweep.pop(sp.workspace_id, None)
 

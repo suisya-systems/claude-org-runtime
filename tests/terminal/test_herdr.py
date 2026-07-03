@@ -1553,7 +1553,8 @@ def test_sweep_does_not_close_workspace_with_non_owned_pane(
 ) -> None:
     # Codex P1: _sweep_space verifies physical emptiness before workspace.close. If a
     # non-owned/reused pane occupies the workspace, it must NOT close it (that would kill
-    # the pane) — it relinquishes the space instead.
+    # the pane) — it is removed from the owned set and deferred to pending (never closed
+    # while occupied, so isolation holds).
     _wire_multi(server)
     a = _adapter(server)
     a.space_sweep_grace_seconds = 0.0
@@ -1564,7 +1565,8 @@ def test_sweep_does_not_close_workspace_with_non_owned_pane(
     server.on("workspace.close", {"type": "ok"})
     a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)  # GONE -> sweep attempt
     assert "workspace.close" not in server.methods_called()   # NOT closed (foreign pane)
-    assert "project:x" not in a._spaces                       # relinquished, not swept
+    assert "project:x" not in a._spaces                       # out of owned set
+    assert ref_p.window_id in a._pending_sweep                # deferred, never closed
 
 
 def test_ensure_space_recreates_when_cached_workspace_auto_closed(
@@ -1587,7 +1589,7 @@ def test_pending_sweep_retry_does_not_close_reoccupied_workspace(
 ) -> None:
     # Codex P2 (round 4): the pending-sweep retry must ALSO verify physical emptiness. If a
     # human/other process created or moved a pane into the pending workspace before retry,
-    # workspace.close would kill that non-owned pane — the retry relinquishes instead.
+    # workspace.close would kill that non-owned pane — the retry keeps it deferred instead.
     _wire_multi(server)
     a = _adapter(server)
     a.space_sweep_grace_seconds = 0.0
@@ -1602,4 +1604,28 @@ def test_pending_sweep_retry_does_not_close_reoccupied_workspace(
     server.requests.clear()
     a._retry_pending_sweep()
     assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)
-    assert ref_p.window_id not in a._pending_sweep            # relinquished, not retried
+    assert ref_p.window_id in a._pending_sweep                # kept deferred (retry), not closed
+
+
+def test_sweep_defers_on_lagging_pane_list_then_closes_when_caught_up(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (round 5): after closing the last pane, Herdr's eventually-consistent
+    # pane.list may still show the just-closed pane (occupied). This must DEFER (pending),
+    # NOT permanently relinquish, so once the snapshot catches up (empty) the workspace is
+    # actually closed within the generation.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    # lagging snapshot still shows our just-closed pane -> looks "occupied".
+    server.on("pane.list", {"panes": [{"pane_id": ref_p.pane_id, "workspace_id": "w1"}]})
+    a.kill_pane(ref_p.pane_id)
+    assert "project:x" not in a._spaces               # out of owned set
+    assert ref_p.window_id in a._pending_sweep         # deferred, NOT relinquished
+    # snapshot catches up: pane.list empty -> retry closes it.
+    server.on("pane.list", {"panes": []})
+    server.on("workspace.close", {"type": "ok"})
+    a._retry_pending_sweep()
+    assert ref_p.window_id not in a._pending_sweep     # reclaimed within the generation
