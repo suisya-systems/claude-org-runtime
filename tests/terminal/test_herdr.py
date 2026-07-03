@@ -599,6 +599,120 @@ def test_kill_pane_non_last_does_not_close_workspace(
     assert a._workspace_id == "w1"  # workspace preserved
 
 
+def test_kill_pane_detailed_reports_pane_close_and_absence(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # kill_pane_detailed reports which close path fired + a post-close residual
+    # check, so the broker's reap physical-close verification can journal it.
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})            # gone after close
+    server.on("pane.layout", {"layout": {"panes": []}})
+    detail = a.kill_pane_detailed("w1:p2")
+    assert detail["closed_via"] == "pane.close"
+    assert detail["still_present"] is False
+
+
+def test_kill_pane_detailed_reports_workspace_close_fallback(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Sole-pane close refusal escalates to workspace.close; the detail records
+    # the fallback path and that nothing remains afterwards.
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "single_pane", "message": "last"}})
+    server.on("pane.list", {"panes": [{"pane_id": "w1:p2", "workspace_id": "w1"}]})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    server.on("workspace.close", {"type": "ok"})
+    detail = a.kill_pane_detailed("w1:p2")
+    assert detail["closed_via"] == "workspace.close"
+    assert a._workspace_id is None
+    assert detail["still_present"] is False
+
+
+def test_kill_pane_detailed_workspace_close_failure_is_not_reported_success(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # If the sole-pane fallback's workspace.close itself fails, the detail must
+    # NOT claim "workspace.close" success (that would let the broker drop
+    # bookkeeping for a still-live pane and orphan it — Codex round3 P2). It
+    # reports a distinct workspace_close_failed code and preserves the cached
+    # workspace state (so it is not mistaken for a fresh workspace next spawn).
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "single_pane", "message": "last"}})
+    server.on("pane.list", {"panes": [{"pane_id": "w1:p2", "workspace_id": "w1"}]})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    detail = a.kill_pane_detailed("w1:p2")
+    assert detail["closed_via"] == "workspace_close_failed"
+    assert a._workspace_id == "w1"       # state preserved on failure (retry-able)
+    assert detail["still_present"] is True  # pane still listed -> not orphaned silently
+
+
+def test_kill_pane_detailed_refusal_with_lagging_empty_list_is_refused(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # pane.close is refused as single_pane (proof the pane exists and is sole),
+    # but the eventually-consistent pane.list lags and returns []. This must NOT
+    # be reported as already_gone — trusting the stale empty list would let the
+    # broker drop bookkeeping for a live pane and orphan it (Codex round4 P1).
+    # With no positive sole-pane confirmation it degrades to refused (defer).
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "single_pane", "message": "last"}})
+    server.on("pane.list", {"panes": []})   # lag hides the live sole pane
+    server.on("pane.layout", {"layout": {"panes": []}})
+    detail = a.kill_pane_detailed("w1:p2")
+    assert detail["closed_via"] == "refused"     # not "already_gone"
+    assert "workspace.close" not in server.methods_called()
+    assert a._workspace_id == "w1"               # workspace not torn down
+
+
+def test_kill_pane_detailed_pane_not_found_is_already_gone(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # A definitive pane_not_found on close authoritatively means gone; we trust
+    # the close error and do NOT consult the (lag-prone) list.
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("pane.close", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("pane.list", {"panes": []})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    detail = a.kill_pane_detailed("w1:p2")
+    assert detail["closed_via"] == "already_gone"
+    assert "workspace.close" not in server.methods_called()
+
+
+def test_close_workspace_returns_false_on_failure(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # close_workspace reports success/failure and only clears cached state when
+    # the workspace.close actually succeeded.
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    assert a.close_workspace() is False
+    assert a._workspace_id == "w1"       # preserved on failure
+
+
+def test_reap_thresholds_are_conservative_for_herdr() -> None:
+    # Herdr's pane.list is eventually consistent, so the broker's opportunistic
+    # reap must gate on pane age, multiple misses, AND a cadence-insensitive
+    # wall-time-missing window (not the immediate tmux/wezterm reap). Pin the
+    # backend-aware ClassVars.
+    assert HerdrAdapter.reap_min_age_seconds > 0
+    assert HerdrAdapter.reap_min_missing_snapshots >= 2
+    assert HerdrAdapter.reap_min_missing_seconds > 0
+
+
 def test_close_workspace(server: FakeHerdrServer, tmp_path) -> None:
     _wire_spawn(server)
     a = _adapter(server)

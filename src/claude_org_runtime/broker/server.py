@@ -57,6 +57,8 @@ class Broker(TokenMixin, StoreMixin):
         admin_token: str | None = None,
         lease_seconds: float = 30.0,
         reclaim_warn_threshold: int = 3,
+        respawn_burst_window: float = 10.0,
+        respawn_burst_threshold: int = 5,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -99,6 +101,16 @@ class Broker(TokenMixin, StoreMixin):
         self._pane_meta: dict[str, dict] = {}
         self._reserved_names: set[str] = set()  # spawn in-flight の name 予約
         self._pane_counter = itertools.count(1)
+        # 同名連続 spawn の burst dampener (Issue #109 真因D 防御)。name -> 直近で
+        # 受理した spawn の timestamp 列 (window 外は都度 prune)。誤 reap 修正
+        # (真因B) で false-reap ループ自体は断つが、launcher 側リトライと reap の
+        # 相互増幅で同名 pane を短時間に量産する経路への追加防御として、window 内
+        # 受理数が threshold 以上なら次の同名 spawn を拒否する。リトライ上限 /
+        # バックオフの本体は launcher 側責務 (本タスクスコープ外、Issue #109 に memo)。
+        # 既定は緩め (10s に 5 回) で人手の通常 spawn / close→respawn は素通りする。
+        self._spawn_history: dict[str, list[float]] = {}
+        self.respawn_burst_window = respawn_burst_window
+        self.respawn_burst_threshold = respawn_burst_threshold
 
         # poll_events 用 lifecycle イベント ring (cursor = list index)。
         # 専用 Condition を使い、_lock の binds/queues 契約と絡めない。
@@ -608,38 +620,151 @@ class Broker(TokenMixin, StoreMixin):
         いなかった — その非対称 (表示と予約の不一致) が幽霊 binding の根本。ここで両者を
         揃える。
 
-        検知は background polling 常駐ではなく adapter snapshot による最小構成:
-        ``_pane_meta`` の非 logical entry で、handle が adapter の live 集合に**いない**
-        ものを stale (= pane 自己終了) とみなし、close と同じ :meth:`_cleanup_pane` で
-        掃除する。**logical pane (human-driven の窓口、adapter 実体を持たない) は reap
-        対象外** — adapter snapshot に永遠に出ないため、reap すると窓口が消える。
+        **決定的 pane 単位モデル (Issue #109 真因B)**: 「snapshot に現れない」を即
+        「物理的に消えた」と等値せず、pane 単位の liveness で判定する。``_pane_meta``
+        の非 logical entry を snapshot と突き合わせ:
+          - live 集合にいる → ``last_seen_at`` 更新・欠落状態クリア。
+          - live 集合にいない → 連続欠落として ``missing_count`` を積み上げ、
+            **age (= now - spawned_at) が ``reap_min_age_seconds`` 超**かつ
+            **``missing_count`` が ``reap_min_missing_snapshots`` 以上**の時だけ
+            reap 候補にする。閾値は adapter の ClassVar から backend-aware に読む
+            (getattr フォールバックで既定 backend は 0.0/1 = 従来の即時 reap)。
+        これで Herdr の eventually consistent snapshot (boot 中・ラグで生 pane が一時
+        欠落) による誤 reap を防ぐ。**logical pane (human-driven の窓口) は reap 対象外**
+        — adapter snapshot に永遠に出ないため、reap すると窓口が消える。
 
-        adapter I/O (list_panes) は lock 外。呼び元が既に snapshot を持つ場合は
-        ``panes`` で渡して二重 I/O を避ける (resolve_target の hot path 用)。close と
-        違い adapter.kill_pane は呼ばない (対象は既に消えている)。reap した pane には
-        ``pane_exited`` event を発行し ``pane_reaped`` を journal する (明示 close は
-        ``pane_closed``。dispatcher の poll_events(pane_exited) 依存に合わせ event type
-        は close と揃え、journal 語彙のみ検知経路で区別する — Surface 3)。
+        **物理 close 検証 (真因A)**: reap 候補を bookkeeping 削除する前に fresh
+        ``pane_exists`` で再確認する。(a) 確認が backend 不通で取れなければこのラウンドは
+        skip し次回に委ねる (backend blip 中の誤 reap 回避)。(b) 依然残存していれば
+        eventually consistent snapshot が欠落させていただけで pane は生存しているので、
+        物理 close (:meth:`kill_pane_detailed` があれば詳細、無ければ ``kill_pane`` +
+        ``pane_exists`` 後確認) を試み、その成否を journal する — reap 経路が物理 close を
+        呼ばない旧設計が孤児 TUI を残していた真因の是正。(c) 不在なら従来どおり bookkeeping
+        のみ掃除。
+
+        adapter I/O (list_panes / pane_exists / kill) は lock 外。呼び元が既に snapshot
+        を持つ場合は ``panes`` で渡して二重 list_panes を避ける (resolve_target の hot
+        path 用)。reap した pane には ``pane_exited`` event を発行し ``pane_reaped`` を
+        journal する (明示 close は ``pane_closed``。dispatcher の poll_events(pane_exited)
+        依存に合わせ event type は close と揃え、journal 語彙のみ検知経路で区別する)。
         """
         if self.adapter is None:
             return
         if panes is None:
             panes = self._adapter_panes()
         live = {str(p.get("pane_id")) for p in panes}
-        with self._lock:  # stale 抽出のみ lock 下 (cleanup 自体は _cleanup_pane が再取得)
-            stale = [
-                m["handle"]
-                for hk, m in self._pane_meta.items()
-                if hk not in live and not m.get("logical")
-            ]
-        for handle in stale:
+        now = time.time()
+        min_age = float(getattr(self.adapter, "reap_min_age_seconds", 0.0))
+        min_missing = int(getattr(self.adapter, "reap_min_missing_snapshots", 1))
+        min_missing_secs = float(getattr(self.adapter, "reap_min_missing_seconds", 0.0))
+        candidates: list["PaneId"] = []
+        with self._lock:  # liveness 更新と候補抽出のみ lock 下 (I/O は下で lock 外)
+            for hk, m in self._pane_meta.items():
+                if m.get("logical"):
+                    continue
+                if hk in live:
+                    # 目撃: 連続欠落をリセット (age だけでなく「連続」性を担保)。
+                    m["last_seen_at"] = now
+                    m["missing_since"] = None
+                    m["missing_count"] = 0
+                    continue
+                # snapshot に不在: 連続欠落を積む (物理消滅とは即断しない)。
+                m["missing_count"] = int(m.get("missing_count", 0)) + 1
+                if m.get("missing_since") is None:
+                    m["missing_since"] = now
+                # age は spawn からの経過。既定 backend (min_age=0.0) は clock 分解能に
+                # 依らず即 reap する必要があるため境界を含める (>=)。Herdr (min_age>0)
+                # では boot 中の一時欠落を保護する実効差は無視できる。
+                age = now - float(m.get("spawned_at", now))
+                # missing_count は reap **呼び出し回数**を数える (poll cadence 非依存)。
+                # broker は ThreadingHTTPServer 配下で resolve_target / _reserve_name を
+                # 並行に呼ぶため、単一の snapshot ラグ窓の間に複数スレッドが立て続けに
+                # missing_count を積むと、count だけでは「連続 snapshot 欠落」の意図を
+                # 満たさず生 pane を誤判定しうる (adversarial review Major)。そこで
+                # missing_since を使った **実時間ゲート** (now - missing_since >=
+                # reap_min_missing_seconds) を併用し、cadence 非依存にする: 何回呼ばれても
+                # 実時間が経たない限り閾値を超えない。既定 backend (=0.0) は初回欠落で
+                # 即成立し従来の即時 reap を保つ。Herdr (>0) は連続欠落が実時間で継続した
+                # 時のみ reap する (単一ラグ窓での bursty 誤 reap を構造的に断つ)。
+                missing_secs = now - float(m.get("missing_since", now))
+                if (
+                    age >= min_age
+                    and m["missing_count"] >= min_missing
+                    and missing_secs >= min_missing_secs
+                ):
+                    candidates.append(m["handle"])
+        for handle in candidates:
+            # 物理 close 検証 (真因A): bookkeeping を落とす前に **必ず物理 close を
+            # 発行**する。herdr の pane_exists は list_panes 由来で stale snapshot と
+            # 同源のため、「消えていそうか」の事前 probe に使うと、生きているのに
+            # snapshot から欠落した pane を「不在」と誤読し、close を発行せず bookkeeping
+            # だけ落として生 TUI を unmanaged 孤児化しうる (Codex round2 P2)。よって
+            # 事前判定はせず常に close する: 既に消えていれば no-op (already_gone)、
+            # snapshot が欠落させていただけで生存していれば実際に閉じる (idempotent)。
+            kill_result = self._physically_close_reaped(handle)
+            # bookkeeping を落とすのは **close が有効だった (= pane を消せた / 既に消えて
+            # いた) と分かった時だけ**。close が拒否 (herdr "refused") / backend 不通
+            # ("list_failed" / "error") なら pane が生きたまま残りうるので、meta/token を
+            # 保持し欠落状態を持ち越して次ラウンドで再 close を試みる (defer)。判定は
+            # stale な post-close probe (still_present) ではなく close 経路 (closed_via)
+            # で行う — 「close を発行して受理された」事実に基づく (Codex round2 P2)。
+            if not self._reap_close_effective(kill_result):
+                self._journal(
+                    "pane_reap_deferred", pane_id=handle,
+                    agent_id=(self._meta_for(handle) or {}).get("agent_id"),
+                    kill=kill_result,
+                )
+                continue
             agent_id, found = self._cleanup_pane(handle)
             if not found:
                 continue  # 並行 close/reap が先に掃除した
             self._emit_event(
                 {"type": "pane_exited", "pane_id": handle, "agent_id": agent_id}
             )
-            self._journal("pane_reaped", pane_id=handle, agent_id=agent_id)
+            self._journal(
+                "pane_reaped", pane_id=handle, agent_id=agent_id, kill=kill_result,
+            )
+
+    # close が「有効だった (pane を消せた or 既に消えていた)」とみなす closed_via。
+    # これ以外 ("refused"=close 拒否で生存 / "list_failed"・"error"=backend 不通で
+    # 未確認) は pane が残りうるため reap を defer する (bookkeeping を落とさない)。
+    _REAP_CLOSE_EFFECTIVE = frozenset(
+        {"pane.close", "workspace.close", "already_gone", "kill_pane"}
+    )
+
+    def _reap_close_effective(self, kill_result: dict) -> bool:
+        """物理 close が pane を消せた/既に不在だったと判断できるか (真因A / P2)。"""
+        return kill_result.get("closed_via") in self._REAP_CLOSE_EFFECTIVE
+
+    def _physically_close_reaped(self, handle: "PaneId") -> dict:
+        """reap 候補に物理 close を発行し、close 経路と残存を返す (真因A)。
+
+        adapter が :meth:`kill_pane_detailed` を持てば close 経路 (``closed_via``) /
+        残存 (``still_present``) の詳細を、無ければ ``kill_pane`` + close 後
+        ``pane_exists`` で最小の可視化を返す。close が有効だったかの判定は呼び元が
+        ``closed_via`` (:meth:`_reap_close_effective`) で行う。best-effort (孤児化回避が
+        目的) なので adapter 例外は握り潰し ``closed_via="error"`` に落とす (= 呼び元は
+        defer する)。``still_present`` は journal 補助 (list-backed backend では stale)。
+        """
+        detailed = getattr(self.adapter, "kill_pane_detailed", None)
+        if callable(detailed):
+            try:
+                return detailed(handle)
+            except Exception as exc:  # noqa: BLE001 - best-effort reap kill
+                return {"closed_via": "error", "still_present": None,
+                        "error": str(exc)}
+        result: dict = {"closed_via": None, "still_present": None}
+        try:
+            self.adapter.kill_pane(handle)
+            result["closed_via"] = "kill_pane"
+        except Exception as exc:  # noqa: BLE001 - best-effort reap kill
+            result["closed_via"] = "error"
+            result["error"] = str(exc)
+        try:
+            result["still_present"] = bool(self.adapter.pane_exists(handle))
+        except Exception:  # noqa: BLE001 - 後確認も best-effort
+            result["still_present"] = None
+        return result
 
     def close_pane_target(self, target: str) -> dict:
         """pane を閉じる (renga close_pane 同形)。token を revoke しイベントを emit。"""
@@ -768,10 +893,16 @@ class Broker(TokenMixin, StoreMixin):
         self, handle: "PaneId", agent_id: str, name: str | None,
         role: str | None, cwd: str | None, kind: str | None, token: str | None,
     ) -> None:
+        now = time.time()
         with self._lock:
             self._pane_meta[str(handle)] = {
                 "handle": handle, "agent_id": agent_id, "name": name,
                 "role": role, "cwd": cwd, "kind": kind, "token": token,
+                # 決定的 reap モデルの pane 単位 liveness (真因B)。spawn 時刻・最終
+                # 目撃時刻・連続欠落の起点/回数。_reap_stale_managed_panes が snapshot
+                # ごとに更新し、age + 連続欠落の閾値超過でのみ reap 対象にする。
+                "spawned_at": now, "last_seen_at": now,
+                "missing_since": None, "missing_count": 0,
             }
             self._reserved_names.discard(name)  # 予約を確定 meta へ昇格
 
@@ -826,20 +957,59 @@ class Broker(TokenMixin, StoreMixin):
         # の中核。resolve_target 経由の split target 解決でも既に reap 済みだが、
         # name=None spawn 等で resolve を経ない経路の保険として入口で明示 reap する)。
         self._reap_stale_managed_panes()
+        now = time.time()
         with self._lock:
+            # 同名連続 spawn の burst dampener (Issue #109 真因D)。window 外を prune
+            # した上で、受理済み spawn が threshold 以上なら次を拒否する。false-reap
+            # ループ自体は真因B 修正で断つが、launcher リトライ x reap の相互増幅で
+            # 同名 pane を短時間量産する経路への追加防御 (バックオフ本体は launcher
+            # 側責務、Issue #109 に memo)。既定は緩めで通常 spawn は素通りする。
+            #
+            # まず全 name の window 外 timestamp を掃除し、空になった entry を落とす。
+            # これをしないと一度きり spawn された uniq name の entry が永久に残り、
+            # 長命 broker で _spawn_history が単調増加する (adversarial review Minor)。
+            # 掃除対象は小さい dict (最近 spawn した name 群) なので毎回でも軽い。
+            for k in list(self._spawn_history):
+                kept = [t for t in self._spawn_history[k] if now - t < self.respawn_burst_window]
+                if kept:
+                    self._spawn_history[k] = kept
+                else:
+                    del self._spawn_history[k]
+            hist = self._spawn_history.get(name, [])
+            if len(hist) >= self.respawn_burst_threshold:
+                return (
+                    f"[respawn_flood] pane name {name!r} spawned "
+                    f"{len(hist)} times within {self.respawn_burst_window:g}s "
+                    "(retry storm dampener; back off before respawning)"
+                )
             taken = name in self._reserved_names or any(
                 m.get("name") == name for m in self._pane_meta.values()
             )
             if taken:
                 return f"[name_taken] pane name {name!r} already in use"
             self._reserved_names.add(name)
+            # 受理を burst 履歴に記録 (空 entry は上の sweep で落ちるため非空で保存)。
+            self._spawn_history[name] = hist + [now]
         return None
 
     def _release_name(self, name: str | None) -> None:
+        """予約失敗/spawn 失敗のロールバック。予約解放に加え、_reserve_name が
+        受理時に積んだ burst 履歴の直近 1 件も戻す (Codex P3)。
+
+        _release_name は失敗経路 (issue_token 衝突 / adapter.spawn 例外等) のみから
+        呼ばれる。成功時は _register_pane が予約を discard し burst 記録は残す (実際に
+        pane が立った spawn だけを数える)。同名予約は _reserved_names で直列化される
+        ため、この name の burst 履歴末尾は必ず本 in-flight 予約が積んだ timestamp で
+        あり、pop で正しく取り消せる (失敗した予約を respawn_flood に数えない)。"""
         if name is None:
             return
         with self._lock:
             self._reserved_names.discard(name)
+            hist = self._spawn_history.get(name)
+            if hist:
+                hist.pop()  # 直近 (この失敗した予約) の記録を戻す
+                if not hist:
+                    del self._spawn_history[name]
 
     def _revoke_token(self, token: str | None) -> None:
         """spawn 途中失敗時の発行済み token の掃除 (部分 spawn のロールバック)。

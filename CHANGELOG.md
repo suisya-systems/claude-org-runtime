@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `broker` + `terminal.herdr`: fix a compound blocker where the Herdr backend's
+  opportunistic reap falsely reaped live, still-booting panes and left orphan
+  TUIs (runtime Issue #109). Three root causes are addressed:
+
+  - **Deterministic pane-unit reap model.** The entry reap
+    (`_reap_stale_managed_panes`) no longer equates "absent from the adapter
+    snapshot" with "physically gone". Each managed pane now tracks
+    `spawned_at` / `last_seen_at` / `missing_since` / `missing_count`, and a
+    pane is only a reap candidate once its age exceeds `reap_min_age_seconds`,
+    it has been missing for `reap_min_missing_snapshots` snapshots, **and** it
+    has been continuously missing for at least `reap_min_missing_seconds` of
+    wall-clock time. The wall-time gate is the cadence-insensitive core: because
+    the broker drives reap from concurrent request threads, a call-count alone
+    could be crossed by several near-simultaneous reap calls within a *single*
+    snapshot-lag window and falsely kill a live pane — the elapsed-time gate
+    cannot be, since it does not advance no matter how many times reap is
+    called. These thresholds are backend-aware (read off the adapter via
+    `getattr`): tmux / wezterm keep the previous immediate reap (`0.0` / `1` /
+    `0.0`), while `HerdrAdapter` sets conservative values (`12.0s` / `3` /
+    `6.0s`) because its `pane.list` is eventually consistent (a live pane can
+    transiently drop out during boot / under snapshot lag). This protects the
+    display-vs-reservation symmetry without loosening the strict `workspace_id`
+    filter.
+
+  - **Physical-close verification on reap.** Before deleting a pane's
+    bookkeeping, reap now **always issues a physical close** (via the new
+    `HerdrAdapter.kill_pane_detailed` when available, else `kill_pane`) rather
+    than gating on a pre-close existence probe. This is deliberate: for Herdr,
+    `pane_exists` is backed by the same eventually-consistent `pane.list`, so a
+    live-but-hidden pane reads "absent" there too — trusting it would drop
+    bookkeeping without ever closing the residual TUI. Issuing the close
+    unconditionally is idempotent (already-gone panes return `already_gone` /
+    `pane_not_found`) and cannot orphan. The bookkeeping is then dropped **only
+    when the close outcome (`closed_via`) confirms the pane is gone**
+    (`pane.close` / `workspace.close` / `already_gone` / `kill_pane`); if the
+    close is refused (`refused`) or the backend is unreachable
+    (`list_failed` / `error`), the metadata/token are kept and the reap is
+    deferred (journaled `pane_reap_deferred`) for a later round, so a live TUI
+    is never left unmanaged and a backend blip never triggers a false reap. The
+    close path + residual are journaled under `pane_reaped`. This fixes the
+    original design gap where `_cleanup_pane` never called adapter I/O, so a
+    falsely reaped Herdr pane kept running unmanaged.
+
+  - **Same-name respawn burst dampener.** `_reserve_name` now rejects a name
+    that has been spawned more than `respawn_burst_threshold` times within
+    `respawn_burst_window` (default `5` / `10s`) with `[respawn_flood]`, a
+    lightweight guard against launcher-retry × reap amplification producing
+    same-name orphans. The retry-limit / backoff proper remains the launcher's
+    responsibility (tracked in Issue #109); this is only a broker-side safety
+    valve and normal human spawn / close→respawn flows pass through untouched.
+
+  `HerdrAdapter.kill_pane` keeps its `-> None` `TerminalAdapter` contract
+  (the detailed variant is additive), so tmux / wezterm are unaffected and all
+  existing tmux tests stay green. Workspace generation-identity and stale
+  workspace sweep are intentionally **out of scope** here and handled by the
+  layout-policy work in Issue #110.
+
 ## [0.1.31] - 2026-07-03
 
 > A paired `claude-org-ja` follow-up (runtime pin floor bump / `pane-layout.md`

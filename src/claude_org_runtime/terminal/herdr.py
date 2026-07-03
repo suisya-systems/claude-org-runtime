@@ -310,6 +310,29 @@ class HerdrAdapter:
     # これを preflight に使い、未対応キーを含む send_keys を [key_unsupported] で弾く。
     supported_named_keys: ClassVar[frozenset[str]] = frozenset(_HERDR_KEY_MAP)
 
+    # opportunistic reap の backend-aware 閾値 (broker が getattr で読む。§真因B)。
+    # Herdr の pane.list は **eventually consistent** で、生きている pane が boot 中や
+    # snapshot ラグで一時的に list から欠落しうる (spike 窓口補足4: events も silent
+    # loss)。tmux/wezterm の即時 reap (age=0 / 1 欠落) をそのまま適用すると、boot 中の
+    # 生 pane を誤 reap し、_cleanup_pane が物理 close を呼ばない設計と相まって孤児 TUI
+    # を残す (runtime Issue #109 の真因)。よって Herdr だけ長めの決定的モデルにする:
+    #   - reap_min_age_seconds: spawn からこの秒数を超えるまで欠落しても reap しない
+    #     (boot 中の一時欠落を保護)。
+    #   - reap_min_missing_snapshots: この回数 snapshot に現れて初めて reap 対象
+    #     (単発の snapshot ラグを弾く。回数ベースの補助ゲート)。
+    #   - reap_min_missing_seconds: 連続欠落が**実時間**でこの秒数継続して初めて reap
+    #     対象 (poll cadence 非依存の主ゲート)。broker は request-driven に reap を
+    #     並行呼び出しするため、count だけだと単一ラグ窓で複数スレッドが立て続けに
+    #     count を積んで誤 reap しうる (adversarial review Major)。実時間ゲートは
+    #     「何回呼ばれても実時間が経たない限り成立しない」ので、この bursty 誤判定を
+    #     構造的に断つ。lag 窓 (spike 実測の eventual-consistency 収束) を十分に跨ぐ値。
+    # 既定 backend (tmux/wezterm) は 0.0 / 1 / 0.0 (= 従来の即時 reap) を getattr の
+    # フォールバックで得るため、本 ClassVar は Herdr のみに効く。閾値は保守側に振る
+    # (孤児化より reap 遅延の方が安全 — 遅延ぶんは物理 close 検証が拾う)。
+    reap_min_age_seconds: ClassVar[float] = 12.0
+    reap_min_missing_snapshots: ClassVar[int] = 3
+    reap_min_missing_seconds: ClassVar[float] = 6.0
+
     socket_path: str = field(default_factory=resolve_socket_path)
     timeout: float = 15.0
     # workspace / agent の Herdr ラベル prefix。Herdr label は一意制約なし
@@ -618,34 +641,107 @@ class HerdrAdapter:
         **唯一の pane** の場合に限り workspace ごと閉じて確実に reap する。既に
         消えている (pane_not_found) / socket 不通等の best-effort 断念は tmux
         ``kill_pane`` (check=False) 同様に握り潰す。
+
+        TerminalAdapter Protocol は ``kill_pane -> None`` なので本メソッドは値を
+        返さない。close 経路の可視化 (どの close が発火したか / close 後の残存) が
+        要る呼出側 (broker の reap 物理 close 検証) は :meth:`kill_pane_detailed` を
+        使う (Protocol 面は不変のまま Herdr のみ詳細を得られる)。fire-and-forget な
+        本経路 (org down の連続 close 等) では close 後の残存 probe (追加 pane.list)
+        を **行わない** — 結果を捨てる呼出でラウンドトリップを増やさない
+        (adversarial review Nit)。
         """
+        self._close_pane(pane_id)
+
+    def kill_pane_detailed(self, pane_id: str) -> dict:
+        """:meth:`kill_pane` と同じ close を行い、経路と残存を dict で返す。
+
+        broker の reap 物理 close 検証 (真因 A: eventually consistent snapshot で
+        誤 reap 候補になった pane が実は生存している場合、bookkeeping 削除前に確実に
+        物理 close する) が、pane.close 応答 / workspace.close fallback 発火 / close
+        後の残存を journal できるようにするための拡張 (bool 以上の結果)。
+
+        :meth:`kill_pane` と違い、close 後に ``pane_exists`` で残存を再確認して
+        ``still_present`` に載せる (この追加 pane.list は詳細を消費する reap 経路
+        だけが払うコスト)。返り値 dict:
+          - ``closed_via``: ``"pane.close"`` (通常 close 成功) / ``"workspace.close"``
+            (唯一 pane の close 拒否 → workspace ごと後始末) / ``"already_gone"``
+            (close 拒否だが list 上も不在 = 既に消滅) / ``"refused"`` (他 pane 残存で
+            close 拒否 = 掴めず) / ``"list_failed"`` (残存確認の list すら不通)。
+          - ``still_present``: close 後の残存確認 (``pane_exists``)。``None`` は確認
+            自体が backend 不通で取れなかったことを表す。
+        """
+        result = self._close_pane(pane_id)
+        # close 後の残存確認 (真因 A: reap 経路が「消えた前提」で bookkeeping を
+        # 落とす前に、物理的に残っていないかを journal できるようにする)。
+        try:
+            result["still_present"] = self.pane_exists(pane_id)
+        except HerdrError:
+            result["still_present"] = None
+        return result
+
+    def _close_pane(self, pane_id: str) -> dict:
+        """pane.close (+ 唯一 pane なら workspace.close fallback) を実行し経路を返す。
+
+        :meth:`kill_pane` (残存 probe なし) と :meth:`kill_pane_detailed` (probe あり)
+        の共通コア。``still_present`` は呼出側が必要なら埋める (ここでは ``None``)。
+        """
+        result: dict[str, Any] = {"closed_via": None, "still_present": None, "raw": None}
         try:
             self._client.request("pane.close", {"pane_id": pane_id})
-            return
-        except HerdrError:
-            pass
-        # close 拒否。残存 pane を確認し、対象が唯一なら workspace ごと後始末する。
-        try:
-            remaining = [p["pane_id"] for p in self.list_panes()]
-        except HerdrError:
-            return  # backend 不通等: best-effort 断念 (これ以上は追わない)
-        if remaining == [pane_id]:
-            self.close_workspace()
+            result["closed_via"] = "pane.close"
+        except HerdrError as exc:
+            result["raw"] = exc.raw or exc.code
+            # pane.close が「不在」を返したなら pane は既に消滅と**確定**できる
+            # (close error 自体が権威。lag しうる pane.list を待たない)。
+            if exc.code == CODE_PANE_NOT_FOUND:
+                result["closed_via"] = "already_gone"
+                return result
+            # それ以外の close 拒否 (single_pane 等) は「pane が存在する」証拠である。
+            # 残存 pane を list で確認するが、pane.list は eventually consistent で
+            # lag 中は生 sole pane を隠しうる (Codex round4 P1)。よって:
+            #   - list が sole pane を **確証** (remaining == [pane_id]) した時のみ
+            #     workspace ごと閉じる。
+            #   - list が空/別 (lag で隠れている / 他 pane あり) の時は already_gone と
+            #     **断じない** (stale list を信じて生 pane の bookkeeping を落とすと
+            #     孤児化する)。掴めないので refused にして呼び元 (broker) が defer する。
+            try:
+                remaining = [p["pane_id"] for p in self.list_panes()]
+            except HerdrError:
+                result["closed_via"] = "list_failed"
+                return result  # backend 不通等: best-effort 断念 (これ以上は追わない)
+            if remaining == [pane_id]:
+                # workspace.close の **成否を確定**してから closed_via を決める。
+                # 失敗 (backend 拒否/不通) を "workspace.close" 成功と誤報すると、broker
+                # reap が「消せた」と誤認し生 workspace/pane の bookkeeping を落として
+                # 孤児化する (Codex round3 P2)。失敗時は専用の未確定コードにして呼び元
+                # (broker) が defer できるようにする。
+                if self.close_workspace():
+                    result["closed_via"] = "workspace.close"
+                else:
+                    result["closed_via"] = "workspace_close_failed"
+            else:
+                # sole pane を確証できない (lag で空 / 他 pane 残存): 掴めないので defer。
+                result["closed_via"] = "refused"
+        return result
 
-    def close_workspace(self) -> None:
+    def close_workspace(self) -> bool:
         """専用 workspace ごと後始末する (tmux ``kill_server`` 相当、best-effort)。
 
-        本 adapter が確保した workspace の全 pane を一括で閉じる。冪等: 未確保 /
-        既に消えている場合は何もしない。
+        本 adapter が確保した workspace の全 pane を一括で閉じる。冪等: 未確保は
+        no-op で ``True``。``workspace.close`` が **成功した時のみ** cached workspace
+        state をクリアし ``True`` を返す。失敗 (HerdrError) 時は state を **保持**して
+        ``False`` を返す — 失敗を成功と誤認して stale id で再 spawn したり、broker が
+        reap を「有効」と誤判定するのを防ぐ (Codex round3 P2)。
         """
         if self._workspace_id is None:
-            return
+            return True
         try:
             self._client.request(
                 "workspace.close", {"workspace_id": self._workspace_id}
             )
         except HerdrError:
-            pass
+            return False  # 失敗: state を保持しリトライ可能に (成功を偽装しない)
         self._workspace_id = None
         self._tab_id = None
         self._root_pane_id = None
+        return True
