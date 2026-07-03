@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `broker` + `terminal.herdr`: `org up --backend herdr` on **native Windows**
+  no longer degrades into a 20s no-info sidecar timeout (runtime Issue #120).
+  The `herdr` backend needs a stdlib `AF_UNIX` Unix domain socket, which native
+  Windows lacks, so the daemon died on boot and `org up` only surfaced the
+  timeout. A single source-of-truth helper `backend_unavailable_reason(backend)`
+  in `terminal/base.py` now drives both the `org up` launcher fail-fast (before
+  any daemon spawn, ahead of the stale-sidecar / conflict checks) and
+  `HerdrAdapter.__post_init__` (the direct `broker serve --backend herdr` path),
+  so both fail immediately with the **same actionable ASCII message** (cp932-safe)
+  pointing at `--backend wezterm` / WSL / the renga transport. `org up` also now
+  distinguishes an *unknown* backend from one *unsupported on this platform*.
+
+### Changed
+
+- `terminal.herdr`: the Windows-unavailable adapter error is now an ASCII-only
+  English message (previously contained `§` and Japanese text, which cannot be
+  encoded on a cp932 console). `docs/cli.md` and `README.md` document the
+  `herdr` POSIX / WSL-only constraint.
+
 ## [0.1.34] - 2026-07-03
 
 ### Added

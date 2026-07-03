@@ -208,12 +208,23 @@ avoid killing unrelated panes. With no sidecar it is a no-op.
 | Flag | Description |
 |------|-------------|
 | `--state-dir PATH` | Daemon state dir (sidecar / queue). Default: `.state/broker`. |
-| `--backend NAME` | Terminal backend for the daemon (default: OS auto — POSIX=tmux / Windows=wezterm). Must match a running daemon when reusing. |
+| `--backend NAME` | Terminal backend for the daemon: `tmux`, `wezterm`, or `herdr` (default: OS auto - POSIX=tmux / Windows=wezterm). `herdr` is an opt-in **POSIX / WSL-only** backend and is not supported on native Windows (see note below). Must match a running daemon when reusing. |
 | `--root-cwd PATH` | cwd given to the secretary bind = anchor for relative-`cwd` spawns (Issue #61). Default: the directory `org up` runs in. |
 | `--name NAME` | secretary agent id/name to mint. Default: `secretary`. |
 | `--model VALUE` | Forwarded to the secretary TUI as `--model <value>`. |
 | `--permission-mode VALUE` | Forwarded to the secretary TUI as `--permission-mode <value>`. |
 | `--claude-arg ARG` | Extra interactive `claude` flag appended after the structured fields (repeatable). Reserved / headless flags are rejected by the builder. |
+
+#### Backend support
+
+`tmux` (POSIX) and `wezterm` (POSIX / Windows) are the general-purpose
+backends. `herdr` is an **opt-in POSIX / WSL-only** backend: it talks to the
+`herdr` daemon over a Unix domain socket, which native Windows does not provide,
+so `--backend herdr` is unsupported when running on native Windows (`os.name ==
+"nt"`). There `org up` fails fast with an actionable error before spawning the
+daemon (rather than the daemon dying and timing out); use `--backend wezterm`
+on native Windows or run under WSL. To drive a remote `herdr` session from
+Windows, use the renga transport instead.
 
 ### `org down` flags
 
@@ -227,7 +238,7 @@ avoid killing unrelated panes. With no sidecar it is a no-op.
 |------|---------|
 | `0` | up: launched (or already up); down: `broker_stopped` verified (or no sidecar). |
 | `1` | down: shutdown requested but `broker_stopped` not observed / daemon unreachable. |
-| `2` | up: backend conflict with a live daemon, or admin mint / MCP surface unhealthy. |
+| `2` | up: unknown backend, a backend unsupported on this platform (e.g. `herdr` on native Windows), backend conflict with a live daemon, or admin mint / MCP surface unhealthy. |
 
 ## Migration from `claude-org-ja`'s `tools/`
 

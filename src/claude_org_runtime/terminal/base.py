@@ -317,6 +317,28 @@ def wait_for_state(
 VALID_BACKENDS = ("wezterm", "tmux", "herdr")
 
 
+def backend_unavailable_reason(backend: str) -> str | None:
+    """Return an ASCII-only English reason the backend cannot run here, or None.
+
+    Single source of truth for backend x platform support. Both the ``org up``
+    launcher (fail-fast before spawning the daemon) and
+    ``HerdrAdapter.__post_init__`` (foreground ``broker serve`` path) call this
+    so the two never drift and both fail with the same actionable message.
+
+    ``herdr`` speaks to its daemon over a stdlib ``AF_UNIX`` Unix domain socket,
+    which native Windows (``os.name == "nt"``) lacks; it is POSIX / WSL only.
+    The message is kept ASCII-only (no em-dash) so it survives a cp932 console.
+    """
+    if backend == "herdr" and os.name == "nt":
+        return (
+            "backend 'herdr' is not supported on native Windows: it requires a "
+            "Unix domain socket (POSIX / WSL only). Use '--backend wezterm' on "
+            "native Windows, or run under WSL. To drive a remote herdr session, "
+            "use the renga transport instead."
+        )
+    return None
+
+
 def default_backend() -> str:
     """実行環境の既定 backend。
 

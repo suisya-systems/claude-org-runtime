@@ -75,6 +75,7 @@ from .base import (  # noqa: F401  (NUDGE_TEXT / space 定数の再利用)
     SPACE_CONTROL,
     PaneRef,
     SpaceDescriptor,
+    backend_unavailable_reason,
 )
 from .keys import CTRL_LETTERS
 
@@ -547,13 +548,13 @@ class HerdrAdapter:
     )
 
     def __post_init__(self) -> None:
-        # POSIX 限定 (設計書 §4.6): Windows named pipe は stdlib AF_UNIX で扱えず未対応。
-        if os.name == "nt":
-            raise HerdrError(
-                CODE_ADAPTER_UNAVAILABLE,
-                "Herdr adapter is POSIX-only; Windows named pipe transport is "
-                "unsupported (design herdr-adapter.md §4.6 / 残存リスク)",
-            )
+        # POSIX / WSL only (design herdr-adapter.md §4.6): native Windows lacks
+        # the stdlib AF_UNIX socket this adapter needs. Reason string comes from
+        # the shared SoT helper so the direct 'broker serve --backend herdr' path
+        # and the org up launcher fail-fast never drift and stay ASCII (cp932).
+        reason = backend_unavailable_reason("herdr")
+        if reason:
+            raise HerdrError(CODE_ADAPTER_UNAVAILABLE, reason)
         self._client = _HerdrClient(self.socket_path, self.timeout)
         # 世代識別の解決 (§5.2)。state_dir があれば永続 org_instance_id + boot ごとの
         # 単調 generation (write-ahead)。無ければ ephemeral (テスト / standalone)。
