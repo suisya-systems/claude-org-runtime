@@ -1631,23 +1631,48 @@ def test_sweep_defers_on_lagging_pane_list_then_closes_when_caught_up(
     assert ref_p.window_id not in a._pending_sweep     # reclaimed within the generation
 
 
-def test_startup_sweep_does_not_close_reoccupied_old_generation_workspace(
+def test_startup_sweep_closes_old_generation_workspace_with_orphan_panes(
     server: FakeHerdrServer, tmp_path
 ) -> None:
-    # Codex P1 (round 6): the startup stale sweep must route old-generation closes through
-    # the physical-empty guard too. If a human/other process reoccupied a prior-gen org
-    # workspace before restart, workspace.close would kill that non-owned pane solely
-    # because the label matches an old generation.
-    oid = "occ"
+    # §5.3 / #109 (human design adjudication): old-generation orphan workspaces contain the
+    # dead daemon's panes (root + orphaned agents), and reaping them WITH their panes is the
+    # whole point of the generation stale sweep. The old-gen path closes them UNCONDITIONALLY
+    # (gated only on the single-live-daemon lock + a current-gen registry check) — it is NOT
+    # routed through the physical-empty guard (that guard is reserved for the current-gen
+    # ephemeral cleanup paths, which still protect foreign panes). A one-time round-6 change
+    # over-generalized the guard onto this path and broke #109's purpose; reverted per human
+    # adjudication.
+    oid = "og"
     server.on("workspace.list", {"workspaces": [
         {"workspace_id": "w_old", "label": f"claude-org/{oid}/g1/project:x"},
     ]})
-    # the old-gen workspace is reoccupied by a foreign pane.
-    server.on("pane.list", {"panes": [{"pane_id": "w_old:pF", "workspace_id": "w_old"}]})
+    # the old-gen workspace still holds the dead daemon's orphan pane(s) — still reaped.
+    server.on("pane.list", {"panes": [{"pane_id": "w_old:p2", "workspace_id": "w_old"}]})
     server.on("workspace.close", {"type": "ok"})
     HerdrAdapter(socket_path=server.path, timeout=2.0,
                  org_instance_id=oid, generation=2, state_dir=str(tmp_path))
-    assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)
+    closes = [
+        r["params"]["workspace_id"] for r in server.requests
+        if r["method"] == "workspace.close"
+    ]
+    assert "w_old" in closes   # old-gen orphan (with panes) reaped (#109 purpose preserved)
+
+
+def test_sweep_old_generation_skips_workspace_with_current_gen_pane(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Defensive §5.3 step 3: _sweep_old_generation skips a workspace that holds a CURRENT-gen
+    # (our registry) pane — never kill a live current-gen pane even if the label is old.
+    # (Constructed without state_dir so the __post_init__ sweep does not run; the registry is
+    # seeded and the method is exercised directly, since boot-time registry is empty.)
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    a._owned_panes["w_old:p9"] = herdr_mod._PaneRecord(
+        pane_id="w_old:p9", space_key=SPACE_CONTROL,
+        workspace_id="w_old", tab_id="w_old:t1",
+    )
+    a._sweep_old_generation("w_old")
+    assert "workspace.close" not in server.methods_called()   # skipped (current-gen pane)
 
 
 def _wire_create_incrementing(server: FakeHerdrServer) -> dict:

@@ -1588,24 +1588,37 @@ class HerdrAdapter:
                 self._adopt_or_sweep_current(wid, w, space_key)
 
     def _sweep_old_generation(self, workspace_id: str) -> None:
-        """旧世代孤児 workspace を掃除する (§5.3 step 3。物理的空を確認してから close)。
+        """旧世代孤児 workspace を掃除する (§5.3 step 3、#109 の主目的)。
 
-        lock で旧 daemon の死は確認済みだが、なお防御的に現世代 pane が混ざっていないか
-        (= 自 registry の pane が居ないか) を確認する。加えて、旧世代ラベルでも人間 / 別プロセスが
-        pane を再占有していれば workspace.close は巻き添えに殺すため、**他の掃除経路と同じく
-        ``_close_workspace_if_empty`` に通して物理的な空を確証した時のみ close** する (Codex P1
-        / §4.1 isolation)。occupied / 失敗は close せず放置 (次 boot / 手動、成功を偽装しない)。
+        single-live-daemon lock で旧 daemon の死は確認済み (§5.3 の primary guard / §14 の
+        load-bearing 残存リスク)。旧世代 orphan は死んだ daemon の pane (root + 孤児 agent) を
+        含むのが常態で、**それごと reap するのが本 sweep の主目的** (#109: 世代共有・孤児堆積の
+        回収)。よって旧世代 workspace は **無条件に workspace.close** する。防御は「予期せぬ
+        **現世代** pane が混ざっていないか」(= 自 registry の pane が居ないか) の確認に限定する。
+
+        **設計裁定 (人間) の経緯**: 一時 round 6 で本経路を `_close_workspace_if_empty` (物理的
+        空の関門) に通したが、旧世代 orphan の pane を全て「非 owned 占有」と誤判定し #109 /
+        §5 の主目的 (pane ごと orphan 掃除) を壊した。round 6 指摘 (occupied 保護) は **現世代の
+        ephemeral 掃除経路** (`_sweep_space` / `_retry_pending_sweep`) 限定で正しく、old-gen 経路
+        への適用は過剰一般化だったため、人間裁定で §5.3 準拠 (無条件 close + 現世代混在チェックのみ)
+        へ復帰した。現世代掃除経路は引き続き `_close_workspace_if_empty` で foreign を保護する。
+
+        defer 意味論: 失敗は握り潰す (次 boot / 次ラウンドで再試行、成功を偽装しない)。
         """
         with self._lock:
             has_own = any(
                 r.workspace_id == workspace_id for r in self._owned_panes.values()
             )
         if has_own:
-            # 防御: 自 registry の pane が居る = 現世代 pane が混ざっている疑い → close しない
-            # (§5.3 step 3)。boot 直後は registry 空なので通常は素通りする安全弁。
+            # 防御: 自 registry の pane が居る = **現世代** pane が混ざっている疑い → close しない
+            # (§5.3 step 3。live 現世代 pane を殺さない)。boot 直後は registry 空なので通常は素通り。
             return
-        # 物理的に空な時だけ close (occupied なら閉じない = 再占有した非 owned pane を保護)。
-        self._close_workspace_if_empty(workspace_id)
+        try:
+            self._client.request(
+                "workspace.close", {"workspace_id": workspace_id}
+            )
+        except HerdrError:
+            pass  # 失敗は次 boot に委ねる (成功を偽装しない)
 
     def _adopt_or_sweep_current(
         self, workspace_id: str, ws: dict, space_key: str
