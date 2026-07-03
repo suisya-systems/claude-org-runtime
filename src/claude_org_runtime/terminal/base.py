@@ -101,6 +101,25 @@ class TerminalAdapter(Protocol):
     ``[key_unsupported]`` で拒否する (all-or-nothing: 途中まで打鍵して壊さない)。
     ``isolated_session`` と同じ理由で **注釈しない** ClassVar とし、broker は
     ``getattr(adapter, "supported_named_keys", frozenset())`` で読む。
+
+    opportunistic reap の tuning (任意 ClassVar、backend-aware):
+    broker の入口 reap (自己終了した managed pane の bookkeeping 掃除) は既定で
+    「snapshot に現れない = 即 reap」だが、``list_panes`` が **eventually consistent**
+    な backend (Herdr: boot 中や snapshot ラグで生 pane が一時欠落しうる) では、生
+    pane を誤 reap し孤児 TUI を残す。これを避けるため adapter は次の 2 つを ClassVar
+    で宣言でき、broker は ``getattr(adapter, ..., default)`` で読む (宣言しない
+    backend は既定 = 従来の即時 reap):
+      - ``reap_min_age_seconds`` (float, 既定 0.0): spawn からこの秒数を超えるまで、
+        snapshot 欠落があっても reap しない (boot 中の一時欠落を保護)。
+      - ``reap_min_missing_snapshots`` (int, 既定 1): この回数 snapshot に現れて
+        初めて reap 対象 (単発 snapshot ラグを弾く回数ベースの補助ゲート)。
+      - ``reap_min_missing_seconds`` (float, 既定 0.0): 連続欠落が**実時間**でこの
+        秒数継続して初めて reap 対象 (poll cadence 非依存の主ゲート)。broker は reap を
+        request-driven に並行呼び出しするため、回数だけだと単一ラグ窓で複数スレッドが
+        立て続けに count を積んで誤 reap しうる。実時間ゲートは「何回呼ばれても実時間が
+        経たない限り成立しない」ので、この bursty 誤判定を構造的に断つ。
+    これは表示面の判定 (``list_panes`` に載るか) は変えず、bookkeeping 削除の
+    決定条件だけを backend の snapshot 一貫性に合わせて硬くする防御である。
     """
 
     def spawn(

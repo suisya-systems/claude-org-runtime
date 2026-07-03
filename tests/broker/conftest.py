@@ -35,12 +35,36 @@ class FakeAdapter:
     # WezTerm subset を模すテストは別途 supported_named_keys を差し替える。
     supported_named_keys = frozenset(CANONICAL_KEYS)
 
-    def __init__(self, isolated_session: bool = True) -> None:
+    def __init__(
+        self,
+        isolated_session: bool = True,
+        reap_min_age_seconds: float = 0.0,
+        reap_min_missing_snapshots: int = 1,
+        reap_min_missing_seconds: float = 0.0,
+        detailed_kill: bool = False,
+        kill_ineffective: bool = False,
+    ) -> None:
         # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
         # global-mux backend (wezterm) を模すテストは False を渡す。
         self.isolated_session = isolated_session
+        # backend-aware reap 閾値 (broker が getattr で読む)。既定は tmux/wezterm と
+        # 同じ即時 reap (0.0 / 1)。Herdr の eventually-consistent 判定を模すテストは
+        # 大きめの値を渡す。
+        self.reap_min_age_seconds = reap_min_age_seconds
+        self.reap_min_missing_snapshots = reap_min_missing_snapshots
+        self.reap_min_missing_seconds = reap_min_missing_seconds
+        # kill_ineffective: kill を発行しても pane が消えない (Herdr の close 拒否や
+        # 実 kill 失敗を模す)。reap の「消せなかったら bookkeeping を保持する」defer
+        # 経路 (Codex P2) を検証するため。
+        self._kill_ineffective = kill_ineffective
+        if detailed_kill:
+            self.kill_pane_detailed = self._kill_pane_detailed_impl
         self._panes: dict[int, dict] = {}
         self._screens: dict[int, str] = {}
+        # snapshot ラグ (eventually consistent) を模す: ここに入れた handle は
+        # list_panes から隠れるが pane_exists では依然「存在」する (物理的には生きて
+        # いるのに snapshot に現れない Herdr 挙動)。
+        self._snapshot_hidden: set = set()
         self.spawned: list[dict] = []
         self.killed: list[int] = []
         self._counter = itertools.count(1)
@@ -71,9 +95,14 @@ class FakeAdapter:
         return PaneRef(pane_id=handle)
 
     def list_panes(self) -> list[dict]:
-        return [dict(p) for p in self._panes.values()]
+        # snapshot ラグ中の pane は list から隠れる (eventually consistent)。
+        return [
+            dict(p) for h, p in self._panes.items()
+            if h not in self._snapshot_hidden
+        ]
 
     def pane_exists(self, pane_id) -> bool:
+        # 物理存在確認は snapshot ラグに影響されない (fresh probe を模す)。
         return pane_id in self._panes
 
     def get_text(self, pane_id, escapes: bool = False) -> str:
@@ -105,9 +134,32 @@ class FakeAdapter:
                 self._screens[pane_id] = self._screens.get(pane_id, "") + f"<{k}>"
 
     def kill_pane(self, pane_id) -> None:
+        # 実 backend の kill は既に消えた pane に対しては no-op。reap は「消えていそう」
+        # の事前 probe に頼らず常に close を発行する (Codex round2 P2) ため、gone な
+        # handle にも kill_pane が来る。`killed` は「生きた pane を実際に kill したか」を
+        # 表す指標として、存在した時だけ記録する (no-op kill を混ぜない)。
+        existed = pane_id in self._panes
         self._panes.pop(pane_id, None)
         self._screens.pop(pane_id, None)
-        self.killed.append(pane_id)
+        self._snapshot_hidden.discard(pane_id)
+        if existed:
+            self.killed.append(pane_id)
+
+    # Herdr-style detailed kill, only bound as an attribute when the adapter
+    # was built with detailed_kill=True. This lets tests cover BOTH the
+    # broker's detailed path (getattr finds it) and its kill_pane fallback
+    # (getattr returns None) with the same fake class.
+    def _kill_pane_detailed_impl(self, pane_id) -> dict:
+        """Mirror ``HerdrAdapter.kill_pane_detailed`` return shape."""
+        if self._kill_ineffective:
+            # close refused / kill failed: pane stays physically alive.
+            return {"closed_via": "refused", "still_present": pane_id in self._panes}
+        present = pane_id in self._panes
+        self.kill_pane(pane_id)
+        return {
+            "closed_via": "pane.close" if present else "already_gone",
+            "still_present": pane_id in self._panes,
+        }
 
     # simulate a pane that exits on its own (self-termination) --------------
     def terminate(self, pane_id) -> None:
@@ -119,6 +171,21 @@ class FakeAdapter:
         """
         self._panes.pop(pane_id, None)
         self._screens.pop(pane_id, None)
+        self._snapshot_hidden.discard(pane_id)
+
+    # simulate eventually-consistent snapshot lag ---------------------------
+    def desync_hide(self, pane_id) -> None:
+        """Hide a pane from ``list_panes`` while keeping it physically present.
+
+        Models Herdr's eventually-consistent ``pane.list``: a live pane can
+        transiently drop out of the snapshot (boot / lag) even though the
+        process is running (``pane_exists`` still True).
+        """
+        self._snapshot_hidden.add(pane_id)
+
+    def desync_show(self, pane_id) -> None:
+        """Reveal a previously hidden pane again (snapshot caught up)."""
+        self._snapshot_hidden.discard(pane_id)
 
 
 @pytest.fixture

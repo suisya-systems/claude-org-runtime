@@ -907,3 +907,265 @@ def test_reap_of_tokenless_generic_pane_spares_live_namesake_delivery(tmp_path):
     assert b.get_bind(cred) is not None              # delivery cred は revoke されない
     assert "r1" in b._rows                            # 未配達行は残る
     assert b._delivery_modes.get("foo") == "PULL"    # delivery state は維持
+
+
+# ============================ deterministic pane-unit reap model (Issue #109)
+# Herdr の eventually consistent snapshot (boot 中 / ラグで生 pane が一時欠落) が、
+# 「snapshot に現れない = 物理消滅」と即断する旧 reap で誤 reap され、_cleanup_pane が
+# 物理 close を呼ばない設計と相まって孤児 TUI を残す複合 Blocker を、pane 単位の
+# 決定的モデル (age + 連続欠落) と物理 close 検証で断つことを固定する。
+
+
+def test_transient_snapshot_miss_does_not_reap_live_pane(tmp_path):
+    """真因B: eventually consistent snapshot から一時的に欠落した生 pane は reap
+    されない (>= min_missing 連続欠落が要る)。snapshot 復帰で欠落 streak はリセット。"""
+    adapter = FakeAdapter(reap_min_missing_snapshots=2)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)   # host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    # snapshot から一時消失 (物理的にはまだ生存 = pane_exists True)。
+    adapter.desync_hide(h)
+    b.resolve_target("focused")     # 欠落 1 回目 -> 閾値未満で生存
+    assert b._meta_for(h) is not None
+    assert b._binds[tok].revoked is False
+    assert h not in adapter.killed
+    assert b._meta_for(h)["missing_count"] == 1
+    # snapshot が追いつく -> 欠落 streak はリセット (連続性を担保)。
+    adapter.desync_show(h)
+    b.resolve_target("focused")
+    assert b._meta_for(h)["missing_count"] == 0
+    assert b._meta_for(h)["missing_since"] is None
+
+
+def test_young_pane_not_reaped_despite_misses(tmp_path):
+    """真因B (age gate): spawn 直後の若い pane は連続欠落しても age 未達で reap されない
+    (boot 中の一時欠落保護)。min_missing=1 でも age が守る。"""
+    adapter = FakeAdapter(reap_min_age_seconds=30.0, reap_min_missing_snapshots=1)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "boot"})
+    h = adapter.spawned[-1]["handle"]
+    adapter.desync_hide(h)
+    for _ in range(5):
+        b.resolve_target("focused")
+    assert b._meta_for(h) is not None            # 若すぎて reap されない
+    assert b._meta_for(h)["missing_count"] == 5  # 欠落は数えているが age が未達
+
+
+def test_pane_reaped_after_age_and_consecutive_miss(tmp_path):
+    """真因B: age 超過 かつ min_missing 連続欠落を満たすと reap される (決定的モデル)。"""
+    adapter = FakeAdapter(reap_min_age_seconds=5.0, reap_min_missing_snapshots=2)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)   # host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    # age gate を満たすよう spawn 時刻を過去へ (100s 前に spawn した扱い)。
+    b._pane_meta[str(h)]["spawned_at"] -= 100
+    adapter.terminate(h)            # pane 自己終了 (物理消滅)
+    b.resolve_target("focused")     # 欠落 1 回目: 閾値未満 -> 生存
+    assert b._meta_for(h) is not None
+    assert b._meta_for(h)["missing_count"] == 1
+    b.resolve_target("focused")     # 欠落 2 回目: age + 連続欠落成立 -> reap
+    assert b._meta_for(h) is None
+    assert b._binds[tok].revoked is True
+    assert h not in adapter.killed  # 物理消滅済みなので kill は呼ばない
+
+
+def test_reap_requires_wall_time_missing_not_just_call_count(tmp_path):
+    """真因B の cadence 非依存ゲート (adversarial review Major): reap は missing_count
+    だけでなく missing_since からの**実時間**経過も要求する。request-driven に何度
+    reap を回しても、単一ラグ窓 (実時間が進まない) では生 pane を reap しない。"""
+    # missing_count は 1 回で満たすが、実時間ゲート (100s) は満たさない設定。
+    adapter = FakeAdapter(
+        reap_min_missing_snapshots=1, reap_min_missing_seconds=100.0,
+    )
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)   # host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    b._pane_meta[str(h)]["spawned_at"] -= 100   # age gate は満たす
+    adapter.desync_hide(h)          # snapshot から欠落 (物理的には生存)
+    # 立て続けに reap を駆動 (単一ラグ窓を模す: 実時間はほぼ進まない)。
+    for _ in range(10):
+        b.resolve_target("focused")
+    assert b._meta_for(h) is not None       # 実時間ゲート未達で reap されない
+    assert b._binds[tok].revoked is False
+    assert h not in adapter.killed          # 生 pane を物理 kill しない (Major 回帰防止)
+    assert b._meta_for(h)["missing_count"] >= 10  # 呼び出しは数えているが時間が未達
+    # missing_since を過去へずらし実時間経過を満たすと reap される。
+    b._pane_meta[str(h)]["missing_since"] -= 200
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None
+
+
+def test_reap_physically_closes_residual_pane_and_journals(tmp_path):
+    """真因A: 物理残存する reap 候補 (snapshot ラグで欠落したが実は生存) は bookkeeping
+    削除前に物理 close され、close 経路 / 残存が pane_reaped に journal される。"""
+    adapter = FakeAdapter(detailed_kill=True)   # 既定閾値 (0.0 / 1) で即候補化
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)   # host pane
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    agent_id = b._meta_for(h)["agent_id"]
+    # snapshot からは消えるが物理的には生存 (eventually consistent)。
+    adapter.desync_hide(h)
+    b.resolve_target("focused")     # reap 駆動
+    # 事前 probe に頼らず常に物理 close を発行する -> 生存していれば実際に閉じる。
+    assert h in adapter.killed
+    assert b._meta_for(h) is None   # close 有効なので bookkeeping も掃除される
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert len(reaped) == 1
+    assert reaped[0]["agent_id"] == agent_id
+    assert reaped[0]["kill"]["closed_via"] == "pane.close"
+    assert reaped[0]["kill"]["still_present"] is False
+
+
+def test_reap_defers_when_physical_close_fails_to_remove_live_pane(tmp_path):
+    """Codex P2: 物理 close が生 pane を消せなかった場合 (close 拒否 / kill 失敗)、
+    bookkeeping を落とさず保持し次ラウンドに委ねる — 誤 reap で生 TUI を unmanaged
+    孤児化させない (本 patch が断とうとする状態を再生しない)。"""
+    adapter = FakeAdapter(detailed_kill=True, kill_ineffective=True)
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    adapter.desync_hide(h)          # snapshot 欠落だが物理生存
+    b.resolve_target("focused")     # reap 駆動 -> close は refused (still_present True)
+    # close が消せなかったので bookkeeping は保持される (defer)。
+    assert b._meta_for(h) is not None
+    assert b._binds[tok].revoked is False
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    assert any(e["event"] == "pane_reap_deferred" and e.get("pane_id") == h for e in events)
+    assert not any(e["event"] == "pane_reaped" and e.get("pane_id") == h for e in events)
+    # close が効くようになれば次ラウンドで通常どおり reap される。
+    adapter._kill_ineffective = False
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None
+    assert b._binds[tok].revoked is True
+
+
+def test_failed_spawn_does_not_count_toward_respawn_flood(tmp_path):
+    """Codex P3: 予約後に spawn が失敗した試行は burst 履歴に残さない — 実際に pane が
+    立たなかった失敗の連続で [respawn_flood] を誤発火しない。bind-only 同名衝突で
+    issue_token(unique=True) が失敗する経路で固定する。"""
+    adapter = FakeAdapter()
+    b = Broker(
+        state_dir=tmp_path, adapter=adapter,
+        respawn_burst_threshold=2, respawn_burst_window=100.0,
+    )
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    # 同名の bind-only agent を先に mint -> spawn_claude の issue_token が衝突で失敗。
+    b.issue_token("dup", "dup", "worker")
+    for _ in range(5):
+        out = dispatch_tool(b, disp, "spawn_claude_pane",
+                            {"direction": "vertical", "name": "dup"})
+        assert out["isError"] is True
+        # threshold(2) を超えても respawn_flood にはならない (失敗は数えない)。
+        assert "[respawn_flood]" not in out["content"][0]["text"]
+    # burst 履歴は失敗ぶんを溜めていない (rollback されている)。
+    assert b._spawn_history.get("dup", []) == []
+
+
+def test_reap_residual_uses_kill_pane_fallback_without_detailed(tmp_path):
+    """kill_pane_detailed を持たない adapter でも、物理残存する reap 候補は kill_pane +
+    close 後 pane_exists で最小可視化しつつ確実に物理 close する (fallback 経路)。"""
+    adapter = FakeAdapter()   # detailed_kill=False -> kill_pane_detailed 無し
+    assert not hasattr(adapter, "kill_pane_detailed")
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    adapter.desync_hide(h)
+    b.resolve_target("focused")
+    assert h in adapter.killed
+    assert b._meta_for(h) is None
+    path = b.state_dir / "queue.jsonl"
+    events = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+    reaped = [e for e in events if e["event"] == "pane_reaped" and e.get("pane_id") == h]
+    assert reaped[0]["kill"]["closed_via"] == "kill_pane"
+    assert reaped[0]["kill"]["still_present"] is False
+
+
+def test_reap_deferred_when_physical_close_backend_unreachable(tmp_path):
+    """真因A の安全側 (Codex round2 P2): 物理 close が backend 不通で発行できない
+    ラウンドは reap を見送る (bookkeeping を落とさない) — 消せたか未確認のまま meta を
+    落とすと生 TUI を孤児化しうる。欠落状態は次ラウンドへ持ち越す。
+
+    判定は list-backed で stale になりうる pane_exists ではなく close 経路で行うので、
+    ここでは close (kill_pane) 自体を backend 不通にする。"""
+    adapter = FakeAdapter()
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical", "name": "w"})
+    h = adapter.spawned[-1]["handle"]
+    tok = b._meta_for(h)["token"]
+    adapter.desync_hide(h)          # snapshot から欠落 (候補化)
+    # 物理 close (kill_pane) を backend 不通 (例外) にする -> closed_via="error" で defer。
+    orig_kill = adapter.kill_pane
+    adapter.kill_pane = lambda pid: (_ for _ in ()).throw(RuntimeError("socket down"))
+    b.resolve_target("focused")
+    assert b._meta_for(h) is not None       # 消せたか未確認 -> 誤 reap しない
+    assert b._binds[tok].revoked is False
+    # backend 復帰後は close が有効になり reap される (孤児化を残さない)。
+    adapter.kill_pane = orig_kill
+    b.resolve_target("focused")
+    assert b._meta_for(h) is None
+    assert h in adapter.killed
+
+
+# ================================ same-name respawn burst dampener (真因D)
+
+
+def test_respawn_burst_is_dampened(tmp_path):
+    """真因D: window 内で threshold 回を超える同名 spawn は [respawn_flood] で拒否する
+    (launcher リトライ x reap の相互増幅による同名孤児量産への追加防御)。"""
+    adapter = FakeAdapter()
+    b = Broker(
+        state_dir=tmp_path, adapter=adapter,
+        respawn_burst_threshold=3, respawn_burst_window=100.0,
+    )
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    # threshold 回まで受理 (毎回 terminate で name 解放 -> 次 spawn 前に reap で再取得可)。
+    for _ in range(3):
+        out = dispatch_tool(b, disp, "spawn_claude_pane",
+                            {"direction": "vertical", "name": "w"})
+        assert out.get("isError") is not True
+        adapter.terminate(adapter.spawned[-1]["handle"])
+    # threshold+1 回目 (window 内) は拒否。
+    out = dispatch_tool(b, disp, "spawn_claude_pane",
+                        {"direction": "vertical", "name": "w"})
+    assert out["isError"] is True
+    assert "[respawn_flood]" in out["content"][0]["text"]
+
+
+def test_respawn_burst_does_not_block_distinct_names(tmp_path):
+    """burst dampener は name 単位。別名の spawn は同一 window でも影響を受けない。"""
+    adapter = FakeAdapter()
+    b = Broker(
+        state_dir=tmp_path, adapter=adapter,
+        respawn_burst_threshold=2, respawn_burst_window=100.0,
+    )
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    for i in range(5):
+        out = dispatch_tool(b, disp, "spawn_claude_pane",
+                            {"direction": "vertical", "name": f"w{i}"})
+        assert out.get("isError") is not True
