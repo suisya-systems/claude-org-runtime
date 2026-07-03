@@ -103,6 +103,42 @@ def test_type_text_is_paste(adapter: WezTermAdapter) -> None:
     ]
 
 
+# --------------------------------------------------------------------------
+# send_named_keys (raw-key vocabulary subset, Issue #108)
+# --------------------------------------------------------------------------
+
+def test_supported_named_keys_is_enter_and_ctrl_c_subset() -> None:
+    # WezTerm declares the subset it can already emit, not the full vocabulary.
+    from claude_org_runtime.terminal.keys import CANONICAL_KEYS
+
+    assert WezTermAdapter.supported_named_keys == frozenset({"enter", "ctrl+c"})
+    # drift guard: every declared key must be a real canonical key (parity with
+    # the tmux/herdr map guards), so a rename in keys.py can't silently desync it.
+    assert WezTermAdapter.supported_named_keys <= CANONICAL_KEYS
+
+
+def test_send_named_keys_subset_routes_to_cr_and_etx(adapter: WezTermAdapter) -> None:
+    adapter.send_named_keys(5, ["enter", "ctrl+c"])
+    first, second = adapter._fake.calls
+    assert _args(first) == ["send-text", "--pane-id", "5", "--no-paste", "--", "\r"]
+    assert _args(second) == ["send-text", "--pane-id", "5", "--no-paste", "--", "\x03"]
+
+
+def test_send_named_keys_rejects_out_of_subset_key(adapter: WezTermAdapter) -> None:
+    # Defensive: broker preflight normally blocks this, but the adapter must
+    # not silently drop an unsupported canonical key.
+    with pytest.raises(ValueError):
+        adapter.send_named_keys(5, ["up"])
+
+
+def test_send_named_keys_mixed_batch_is_all_or_nothing(adapter: WezTermAdapter) -> None:
+    # A supported key BEFORE an unsupported one must not be emitted: the whole
+    # batch is validated first, so nothing reaches the pty (all-or-nothing).
+    with pytest.raises(ValueError):
+        adapter.send_named_keys(5, ["enter", "up"])
+    assert adapter._fake.calls == []
+
+
 def test_send_line_pastes_then_enters(adapter: WezTermAdapter) -> None:
     adapter.send_line(5, "a line")
     first, second = adapter._fake.calls

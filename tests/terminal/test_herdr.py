@@ -507,6 +507,38 @@ def test_send_enter_and_interrupt(server: FakeHerdrServer) -> None:
     assert server.params_for("pane.send_keys")["keys"] == ["ctrl+c"]
 
 
+def test_send_named_keys_maps_canonical_to_herdr_tokens(
+    server: FakeHerdrServer,
+) -> None:
+    # representative raw keys mapped to Herdr tokens (backtab -> shift+tab,
+    # esc -> escape), batched into one pane.send_keys request, order preserved
+    # (Issue #108). Tokens pinned against the live Herdr 0.7.1 probe.
+    server.on("pane.send_keys", {"type": "ok"})
+    a = _adapter(server)
+    a.send_named_keys("w1:p2", ["backtab", "esc", "up", "left", "ctrl+a"])
+    p = server.params_for("pane.send_keys")
+    assert p["pane_id"] == "w1:p2"
+    assert p["keys"] == ["shift+tab", "escape", "up", "left", "ctrl+a"]
+
+
+def test_supported_named_keys_is_measured_subset() -> None:
+    # Herdr 0.7.1 send-keys is NOT the full vocabulary: Delete/Home/End/
+    # PageUp/PageDown are rejected by the server (invalid_key), so they are
+    # intentionally excluded. Everything else (arrows, backtab, ctrl+a..z) is
+    # supported. Pinned against the live-server probe.
+    from claude_org_runtime.terminal.keys import CANONICAL_KEYS
+
+    missing = CANONICAL_KEYS - HerdrAdapter.supported_named_keys
+    assert missing == {"delete", "home", "end", "pageup", "pagedown"}
+    assert HerdrAdapter.supported_named_keys < CANONICAL_KEYS
+
+
+def test_send_named_keys_empty_is_noop(server: FakeHerdrServer) -> None:
+    a = _adapter(server)
+    a.send_named_keys("w1:p2", [])
+    assert server.methods_called() == []
+
+
 def test_send_line_text_then_enter(
     server: FakeHerdrServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -519,11 +519,13 @@ class Broker(TokenMixin, StoreMixin):
     ) -> dict:
         """raw PTY 打鍵 (renga send_keys 同形)。
 
-        語彙検証は surface 側 (-32602)。実打鍵は現 adapter 能力 (literal text /
-        Enter / Ctrl+C) に限定される。それ以外の有効キー (Tab / Shift+Tab /
-        矢印等) は backend adapter が emit 面を持たないため
-        ``[key_unsupported]`` を返す (§4.7 Phase 4 で full backend adapter 化。
-        既知制限)。
+        ``keys`` は surface で **canonical** 形へ正規化済み
+        (:func:`~claude_org_runtime.terminal.keys.normalize_key`)。実打鍵可能な
+        canonical 部分集合は backend adapter の ``supported_named_keys`` が宣言し
+        (tmux は full、Herdr は subset、WezTerm は Enter / Ctrl+C の最小 subset)、
+        text 送信の**前に**送信予定の全キーを preflight する。未対応が 1 つでもあれば全体を
+        ``[key_unsupported]`` で拒否する (all-or-nothing: 途中まで打鍵して画面を
+        壊さない、Issue #108 確定事項 (1))。順序は text -> keys -> enter を維持する。
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
@@ -531,25 +533,19 @@ class Broker(TokenMixin, StoreMixin):
         if handle is None:
             return _err(f"[pane_not_found] no pane for target {target!r}")
         seq = list(keys) + (["enter"] if enter else [])
-        # adapter で emit 可能なキーだけを許す。未対応キーがあれば先に弾く
-        # (部分実行で画面を壊さない)。
-        unsupported = [
-            k for k in seq if k.lower() not in ("enter", "return", "ctrl+c")
-        ]
+        # adapter が emit 可能な canonical だけを許す。未対応キーがあれば **text を
+        # 送る前に**全体を弾く (部分実行で画面を壊さない all-or-nothing preflight)。
+        supported = getattr(self.adapter, "supported_named_keys", frozenset())
+        unsupported = [k for k in seq if k not in supported]
         if unsupported:
             return _err(
-                f"[key_unsupported] keys {unsupported!r} are not emittable by the "
-                "current terminal adapter (only Enter / Ctrl+C / literal text; "
-                "full raw-key vocabulary is Phase 4 / full backend adapter)"
+                f"[key_unsupported] canonical keys {unsupported!r} are not emittable "
+                f"by the current terminal adapter (supported: {sorted(supported)})"
             )
         if text:
             self.adapter.type_text(handle, text)
-        for k in seq:
-            kl = k.lower()
-            if kl in ("enter", "return"):
-                self.adapter.send_enter(handle)
-            elif kl == "ctrl+c":
-                self.adapter.send_interrupt(handle)
+        if seq:
+            self.adapter.send_named_keys(handle, seq)
         return _ok({"ok": True, "target": target})
 
     # ---------------------------------------------------- pane: 共通 cleanup / reap

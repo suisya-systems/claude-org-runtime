@@ -38,13 +38,38 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar
 
 from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
+from .keys import CANONICAL_KEYS, CTRL_LETTERS
 
 # 専用 socket 名: 既存 tmux サーバーと分離する (本体非干渉)。
 BROKER_SOCKET = "claude-org-broker"
+
+# canonical キー -> tmux send-keys 語彙 の明示マップ (design review 確定事項 (4))。
+# schema 名をそのまま渡すと BTab / PPage / NPage / BSpace / DC / Escape のズレで
+# 黙って誤打鍵するため、既存 Enter / C-c と同様に adapter 内対応表で固定する。
+# tmux の named key は case-sensitive (`Enter`/`Escape`/`BTab` 等、man tmux KEY BINDINGS)。
+_TMUX_KEY_MAP: dict[str, str] = {
+    "enter": "Enter",
+    "tab": "Tab",
+    "backtab": "BTab",
+    "esc": "Escape",
+    "backspace": "BSpace",
+    "delete": "DC",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PPage",
+    "pagedown": "NPage",
+    "space": "Space",
+    **{f"ctrl+{c}": f"C-{c}" for c in CTRL_LETTERS},
+}
 
 # detached session の仮想端末サイズ。80x24 だと Claude TUI が折返し過多で
 # プロンプト / ヒント行の検出が不安定になるため広めに取る。
@@ -79,6 +104,10 @@ class TmuxAdapter:
     # broker の last-pane ガードが論理ペイン (窓口) を +1 計上してよい backend。
     # backend 固定の能力なので ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = True
+
+    # tmux は send-keys が一級プリミティブで、full raw-key vocabulary を emit できる。
+    # 対応表 (_TMUX_KEY_MAP) の key = canonical 全集合 (テストで包含を固定)。
+    supported_named_keys: ClassVar[frozenset[str]] = frozenset(_TMUX_KEY_MAP)
 
     exe: str = field(default_factory=find_tmux)
     socket: str = BROKER_SOCKET
@@ -187,6 +216,25 @@ class TmuxAdapter:
     def send_interrupt(self, pane_id: str) -> None:
         """Ctrl+C 1 打 (一級プリミティブ。入力欄クリア)。"""
         self._tmux("send-keys", "-t", str(pane_id), "C-c")
+
+    def send_named_keys(self, pane_id: str, keys: Sequence[str]) -> None:
+        """canonical キー列を tmux 語彙へ写像して 1 回の send-keys で batch 送出する。
+
+        broker が preflight 済みの canonical キーのみを受ける (未対応が混じらない前提)。
+        防御的に未知 canonical を検出したら :class:`KeyError` を上げ、部分打鍵する前に
+        全体を止める (broker 側 preflight のバグ検出用。実運用では到達しない)。
+        tmux send-keys は複数キー引数を順に打鍵するため、順序を保って 1 コマンドで送る。
+
+        既知の制限 (batch design の受容トレードオフ): ESC の直後に別キーを含む batch
+        (例 ``["esc", "up"]``) は inter-key delay なしで ``\\x1b`` + ``\\x1b[A`` を連続打鍵
+        するため、受信側 vt/readline が timeout で lone-ESC と escape-prefix を区別する
+        実装だと Meta/Alt 修飾 (ESC-prefix) と解釈しうる。単一キー batch (Esc 単独 /
+        矢印単独 = 主用途) は隣接が生じないため影響なし。ESC を独立キーとして確実に
+        届けたい場合は Esc だけ別 send_keys 呼出に分ける。"""
+        if not keys:
+            return
+        tokens = [_TMUX_KEY_MAP[k] for k in keys]  # 未知 canonical は KeyError
+        self._tmux("send-keys", "-t", str(pane_id), *tokens)
 
     def type_text(self, pane_id: str, text: str) -> None:
         """未送信で入力欄に置く (submit しない)。

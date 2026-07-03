@@ -42,6 +42,8 @@ import posixpath
 import re
 from typing import TYPE_CHECKING
 
+from ..terminal.keys import normalize_key
+
 if TYPE_CHECKING:  # 循環 import 回避 (server -> surface -> server を型のみで切る)
     from .server import Broker
     from .tokens import AgentBind
@@ -68,13 +70,12 @@ _ALL_DIGITS = re.compile(r"^\d+$")
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # send_keys の named-key 語彙 (renga golden shape と一致。B で照合済み)。
-# 値は「契約上有効なキー名」の集合。実打鍵可能かは backend adapter 能力に依存
-# (現 adapter は Enter / Ctrl+C / literal text のみ。raw 全語彙は §4.7 Phase 4)。
-_SEND_KEYS_VOCAB = {
-    "enter", "return", "tab", "shift+tab", "backtab", "esc", "escape",
-    "backspace", "delete", "del", "up", "down", "left", "right",
-    "home", "end", "pageup", "pagedown", "space",
-} | {f"ctrl+{c}" for c in "abcdefghijklmnopqrstuvwxyz"}
+# 契約上有効な**入力表記** / canonical 定義は terminal.keys が唯一の正本 (canonical /
+# schema / validation / backend map の三重管理 drift を避ける、Issue #108 確定事項
+# (6))。surface は :func:`normalize_key` で入力を canonical へ畳んで broker へ渡し
+# (正規化は broker/surface 側、確定事項 (3))、未知名は -32602 に写像する。実打鍵可能な
+# canonical 部分集合は各 adapter の ``supported_named_keys`` が宣言し、broker が
+# text 送信前に preflight する (all-or-nothing、確定事項 (1))。
 
 
 class ToolArgError(ValueError):
@@ -191,7 +192,11 @@ TOOLS = [
                         "Named special keys appended after text: Enter/Return, Tab, "
                         "Shift+Tab/BackTab, Esc/Escape, Backspace, Delete/Del, "
                         "Up/Down/Left/Right, Home, End, PageUp, PageDown, Space, "
-                        "Ctrl+<A-Z>. Unknown names return -32602."
+                        "Ctrl+<A-Z>. Case-insensitive. Unknown names return -32602; "
+                        "names the active terminal backend cannot emit return "
+                        "[key_unsupported] (tmux emits all; Herdr all except "
+                        "Delete/Home/End/PageUp/PageDown; WezTerm only Enter and "
+                        "Ctrl+C)."
                     ),
                 },
                 "enter": {
@@ -748,11 +753,15 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
         if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
             raise ToolArgError("send_keys keys must be a list of strings")
         enter = bool(args.get("enter", False))
-        # 語彙検証 (renga parity: 未知キー名は -32602)。
+        # 語彙検証 + canonical 正規化 (renga parity: 未知キー名は -32602)。
+        # 正規化は surface で一元化し (確定事項 (3))、broker/adapter は canonical のみ扱う。
+        canonical: list[str] = []
         for k in keys:
-            if k.lower() not in _SEND_KEYS_VOCAB:
+            ck = normalize_key(k)
+            if ck is None:
                 raise ToolArgError(f"unknown key name {k!r}")
-        return broker.send_keys_to(target, text, keys, enter)
+            canonical.append(ck)
+        return broker.send_keys_to(target, text, canonical, enter)
 
     if name == "poll_events":
         since = args.get("since")
