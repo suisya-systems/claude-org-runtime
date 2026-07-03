@@ -1355,43 +1355,54 @@ class HerdrAdapter:
         for key in candidates:
             self._sweep_if_empty(key)
 
+    def _close_workspace_if_empty(self, workspace_id: str) -> str:
+        """workspace が物理的に空な時**だけ** workspace.close する (§4.1 isolation の要)。
+
+        workspace.close は workspace 内の全 pane を巻き込むため、**非 owned pane** (REUSED で
+        pane_id を引き継いだ別プロセス / 人間 / 外部が move-in した pane) が 1 つでも居る間は
+        絶対に close しない (巻き添え kill = isolation 違反、Codex P1/P2)。sweep も pending 再試行も
+        この単一関門を通す。返り値:
+          - ``"closed"``    物理的に空で workspace.close 成功。
+          - ``"gone"``      pane.list / workspace.close が not_found = 既に auto-close 済み。
+          - ``"occupied"``  非 owned pane が居る → close せず (relinquish 判断は呼び元)。
+          - ``"close_failed"`` 空だが workspace.close が失敗 (transient/refused) → 再試行対象。
+          - ``"unknown"``   pane.list が backend 不通等で確認不能 → defer (再試行)。
+        """
+        try:
+            res = self._client.request("pane.list", {"workspace_id": workspace_id})
+        except HerdrError as exc:
+            if exc.code == CODE_PANE_NOT_FOUND:
+                return "gone"
+            return "unknown"
+        if res.get("panes"):
+            return "occupied"
+        try:
+            self._client.request(
+                "workspace.close", {"workspace_id": workspace_id}
+            )
+        except HerdrError as exc:
+            if exc.code == CODE_PANE_NOT_FOUND:
+                return "gone"
+            return "close_failed"
+        return "closed"
+
     def _sweep_space(self, space_key: str) -> None:
         with self._lock:
             sp = self._spaces.get(space_key)
         if sp is None:
             return
-        # workspace.close の**前に物理的な空を確認**する (Codex P1 / §4.1 isolation)。呼出時点で
-        # 自 registry には本 space の pane が居ない (呼び元 _sweep_if_empty が _spawn_lock 下で
-        # 確認済み) が、workspace に **非 owned pane** (REUSED で pane_id を引き継いだ別プロセス /
-        # 外部) が居る場合、workspace.close は全 pane を巻き込むためその pane を巻き添えに殺す。
-        # よって raw pane.list で空を確証できた時のみ close し、居れば close せず relinquish する。
-        try:
-            res = self._client.request("pane.list", {"workspace_id": sp.workspace_id})
-        except HerdrError as exc:
-            if exc.code == CODE_PANE_NOT_FOUND:
-                self._drop_space(space_key, WS_SWEPT)  # 既に auto-close 済み = 掃除完了
-                return
-            return  # 確認不能 (adapter_unavailable 等): defer (次ラウンドで再試行)
-        if res.get("panes"):
-            # 非 owned pane が居る (reused/foreign)。close すると巻き添えるので閉じない。管理から
-            # 外す (relinquish): 我々の空 project space ではなくなった。閉じられないので leak だが
-            # 巻き添え close よりは安全側 (isolation 優先)。
+        status = self._close_workspace_if_empty(sp.workspace_id)
+        if status in ("closed", "gone"):
+            self._drop_space(space_key, WS_SWEPT)
+        elif status == "occupied":
+            # 非 owned pane が居る (reused/foreign) → close せず管理から外す (relinquish)。
+            # 閉じられないので leak だが巻き添え close よりは安全側 (isolation 優先)。
             self._drop_space(space_key, WS_GONE)
-            return
-        try:
-            self._client.request(
-                "workspace.close", {"workspace_id": sp.workspace_id}
-            )
-        except HerdrError as exc:
-            # workspace_not_found = 既に auto-close 済み (最後の pane 退出時)。掃除完了扱い。
-            if exc.code == CODE_PANE_NOT_FOUND:
-                self._drop_space(space_key, WS_SWEPT)
-                return
-            # それ以外の失敗: **owned set から外して** pending_sweep (workspace_id キー) に
-            # 保持し _retry_pending_sweep で再試行する (§4.3)。owned set に SWEPT のまま残すと、
-            # 同一 space_key への re-spawn が _ensure_space でこのエントリを上書きし、閉じ損ねた
-            # workspace が pending_sweep だけに残って世代内孤児になる (adversarial review MAJOR)。
-            # space は空 (掃除の前提) なので owned pane も一緒に落とす。
+        elif status == "close_failed":
+            # **owned set から外して** pending_sweep (workspace_id キー) に保持し再試行する (§4.3)。
+            # owned set に SWEPT のまま残すと同一 space_key への re-spawn が _ensure_space でこの
+            # エントリを上書きし、閉じ損ねた workspace が pending だけに残って世代内孤児になる
+            # (adversarial review MAJOR)。space は空なので owned pane も一緒に落とす。
             with self._lock:
                 sp2 = self._spaces.pop(space_key, None)
                 if sp2 is not None:
@@ -1402,29 +1413,25 @@ class HerdrAdapter:
                         if r.workspace_id == sp2.workspace_id
                     ]:
                         self._owned_panes.pop(pid, None)
-            return
-        self._drop_space(space_key, WS_SWEPT)
+        # status == "unknown": defer (何もしない、次ラウンドで再試行)。
 
     def _retry_pending_sweep(self) -> None:
         """close 失敗で pending に残った workspace の workspace.close を再試行する (§4.3)。
 
         list_panes / close_workspace(None) から呼ばれ、掃除失敗した空 workspace を **同一
         世代内で** 回収する (起動時 sweep は gen < current のみ対象で次 boot まで待つため)。
-        pending の workspace は既に owned set の外・空なので spawn と競合せず、``_spawn_lock``
-        は不要。成功 / workspace_not_found で pending から外す。
+        **再試行も物理的な空を確認してから close する** (Codex P2): pending 中に人間 / 別プロセスが
+        その workspace へ pane を作成 / 移送しうるため、無条件 close だと非 owned pane を巻き添える。
+        closed / gone (回収完了) / occupied (foreign 占有 → relinquish) で pending から外す。
+        close_failed / unknown は保持して次ラウンドで再試行する。
         """
         with self._lock:
             pending = list(self._pending_sweep.values())
         for sp in pending:
-            try:
-                self._client.request(
-                    "workspace.close", {"workspace_id": sp.workspace_id}
-                )
-            except HerdrError as exc:
-                if exc.code != CODE_PANE_NOT_FOUND:
-                    continue  # まだ失敗: 次ラウンドで再試行
-            with self._lock:
-                self._pending_sweep.pop(sp.workspace_id, None)
+            status = self._close_workspace_if_empty(sp.workspace_id)
+            if status in ("closed", "gone", "occupied"):
+                with self._lock:
+                    self._pending_sweep.pop(sp.workspace_id, None)
 
     def close_workspace(self, workspace_id: str | None = None) -> bool:
         """workspace を後始末する (§4.1: close-authority owned set のメンバのみ)。

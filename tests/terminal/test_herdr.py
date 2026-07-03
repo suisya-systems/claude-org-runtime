@@ -1580,3 +1580,26 @@ def test_ensure_space_recreates_when_cached_workspace_auto_closed(
     ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
     assert ref_p2.window_id != ref_p.window_id
     assert a._spaces["project:x"].workspace_id == ref_p2.window_id
+
+
+def test_pending_sweep_retry_does_not_close_reoccupied_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (round 4): the pending-sweep retry must ALSO verify physical emptiness. If a
+    # human/other process created or moved a pane into the pending workspace before retry,
+    # workspace.close would kill that non-owned pane — the retry relinquishes instead.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})                # empty at sweep time
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    a.kill_pane(ref_p.pane_id)                            # sweep fails -> pending(w1)
+    assert ref_p.window_id in a._pending_sweep
+    # a foreign pane now occupies w1 before the retry runs.
+    server.on("pane.list", {"panes": [{"pane_id": "w1:pX", "workspace_id": "w1"}]})
+    server.requests.clear()
+    a._retry_pending_sweep()
+    assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)
+    assert ref_p.window_id not in a._pending_sweep            # relinquished, not retried
