@@ -1355,16 +1355,37 @@ class HerdrAdapter:
         for key in candidates:
             self._sweep_if_empty(key)
 
-    def _close_workspace_if_empty(self, workspace_id: str) -> str:
-        """workspace が物理的に空な時**だけ** workspace.close する (§4.1 isolation の要)。
+    def _own_pane_ids(self, sp: _Space) -> set[str]:
+        """space が閉じてよい **自分の pane_id 集合** (space の root pane + 自 registry pane)。
+
+        workspace.close の占有判定で「自分の pane」を除外するために使う (§7.4 の born-empty:
+        spawn 失敗で workspace.create の root pane だけが残るケースを foreign と誤判定しないため、
+        Codex 確認ラウンド P2)。root pane は自作成 workspace の付属物で workspace ごと閉じてよい。
+        """
+        ids: set[str] = set()
+        if sp.root_pane_id is not None:
+            ids.add(str(sp.root_pane_id))
+        with self._lock:
+            ids.update(
+                str(p) for p, r in self._owned_panes.items()
+                if r.workspace_id == sp.workspace_id
+            )
+        return ids
+
+    def _close_workspace_if_empty(
+        self, workspace_id: str, own_pane_ids: "frozenset[str] | set[str]" = frozenset()
+    ) -> str:
+        """workspace が **非 owned pane 皆無**の時**だけ** workspace.close する (§4.1 isolation の要)。
 
         workspace.close は workspace 内の全 pane を巻き込むため、**非 owned pane** (REUSED で
         pane_id を引き継いだ別プロセス / 人間 / 外部が move-in した pane) が 1 つでも居る間は
-        絶対に close しない (巻き添え kill = isolation 違反、Codex P1/P2)。sweep も pending 再試行も
-        この単一関門を通す。返り値:
-          - ``"closed"``    物理的に空で workspace.close 成功。
+        絶対に close しない (巻き添え kill = isolation 違反、Codex P1/P2)。ただし ``own_pane_ids``
+        (= space の root pane + 自 registry pane) は「自分のもの」で workspace ごと閉じてよいので
+        **占有に数えない** (Codex 確認ラウンド P2: born-empty の自 root pane を foreign と誤判定して
+        leak させない)。sweep も pending 再試行もこの単一関門を通す。返り値:
+          - ``"closed"``    非 owned pane 皆無で workspace.close 成功。
           - ``"gone"``      pane.list / workspace.close が not_found = 既に auto-close 済み。
-          - ``"occupied"``  非 owned pane が居る → close せず (relinquish 判断は呼び元)。
+          - ``"occupied"``  非 owned pane が居る → close せず (relinquish/defer 判断は呼び元)。
           - ``"close_failed"`` 空だが workspace.close が失敗 (transient/refused) → 再試行対象。
           - ``"unknown"``   pane.list が backend 不通等で確認不能 → defer (再試行)。
         """
@@ -1374,7 +1395,12 @@ class HerdrAdapter:
             if exc.code == CODE_PANE_NOT_FOUND:
                 return "gone"
             return "unknown"
-        if res.get("panes"):
+        # 自分の pane (root + 自 registry) は占有に数えない。非 owned pane が 1 つでも居る時のみ occupied。
+        foreign = [
+            p for p in (res.get("panes") or [])
+            if str(p.get("pane_id")) not in own_pane_ids
+        ]
+        if foreign:
             return "occupied"
         try:
             self._client.request(
@@ -1391,7 +1417,9 @@ class HerdrAdapter:
             sp = self._spaces.get(space_key)
         if sp is None:
             return
-        status = self._close_workspace_if_empty(sp.workspace_id)
+        status = self._close_workspace_if_empty(
+            sp.workspace_id, self._own_pane_ids(sp)
+        )
         if status in ("closed", "gone"):
             self._drop_space(space_key, WS_SWEPT)
         elif status in ("occupied", "close_failed"):
@@ -1431,7 +1459,9 @@ class HerdrAdapter:
         with self._lock:
             pending = list(self._pending_sweep.values())
         for sp in pending:
-            status = self._close_workspace_if_empty(sp.workspace_id)
+            status = self._close_workspace_if_empty(
+                sp.workspace_id, self._own_pane_ids(sp)
+            )
             if status in ("closed", "gone"):
                 with self._lock:
                     self._pending_sweep.pop(sp.workspace_id, None)

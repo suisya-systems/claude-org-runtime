@@ -1648,3 +1648,55 @@ def test_startup_sweep_does_not_close_reoccupied_old_generation_workspace(
     HerdrAdapter(socket_path=server.path, timeout=2.0,
                  org_instance_id=oid, generation=2, state_dir=str(tmp_path))
     assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)
+
+
+def _wire_create_incrementing(server: FakeHerdrServer) -> dict:
+    """workspace.create hands out w1,w2,... each with a root pane wN:p0."""
+    state = {"ws": 0}
+
+    def create(_p: dict) -> dict:
+        state["ws"] += 1
+        wid = f"w{state['ws']}"
+        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
+                "root_pane": {"pane_id": f"{wid}:p0"}}
+
+    server.on("workspace.create", create)
+    return state
+
+
+def test_born_empty_workspace_swept_on_spawn_failure(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex confirmation P2: when agent.start fails before root cleanup, the just-created
+    # project workspace still holds only its OWN workspace.create root pane. The born-empty
+    # sweep must treat that root pane as own (not foreign) and CLOSE the workspace — not
+    # classify the root as an occupant and leak it forever.
+    _wire_create_incrementing(server)
+    server.on("agent.start", {"agent": {}})   # no pane_id -> spawn fails after create
+    server.on("pane.list", {"panes": [{"pane_id": "w1:p0", "workspace_id": "w1"}]})  # only root
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    with pytest.raises(HerdrError):
+        a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    assert "workspace.close" in server.methods_called()   # born-empty ws swept (root is own)
+    assert "project:x" not in a._spaces
+    assert "w1" not in a._pending_sweep                    # not leaked to pending
+
+
+def test_born_empty_workspace_with_foreign_pane_is_not_closed(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # If a foreign pane is present alongside our own root pane, the workspace must NOT be
+    # closed (isolation) — only our own panes are excluded from the occupancy check.
+    _wire_create_incrementing(server)
+    server.on("agent.start", {"agent": {}})   # spawn fails after create
+    server.on("pane.list", {"panes": [
+        {"pane_id": "w1:p0", "workspace_id": "w1"},     # our root
+        {"pane_id": "w1:pF", "workspace_id": "w1"},     # a foreign pane
+    ]})
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    with pytest.raises(HerdrError):
+        a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    assert "workspace.close" not in server.methods_called()   # foreign present -> not closed
+    assert "w1" in a._pending_sweep                            # deferred (protected)
