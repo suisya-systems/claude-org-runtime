@@ -1629,3 +1629,22 @@ def test_sweep_defers_on_lagging_pane_list_then_closes_when_caught_up(
     server.on("workspace.close", {"type": "ok"})
     a._retry_pending_sweep()
     assert ref_p.window_id not in a._pending_sweep     # reclaimed within the generation
+
+
+def test_startup_sweep_does_not_close_reoccupied_old_generation_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P1 (round 6): the startup stale sweep must route old-generation closes through
+    # the physical-empty guard too. If a human/other process reoccupied a prior-gen org
+    # workspace before restart, workspace.close would kill that non-owned pane solely
+    # because the label matches an old generation.
+    oid = "occ"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_old", "label": f"claude-org/{oid}/g1/project:x"},
+    ]})
+    # the old-gen workspace is reoccupied by a foreign pane.
+    server.on("pane.list", {"panes": [{"pane_id": "w_old:pF", "workspace_id": "w_old"}]})
+    server.on("workspace.close", {"type": "ok"})
+    HerdrAdapter(socket_path=server.path, timeout=2.0,
+                 org_instance_id=oid, generation=2, state_dir=str(tmp_path))
+    assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)

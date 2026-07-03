@@ -1558,11 +1558,13 @@ class HerdrAdapter:
                 self._adopt_or_sweep_current(wid, w, space_key)
 
     def _sweep_old_generation(self, workspace_id: str) -> None:
-        """旧世代孤児 workspace を掃除する (§5.3 step 3。防御的に live pane 確認)。
+        """旧世代孤児 workspace を掃除する (§5.3 step 3。物理的空を確認してから close)。
 
         lock で旧 daemon の死は確認済みだが、なお防御的に現世代 pane が混ざっていないか
-        (= 自 registry の pane が居ないか) を確認してから close する。defer 意味論:
-        失敗は握り潰す (次 boot / 次ラウンドで再試行、成功を偽装しない)。
+        (= 自 registry の pane が居ないか) を確認する。加えて、旧世代ラベルでも人間 / 別プロセスが
+        pane を再占有していれば workspace.close は巻き添えに殺すため、**他の掃除経路と同じく
+        ``_close_workspace_if_empty`` に通して物理的な空を確証した時のみ close** する (Codex P1
+        / §4.1 isolation)。occupied / 失敗は close せず放置 (次 boot / 手動、成功を偽装しない)。
         """
         with self._lock:
             has_own = any(
@@ -1572,12 +1574,8 @@ class HerdrAdapter:
             # 防御: 自 registry の pane が居る = 現世代 pane が混ざっている疑い → close しない
             # (§5.3 step 3)。boot 直後は registry 空なので通常は素通りする安全弁。
             return
-        try:
-            self._client.request(
-                "workspace.close", {"workspace_id": workspace_id}
-            )
-        except HerdrError:
-            pass  # 失敗は次 boot に委ねる
+        # 物理的に空な時だけ close (occupied なら閉じない = 再占有した非 owned pane を保護)。
+        self._close_workspace_if_empty(workspace_id)
 
     def _adopt_or_sweep_current(
         self, workspace_id: str, ws: dict, space_key: str
