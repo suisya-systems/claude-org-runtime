@@ -42,6 +42,12 @@ import posixpath
 import re
 from typing import TYPE_CHECKING
 
+from ..terminal.base import (
+    SPACE_CONTROL,
+    SPACE_UNASSIGNED,
+    SpaceDescriptor,
+    project_space_key,
+)
 from ..terminal.keys import normalize_key
 
 if TYPE_CHECKING:  # 循環 import 回避 (server -> surface -> server を型のみで切る)
@@ -60,6 +66,41 @@ SERVER_INFO = {"name": "org-broker", "version": "0.1.0"}
 # capability surface としての一次手段を表す (§9.7 renga 経路 = opt-in fallback は不変)。
 RECEIVE_MODE = "push"
 FALLBACK_RECEIVE_MODE = "pull"
+
+# ---------------------------------------------------------------------------
+# workspace レイアウト: spawn 時 space 選択 (Issue #110 §6.2 Layer B)
+# ---------------------------------------------------------------------------
+
+# control 面 (dispatcher / watcher / secretary) の role 群 (§6.2)。これらは
+# control スペースへ集約する。worker role は project スペースへ。role が制御面か
+# の判定は「既知の制御 role」+「watch を含む role」(pr-watch / attention-watch 等の
+# watcher 変種) で行う。列挙外の未知 role は worker 扱い (安全側 = control を汚さない)。
+_CONTROL_ROLES = frozenset({"secretary", "dispatcher", "watcher", "attention"})
+
+
+def is_control_role(role: str | None) -> bool:
+    """role が control 面 (dispatcher / watcher / secretary) か (§6.2)。"""
+    if not role:
+        return False
+    r = role.lower()
+    return r in _CONTROL_ROLES or "watch" in r
+
+
+def space_descriptor_for(
+    role: str | None, project: str | None
+) -> SpaceDescriptor:
+    """role / project_slug から :class:`SpaceDescriptor` を算出する (§6.2 Layer B)。
+
+    - control role (secretary / dispatcher / watcher) → ``control`` スペース。
+    - worker role + project_slug → ``project:<slug>`` スペース。
+    - project_slug 欠落の worker → ``project:_unassigned`` (control を汚さない catch-all、
+      degrade だが安全側。cwd 推定は pattern 依存で脆いため採らない、§6.2 / §14)。
+    """
+    if is_control_role(role):
+        return SpaceDescriptor(space_key=SPACE_CONTROL)
+    if project:
+        return SpaceDescriptor(space_key=project_space_key(project))
+    return SpaceDescriptor(space_key=SPACE_UNASSIGNED)
 
 # pane addressing: 全桁数字 → handle 確定 (renga と同契約; "7" という名前の
 # pane は名前で引けず id で引く)。'focused' はリテラル。
@@ -262,6 +303,14 @@ TOOLS = [
                 "target": _TARGET_SCHEMA,
                 "name": {"type": "string", "description": "Stable id for the new pane."},
                 "role": {"type": "string", "description": "Free-form role label."},
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Project slug for workspace-layout backends (Herdr): worker "
+                        "panes are grouped into a per-project space. Ignored by flat "
+                        "backends (tmux/wezterm). Omit for control roles."
+                    ),
+                },
                 "model": {"type": "string", "description": "Rendered as --model <value>."},
                 "permission_mode": {
                     "type": "string",
@@ -294,6 +343,13 @@ TOOLS = [
                 "target": _TARGET_SCHEMA,
                 "name": {"type": "string", "description": "Stable id for the new pane."},
                 "role": {"type": "string", "description": "Free-form role label."},
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Project slug for workspace-layout backends (Herdr). Ignored "
+                        "by flat backends. Omit for control-plane watchers."
+                    ),
+                },
                 "cwd": {"type": "string", "description": "Working directory for the new pane."},
             },
             "required": ["direction"],
@@ -313,6 +369,13 @@ TOOLS = [
                 "target": _TARGET_SCHEMA,
                 "name": {"type": "string", "description": "Stable id for the new pane."},
                 "role": {"type": "string", "description": "Free-form role label."},
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Project slug for workspace-layout backends (Herdr). Ignored "
+                        "by flat backends. Omit for control roles."
+                    ),
+                },
                 "args": {
                     "type": "array", "items": {"type": "string"},
                     "description": (
@@ -817,6 +880,11 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
         role = args.get("role")
         if role is not None and not isinstance(role, str):
             raise ToolArgError("role must be a string")
+        # project slug (Issue #110 §6.2 Layer A→B): workspace-layout backend の space
+        # 選択入力。flat backend は無視する。delegate (dispatcher) が供給する。
+        project = args.get("project")
+        if project is not None and not isinstance(project, str):
+            raise ToolArgError("project must be a string")
         cwd = args.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
             raise ToolArgError("cwd must be a string")
@@ -838,15 +906,19 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
                 raise ToolArgError("permission_mode must be a string")
             return broker.spawn_claude(
                 bind, direction, target, pane_name, role, model,
-                permission_mode, extra, cwd,
+                permission_mode, extra, cwd, project,
             )
         if name == "spawn_codex_pane":
-            return broker.spawn_codex(bind, direction, target, pane_name, role, extra, cwd)
+            return broker.spawn_codex(
+                bind, direction, target, pane_name, role, extra, cwd, project
+            )
         # spawn_pane (generic)
         command = args.get("command")
         if command is not None and not isinstance(command, str):
             raise ToolArgError("command must be a string")
-        return broker.spawn_generic(direction, target, pane_name, role, command, cwd)
+        return broker.spawn_generic(
+            direction, target, pane_name, role, command, cwd, project
+        )
 
     # 到達不能 (catalogue にあるが分岐漏れ)。保険。
     return _err(f"[unknown_tool] {name}")

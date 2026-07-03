@@ -94,6 +94,41 @@ class PaneRef:
     terminal_id: PaneId | None = None
 
 
+# ---------------------------------------------------------------------------
+# workspace レイアウト配置ヒント (Issue #110 §6.2)
+# ---------------------------------------------------------------------------
+
+# space key: レイアウト上の論理スペース種別 (Issue #110 §2)。broker が role /
+# project-slug から算出し、supports_space_layout=True の adapter (Herdr) が
+# workspace へ解決する。
+SPACE_CONTROL = "control"                     # dispatcher / watcher / secretary の制御面
+SPACE_UNASSIGNED = "project:_unassigned"      # project 欠落 worker の catch-all (control を汚さない)
+
+
+def project_space_key(slug: str) -> str:
+    """project-slug を worker スペースの space key へ写像する (``project:<slug>``)。"""
+    return f"project:{slug}"
+
+
+@dataclass
+class SpaceDescriptor:
+    """spawn 時の workspace 配置ヒント (Issue #110 §6.2 Layer B → C)。
+
+    broker が ``role`` / ``project_slug`` から算出し、``supports_space_layout=True``
+    の adapter (Herdr) が ``spawn(space=...)`` で受けて workspace へ解決する。持たない
+    adapter (tmux / wezterm) には **渡さない** — broker が
+    ``getattr(adapter, "supports_space_layout", False)`` で分岐し、False の backend へは
+    従来どおり ``spawn(argv, cwd, new_window)`` のみを呼ぶ (flat session 不変)。
+
+    - ``space_key``: :data:`SPACE_CONTROL` / ``project:<slug>`` / :data:`SPACE_UNASSIGNED`。
+    - ``split_direction``: per-space 既定分割方向 (Herdr ``"down"`` = 上下 / ``"right"``
+      = 左右、Issue #110 §8)。``None`` は adapter の per-space policy 既定に委ねる。
+    """
+
+    space_key: str
+    split_direction: str | None = None
+
+
 @runtime_checkable
 class TerminalAdapter(Protocol):
     """broker / harness が依存する terminal backend の最小面 (構造的型)。
@@ -161,10 +196,30 @@ class TerminalAdapter(Protocol):
     経路のまま (getattr が None を返し reaper が旧経路にフォールバック)。
     ``isolated_session`` 等と同じ理由で **注釈しない** 任意メンバとする
     (``@runtime_checkable`` の issubclass 検査を tmux/wezterm で壊さないため)。
+
+    workspace レイアウト (任意 ClassVar ``supports_space_layout``、Issue #110):
+    backend が「control 面 1 スペース + ワーカーはプロジェクト単位スペース」の
+    workspace レイアウトポリシー (§1.2) を持つかを宣言する。Herdr=True (org 所有
+    workspace 集合を持ち、:class:`SpaceDescriptor` を workspace へ解決)、tmux/wezterm=
+    False (flat session)。broker は ``getattr(adapter, "supports_space_layout", False)``
+    で読み、True の時だけ role / project から :class:`SpaceDescriptor` を算出して
+    :meth:`spawn` の ``space`` 引数へ渡し、空スペース掃除等のレイアウト挙動を有効化する。
+    False の backend へは ``space`` を渡さず従来の flat spawn を呼ぶ (完全不変)。
+    ``isolated_session`` 等と同じく **注釈しない** ClassVar とする。
+
+    :meth:`spawn` の ``space`` 引数 (optional, Issue #110 §6.2 Layer C): 既定 ``None``
+    で後方互換 (現行 flat 挙動)。``supports_space_layout`` な backend のみが解釈し、
+    他は無視する。**この追加は Set D Surface 1 (spawn) の契約変更**だが default None で
+    後方互換であり、契約 ratify は本体取り込みスコープ (別 PR)、本タスクは flag のみ
+    (§10)。
     """
 
     def spawn(
-        self, argv: list[str], cwd: str | None = ..., new_window: bool = ...
+        self,
+        argv: list[str],
+        cwd: str | None = ...,
+        new_window: bool = ...,
+        space: "SpaceDescriptor | None" = ...,
     ) -> PaneRef: ...
 
     def list_panes(self) -> list[dict]: ...
@@ -280,11 +335,17 @@ def default_backend() -> str:
     return "tmux"
 
 
-def make_adapter(backend: str | None = None) -> TerminalAdapter:
+def make_adapter(
+    backend: str | None = None, *, state_dir: str | None = None
+) -> TerminalAdapter:
     """backend 名から adapter を生成する。
 
     循環 import を避けるため adapter 実体は関数内で遅延 import する
     (wezterm / tmux は本モジュールを import するため)。
+
+    ``state_dir`` は workspace レイアウトを持つ backend (Herdr) の世代識別
+    (org_instance_id / generation) 永続と起動時 stale 掃除に使う (Issue #110 §5)。
+    tmux / wezterm は無視する (flat session)。
     """
     backend = backend or default_backend()
     if backend == "tmux":
@@ -298,7 +359,7 @@ def make_adapter(backend: str | None = None) -> TerminalAdapter:
     if backend == "herdr":
         from .herdr import HerdrAdapter
 
-        return HerdrAdapter()
+        return HerdrAdapter(state_dir=state_dir)
     raise ValueError(
         f"unknown backend {backend!r} (valid: {', '.join(VALID_BACKENDS)})"
     )

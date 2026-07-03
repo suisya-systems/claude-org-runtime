@@ -1114,10 +1114,26 @@ class Broker(TokenMixin, StoreMixin):
             return None, _err(f"[pane_not_found] no pane for split target {target!r}")
         return handle, None
 
+    def _adapter_spawn(
+        self, argv: list[str], cwd: str | None,
+        role: str | None, project: str | None,
+    ):
+        """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
+
+        ``supports_space_layout`` な backend (Herdr) には role/project から算出した
+        :class:`SpaceDescriptor` を ``space=`` で渡し、持たない backend (tmux/wezterm) には
+        ``space`` を渡さず従来の flat spawn を呼ぶ (完全不変)。分岐は ``getattr`` で読む
+        (``isolated_session`` 等と同じ能力フラグ規約)。
+        """
+        if getattr(self.adapter, "supports_space_layout", False):
+            space = surface.space_descriptor_for(role, project)
+            return self.adapter.spawn(argv, cwd=cwd, new_window=True, space=space)
+        return self.adapter.spawn(argv, cwd=cwd, new_window=True)
+
     def spawn_claude(
         self, caller: AgentBind, direction: str, target: str, name: str | None,
         role: str | None, model: str | None, permission_mode: str | None,
-        extra: list[str], cwd: str | None,
+        extra: list[str], cwd: str | None, project: str | None = None,
     ) -> dict:
         """spawn_claude_pane: 対話 TUI claude を broker MCP 接続で起動する。
 
@@ -1177,7 +1193,7 @@ class Broker(TokenMixin, StoreMixin):
                 model=model, permission_mode=permission_mode, extra_args=extra,
                 channel_server="org-broker-channel",
             )
-            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+            ref = self._adapter_spawn(argv, cwd, role, project)
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
             # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1203,6 +1219,7 @@ class Broker(TokenMixin, StoreMixin):
     def spawn_codex(
         self, caller: AgentBind, direction: str, target: str, name: str | None,
         role: str | None, extra: list[str], cwd: str | None,
+        project: str | None = None,
     ) -> dict:
         """spawn_codex_pane: 対話 TUI codex を起動する (§3.3-6)。
 
@@ -1238,7 +1255,7 @@ class Broker(TokenMixin, StoreMixin):
                 # 原子的に拒否する。予約名は解放してから返す。
                 self._release_name(name)
                 return _err(str(e))
-            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+            ref = self._adapter_spawn(argv, cwd, role, project)
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1262,7 +1279,7 @@ class Broker(TokenMixin, StoreMixin):
 
     def spawn_generic(
         self, direction: str, target: str, name: str | None, role: str | None,
-        command: str | None, cwd: str | None,
+        command: str | None, cwd: str | None, project: str | None = None,
     ) -> dict:
         """spawn_pane (generic, secretary tier): 任意コマンドを起動する。
 
@@ -1280,7 +1297,7 @@ class Broker(TokenMixin, StoreMixin):
         token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
-            ref = self.adapter.spawn(argv, cwd=cwd, new_window=True)
+            ref = self._adapter_spawn(argv, cwd, role, project)
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約

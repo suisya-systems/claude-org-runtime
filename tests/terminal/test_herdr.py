@@ -21,6 +21,11 @@ from typing import Any, Callable
 import pytest
 
 from claude_org_runtime.terminal import herdr as herdr_mod
+from claude_org_runtime.terminal.base import (
+    SPACE_CONTROL,
+    SPACE_UNASSIGNED,
+    SpaceDescriptor,
+)
 from claude_org_runtime.terminal.herdr import (
     CODE_ADAPTER_UNAVAILABLE,
     CODE_CWD_INVALID,
@@ -288,14 +293,18 @@ def test_spawn_second_reuses_workspace_no_recreate(
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path))
     server.requests.clear()
+    # the reuse path verifies the cached workspace still exists (§4.2 / Codex P2) via
+    # workspace.list before reusing it — wire it present so reuse proceeds.
+    server.on("workspace.list", {"workspaces": [{"workspace_id": "w1", "label": "l"}]})
     server.on(
         "agent.start",
         {"type": "agent_started", "agent": {"pane_id": "w1:p3", "name": "x"}},
     )
     ref2 = a.spawn(["codex"], cwd=str(tmp_path))
     assert ref2.pane_id == "w1:p3"
-    # no second workspace.create, no root cleanup; just agent.start into w1/t1
-    assert server.methods_called() == ["agent.start"]
+    # no second workspace.create (reuse), no root cleanup; agent.start into the same w1/t1.
+    assert "workspace.create" not in server.methods_called()
+    assert "agent.start" in server.methods_called()
     assert server.params_for("agent.start")["workspace"] == "w1"
     assert server.params_for("agent.start")["split"] == "down"
 
@@ -601,11 +610,18 @@ def test_list_panes_merges_geometry_and_filters_workspace(
 def test_list_panes_active_false_for_unfocused(
     server: FakeHerdrServer, tmp_path
 ) -> None:
-    # Two panes survive the workspace filter; only the focused_pane_id gets
-    # active=True — exercises the active=False branch of the geometry merge.
+    # Two panes survive the registry + workspace filter; only the focused_pane_id
+    # gets active=True — exercises the active=False branch of the geometry merge.
+    # Both panes must be in the adapter registry (Issue #110 §4.1 primary gate), so
+    # spawn twice to record w1:p2 and w1:p3.
     _wire_spawn(server)
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path))
+    server.on(
+        "agent.start",
+        {"type": "agent_started", "agent": {"pane_id": "w1:p3", "name": "x"}},
+    )
+    a.spawn(["codex"], cwd=str(tmp_path))
     server.on(
         "pane.list",
         {
@@ -632,9 +648,13 @@ def test_list_panes_active_false_for_unfocused(
     assert by_id["w1:p2"]["active"] is False
 
 
-def test_list_panes_workspace_gone_returns_empty_and_recovers(
+def test_list_panes_workspace_not_found_marks_degraded_not_clear(
     server: FakeHerdrServer, tmp_path
 ) -> None:
+    # Issue #110 §4.2 supersede: a single workspace_not_found must NOT clear/recreate
+    # the space (that eager clear was the #109/#114 orphan-proliferation arm). It marks
+    # the space DEGRADED and keeps it (no auto-recreate). list_panes returns [] for that
+    # (degraded) workspace but does not drop the space.
     _wire_spawn(server)
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path))
@@ -642,10 +662,33 @@ def test_list_panes_workspace_gone_returns_empty_and_recovers(
         "pane.list",
         {"error": {"code": "workspace_not_found", "message": "gone"}},
     )
-    assert a.list_panes() == []  # benign: our workspace was closed externally
-    # cached workspace state must be cleared so the next spawn re-creates it
-    # (else agent.start targets the vanished workspace forever).
-    assert a._workspace_id is None
+    # workspace.list still shows w1 -> transient blip, stays DEGRADED (not GONE).
+    server.on(
+        "workspace.list",
+        {"workspaces": [{"workspace_id": "w1", "label": a._spaces["control"].label}]},
+    )
+    assert a.list_panes() == []          # benign empty for the degraded workspace
+    assert a._workspace_id == "w1"       # NOT cleared: space retained as DEGRADED
+    assert a._spaces["control"].state == herdr_mod.WS_DEGRADED
+
+
+def test_list_panes_degraded_escapes_to_gone_and_recreates(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # DEGRADED bounded escape (§4.2): once consecutive misses exceed the threshold and
+    # workspace.list confirms the workspace is truly gone, the space is dropped (GONE) so
+    # a later spawn lazily recreates a fresh one — no eager recreate on the first blip.
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    server.on(
+        "pane.list",
+        {"error": {"code": "workspace_not_found", "message": "gone"}},
+    )
+    server.on("workspace.list", {"workspaces": []})  # truly gone
+    for _ in range(HerdrAdapter.degraded_max_misses):
+        assert a.list_panes() == []
+    assert a._workspace_id is None       # GONE -> space dropped -> recreatable
     server.requests.clear()
     _wire_spawn(server, pane_id="w2:p2")  # re-arm workspace.create/agent.start
     server.on(
@@ -656,7 +699,7 @@ def test_list_panes_workspace_gone_returns_empty_and_recovers(
         },
     )
     ref = a.spawn(["claude"], cwd=str(tmp_path))
-    assert ref.window_id == "w2"  # a fresh workspace was created
+    assert ref.window_id == "w2"          # a fresh workspace was created
     assert "workspace.create" in server.methods_called()
 
 
@@ -688,8 +731,14 @@ def test_list_panes_unreachable_raises_not_empty() -> None:
         socket_path=os.path.join(tempfile.mkdtemp(prefix="hrdr"), "nope.sock"),
         timeout=1.0,
     )
-    a._workspace_id = "w1"  # pretend a workspace was bound
-    a._tab_id = "w1:t1"
+    # pretend a workspace was bound (seed the owned-set directly; _workspace_id is now
+    # a read-only accessor over the space map, Issue #110 §4.1).
+    a._spaces[herdr_mod.SPACE_CONTROL] = herdr_mod._Space(
+        space_key=herdr_mod.SPACE_CONTROL,
+        workspace_id="w1",
+        tab_id="w1:t1",
+        label="l",
+    )
     with pytest.raises(HerdrError) as exc:
         a.list_panes()
     assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
@@ -1028,3 +1077,651 @@ def test_malformed_response_is_internal_not_adapter_unavailable(
     with pytest.raises(HerdrError) as exc:
         a.get_text("w1:p2")
     assert exc.value.code == herdr_mod.CODE_INTERNAL
+
+
+# ---------------------------------------------------------------------------
+# workspace layout (Issue #110): multi-space placement, generation labels,
+# owned-set closure, ephemeral project-space sweep, startup stale sweep.
+# ---------------------------------------------------------------------------
+
+
+def _wire_multi(server: FakeHerdrServer) -> dict:
+    """Stateful multi-space wiring: ``workspace.create`` hands out w1,w2,... and
+    ``agent.start`` lands the pane directly in the requested workspace (strategy A
+    respected in the fake -> no move needed), recording each pane in its own space.
+    """
+    state = {"ws": 0, "pane": 1}
+
+    def create(_params: dict) -> dict:
+        state["ws"] += 1
+        wid = f"w{state['ws']}"
+        return {
+            "workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
+            "root_pane": {"pane_id": f"{wid}:p0"},
+        }
+
+    def start(params: dict) -> dict:
+        state["pane"] += 1
+        wid = params.get("workspace")
+        return {
+            "agent": {
+                "pane_id": f"{wid}:p{state['pane']}",
+                "workspace_id": wid,
+                "name": params.get("name"),
+                "terminal_id": f"t{state['pane']}",
+            }
+        }
+
+    server.on("workspace.create", create)
+    server.on("agent.start", start)
+    server.on("pane.close", {"type": "ok"})
+    return state
+
+
+def test_supports_space_layout_flag_is_true() -> None:
+    # Herdr declares the workspace-layout capability; flat backends do not (broker
+    # reads it via getattr and only passes SpaceDescriptor when True, §6.2).
+    assert HerdrAdapter.supports_space_layout is True
+    from claude_org_runtime.terminal.tmux import TmuxAdapter
+    from claude_org_runtime.terminal.wezterm import WezTermAdapter
+
+    assert getattr(TmuxAdapter, "supports_space_layout", False) is False
+    assert getattr(WezTermAdapter, "supports_space_layout", False) is False
+
+
+def test_spawn_no_space_defaults_to_control(server: FakeHerdrServer, tmp_path) -> None:
+    # A spawn without a SpaceDescriptor collapses into the control space (back-compat
+    # single-workspace behaviour): one workspace labelled .../control.
+    _wire_multi(server)
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id="oid", generation=3)
+    a.spawn(["claude"], cwd=str(tmp_path))
+    label = server.params_for("workspace.create")["label"]
+    assert label == "claude-org/oid/g3/control"
+
+
+def test_spawn_routes_control_and_project_to_distinct_workspaces(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_c = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    # distinct workspaces for control vs project
+    assert ref_c.window_id != ref_p.window_id
+    creates = [
+        r["params"]["label"] for r in server.requests
+        if r["method"] == "workspace.create"
+    ]
+    assert any(lbl.endswith("/control") for lbl in creates)
+    assert any(lbl.endswith("/project:x") for lbl in creates)
+    # both panes live in the owned set (2 spaces)
+    assert set(a._spaces) == {SPACE_CONTROL, "project:x"}
+
+
+def test_workspace_label_encodes_generation_and_space_key(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_multi(server)
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id="abc123", generation=7)
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:transport-lab"))
+    label = server.params_for("workspace.create")["label"]
+    assert label == "claude-org/abc123/g7/project:transport-lab"
+
+
+def test_unassigned_space_key_used_for_projectless_worker(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_multi(server)
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id="o", generation=1)
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_UNASSIGNED))
+    assert server.params_for("workspace.create")["label"].endswith(f"/{SPACE_UNASSIGNED}")
+
+
+def test_list_panes_unions_owned_workspaces(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # list_panes queries each owned workspace and unions, filtering by registry.
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_c = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+
+    def plist(params: dict) -> dict:
+        wid = params.get("workspace_id")
+        return {"panes": [
+            {"pane_id": ref_c.pane_id if wid == ref_c.window_id else ref_p.pane_id,
+             "workspace_id": wid, "tab_id": f"{wid}:t1"},
+        ]}
+
+    server.on("pane.list", plist)
+    server.on("pane.layout", {"layout": {"panes": []}})
+    ids = sorted(p["pane_id"] for p in a.list_panes())
+    assert ids == sorted([ref_c.pane_id, ref_p.pane_id])
+
+
+def test_degraded_one_workspace_does_not_empty_others(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # A single workspace's workspace_not_found must NOT drop the other workspace's
+    # panes (§4.2: set-wise degraded isolation).
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_c = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+
+    def plist(params: dict) -> dict:
+        wid = params.get("workspace_id")
+        if wid == ref_p.window_id:
+            return {"error": {"code": "workspace_not_found", "message": "gone"}}
+        return {"panes": [{"pane_id": ref_c.pane_id, "workspace_id": wid,
+                           "tab_id": f"{wid}:t1"}]}
+
+    server.on("pane.list", plist)
+    server.on("pane.layout", {"layout": {"panes": []}})
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": ref_c.window_id, "label": "x"},
+        {"workspace_id": ref_p.window_id, "label": "y"},
+    ]})
+    ids = [p["pane_id"] for p in a.list_panes()]
+    assert ids == [ref_c.pane_id]                    # control pane survives
+    assert a._spaces["project:x"].state == herdr_mod.WS_DEGRADED  # project degraded
+
+
+def test_close_workspace_all_closes_every_owned(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_multi(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    server.on("workspace.close", {"type": "ok"})
+    assert a.close_workspace() is True
+    closes = sorted(
+        r["params"]["workspace_id"] for r in server.requests
+        if r["method"] == "workspace.close"
+    )
+    assert closes == ["w1", "w2"]
+    assert a._spaces == {}
+
+
+def test_project_space_swept_on_last_pane_close_control_preserved(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_c = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    # closing the sole project pane escalates to workspace.close of the project ws;
+    # the control ws is untouched (control is org-lifetime, §4.3).
+    server.on("pane.close", {"error": {"code": "single_pane", "message": "last"}})
+
+    def plist(params: dict) -> dict:
+        wid = params.get("workspace_id")
+        pid = ref_p.pane_id if wid == ref_p.window_id else ref_c.pane_id
+        return {"panes": [{"pane_id": pid, "workspace_id": wid, "tab_id": f"{wid}:t1"}]}
+
+    server.on("pane.list", plist)
+    server.on("workspace.close", {"type": "ok"})
+    a.kill_pane(ref_p.pane_id)
+    closes = [
+        r["params"]["workspace_id"] for r in server.requests
+        if r["method"] == "workspace.close"
+    ]
+    assert ref_p.window_id in closes         # project workspace swept
+    assert ref_c.window_id not in closes     # control preserved
+    assert "project:x" not in a._spaces
+    assert SPACE_CONTROL in a._spaces
+
+
+def test_reconcile_moves_diverged_project_pane_into_its_own_tab_not_foreign(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # agent.start rides along into the focused *foreign* workspace w9; reconcile must
+    # pane.move it into the project space's own tab and NEVER close the foreign ws
+    # (self-ownership gate, §7.3 BLOCKER invariant).
+    state = {"ws": 0}
+
+    def create(_params: dict) -> dict:
+        state["ws"] += 1
+        wid = f"w{state['ws']}"
+        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
+                "root_pane": {"pane_id": f"{wid}:p0"}}
+
+    server.on("workspace.create", create)
+    server.on(
+        "agent.start",
+        lambda p: {"agent": {"pane_id": "w9:p5", "workspace_id": "w9",
+                             "terminal_id": "tX"}},
+    )
+    server.on(
+        "pane.move",
+        lambda p: {"move_result": {"pane": {
+            "pane_id": p["destination"]["tab_id"].split(":")[0] + ":p5",
+            "terminal_id": "tX",
+        }}},
+    )
+    server.on("pane.close", {"type": "ok"})
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    assert ref.window_id == "w1"             # project space is the first-created ws
+    assert ref.pane_id == "w1:p5"            # moved into the project tab
+    mv = server.params_for("pane.move")
+    assert mv["destination"]["tab_id"] == "w1:t1"
+    # foreign w9 is never adopted into the owned set and never closed
+    assert "workspace.close" not in server.methods_called()
+    assert not any(s.workspace_id == "w9" for s in a._spaces.values())
+    assert a._owned_panes["w1:p5"].workspace_id == "w1"
+
+
+def test_startup_sweep_closes_old_generation_only(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # boot sweep closes gen < current for our own org, leaves foreign orgs / humans
+    # untouched, and closes empty current-gen remnants (§5.3).
+    oid = "abc"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_old", "label": f"claude-org/{oid}/g1/control"},
+        {"workspace_id": "w_cur_empty", "label": f"claude-org/{oid}/g2/project:x"},
+        {"workspace_id": "w_other", "label": "claude-org/OTHERORG/g1/control"},
+        {"workspace_id": "w_human", "label": "my-terminal"},
+    ]})
+    server.on("pane.list", {"panes": []})       # current-gen remnant has no live pane
+    server.on("workspace.close", {"type": "ok"})
+    # generation=2 explicit (skips bump); state_dir present -> sweep runs at construction.
+    HerdrAdapter(socket_path=server.path, timeout=2.0,
+                 org_instance_id=oid, generation=2, state_dir=str(tmp_path))
+    closes = [
+        r["params"]["workspace_id"] for r in server.requests
+        if r["method"] == "workspace.close"
+    ]
+    assert "w_old" in closes            # old generation swept
+    assert "w_cur_empty" in closes      # empty current-gen remnant swept
+    assert "w_other" not in closes      # foreign org untouched (isolation)
+    assert "w_human" not in closes      # unrelated human workspace untouched
+
+
+def test_startup_sweep_adopts_live_current_generation(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # A current-gen label WITH live panes is adopted into the owned set (crash mid-spawn
+    # recovery), not closed (§5.3 step 4).
+    oid = "def"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_live", "active_tab_id": "w_live:t1",
+         "label": f"claude-org/{oid}/g5/control"},
+    ]})
+    server.on("pane.list", {"panes": [{"pane_id": "w_live:p2", "workspace_id": "w_live"}]})
+    server.on("workspace.close", {"type": "ok"})
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id=oid, generation=5, state_dir=str(tmp_path))
+    assert "workspace.close" not in server.methods_called()   # adopted, not closed
+    assert a._spaces[SPACE_CONTROL].workspace_id == "w_live"
+
+
+def test_generation_bumps_monotonically_per_boot(tmp_path) -> None:
+    # Each adapter construction with a state_dir bumps the persisted generation counter
+    # (write-ahead), so a restarted daemon gets a strictly newer generation (§5.2).
+    sd = str(tmp_path)
+    g1 = herdr_mod._bump_generation(sd)
+    g2 = herdr_mod._bump_generation(sd)
+    assert g2 == g1 + 1
+
+
+def test_org_instance_id_is_stable_across_reads(tmp_path) -> None:
+    sd = str(tmp_path)
+    a = herdr_mod._read_or_create_org_instance_id(sd)
+    b = herdr_mod._read_or_create_org_instance_id(sd)
+    assert a == b and len(a) >= 32   # >=128-bit hex, collision-resistant (§5.2)
+
+
+def test_failed_project_sweep_retries_via_pending_and_respawn_creates_fresh(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Regression (adversarial review MAJOR, §4.3): when a project space's sweep
+    # workspace.close FAILS, the space is removed from the owned set and retained in
+    # _pending_sweep (keyed by workspace_id); a respawn to the same slug creates a
+    # FRESH workspace (no SWEPT-entry overwrite orphan); the failed workspace is
+    # retried and reclaimed within the generation.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0   # sweep immediately when empty
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))   # w1
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
+    # close the sole project pane; pane.close succeeds; the empty-space sweep verifies the
+    # workspace is physically empty (pane.list -> []) then its workspace.close fails.
+    server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    a.kill_pane(ref_p.pane_id)
+    # removed from owned set (not left as a SWEPT-in-_spaces entry) and retained in
+    # pending by workspace_id for retry.
+    assert "project:x" not in a._spaces
+    assert ref_p.window_id in a._pending_sweep
+    # a respawn to the SAME slug creates a fresh workspace (no overwrite orphan).
+    ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w3
+    assert ref_p2.window_id != ref_p.window_id
+    assert a._spaces["project:x"].workspace_id == ref_p2.window_id
+    # the old failed workspace is retried and reclaimed within the generation.
+    server.on("workspace.close", {"type": "ok"})
+    a._retry_pending_sweep()
+    assert ref_p.window_id not in a._pending_sweep
+
+
+def test_reconcile_move_honors_per_space_split_direction(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # §8: under strategy C the operative placement is pane.move, so the per-space
+    # split_direction must reach pane.move (agent.start's split is ignored by Herdr).
+    state = {"ws": 0}
+
+    def create(_p: dict) -> dict:
+        state["ws"] += 1
+        wid = f"w{state['ws']}"
+        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
+                "root_pane": {"pane_id": f"{wid}:p0"}}
+
+    server.on("workspace.create", create)
+    server.on("agent.start",
+              lambda p: {"agent": {"pane_id": "w9:p5", "workspace_id": "w9"}})
+    server.on("pane.move",
+              lambda p: {"move_result": {"pane": {"pane_id": "w1:p5"}}})
+    server.on("pane.close", {"type": "ok"})
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path),
+            space=SpaceDescriptor(SPACE_CONTROL, split_direction="right"))
+    assert server.params_for("pane.move")["destination"]["split"] == "right"
+
+
+def test_fresh_state_dir_is_created_and_generation_persisted(tmp_path) -> None:
+    # Codex P1: the adapter can be constructed before Broker/sidecar create state_dir
+    # (cli.py: make_adapter runs before Broker). __post_init__ must create the dir so the
+    # write-ahead generation bump does not crash a first-time Herdr daemon.
+    sd = os.path.join(str(tmp_path), "does", "not", "exist", "yet")
+    a = HerdrAdapter(
+        socket_path=os.path.join(tempfile.mkdtemp(prefix="hrdr"), "absent.sock"),
+        timeout=0.5, state_dir=sd,  # unreachable socket -> startup sweep skips (caught)
+    )
+    assert os.path.isdir(sd)
+    assert a.generation == 1
+    assert os.path.exists(os.path.join(sd, herdr_mod._GENERATION_FILE))
+
+
+def test_project_space_dropped_immediately_on_last_pane_close_then_respawn_fresh(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: closing the last owned pane of a project space must drop the space
+    # IMMEDIATELY (bypassing the 8s grace), because Herdr auto-closes the workspace on
+    # last-pane exit; a grace-lingering LIVE entry would make a quick respawn reuse a
+    # dead workspace. A respawn then creates a fresh workspace.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))   # w1
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
+    server.on("pane.close", {"type": "ok"})
+    # Herdr auto-closed the workspace when the last pane exited: the sweep's physical-empty
+    # probe (pane.list) returns workspace_not_found -> the space is dropped as SWEPT.
+    server.on("pane.list", {"error": {"code": "workspace_not_found", "message": "auto"}})
+    a.kill_pane(ref_p.pane_id)
+    assert "project:x" not in a._spaces          # dropped immediately, no grace linger
+    ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w3
+    assert ref_p2.window_id != ref_p.window_id   # fresh workspace, not the dead one
+
+
+def test_startup_adopt_registers_panes_so_they_are_visible(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: adopting a live current-gen workspace must also register its panes in
+    # _owned_panes, else list_panes (registry-primary filter) hides them and the project
+    # space is later treated as empty and swept.
+    oid = "reg"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_live", "active_tab_id": "w_live:t1",
+         "label": f"claude-org/{oid}/g5/project:x"},
+    ]})
+    server.on("pane.list", {"panes": [
+        {"pane_id": "w_live:p2", "workspace_id": "w_live", "tab_id": "w_live:t1"},
+    ]})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id=oid, generation=5, state_dir=str(tmp_path))
+    assert "w_live:p2" in a._owned_panes                       # registered on adopt
+    assert any(p["pane_id"] == "w_live:p2" for p in a.list_panes())  # visible in list
+
+
+def test_reused_pane_liveness_drops_registry_but_does_not_sweep_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (re-review): on PANE_LIVE_REUSED the pane_id now belongs to a different
+    # process; forgetting our registry entry must NOT sweep/close the workspace (that
+    # would kill the reused pane, violating the REUSED hands-off / isolation guard).
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    server.on("pane.get", {"pane": {"pane_id": ref_p.pane_id, "terminal_id": "OTHER"}})
+    server.on("workspace.close", {"type": "ok"})
+    verdict = a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)
+    assert verdict == PANE_LIVE_REUSED
+    assert "workspace.close" not in server.methods_called()   # NOT swept on REUSED
+    assert str(ref_p.pane_id) not in a._owned_panes           # registry entry dropped
+
+
+def test_gone_pane_liveness_sweeps_empty_project_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # The GONE path (pane truly gone) DOES sweep the now-empty project workspace.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    server.on("pane.get", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
+    server.on("workspace.close", {"type": "ok"})
+    verdict = a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)
+    assert verdict == PANE_LIVE_GONE
+    assert "workspace.close" in server.methods_called()       # swept on GONE
+    assert "project:x" not in a._spaces
+
+
+def test_pending_sweep_retried_on_poll_even_with_no_owned_spaces(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (re-review): a single-project session whose only space became empty and
+    # whose workspace.close failed (now only in _pending_sweep, _spaces empty) must still
+    # be retried on a normal poll — the empty-query early return must not skip the retry.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})   # physically empty -> sweep proceeds to close
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    a.kill_pane(ref_p.pane_id)          # sweep fails -> pending; _spaces now empty
+    assert a._spaces == {}
+    assert ref_p.window_id in a._pending_sweep
+    # a subsequent poll (list_panes) with no owned spaces/panes must retry & reclaim it.
+    server.on("workspace.close", {"type": "ok"})
+    assert a.list_panes() == []
+    assert ref_p.window_id not in a._pending_sweep    # reclaimed within the generation
+
+
+def test_sweep_does_not_close_workspace_with_non_owned_pane(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P1: _sweep_space verifies physical emptiness before workspace.close. If a
+    # non-owned/reused pane occupies the workspace, it must NOT close it (that would kill
+    # the pane) — it is removed from the owned set and deferred to pending (never closed
+    # while occupied, so isolation holds).
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    # our pane goes GONE (registry entry dropped) but a foreign pane occupies the workspace.
+    server.on("pane.get", {"error": {"code": "pane_not_found", "message": "gone"}})
+    server.on("pane.list", {"panes": [{"pane_id": "w1:pX", "workspace_id": "w1"}]})
+    server.on("workspace.close", {"type": "ok"})
+    a.pane_liveness(ref_p.pane_id, terminal_id=ref_p.terminal_id)  # GONE -> sweep attempt
+    assert "workspace.close" not in server.methods_called()   # NOT closed (foreign pane)
+    assert "project:x" not in a._spaces                       # out of owned set
+    assert ref_p.window_id in a._pending_sweep                # deferred, never closed
+
+
+def test_ensure_space_recreates_when_cached_workspace_auto_closed(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: a worker self-exits outside kill_pane; Herdr auto-closes the workspace but
+    # the cached _Space stays LIVE (sweep hasn't run yet). A respawn must verify existence
+    # and recreate a fresh workspace instead of reusing the dead one.
+    _wire_multi(server)
+    a = _adapter(server)
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("workspace.list", {"workspaces": []})   # w1 no longer exists (auto-closed)
+    ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
+    assert ref_p2.window_id != ref_p.window_id
+    assert a._spaces["project:x"].workspace_id == ref_p2.window_id
+
+
+def test_pending_sweep_retry_does_not_close_reoccupied_workspace(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (round 4): the pending-sweep retry must ALSO verify physical emptiness. If a
+    # human/other process created or moved a pane into the pending workspace before retry,
+    # workspace.close would kill that non-owned pane — the retry keeps it deferred instead.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    server.on("pane.list", {"panes": []})                # empty at sweep time
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    a.kill_pane(ref_p.pane_id)                            # sweep fails -> pending(w1)
+    assert ref_p.window_id in a._pending_sweep
+    # a foreign pane now occupies w1 before the retry runs.
+    server.on("pane.list", {"panes": [{"pane_id": "w1:pX", "workspace_id": "w1"}]})
+    server.requests.clear()
+    a._retry_pending_sweep()
+    assert "workspace.close" not in server.methods_called()   # NOT closed (occupied)
+    assert ref_p.window_id in a._pending_sweep                # kept deferred (retry), not closed
+
+
+def test_sweep_defers_on_lagging_pane_list_then_closes_when_caught_up(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (round 5): after closing the last pane, Herdr's eventually-consistent
+    # pane.list may still show the just-closed pane (occupied). This must DEFER (pending),
+    # NOT permanently relinquish, so once the snapshot catches up (empty) the workspace is
+    # actually closed within the generation.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    # lagging snapshot still shows our just-closed pane -> looks "occupied".
+    server.on("pane.list", {"panes": [{"pane_id": ref_p.pane_id, "workspace_id": "w1"}]})
+    a.kill_pane(ref_p.pane_id)
+    assert "project:x" not in a._spaces               # out of owned set
+    assert ref_p.window_id in a._pending_sweep         # deferred, NOT relinquished
+    # snapshot catches up: pane.list empty -> retry closes it.
+    server.on("pane.list", {"panes": []})
+    server.on("workspace.close", {"type": "ok"})
+    a._retry_pending_sweep()
+    assert ref_p.window_id not in a._pending_sweep     # reclaimed within the generation
+
+
+def test_startup_sweep_closes_old_generation_workspace_with_orphan_panes(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # §5.3 / #109 (human design adjudication): old-generation orphan workspaces contain the
+    # dead daemon's panes (root + orphaned agents), and reaping them WITH their panes is the
+    # whole point of the generation stale sweep. The old-gen path closes them UNCONDITIONALLY
+    # (gated only on the single-live-daemon lock + a current-gen registry check) — it is NOT
+    # routed through the physical-empty guard (that guard is reserved for the current-gen
+    # ephemeral cleanup paths, which still protect foreign panes). A one-time round-6 change
+    # over-generalized the guard onto this path and broke #109's purpose; reverted per human
+    # adjudication.
+    oid = "og"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_old", "label": f"claude-org/{oid}/g1/project:x"},
+    ]})
+    # the old-gen workspace still holds the dead daemon's orphan pane(s) — still reaped.
+    server.on("pane.list", {"panes": [{"pane_id": "w_old:p2", "workspace_id": "w_old"}]})
+    server.on("workspace.close", {"type": "ok"})
+    HerdrAdapter(socket_path=server.path, timeout=2.0,
+                 org_instance_id=oid, generation=2, state_dir=str(tmp_path))
+    closes = [
+        r["params"]["workspace_id"] for r in server.requests
+        if r["method"] == "workspace.close"
+    ]
+    assert "w_old" in closes   # old-gen orphan (with panes) reaped (#109 purpose preserved)
+
+
+def test_sweep_old_generation_skips_workspace_with_current_gen_pane(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Defensive §5.3 step 3: _sweep_old_generation skips a workspace that holds a CURRENT-gen
+    # (our registry) pane — never kill a live current-gen pane even if the label is old.
+    # (Constructed without state_dir so the __post_init__ sweep does not run; the registry is
+    # seeded and the method is exercised directly, since boot-time registry is empty.)
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    a._owned_panes["w_old:p9"] = herdr_mod._PaneRecord(
+        pane_id="w_old:p9", space_key=SPACE_CONTROL,
+        workspace_id="w_old", tab_id="w_old:t1",
+    )
+    a._sweep_old_generation("w_old")
+    assert "workspace.close" not in server.methods_called()   # skipped (current-gen pane)
+
+
+def _wire_create_incrementing(server: FakeHerdrServer) -> dict:
+    """workspace.create hands out w1,w2,... each with a root pane wN:p0."""
+    state = {"ws": 0}
+
+    def create(_p: dict) -> dict:
+        state["ws"] += 1
+        wid = f"w{state['ws']}"
+        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
+                "root_pane": {"pane_id": f"{wid}:p0"}}
+
+    server.on("workspace.create", create)
+    return state
+
+
+def test_born_empty_workspace_swept_on_spawn_failure(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex confirmation P2: when agent.start fails before root cleanup, the just-created
+    # project workspace still holds only its OWN workspace.create root pane. The born-empty
+    # sweep must treat that root pane as own (not foreign) and CLOSE the workspace — not
+    # classify the root as an occupant and leak it forever.
+    _wire_create_incrementing(server)
+    server.on("agent.start", {"agent": {}})   # no pane_id -> spawn fails after create
+    server.on("pane.list", {"panes": [{"pane_id": "w1:p0", "workspace_id": "w1"}]})  # only root
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    with pytest.raises(HerdrError):
+        a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    assert "workspace.close" in server.methods_called()   # born-empty ws swept (root is own)
+    assert "project:x" not in a._spaces
+    assert "w1" not in a._pending_sweep                    # not leaked to pending
+
+
+def test_born_empty_workspace_with_foreign_pane_is_not_closed(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # If a foreign pane is present alongside our own root pane, the workspace must NOT be
+    # closed (isolation) — only our own panes are excluded from the occupancy check.
+    _wire_create_incrementing(server)
+    server.on("agent.start", {"agent": {}})   # spawn fails after create
+    server.on("pane.list", {"panes": [
+        {"pane_id": "w1:p0", "workspace_id": "w1"},     # our root
+        {"pane_id": "w1:pF", "workspace_id": "w1"},     # a foreign pane
+    ]})
+    server.on("workspace.close", {"type": "ok"})
+    a = _adapter(server)
+    with pytest.raises(HerdrError):
+        a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
+    assert "workspace.close" not in server.methods_called()   # foreign present -> not closed
+    assert "w1" in a._pending_sweep                            # deferred (protected)

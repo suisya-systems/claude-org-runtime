@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `terminal.herdr` + `broker`: implement the Herdr backend **workspace-layout
+  policy** (runtime Issue #110) — *control plane in one space + workers in
+  per-project spaces* — on top of the #114/#115 placement fix. Placement strategy
+  **C (spawn-then-move)** was confirmed by a probe on live Herdr 0.7.1
+  (`investigation/run_layout_probe.sh`): `agent.start` ignores the `workspace`
+  parameter (rides along the focused workspace), but `pane.move` can relocate a
+  pane cross-workspace into any owned tab (pane_id changes, terminal_id preserved).
+  Four scopes:
+
+  - **Isolation boundary set-ification (§4.1/§7.3, BLOCKER invariant).** The
+    adapter now tracks two separated sets: a **close-authority owned set**
+    (`_spaces`, only workspaces it `workspace.create`d with its own generation
+    label — the only workspaces it may `workspace.close`) and a
+    **liveness-tracking registry** (`_owned_panes`, each spawned pane's real
+    placement). A **self-ownership gate** ensures a diverged pane that rode along a
+    *foreign* (human / other-org) workspace is `pane.move`d out and never adds that
+    workspace to the close-authority set. `list_panes` unions the owned workspaces,
+    gates on the registry (primary) + adapter-managed tab (per-workspace single-tab
+    invariant), and a single degraded workspace no longer empties the others.
+
+  - **Spawn-time space selection, 3-layer relay (§6).** `TerminalAdapter.spawn`
+    gains an optional `space: SpaceDescriptor` and a `supports_space_layout`
+    capability flag (Herdr=True; tmux/wezterm unchanged — the broker branches via
+    `getattr`, flat backends keep the exact old signature). The broker computes the
+    `SpaceDescriptor` from `role` + a new optional `project` field (control roles →
+    `control`; worker+project → `project:<slug>`; projectless worker →
+    `project:_unassigned`). Surface amendment is **flag-only** (not ratified, §10).
+
+  - **Generation identity + startup stale sweep (§5).** Workspaces are labelled
+    `{prefix}/{org_instance_id}/g{gen}/{space_key}` with a collision-resistant
+    persisted `org_instance_id` and a write-ahead-persisted monotonic `generation`.
+    On daemon boot the adapter sweeps its own prior-generation orphan workspaces
+    (single-live-daemon lock, foreign orgs / humans never touched), supplying the
+    cleanup #112 deferred to #110.
+
+  - **Lazy space creation + empty-space cleanup (§4.3/§7.4).** Project spaces are
+    created lazily and swept (`workspace.close`) when their last owned pane exits;
+    the control space is org-lifetime (never ephemeral-swept). Root-pane cleanup is
+    gated on verified placement (probe 6e auto-close avoidance), with in-flight /
+    grace guards and a `DEGRADED → GONE` bounded escape.
+
 ## [0.1.33] - 2026-07-03
 
 ### Fixed
