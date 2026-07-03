@@ -49,6 +49,7 @@ class FakeAdapter:
         detailed_kill: bool = False,
         kill_ineffective: bool = False,
         authoritative_liveness: bool = False,
+        supports_space_layout: bool = False,
     ) -> None:
         # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
         # global-mux backend (wezterm) を模すテストは False を渡す。
@@ -83,6 +84,11 @@ class FakeAdapter:
         # list_panes から隠れるが pane_exists では依然「存在」する (物理的には生きて
         # いるのに snapshot に現れない Herdr 挙動)。
         self._snapshot_hidden: set = set()
+        # supports_space_layout: Herdr のように workspace レイアウト (control 面 +
+        # プロジェクト単位スペース) を持つ backend を模す (Issue #110 §6.2)。True の
+        # 時だけ broker が SpaceDescriptor を spawn(space=) へ渡す。既定 False (flat)。
+        if supports_space_layout:
+            self.supports_space_layout = True
         self.spawned: list[dict] = []
         self.killed: list[int] = []
         self._counter = itertools.count(1)
@@ -107,9 +113,11 @@ class FakeAdapter:
             p["active"] = (h == handle)
 
     # TerminalAdapter Protocol --------------------------------------------
-    def spawn(self, argv, cwd=None, new_window=True) -> PaneRef:
+    def spawn(self, argv, cwd=None, new_window=True, space=None) -> PaneRef:
         handle = self.add_pane()
-        self.spawned.append({"argv": list(argv), "cwd": cwd, "handle": handle})
+        self.spawned.append(
+            {"argv": list(argv), "cwd": cwd, "handle": handle, "space": space}
+        )
         tid = f"term_{handle}" if self._provides_terminal_id else None
         if tid is not None:
             # record the pane's current terminal_id so _pane_liveness_impl can mirror

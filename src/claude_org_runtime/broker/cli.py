@@ -168,7 +168,9 @@ def run(args: argparse.Namespace) -> int:
         backend_name = None
     else:
         backend_name = args.backend or default_backend()
-        adapter = make_adapter(backend_name)
+        # state_dir を渡す: workspace レイアウト backend (Herdr) の世代識別永続 +
+        # 起動時 stale 掃除に使う (Issue #110 §5)。flat backend は無視する。
+        adapter = make_adapter(backend_name, state_dir=state_dir)
     # admin HTTP RPC (token mint / graceful shutdown) の認証 token。root token とは
     # 別系統で生成し sidecar に 0600 で書く (平文 journal 禁止。Codex review)。
     admin_token = secrets.token_urlsafe(32)
