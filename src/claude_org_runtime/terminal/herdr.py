@@ -557,6 +557,14 @@ class HerdrAdapter:
         self._client = _HerdrClient(self.socket_path, self.timeout)
         # 世代識別の解決 (§5.2)。state_dir があれば永続 org_instance_id + boot ごとの
         # 単調 generation (write-ahead)。無ければ ephemeral (テスト / standalone)。
+        # state_dir は Broker より先に adapter が構築されうる (cli.py: make_adapter →
+        # Broker の順) ため、ここで確実に作る。さもないと _bump_generation の write-ahead
+        # が FileNotFoundError で落ち、初回 Herdr daemon が起動できない (Codex P1)。
+        if self.state_dir:
+            try:
+                os.makedirs(self.state_dir, exist_ok=True)
+            except OSError:
+                pass
         if self.org_instance_id is None:
             if self.state_dir:
                 self.org_instance_id = _read_or_create_org_instance_id(self.state_dir)
@@ -822,7 +830,7 @@ class HerdrAdapter:
                 if failed and created_now:
                     try:
                         self._sweep_if_empty(
-                            space_key, force_created=True, _locked=True
+                            space_key, immediate=True, _locked=True
                         )
                     except HerdrError:
                         pass
@@ -1123,11 +1131,16 @@ class HerdrAdapter:
         return PANE_LIVE_ALIVE
 
     def _forget_pane(self, pane_id: str) -> None:
-        """registry から pane を除去し、その project space が空になったら掃除する。"""
+        """registry から pane を除去し、その project space が空になったら即掃除する。
+
+        pane が実際に除去された = space が真に空で workspace は auto-close 済みのことが多い
+        ので grace を飛ばす (immediate、Codex P2: grace で LIVE 残置すると respawn が死んだ
+        workspace を再利用する)。
+        """
         with self._lock:
             rec = self._owned_panes.pop(str(pane_id), None)
         if rec is not None:
-            self._sweep_if_empty(rec.space_key)
+            self._sweep_if_empty(rec.space_key, immediate=True)
 
     # -------------------------------------------------------------- get-text
     def get_text(self, pane_id: str, escapes: bool = False) -> str:
@@ -1265,14 +1278,21 @@ class HerdrAdapter:
 
     # ------------------------------------------------------- space cleanup
     def _sweep_if_empty(
-        self, space_key: str, *, force_created: bool = False, _locked: bool = False
+        self, space_key: str, *, immediate: bool = False, _locked: bool = False
     ) -> None:
         """プロジェクトスペースが空になったら workspace.close で掃除する (§4.3)。
 
         control スペースは org ライフタイムと同寿命なので掃除しない (§4.3、一時的に空でも
-        残す)。in-flight spawn がある / grace 未達 / まだ owned pane が居るスペースはスキップ
-        (§4.3 の in-flight / grace ガード)。``force_created`` は spawn 失敗の born-empty
-        即掃除 (§7.4 の misplaced-W)。
+        残す)。in-flight spawn がある / まだ owned pane が居るスペースはスキップ (§4.3 の
+        in-flight ガード)。
+
+        ``immediate=True`` は grace を飛ばして即掃除する。**pane が実際に除去された経路**
+        (`_forget_pane` = org 主導 close / self-exit、§4.3 空検知 (a)(b)) と spawn 失敗の
+        born-empty (§7.4) で使う: これらは space が真に空で、かつ最後の pane 退出で Herdr が
+        workspace を auto-close 済みのことが多い。grace で LIVE のまま残すと、直後の同 slug
+        respawn が `_ensure_space` で **死んだ workspace/tab を LIVE として再利用**し move/start
+        が失敗する (Codex P2)。grace は periodic な `_sweep_empty_project_spaces` の安全網でのみ
+        効かせ、pane 除去起点の即時掃除では飛ばす。
 
         掃除と spawn の race を断つため **``_spawn_lock`` 下で判定〜close** する
         (``_locked=False`` の呼出は lock を取得する)。spawn の失敗経路は既に
@@ -1284,7 +1304,7 @@ class HerdrAdapter:
             # spawn と相互排他にして「掃除中に同 space へ spawn が pane を足す」race を断つ。
             with self._spawn_lock:
                 self._sweep_if_empty(
-                    space_key, force_created=force_created, _locked=True
+                    space_key, immediate=immediate, _locked=True
                 )
             return
         with self._lock:
@@ -1298,7 +1318,7 @@ class HerdrAdapter:
             )
             if has_pane:
                 return
-            if not force_created:
+            if not immediate:
                 if time.time() - sp.created_at < self.space_sweep_grace_seconds:
                     return  # grace 未達: _sweep_empty_project_spaces の retry で後回収
         # workspace.close (lock 外 I/O)。成功で SWEPT、失敗は pending_sweep で再試行。
@@ -1559,3 +1579,18 @@ class HerdrAdapter:
                 root_pane_id=None,
                 created_at=time.time(),
             )
+            # adopt した live pane を registry にも登録する (Codex P2): list_panes は
+            # _owned_panes を一次ゲートにするため、登録しないと adopt した pane が不可視に
+            # なり、project スペースは「空」と誤判定されて掃除されてしまう。
+            for p in panes:
+                pid = p.get("pane_id")
+                if pid is None:
+                    continue
+                self._owned_panes[str(pid)] = _PaneRecord(
+                    pane_id=str(pid),
+                    space_key=space_key,
+                    workspace_id=workspace_id,
+                    tab_id=p.get("tab_id") or tab_id,
+                    terminal_id=p.get("terminal_id"),
+                    spawned_at=time.time(),
+                )

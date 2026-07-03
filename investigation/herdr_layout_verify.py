@@ -61,9 +61,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def main() -> int:
     sock = sys.argv[1]
+    # NB: intentionally NOT pre-created — the adapter must create state_dir itself
+    # (Codex P1: make_adapter runs before Broker/sidecar create the dir).
     state_dir = os.path.join(os.path.dirname(sock), "broker_state")
-    os.makedirs(state_dir, exist_ok=True)
-    print(f"[verify] socket={sock} state_dir={state_dir}")
+    print(f"[verify] socket={sock} state_dir={state_dir} (not pre-created)")
 
     # 人間が TUI で見ている状態を模す: user workspace を focus 済みにする
     # (これで agent.start は focused=user へ相乗りし、reconcile の move が必要になる)。

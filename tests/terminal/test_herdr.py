@@ -1428,3 +1428,58 @@ def test_reconcile_move_honors_per_space_split_direction(
     a.spawn(["claude"], cwd=str(tmp_path),
             space=SpaceDescriptor(SPACE_CONTROL, split_direction="right"))
     assert server.params_for("pane.move")["destination"]["split"] == "right"
+
+
+def test_fresh_state_dir_is_created_and_generation_persisted(tmp_path) -> None:
+    # Codex P1: the adapter can be constructed before Broker/sidecar create state_dir
+    # (cli.py: make_adapter runs before Broker). __post_init__ must create the dir so the
+    # write-ahead generation bump does not crash a first-time Herdr daemon.
+    sd = os.path.join(str(tmp_path), "does", "not", "exist", "yet")
+    a = HerdrAdapter(
+        socket_path=os.path.join(tempfile.mkdtemp(prefix="hrdr"), "absent.sock"),
+        timeout=0.5, state_dir=sd,  # unreachable socket -> startup sweep skips (caught)
+    )
+    assert os.path.isdir(sd)
+    assert a.generation == 1
+    assert os.path.exists(os.path.join(sd, herdr_mod._GENERATION_FILE))
+
+
+def test_project_space_dropped_immediately_on_last_pane_close_then_respawn_fresh(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: closing the last owned pane of a project space must drop the space
+    # IMMEDIATELY (bypassing the 8s grace), because Herdr auto-closes the workspace on
+    # last-pane exit; a grace-lingering LIVE entry would make a quick respawn reuse a
+    # dead workspace. A respawn then creates a fresh workspace.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor(SPACE_CONTROL))   # w1
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w2
+    server.on("pane.close", {"type": "ok"})
+    # Herdr auto-closed the workspace when the last pane exited.
+    server.on("workspace.close", {"error": {"code": "workspace_not_found", "message": "auto"}})
+    a.kill_pane(ref_p.pane_id)
+    assert "project:x" not in a._spaces          # dropped immediately, no grace linger
+    ref_p2 = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w3
+    assert ref_p2.window_id != ref_p.window_id   # fresh workspace, not the dead one
+
+
+def test_startup_adopt_registers_panes_so_they_are_visible(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2: adopting a live current-gen workspace must also register its panes in
+    # _owned_panes, else list_panes (registry-primary filter) hides them and the project
+    # space is later treated as empty and swept.
+    oid = "reg"
+    server.on("workspace.list", {"workspaces": [
+        {"workspace_id": "w_live", "active_tab_id": "w_live:t1",
+         "label": f"claude-org/{oid}/g5/project:x"},
+    ]})
+    server.on("pane.list", {"panes": [
+        {"pane_id": "w_live:p2", "workspace_id": "w_live", "tab_id": "w_live:t1"},
+    ]})
+    server.on("pane.layout", {"layout": {"panes": []}})
+    a = HerdrAdapter(socket_path=server.path, timeout=2.0,
+                     org_instance_id=oid, generation=5, state_dir=str(tmp_path))
+    assert "w_live:p2" in a._owned_panes                       # registered on adopt
+    assert any(p["pane_id"] == "w_live:p2" for p in a.list_panes())  # visible in list
