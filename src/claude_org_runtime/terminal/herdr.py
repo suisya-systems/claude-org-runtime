@@ -927,6 +927,11 @@ class HerdrAdapter:
             query_ws |= pane_ws
             registry = dict(self._owned_panes)
         if not query_ws:
+            # owned space も pane も残っていなくても、pending-sweep (close 失敗で owned 外へ
+            # 退避した空 workspace) は世代内で回収する必要がある (Codex P2: single-project
+            # セッションで最後の space が空 + close 失敗だと query_ws が空になり、この early
+            # return が retry をスキップして次 boot まで孤児が残る)。
+            self._retry_pending_sweep()
             return []
         collected: list[dict] = []
         degraded_now: list[str] = []

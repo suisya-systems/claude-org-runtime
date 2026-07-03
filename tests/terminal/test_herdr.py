@@ -1517,3 +1517,24 @@ def test_gone_pane_liveness_sweeps_empty_project_workspace(
     assert verdict == PANE_LIVE_GONE
     assert "workspace.close" in server.methods_called()       # swept on GONE
     assert "project:x" not in a._spaces
+
+
+def test_pending_sweep_retried_on_poll_even_with_no_owned_spaces(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Codex P2 (re-review): a single-project session whose only space became empty and
+    # whose workspace.close failed (now only in _pending_sweep, _spaces empty) must still
+    # be retried on a normal poll — the empty-query early return must not skip the retry.
+    _wire_multi(server)
+    a = _adapter(server)
+    a.space_sweep_grace_seconds = 0.0
+    ref_p = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))  # w1
+    server.on("pane.close", {"type": "ok"})
+    server.on("workspace.close", {"error": {"code": "boom", "message": "x"}})
+    a.kill_pane(ref_p.pane_id)          # sweep fails -> pending; _spaces now empty
+    assert a._spaces == {}
+    assert ref_p.window_id in a._pending_sweep
+    # a subsequent poll (list_panes) with no owned spaces/panes must retry & reclaim it.
+    server.on("workspace.close", {"type": "ok"})
+    assert a.list_panes() == []
+    assert ref_p.window_id not in a._pending_sweep    # reclaimed within the generation
