@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `terminal.herdr` + `broker`: fix the Herdr backend's **workspace-isolation
+  collapse and consequent false-reap** of live, `agent_registered` dispatcher
+  panes (runtime Issue #114). The v0.1.32 (#112) reap gates were only a *delay*
+  against a *constant* absence, not a cure: the real root cause is that Herdr
+  0.7.1 `agent.start` **ignores the `workspace` / `tab` parameters and places the
+  agent in the currently-focused workspace** (the user's), so the adapter's
+  dedicated-workspace isolation was a no-op on every spawn and the live pane never
+  appeared in the adapter's strict `workspace_id`-filtered `list_panes` — the
+  reaper then read that structural absence as "gone" and actively closed a healthy
+  pane. Two independently-guarding fixes, both idempotent (they verify the actual
+  landing and only fire when it diverged, so a future Herdr that honors the
+  parameters does not regress):
+
+  - **Placement reconciliation via `pane.move` (primary).** After `agent.start`,
+    `HerdrAdapter.spawn` reads the pane's actual landing workspace from the
+    response and, **only when it diverged** from the dedicated workspace, issues
+    `pane.move` to relocate the pane into the dedicated tab — **before** the root
+    shell pane cleanup (closing root first would auto-close the now-empty dedicated
+    workspace and destroy the move target). The pane's `terminal_id` is preserved
+    across the move (the Claude process is not restarted), and the returned
+    `PaneRef` carries the post-move `pane_id`. `pane.move` was chosen over the
+    alternative pre-`agent.start` `workspace.focus` (Fix-A) because it never steals
+    focus: it does not flicker the user's TUI on every spawn and cannot race a
+    human focus change into landing an agent in a user workspace. If the corrective
+    move fails, the stranded pane is best-effort closed and the error is propagated
+    (spawn fails cleanly) rather than returning an isolation-broken `PaneRef`.
+
+  - **Workspace-independent authoritative liveness (defense, mandatory
+    companion).** `HerdrAdapter` gains `pane_liveness(pane_id, terminal_id)`,
+    which the reaper consults (via `getattr`) before deleting a candidate's
+    bookkeeping. It resolves the pane directly with `pane.get(pane_id)` — which is
+    **not** workspace-filtered — and compares the recorded `terminal_id`:
+    `alive` (present + `terminal_id` matches) never reaps; `gone`
+    (`pane_not_found`) reaps the bookkeeping with no physical close needed;
+    `reused` (present but `terminal_id` differs, i.e. the `pane_id` was reused by a
+    foreign pane) reaps the bookkeeping but **never issues a physical close** — so
+    a dead dispatcher's recycled `pane_id` can neither false-reap an unrelated user
+    pane nor defer forever and resurrect the ghost name bindings that #106/#112
+    closed; `unknown` (backend unreachable) defers. This replaces the inverted
+    "blindly `pane.close` then judge liveness by whether the close succeeded" logic
+    for Herdr with an authoritative pre-check (no more closing a live pane just to
+    learn it was alive). `terminal_id` now threads through
+    `PaneRef` → `_register_pane` → the pane registry.
+
+  - **tmux / wezterm are unchanged.** Both lack `pane.get` / `terminal_id`, so
+    `getattr(adapter, "pane_liveness", None)` returns `None` and the reaper keeps
+    the previous physical-close-verification path; `PaneRef.terminal_id` defaults
+    to `None`. The isolation guarantees for `org down` / `list_panes` /
+    `close_pane` (no touching of panes outside the dedicated workspace) are held —
+    the rejected rebind-onto-user-workspace approach is not used.
+
 ## [0.1.32] - 2026-07-03
 
 > The paired `claude-org-ja` follow-up for this release is a runtime **pin

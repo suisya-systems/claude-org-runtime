@@ -60,17 +60,38 @@ PaneId = Union[int, str]
 NUDGE_TEXT = "📨 新着あり。mcp__org-broker__check_messages を実行"
 
 
+# Fix-D: workspace 非依存 liveness の判定結果 (Issue #114)。adapter の任意メソッド
+# ``pane_liveness(pane_id, terminal_id)`` が返す語彙で、broker reaper が bookkeeping を
+# 落とす前の権威判定に使う。list_panes/pane_exists は「自 workspace filter 越し」の
+# liveness なので、placement バグや workspace 消失で生 pane を構造的に欠落させ、それを
+# reaper が「消えた」と誤読して生 pane を close していた (真因 A/B)。pane.get のような
+# workspace 非依存の直接 probe を持つ backend (Herdr) はこの verdict を返し、reaper は
+# 盲目的な物理 close をやめて verdict に従う。持たない backend (tmux/wezterm) は従来の
+# 物理 close 検証経路のまま (broker は getattr で存在を見て分岐する)。
+PANE_LIVE_ALIVE = "alive"      # 直接 probe で present かつ terminal_id 一致 (= 同一プロセス)
+PANE_LIVE_REUSED = "reused"    # present だが terminal_id 不一致 (pane_id が別 pane に再利用)
+PANE_LIVE_GONE = "gone"        # 直接 probe で不在 (= 権威的に消滅)
+PANE_LIVE_UNKNOWN = "unknown"  # backend 不通等で判定不能 (reaper は defer する)
+
+
 @dataclass
 class PaneRef:
     """spawn した pane の追跡情報。毎回 target を明示するために保持する。
 
     pane_id は backend ネイティブ型 (WezTerm=int / tmux=str)。tab_id / window_id は
     backend での「タブ / ウィンドウ」相当 (tmux では window_id / session を充てる)。
+
+    terminal_id は backend が付ける **プロセス/端末の安定 identity** (Herdr
+    ``terminal_id``)。pane_id は移送 (pane.move) や backend の id 再利用で変わりうるが
+    terminal_id はプロセスに紐づき不変 (Issue #114 実測)。broker はこれを reaper の
+    id 再利用ガード (workspace 非依存 liveness と照合) に使う。持たない backend
+    (tmux/wezterm) は ``None`` (id 再利用ガードは効かないが従来経路は不変)。
     """
 
     pane_id: PaneId
     tab_id: PaneId | None = None
     window_id: PaneId | None = None
+    terminal_id: PaneId | None = None
 
 
 @runtime_checkable
@@ -120,6 +141,26 @@ class TerminalAdapter(Protocol):
         経たない限り成立しない」ので、この bursty 誤判定を構造的に断つ。
     これは表示面の判定 (``list_panes`` に載るか) は変えず、bookkeeping 削除の
     決定条件だけを backend の snapshot 一貫性に合わせて硬くする防御である。
+
+    workspace 非依存 liveness (任意メソッド ``pane_liveness``、Issue #114 Fix-D):
+    ``list_panes`` / ``pane_exists`` は「自 workspace filter 越し」の liveness で、
+    placement バグ (Herdr ``agent.start`` が workspace param を無視し focused workspace
+    へ配置する) や workspace 消失で **生 pane を構造的に欠落**させる。それを reaper が
+    「消えた」と誤読すると生 pane を close して殺す (Issue #114 の isolation 崩壊)。
+    これを断つため adapter は次の任意メソッドを実装でき、broker は
+    ``getattr(adapter, "pane_liveness", None)`` で存在を見て使う:
+
+        def pane_liveness(self, pane_id, terminal_id=None) -> str: ...
+
+    workspace を指定しない直接 probe (Herdr ``pane.get``) で pane の実在を引き、記録済み
+    terminal_id と照合して :data:`PANE_LIVE_ALIVE` / :data:`PANE_LIVE_REUSED` /
+    :data:`PANE_LIVE_GONE` / :data:`PANE_LIVE_UNKNOWN` を返す。broker reaper はこの
+    verdict に従い、ALIVE/UNKNOWN は reap を defer、GONE/REUSED のみ bookkeeping を掃除、
+    かつ **REUSED では物理 close を発行しない** (その pane_id は今や無関係 pane で、
+    close すると巻き添える)。宣言しない backend (tmux/wezterm) は従来の物理 close 検証
+    経路のまま (getattr が None を返し reaper が旧経路にフォールバック)。
+    ``isolated_session`` 等と同じ理由で **注釈しない** 任意メンバとする
+    (``@runtime_checkable`` の issubclass 検査を tmux/wezterm で壊さないため)。
     """
 
     def spawn(

@@ -19,6 +19,10 @@ from __future__ import annotations
 
 from .base import (
     NUDGE_TEXT,
+    PANE_LIVE_ALIVE,
+    PANE_LIVE_GONE,
+    PANE_LIVE_REUSED,
+    PANE_LIVE_UNKNOWN,
     VALID_BACKENDS,
     PaneId,
     PaneRef,
@@ -34,6 +38,10 @@ from .wezterm import WezTermAdapter
 
 __all__ = [
     "NUDGE_TEXT",
+    "PANE_LIVE_ALIVE",
+    "PANE_LIVE_GONE",
+    "PANE_LIVE_REUSED",
+    "PANE_LIVE_UNKNOWN",
     "VALID_BACKENDS",
     "PaneId",
     "PaneRef",

@@ -1,0 +1,3 @@
+# 再現/検証実行時に生成される隔離 herdr サーバのログ置き場 (コミット対象外)
+# run_repro.sh は _run/、各 probe / run_verify.sh は _run2/ _run3/ _run_verify/ 等を作る。
+_run*/

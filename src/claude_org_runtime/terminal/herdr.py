@@ -58,7 +58,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
+from .base import (  # noqa: F401  (NUDGE_TEXT 再利用)
+    NUDGE_TEXT,
+    PANE_LIVE_ALIVE,
+    PANE_LIVE_GONE,
+    PANE_LIVE_REUSED,
+    PANE_LIVE_UNKNOWN,
+    PaneRef,
+)
 from .keys import CTRL_LETTERS
 
 # ---------------------------------------------------------------------------
@@ -446,6 +453,10 @@ class HerdrAdapter:
                     CODE_INTERNAL,
                     f"herdr agent.start: response missing pane_id: {res!r}",
                 )
+            # placement 補正 (Issue #114 Fix-C)。root cleanup の**前**に行う: 先に root を
+            # 閉じると相乗り先が空になった専用 workspace が auto-close し、移送先 tab が
+            # 消えるため。DIVERGED (専用 ws 外へ着地) の時のみ pane.move で移送する。
+            pane_id, terminal_id = self._reconcile_placement(agent, pane_id)
             # workspace.create が同時生成した root shell pane を後始末する。
             # 判定は ``first`` ではなく ``_root_pane_id`` の有無で行う: 初回 spawn
             # の agent.start が (transient に) 失敗すると workspace は確保済み
@@ -465,7 +476,86 @@ class HerdrAdapter:
                 pane_id=pane_id,
                 window_id=self._workspace_id,
                 tab_id=self._tab_id,
+                terminal_id=terminal_id,
             )
+
+    # ------------------------------------------------------- placement (Fix-C)
+    @staticmethod
+    def _workspace_of(pane_id: Any) -> Any:
+        """pane_id (``wN:pM``) から workspace prefix (``wN``) を取り出す。
+
+        agent.start 応答が ``workspace_id`` を欠く旧/新 schema への保険。通常は応答の
+        ``workspace_id`` を直接使う (``_reconcile_placement``)。
+        """
+        if isinstance(pane_id, str) and ":" in pane_id:
+            return pane_id.split(":", 1)[0]
+        return pane_id
+
+    def _reconcile_placement(
+        self, agent: dict, pane_id: Any
+    ) -> tuple[Any, Any]:
+        """agent.start の実着地を検証し、専用 workspace とずれていれば移送する (Fix-C)。
+
+        Herdr 0.7.1 は ``agent.start`` の ``workspace`` / ``tab`` パラメータを**無視**し、
+        現在 focused の workspace に agent を配置する (Issue #114 実測)。よって専用
+        workspace への隔離 (isolated_session) は着地時点で崩れうる。本 helper は着地
+        workspace を **agent.start 応答から検証** (別 RPC 不要: 応答が実 ``workspace_id`` /
+        ``terminal_id`` を持つ) し、専用 workspace と DIVERGED した時**のみ** ``pane.move``
+        で専用 tab へ移送する。
+
+        冪等性 (要件): 将来 Herdr が ``workspace`` param を honor して直着地したら
+        ``landed == 専用 ws`` となり move しない (二重移送を防ぐ)。診断は「0.7.1 が param
+        を無視する」という version 固有事実に依存するため、実着地を検証し diverged 時
+        のみ発火する形にして version 跨ぎの退行を防ぐ。
+
+        移送は ``_spawn_lock`` 下・root cleanup の**前**に呼ばれる (docstring 参照)。
+        pane.move は pane_id を remap する (``w1:pN`` -> ``wDED:pM``) が terminal_id は
+        保存する (実測: プロセス不再起動)。移送先は tab_id 明示なので focused に依らず
+        決定的で、人間の TUI focus と race しない (Fix-A の focus 奪取を避けた理由)。
+
+        移送に失敗したら pane は foreign workspace に取り残される (= isolation 崩壊)。
+        その場合 best-effort で残置 pane を close し、元エラーを透過して spawn を失敗
+        させる — isolation を破った PaneRef を決して返さない。
+
+        返り値 ``(pane_id, terminal_id)``: 移送した時は post-move の id、しない時は着地
+        時の id。
+        """
+        terminal_id = agent.get("terminal_id")
+        landed_ws = agent.get("workspace_id") or self._workspace_of(pane_id)
+        if landed_ws == self._workspace_id:
+            # 直着地: param が honor された / たまたま専用 ws が focused。移送不要。
+            return pane_id, terminal_id
+        # DIVERGED: focused workspace に相乗り。専用 tab へ移送して隔離を回復する。
+        try:
+            res = self._client.request(
+                "pane.move",
+                {
+                    "pane_id": pane_id,
+                    "destination": {
+                        "type": "tab",
+                        "tab_id": self._tab_id,
+                        "split": "down",
+                    },
+                },
+            )
+        except HerdrError:
+            # 移送失敗: 取り残し pane を best-effort close (foreign ws の孤児を残さない)
+            # してから元エラーを透過する (broker が spawn 失敗として rollback する)。
+            try:
+                self._client.request("pane.close", {"pane_id": pane_id})
+            except HerdrError:
+                pass
+            raise
+        moved = (res.get("move_result") or {}).get("pane") or {}
+        new_pane_id = moved.get("pane_id")
+        if new_pane_id is None:
+            # move は受理されたが post-move id が取れない = schema/version 不一致。
+            # 移送済み pane は専用 ws 内 (少なくとも隔離側) なので internal を上げる。
+            raise HerdrError(
+                CODE_INTERNAL,
+                f"herdr pane.move: response missing post-move pane_id: {res!r}",
+            )
+        return new_pane_id, moved.get("terminal_id", terminal_id)
 
     # ------------------------------------------------------------------ list
     def list_panes(self) -> list[dict]:
@@ -561,6 +651,48 @@ class HerdrAdapter:
 
     def pane_exists(self, pane_id: str) -> bool:
         return any(p["pane_id"] == pane_id for p in self.list_panes())
+
+    def pane_liveness(
+        self, pane_id: str, terminal_id: str | None = None
+    ) -> str:
+        """workspace 非依存に pane の生存を **権威判定** する (Issue #114 Fix-D)。
+
+        :meth:`list_panes` / :meth:`pane_exists` は専用 workspace filter 越しの liveness
+        で、placement バグ (``agent.start`` が workspace param を無視して focused ws に
+        配置) や workspace 消失で **生 pane を構造的に欠落**させる。broker reaper がそれを
+        「消えた」と誤読すると生 dispatcher を close して殺す (本 Issue の isolation 崩壊)。
+
+        本メソッドは workspace を指定しない ``pane.get(pane_id)`` で pane の実在を直接引き、
+        spawn 時に記録した terminal_id と照合する:
+          - present かつ terminal_id 一致 -> :data:`PANE_LIVE_ALIVE` (我々の pane が生存。
+            誤 reap 禁止)。
+          - present だが terminal_id 不一致 -> :data:`PANE_LIVE_REUSED` (pane_id が別 pane
+            に再利用された。我々の pane は消滅。bookkeeping は掃除するが **その pane_id を
+            close してはならない** = 無関係 pane の巻き添え close 防止)。
+          - ``pane_not_found`` -> :data:`PANE_LIVE_GONE` (権威的に消滅。bookkeeping 掃除、
+            物理 close 不要)。
+          - socket 不通等 (adapter_unavailable / internal) -> :data:`PANE_LIVE_UNKNOWN`
+            (判定不能。reaper は defer し次ラウンドに委ねる)。
+
+        ``terminal_id`` が ``None`` (旧 spawn で未記録 / 移送で取れなかった) の時は照合を
+        省き present -> ALIVE 扱いにする (id 再利用ガードは効かないが workspace 非依存
+        liveness は効く。旧 registry entry を安全側に倒す)。
+        """
+        try:
+            res = self._client.request("pane.get", {"pane_id": pane_id})
+        except HerdrError as exc:
+            # pane_not_found / workspace_not_found はいずれも CODE_PANE_NOT_FOUND に
+            # 正規化される (= 権威的に不在)。それ以外 (adapter_unavailable/internal) は
+            # 判定不能。
+            if exc.code == CODE_PANE_NOT_FOUND:
+                return PANE_LIVE_GONE
+            return PANE_LIVE_UNKNOWN
+        pane = res.get("pane") or {}
+        got_tid = pane.get("terminal_id")
+        if terminal_id is not None and got_tid is not None and got_tid != terminal_id:
+            # pane_id は解決したが別プロセス = id 再利用。我々の pane は消えている。
+            return PANE_LIVE_REUSED
+        return PANE_LIVE_ALIVE
 
     # -------------------------------------------------------------- get-text
     def get_text(self, pane_id: str, escapes: bool = False) -> str:
