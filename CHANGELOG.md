@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-07-03
+
+> The paired `claude-org-ja` follow-up for this release is a runtime **pin
+> floor bump only** — no `org_extension_schema` / `DEFAULT_NOTIFY` / attention
+> vocabulary changes ship here, so ja needs no schema-drift or classifier
+> co-update. It runs in a separate PR alongside this release.
+
+### Added
+
+- `broker.send_keys` / `terminal`: the `send_keys` **named-key vocabulary is
+  expanded** to the Surface 1.9 contract — `Esc`, the arrow keys, `Shift+Tab`,
+  `Home`/`End`, `PageUp`/`PageDown`, `Delete`, and `Ctrl+A`..`Ctrl+Z` — beyond
+  the previous `Enter` / `Ctrl+C` / literal-text surface. The existing
+  `Enter` / `Ctrl+C` / literal-text paths are unchanged (backward compatible).
+  - `terminal.keys`: new module holding the single source of truth for the
+    canonical key vocabulary plus alias normalization (`normalize_key`; unknown
+    names are rejected at the surface with `-32602`). A drift test pins the
+    three-way invariant (alias targets ⊆ canonical, every backend map ⊆
+    canonical) so the vocabulary cannot silently fork across backends.
+  - `TerminalAdapter` gains a batch `send_named_keys(pane_id, keys)` and a
+    `supported_named_keys` ClassVar declaring the canonical subset each backend
+    can emit; `type_text` / `send_enter` / `send_interrupt` are untouched.
+  - `broker.send_keys_to` preflights the **entire** key batch against
+    `supported_named_keys` before emitting anything: if even one key is
+    unsupported the whole call is rejected with `[key_unsupported]` (no partial
+    keystrokes), and the send order stays `text -> keys -> enter`.
+  - Backend coverage: **tmux** maps the full canonical vocabulary to its tmux
+    key names (`BTab` / `BSpace` / `DC` / `PPage` / `NPage` / `Escape` …);
+    **Herdr** advertises the subset measured against a real server
+    (`delete` / `home` / `end` / `pageup` / `pagedown` return `invalid_key`, so
+    they are excluded); **WezTerm** advertises `{enter, ctrl+c}` only and
+    validates the batch all-or-nothing (a mixed batch emits nothing rather than
+    typing the supported prefix). This supersedes the 0.1.16 known limitation
+    where valid keys such as `Shift+Tab` returned `[key_unsupported]` on tmux.
+
 ### Fixed
 
 - `broker` + `terminal.herdr`: fix a compound blocker where the Herdr backend's
