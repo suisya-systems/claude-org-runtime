@@ -674,8 +674,32 @@ def test_launch_claude_windows_activates_root_cwd_venv(monkeypatch, tmp_path):
     scripts = launcher.venv_bin_dir(f"{tmp_path}/.venv")
     assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
     # Windows は argv を包まず、PATH を env dict に os.pathsep で前置する (%PATH% なし)。
+    # claude が venv Scripts に無い通常形では argv[0] は不変 (ambient PATH 解決のまま)。
     assert captured["argv"] == ["claude"]
     assert captured["env"]["PATH"].startswith(scripts + os.pathsep)
+
+
+def test_launch_claude_windows_resolves_exe_in_venv_scripts(monkeypatch, tmp_path):
+    """Codex P2: Windows subprocess.call は env= の PATH で argv[0] を解決しないため、
+    venv Scripts にしか無い実行体を明示解決する。venv 内でヒットしたら argv[0] を差し替える。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("")
+    fake_exe = str(tmp_path / ".venv" / "Scripts" / "claude.cmd")
+    # shutil.which(path=<venv Scripts>) が venv 内の実行体を返す状況を模す。
+    monkeypatch.setattr(
+        launcher.shutil, "which",
+        lambda cmd, path=None: fake_exe if cmd == "claude" else None,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        launcher.subprocess, "call",
+        lambda argv, *, env: captured.update(argv=argv, env=env) or 0,
+    )
+    launcher._launch_claude(["claude", "--x"], root_cwd=str(tmp_path))
+    # argv[0] は venv 内の実行体へ解決され、残りの引数は保たれる。
+    assert captured["argv"] == [fake_exe, "--x"]
+    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
 
 
 def test_launch_claude_omits_state_dir_when_not_given(monkeypatch):

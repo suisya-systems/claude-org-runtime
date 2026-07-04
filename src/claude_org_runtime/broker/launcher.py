@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -322,6 +323,16 @@ def _launch_claude(
         env["VIRTUAL_ENV"] = venv
         if os.name == "nt":
             env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+            # Windows subprocess.call resolves argv[0] against the CURRENT PATH,
+            # not env=, so a command that lives only in the venv Scripts dir
+            # would not be found (Codex P2). Resolve argv[0] against the venv bin
+            # dir and substitute only on a hit; on a miss argv[0] is unchanged so
+            # ambient-PATH resolution stays exactly as before (no regression for
+            # a globally-installed claude, the normal case). The POSIX branch is
+            # unaffected: execvpe(shell) resolves the exec'd argv via env's PATH.
+            venv_exe = shutil.which(argv[0], path=bin_dir)
+            if venv_exe:
+                argv = [venv_exe, *argv[1:]]
         else:
             # run_cwd = root_cwd so a login profile that cd's cannot move the
             # secretary out of its workspace root (self-review MINOR).
