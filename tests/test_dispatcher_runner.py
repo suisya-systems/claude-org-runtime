@@ -98,13 +98,25 @@ def test_rect_adjacent_no_overlap() -> None:
         ("%12", 12),
         ("  %3  ", 3),     # surrounding whitespace tolerated
         (" 4 ", 4),
+        ("w1W:p2", 2),      # Herdr handle (alphanumeric workspace segment)
+        ("w1:p1", 1),       # Herdr handle (numeric workspace segment)
+        ("w_live:p2", 2),   # Herdr handle (underscore in workspace segment)
+        ("w9:p99", 99),
+        ("w0:p0", 0),
+        ("  w1W:p2  ", 2),  # surrounding whitespace tolerated
     ],
 )
 def test_parse_pane_id_accepts_both_formats(raw: object, expected: int) -> None:
     assert _parse_pane_id(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["", "%", "%x", "abc", "1.0", "%-1", None, True])
+@pytest.mark.parametrize(
+    "raw",
+    ["", "%", "%x", "abc", "1.0", "%-1", None, True,
+     # Herdr-shaped but malformed: missing pane number, non-numeric pane
+     # segment, missing ``:p`` separator, or empty workspace segment.
+     "w1W:p", "w1W:px", "w1W", "w:p2", "w1W:2"],
+)
 def test_parse_pane_id_rejects_malformed(raw: object) -> None:
     with pytest.raises(ValueError):
         _parse_pane_id(raw)
@@ -246,6 +258,20 @@ def test_parse_panes_parses_tmux_pane_ids() -> None:
     assert [p.id for p in panes] == [0, 1]
 
 
+def test_parse_panes_parses_herdr_pane_handles() -> None:
+    # Issue #133: the Herdr backend's list_panes emits ``w<workspace>:p<pane>``
+    # handles (workspace segment alphanumeric). They must parse to the trailing
+    # pane number rather than being rejected as unrecognised pane ids (which
+    # dropped every Herdr dispatch into manual degraded mode).
+    panes = _parse_panes([
+        {"id": "w1W:p0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+        {"id": "w1W:p2", "name": "worker-x", "role": "worker",
+         "x": 200, "y": 0, "width": 100, "height": 50},
+    ])
+    assert [p.id for p in panes] == [0, 2]
+
+
 def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:
     # Curator too small to split (would fall under MIN_PANE_HEIGHT after
     # halving). The dispatcher is the primary split target (top priority) and
@@ -285,16 +311,18 @@ def test_choose_split_dispatcher_first_outranks_larger_pane() -> None:
     [
         pytest.param((1, 2, 3), id="renga-numeric"),
         pytest.param(("%0", "%1", "%2"), id="tmux-pane-id"),
+        pytest.param(("w1W:p0", "w1W:p1", "w1W:p2"), id="herdr-handle"),
     ],
 )
 def test_choose_split_identical_under_renga_and_tmux_ids(
     ids: tuple[object, object, object],
 ) -> None:
-    # Issue #60: the broker/tmux backend emits %N pane ids. The same layout
-    # parsed from numeric (renga) ids and from %N (tmux) ids must yield the
-    # identical balanced-split decision. The winner here is the dispatcher by
-    # role priority (not the id tie-breaker), so the choice is unambiguous and
-    # cannot diverge merely because tmux is 0-based and renga is 1-based.
+    # Issue #60/#133: the broker/tmux backend emits %N pane ids and the Herdr
+    # backend emits w<workspace>:p<pane> handles. The same layout parsed from
+    # numeric (renga) ids, from %N (tmux) ids and from Herdr handles must yield
+    # the identical balanced-split decision. The winner here is the dispatcher
+    # by role priority (not the id tie-breaker), so the choice is unambiguous
+    # and cannot diverge merely because the id encodings differ.
     cur, disp, sec = ids
     panes = _parse_panes([
         {"id": cur, "name": "curator", "role": "curator",
@@ -856,6 +884,39 @@ def test_cli_delegate_plan_accepts_tmux_pane_ids(tmp_path: Path) -> None:
     ])
     assert rc == 0
     assert (state_dir / "workers" / "worker-broker-demo.md").exists()
+
+
+def test_cli_delegate_plan_accepts_herdr_pane_handles(tmp_path: Path) -> None:
+    # Issue #133 end-to-end: a panes.json carrying Herdr w<workspace>:p<pane>
+    # handles must drive the automated spawn path (rc 0 + state files written),
+    # not be rejected as unrecognised pane ids and force every Herdr dispatch
+    # into the manual degraded fallback.
+    task = {
+        "task_id": "herdr-demo",
+        "worker_dir": str(tmp_path),
+        "instruction": "from herdr",
+        "task_description": "smoke",
+    }
+    panes = [
+        {"id": "w1W:p0", "name": "dispatcher", "role": "dispatcher",
+         "x": 0, "y": 0, "width": 200, "height": 50},
+        {"id": "w1W:p1", "name": "curator", "role": "curator",
+         "x": 200, "y": 0, "width": 100, "height": 50},
+    ]
+    task_path = tmp_path / "task.json"
+    panes_path = tmp_path / "panes.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    panes_path.write_text(json.dumps(panes), encoding="utf-8")
+
+    state_dir = tmp_path / ".state"
+    rc = main([
+        "delegate-plan",
+        "--task-json", str(task_path),
+        "--panes-json", str(panes_path),
+        "--state-dir", str(state_dir),
+    ])
+    assert rc == 0
+    assert (state_dir / "workers" / "worker-herdr-demo.md").exists()
 
 
 def test_cli_delegate_plan_accepts_broker_native_snapshot(tmp_path: Path) -> None:
