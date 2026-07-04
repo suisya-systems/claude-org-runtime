@@ -83,14 +83,18 @@ def test_org_up_reuses_live_healthy_daemon(live_daemon):
         spawn_calls.append((a, k))
         raise AssertionError("spawn_daemon must not run when reusing a live daemon")
 
-    def fake_launch(argv):
+    def fake_launch(argv, state_dir=None):
         captured["argv"] = argv
+        captured["state_dir"] = state_dir
         return 0
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
                          launch=fake_launch)
     assert rc == 0
     assert spawn_calls == []                       # 再利用 → 新規起動しない
+    # org_up threads the (absolutized) state_dir into launch so the root
+    # secretary env gets ORG_BROKER_STATE_DIR (#122).
+    assert captured["state_dir"] == sidecar.absolutize(state_dir)
     # secretary token が mint され、mcp-config が書かれ、argv が組まれた。
     cfg_path = os.path.join(state_dir, "secretary-mcp.json")
     cfg = json.loads(open(cfg_path, encoding="utf-8").read())
@@ -107,7 +111,7 @@ def test_org_up_reused_secretary_named_secretary(live_daemon):
     b, state_dir = live_daemon
     launcher.org_up(_up_args(state_dir, name="secretary"),
                     spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-                    launch=lambda argv: 0)
+                    launch=lambda argv, state_dir=None: 0)
     # mint された bind の agent_id は 'secretary' (root name 契約)。
     assert any(bnd.agent_id == "secretary" and bnd.auth_role == "secretary"
                for bnd in b._binds.values())
@@ -123,7 +127,7 @@ def test_org_up_noop_when_secretary_already_registered(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, name="secretary"),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
     )
     assert rc == 0
     assert launched == []                          # 二人目の secretary を起動しない
@@ -139,7 +143,7 @@ def test_org_up_errors_on_live_backend_conflict(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, backend=other),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
     )
     assert rc == 2                                 # 競合エラー
     assert launched == []                          # 起動しない
@@ -162,7 +166,7 @@ def test_org_up_fails_fast_on_herdr_native_windows(tmp_path, monkeypatch, capsys
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unsupported backend")
         ),
-        launch=lambda argv: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []                          # secretary TUI not launched
@@ -185,7 +189,7 @@ def test_org_up_errors_on_unknown_backend(tmp_path, capsys):
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unknown backend")
         ),
-        launch=lambda argv: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -210,7 +214,7 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
 
     captured = {}
 
-    def fake_launch(argv):
+    def fake_launch(argv, state_dir=None):
         captured["argv"] = argv
         return 0
 
@@ -292,7 +296,7 @@ def test_org_up_wires_channel_into_secretary(live_daemon):
     b, state_dir = live_daemon
     captured = {}
 
-    def fake_launch(argv):
+    def fake_launch(argv, state_dir=None):
         captured["argv"] = argv
         return 0
 
@@ -379,7 +383,7 @@ def test_org_up_does_not_cold_start_when_admin_token_missing(tmp_path, monkeypat
         raise AssertionError("must not spawn a second daemon over a claimed state_dir")
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
-                         launch=lambda argv: launched.append(argv) or 0)
+                         launch=lambda argv, state_dir=None: launched.append(argv) or 0)
     assert rc == 2                                 # token_missing → 明示エラー
     assert launched == []                          # TUI も起動しない
     assert not os.path.exists(os.path.join(state_dir, "secretary-mcp.json"))
@@ -458,7 +462,7 @@ def test_org_up_errors_when_mcp_surface_unhealthy(live_daemon, monkeypatch):
     rc = launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -471,7 +475,7 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
     launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv: 0,
+        launch=lambda argv, state_dir=None: 0,
     )
     # admin-* の probe bind は close() で registered=False に落ちている。
     registered_admin = [
@@ -587,4 +591,42 @@ def test_launch_claude_fallback_command_prefixes_broker_transport(monkeypatch, c
     rc = launcher._launch_claude(["claude", "--mcp-config", "{}"])
     assert rc == 0
     out = capsys.readouterr().out
+    assert "ORG_TRANSPORT=broker" in out
+
+
+def test_launch_claude_posix_exec_injects_broker_state_dir(monkeypatch):
+    """POSIX exec 経路: state_dir 指定時 ORG_BROKER_STATE_DIR(絶対) を子環境へ注入 (#122)。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(env=env),
+    )
+    launcher._launch_claude(["claude"], state_dir="/abs/state")
+    assert captured["env"]["ORG_BROKER_STATE_DIR"] == "/abs/state"
+    assert captured["env"]["ORG_TRANSPORT"] == "broker"
+
+
+def test_launch_claude_omits_state_dir_when_not_given(monkeypatch):
+    """state_dir 未指定 (既定 None) なら ORG_BROKER_STATE_DIR は注入しない (後方互換)。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(env=env),
+    )
+    launcher._launch_claude(["claude"])
+    assert "ORG_BROKER_STATE_DIR" not in captured["env"]
+
+
+def test_launch_claude_fallback_prefixes_state_dir(monkeypatch, capsys):
+    """claude 不在の 1 行コマンド fallback にも ORG_BROKER_STATE_DIR 前置を含める (#122)。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    monkeypatch.setattr(
+        launcher.subprocess, "call",
+        lambda argv, *, env: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    launcher._launch_claude(["claude"], state_dir="/abs/state")
+    out = capsys.readouterr().out
+    assert "ORG_BROKER_STATE_DIR=/abs/state" in out
     assert "ORG_TRANSPORT=broker" in out

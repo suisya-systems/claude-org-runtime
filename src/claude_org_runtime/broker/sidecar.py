@@ -144,6 +144,71 @@ def read_sidecar(state_dir: str | os.PathLike[str]) -> dict | None:
         return None
 
 
+def pid_alive(pid: int) -> bool:
+    """Best-effort liveness of a recorded ``daemon.json`` pid (Issue #122).
+
+    Used by ``broker send`` to decide whether an unreachable sidecar is likely a
+    *stale* record (daemon crashed / state dir mismatch) so it can print an
+    actionable hint. Conservative by design: return ``True`` on any uncertainty
+    so the ``stale sidecar?`` hint is only emitted when the pid is *confidently*
+    dead (a false hint is worse than a missing one). No ad-hoc probing lives in
+    ``notify.py``; this is the single best-effort helper (Codex review Major).
+
+    - POSIX: ``os.kill(pid, 0)`` -- ``ProcessLookupError`` means gone;
+      ``PermissionError`` means alive but not ours (still alive).
+    - Windows: ``OpenProcess`` + ``GetExitCodeProcess``. A terminated process
+      whose handle is still held (a zombie) keeps its pid *openable*, so opening
+      alone does not prove liveness -- we must read the exit code and treat only
+      ``STILL_ACTIVE`` (259) as alive. ``use_last_error=True`` + typed argtypes
+      keep the thread last-error read reliable across the ctypes boundary.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            ERROR_INVALID_PARAMETER = 87
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+            ]
+            kernel32.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            ]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # 87 => no such pid (dead). Anything else (e.g. ACCESS_DENIED)
+                # means it exists but we cannot open it -> assume alive.
+                return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+            try:
+                code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    # A held-handle zombie reports its real exit code (!= 259),
+                    # so it is correctly classified dead.
+                    return code.value == STILL_ACTIVE
+                return True  # cannot determine -> conservative alive
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - best-effort: never claim stale on error
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True  # best-effort: do not over-claim stale
+    return True
+
+
 def read_admin_token(state_dir: str | os.PathLike[str]) -> str | None:
     """admin.token を読む (無い / 空なら None)。
 

@@ -308,6 +308,29 @@ def test_spawn_creates_workspace_then_agent(server: FakeHerdrServer, tmp_path) -
     assert server.params_for("pane.close")["pane_id"] == "w1:p1"
 
 
+def test_spawn_injects_env_into_agent_start_params(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Issue #122: Herdr protocol supports env injection via agent.start's `env`
+    # param (socket spike). The broker threads ORG_BROKER_STATE_DIR through here.
+    _wire_spawn(server, pane_id="w1:p2")
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path),
+            env={"ORG_BROKER_STATE_DIR": "/abs/state"})
+    assert server.params_for("agent.start")["env"] == {
+        "ORG_BROKER_STATE_DIR": "/abs/state"
+    }
+
+
+def test_spawn_without_env_omits_agent_start_env_param(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    _wire_spawn(server, pane_id="w1:p2")
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path))  # no env -> no param (backward compat)
+    assert "env" not in server.params_for("agent.start")
+
+
 def test_spawn_second_reuses_workspace_no_recreate(
     server: FakeHerdrServer, tmp_path
 ) -> None:

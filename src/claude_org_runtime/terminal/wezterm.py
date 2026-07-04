@@ -44,6 +44,30 @@ from .base import (  # noqa: F401
 WEZTERM_DEFAULT_EXE = r"C:\Program Files\WezTerm\wezterm.exe"
 
 
+def _env_wrapped_argv(argv: list[str], env: dict[str, str] | None) -> list[str]:
+    """argv を「環境変数を先に設定してから argv を exec する」形に包む (Issue #122)。
+
+    WezTerm の ``cli spawn`` は起動プログラムの環境を mux サーバー環境から引くため、
+    ``subprocess.run(env=...)`` (cli クライアント側の env) は pane プロセスに届かない。
+    そこで **起動する argv 自体** に env 設定を織り込む (design review が言う
+    wezterm=argv 経路)。``env`` が空 / None なら argv をそのまま返す (完全に従来挙動)。
+
+    - POSIX: ``env KEY=VALUE ... <argv>`` (``env`` は最初の非オプション語で option 解析を
+      止めるので ``--`` は不要)。
+    - native Windows: ``cmd /d /c set "KEY=VALUE"&& <argv>`` (Windows には ``env`` が無い)。
+      ``set`` は cmd 組込みなので追加バイナリ依存を持ち込まない。
+
+    値は追加分のみを重ねる (親環境全体を渡さない)。default-deny guard は
+    :func:`surface.build_claude_argv` で **包む前** の argv に既に適用済み。
+    """
+    if not env:
+        return list(argv)
+    if os.name == "nt":
+        assigns = "".join(f'set "{k}={v}"&& ' for k, v in env.items())
+        return ["cmd", "/d", "/c", assigns + subprocess.list2cmdline(argv)]
+    return ["env", *(f"{k}={v}" for k, v in env.items()), *argv]
+
+
 def find_wezterm() -> str:
     """PATH 優先、無ければ winget 既定の絶対パス (CLAUDE.md 記載) を使う。"""
     exe = shutil.which("wezterm")
@@ -135,6 +159,7 @@ class WezTermAdapter:
         argv: list[str],
         cwd: str | None = None,
         new_window: bool = True,
+        env: dict[str, str] | None = None,
     ) -> PaneRef:
         """新しい pane を spawn し PaneRef を返す。
 
@@ -150,6 +175,10 @@ class WezTermAdapter:
 
         new_window=False は集約を行わず、現在ペインのウィンドウへ spawn する
         (--new-window も --window-id も付けない既存挙動)。
+
+        ``env`` (Issue #122): pane プロセスへ追加注入する環境変数。WezTerm では起動
+        argv に env 設定を織り込む (:func:`_env_wrapped_argv`。``subprocess.run(env=)``
+        は mux が pane に届けないため)。空 / None なら従来どおり argv をそのまま起動する。
 
         並行 spawn 時もアンカー判定〜記録が直列化されるよう _spawn_lock 下で
         実行する (Codex review Major、_spawn_lock 参照)。
@@ -171,7 +200,7 @@ class WezTermAdapter:
                     opened_new_window = True
             if cwd:
                 args += ["--cwd", cwd]
-            args += ["--", *argv]
+            args += ["--", *_env_wrapped_argv(argv, env)]
             proc = self._cli(*args)
             pane_id = int(proc.stdout.strip())
             ref = PaneRef(pane_id=pane_id)

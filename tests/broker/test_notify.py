@@ -208,13 +208,113 @@ def test_top_level_cli_routes_to_broker_send(tmp_path):
     assert rc != 0  # daemon 不在 = 未配送。例外は漏れない。
 
 
+# ============================================ state-dir resolution (Issue #122)
+def test_resolve_state_dir_precedence(monkeypatch):
+    """flag > ORG_BROKER_STATE_DIR env > default (#122)。"""
+    monkeypatch.delenv(notify.STATE_DIR_ENV, raising=False)
+    # 1) flag wins over both env and default.
+    monkeypatch.setenv(notify.STATE_DIR_ENV, "/from/env")
+    assert notify._resolve_state_dir("/from/flag") == "/from/flag"
+    # 2) env used when flag omitted (None sentinel).
+    assert notify._resolve_state_dir(None) == "/from/env"
+    # 3) default when neither flag nor env is set.
+    monkeypatch.delenv(notify.STATE_DIR_ENV, raising=False)
+    assert notify._resolve_state_dir(None) == notify.DEFAULT_STATE_DIR
+    # 4) empty env is treated as unset (falls back to default).
+    monkeypatch.setenv(notify.STATE_DIR_ENV, "")
+    assert notify._resolve_state_dir(None) == notify.DEFAULT_STATE_DIR
+
+
+def test_send_uses_env_state_dir_when_flag_omitted(live_daemon, monkeypatch):
+    """--state-dir 省略時、ORG_BROKER_STATE_DIR env の daemon に配送できる (#122)。
+
+    これが本タスクの本丸: 非既定 state-dir の daemon が spawn した pane 内 subprocess は
+    flag を付けずとも env 経由でその daemon の queue を発見する。
+    """
+    b, state_dir = live_daemon
+    recip_tok = _register_recipient(b, "alice")
+    monkeypatch.setenv(notify.STATE_DIR_ENV, str(state_dir))
+    # state_dir=None sentinel = flag 未指定。env の state_dir に解決される。
+    args = argparse.Namespace(to="alice", message="via-env", state_dir=None)
+    rc = notify.broker_send(args)
+    assert rc == 0
+    assert [m["message"] for m in b.drain(b.get_bind(recip_tok))] == ["via-env"]
+
+
+def test_send_flag_beats_env(live_daemon, monkeypatch):
+    """明示 --state-dir は env を上書きする (#122 の解決順)。"""
+    b, state_dir = live_daemon
+    recip_tok = _register_recipient(b, "alice")
+    # env は誤った空 dir を指すが、flag が正しい daemon を指すので配送成功する。
+    monkeypatch.setenv(notify.STATE_DIR_ENV, str(Path(state_dir).parent / "wrong"))
+    rc = notify.broker_send(_send_args(state_dir, to="alice", message="via-flag"))
+    assert rc == 0
+    assert [m["message"] for m in b.drain(b.get_bind(recip_tok))] == ["via-flag"]
+
+
+def test_send_stale_hint_when_pid_dead(tmp_path, monkeypatch, capsys):
+    """記録 pid が非生存で unreachable なら stale sidecar hint を stderr に足す (#122)。"""
+    state_dir = str(tmp_path / "broker")
+    b = Broker(state_dir=state_dir, adapter=None, port=0, admin_token="ADMIN-SECRET")
+    b.start()
+    _write_sidecar(state_dir, b.host, b.port)
+    b.stop()  # 到達不能にする (admin RPC は URLError)
+    # 記録 pid を「確実に非生存」と判定させる (実 pid_alive の deterministic な代役)。
+    monkeypatch.setattr(notify.sidecar, "pid_alive", lambda _pid: False)
+    rc = notify.broker_send(_send_args(state_dir, to="alice", message="x"))
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "stale sidecar?" in err
+    assert notify.STATE_DIR_ENV in err  # actionable: names flag + env
+    err.encode("ascii")  # hint は ASCII (cp932 安全)
+
+
+def test_send_no_stale_hint_when_pid_alive(tmp_path, monkeypatch, capsys):
+    """記録 pid が生存中なら (transient な connect 失敗) hint は出さない (#122)。"""
+    state_dir = str(tmp_path / "broker")
+    b = Broker(state_dir=state_dir, adapter=None, port=0, admin_token="ADMIN-SECRET")
+    b.start()
+    _write_sidecar(state_dir, b.host, b.port)
+    b.stop()
+    monkeypatch.setattr(notify.sidecar, "pid_alive", lambda _pid: True)
+    rc = notify.broker_send(_send_args(state_dir, to="alice", message="x"))
+    assert rc != 0
+    assert "stale sidecar?" not in capsys.readouterr().err
+
+
+def test_send_stale_hint_on_mcp_surface_leg(live_daemon, monkeypatch, capsys):
+    """MCP send leg が unreachable + 記録 pid 非生存でも hint を出す (#122)。
+
+    mint は成功させ、その後の MCP surface leg だけ URLError にして、mint leg とは別の
+    hint site (notify.py の send 経路) を独立に固定する (両 leg が drift しない保険)。
+    """
+    import urllib.error
+
+    b, state_dir = live_daemon
+    _register_recipient(b, "alice")
+    monkeypatch.setattr(
+        notify._McpClient, "initialize",
+        lambda self: (_ for _ in ()).throw(urllib.error.URLError("mcp down")),
+    )
+    monkeypatch.setattr(notify.sidecar, "pid_alive", lambda _pid: False)
+    rc = notify.broker_send(_send_args(state_dir, to="alice", message="x"))
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "MCP surface unreachable" in err
+    assert "stale sidecar?" in err
+
+
 # ====================================================================== wiring
 def test_send_parser_defaults_and_required():
     parser = broker_cli.build_parser()
     args = parser.parse_args(["send", "--to", "x", "--message", "y"])
     assert args.to == "x"
     assert args.message == "y"
-    assert args.state_dir == notify.DEFAULT_STATE_DIR == ".state/broker"
+    # --state-dir now defaults to None (sentinel) so an explicit flag is
+    # distinguishable from omission; resolution happens in _resolve_state_dir
+    # with precedence flag > ORG_BROKER_STATE_DIR env > DEFAULT_STATE_DIR (#122).
+    assert args.state_dir is None
+    assert notify.DEFAULT_STATE_DIR == ".state/broker"
     assert args.func is notify.broker_send
 
 

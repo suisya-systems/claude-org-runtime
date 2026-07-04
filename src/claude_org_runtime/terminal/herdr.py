@@ -738,6 +738,7 @@ class HerdrAdapter:
         cwd: str | None = None,
         new_window: bool = True,
         space: SpaceDescriptor | None = None,
+        env: dict[str, str] | None = None,
     ) -> PaneRef:
         """argv を space の workspace/tab に起動し PaneRef を返す (戦略 C)。
 
@@ -748,6 +749,10 @@ class HerdrAdapter:
           tab へ移送する (probe 6a: agent.start は focused に相乗り / 6c: move 可)。
         - ``new_window`` は tmux/wezterm 面との互換のため受けるが Herdr では space の
           workspace/tab に置く。
+        - ``env`` (Issue #122): pane プロセスへ追加注入する環境変数。Herdr protocol は
+          ``agent.start`` の ``env`` param で任意 env 注入をサポートする (socket spike
+          実測、knowledge/curated/herdr.md)。Herdr が自動注入する ``HERDR_*`` の上に
+          重なる。空 / None なら param を付けない (従来挙動)。
         """
         if cwd is not None and not os.path.isdir(cwd):
             raise HerdrError(
@@ -773,6 +778,8 @@ class HerdrAdapter:
                 }
                 if cwd:
                     params["cwd"] = cwd
+                if env:
+                    params["env"] = dict(env)
                 res = self._client.request("agent.start", params)
                 agent = res.get("agent") or {}
                 pane_id = agent.get("pane_id")
