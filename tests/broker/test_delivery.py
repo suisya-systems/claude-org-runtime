@@ -364,6 +364,34 @@ def test_old_generation_confirm_rejected(tmp_path):
     assert _row_states(b, "dst") == [DELIVERED]
 
 
+def test_stale_instance_cannot_replay_current_generation(tmp_path):
+    """Codex review P2: stale sidecar は stale_sidecar 応答で現世代番号を知りうるが、
+    その番号を自分の instance_id で replay しても daemon が instance を照合して拒否する
+    (真に daemon 側で単一 claimer を強制)。現 instance の live claim も剥がさない。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    b.register_delivery_instance(dc, "old")            # generation 1
+    reg_new = b.register_delivery_instance(dc, "new")  # generation 2 (現世代 instance=new)
+    cur_gen = reg_new["generation"]
+    b.enqueue(src, "dst", "x")
+    # 現世代 sidecar が claim (row は new の live claim)。
+    claimed = b.poll_claims(dc, cur_gen, "new")
+    rid = claimed["rows"][0]["id"]
+    assert _row_states(b, "dst") == [CLAIMED]
+    # stale (old) が漏れた現世代番号 2 を自分の instance_id で replay -> それでも拒否。
+    replay = b.poll_claims(dc, cur_gen, "old")
+    assert replay["error"] == "stale_sidecar" and replay["rows"] == []
+    assert _row_states(b, "dst") == [CLAIMED]   # new の claim は無傷
+    # stale が現世代番号で confirm を試みても拒否し、new の claim を剥がさない。
+    conf = b.confirm_delivered(dc, rid, claimed["epoch"], cur_gen, "old")
+    assert conf["error"] == "stale_sidecar"
+    assert _row_states(b, "dst") == [CLAIMED]   # 依然 new の live claim
+    # 現世代 (new) の confirm は成功する (剥がされていない証拠)。
+    assert b.confirm_delivered(dc, rid, claimed["epoch"], cur_gen, "new")["ok"] is True
+    assert _row_states(b, "dst") == [DELIVERED]
+
+
 def test_register_requeues_old_generation_claim(tmp_path):
     """Issue #125 Blocker #3: 新 generation register で旧 CLAIMED を UNDELIVERED へ即戻す
     (lease 失効を待たない)。"""

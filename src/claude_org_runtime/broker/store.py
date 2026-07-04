@@ -357,8 +357,15 @@ class StoreMixin:
             # 「二重 sidecar が生きている」シグナルを残す — Major #5 / #10)。
             dup_journal = self._note_poll_locked(owner, instance_id, now)
             cur_gen = self._generation_of(owner)
-            if cur_gen == 0 or generation != cur_gen:
-                # 未登録 (cur_gen==0) / 旧世代の sidecar。claim を発行しない (fence)。
+            cur_instance = self._delivery_instances.get(owner)
+            if (cur_gen == 0 or generation != cur_gen
+                    or instance_id != cur_instance):
+                # 未登録 (cur_gen==0) / 旧世代 / 別 instance の sidecar。claim を発行
+                # しない (fence)。**instance_id も照合する** のが要: stale sidecar は
+                # stale_sidecar 応答で現世代番号を知りうるため、generation だけの照合は
+                # 現世代番号を replay されると破れる。現 instance_id は応答に載せず daemon
+                # だけが持つ (register 済の唯一の claimer 識別子) ので、これを一致条件に
+                # 加えることで daemon 側で真に単一 claimer を強制する (Codex review P2)。
                 result: dict = {"error": "stale_sidecar", "rows": [],
                                 "generation": cur_gen}
             else:
@@ -419,17 +426,23 @@ class StoreMixin:
             reaped = self._reap_locked()
             cur_epoch = self._epoch_of(owner)
             cur_gen = self._generation_of(owner)
+            cur_instance = self._delivery_instances.get(owner)
             row = self._rows.get(rid)
             if row is None:
                 result: dict = {"ok": False, "error": "unknown_row"}
             elif row.to_id != owner:
                 result = {"ok": False, "error": "not_owner"}
-            elif cur_gen == 0 or generation != cur_gen:
-                # stale sidecar (superseded by newer generation / 未登録)。拒否し、
-                # **この stale sidecar 自身の live claim だけ** を再 eligible 化する
-                # (現世代 sidecar の claim は claim_generation で守られ剥がれない)。
-                # register 側の差し戻しと二重でも冪等 (既に UNDELIVERED なら no-op)。
-                if (row.state == CLAIMED and row.owner == owner
+            elif (cur_gen == 0 or generation != cur_gen
+                    or instance_id != cur_instance):
+                # stale sidecar (superseded / 未登録 / 別 instance)。拒否する。
+                # instance_id も照合する (poll と同じ理由: 現世代番号 replay 防止。P2)。
+                # 再 eligible 化は **世代番号が真に古い (generation != cur_gen) 呼び手の
+                # 自分の claim だけ** に限る: 同世代・別 instance の呼び手 (現世代番号を
+                # replay した stale) が現 instance の live claim (claim_generation ==
+                # cur_gen) を剥がしてはならない。register 側の即差し戻しが主で、これは
+                # lease 遅延回避の保険 (既に UNDELIVERED なら no-op で冪等)。
+                if (generation != cur_gen and row.state == CLAIMED
+                        and row.owner == owner
                         and row.claim_generation == generation):
                     row.state = UNDELIVERED
                     row.owner = None
