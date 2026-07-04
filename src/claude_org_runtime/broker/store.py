@@ -76,6 +76,7 @@ class QueueRow:
     lease_until: float = 0.0
     owner: str | None = None         # CLAIMED 中の drainer (delivery cred の owner)
     claim_epoch: int = -1            # claim 時の mode-epoch (fencing 用)
+    claim_generation: int = -1       # claim 時の delivery generation (session fencing 用)
     reclaim_count: int = 0           # lease reap で UNDELIVERED へ戻った回数
     enqueued_at: float = 0.0
 
@@ -94,6 +95,12 @@ class StoreMixin:
     _rows: dict[str, QueueRow]
     _delivery_modes: dict[str, str]   # agent_id -> PUSH/PULL (既定 PUSH)
     _epochs: dict[str, int]           # agent_id -> mode-epoch (既定 0)
+    # session-scoped delivery fencing (Issue #125)。owner -> 現世代 / 現世代 instance。
+    _delivery_generations: dict[str, int]   # owner -> current delivery generation (既定 0)
+    _delivery_instances: dict[str, str]     # owner -> current-generation sidecar instance id
+    # duplicate-claimer 検知: owner -> {instance_id: last poll ts} と emit cooldown。
+    _delivery_poll_seen: dict[str, dict[str, float]]
+    _duplicate_emit_at: dict[tuple[str, str, str], float]  # (owner, iA, iB) -> last emit ts
     state_dir: Path
     lease_seconds: float
     reclaim_warn_threshold: int
@@ -113,6 +120,49 @@ class StoreMixin:
     def _epoch_of(self, agent_id: str) -> int:
         """agent の mode-epoch (既定 0)。**caller が _lock を保持中に呼ぶ**。"""
         return self._epochs.get(agent_id, 0)
+
+    def _generation_of(self, owner: str) -> int:
+        """owner の delivery generation (既定 0 = 未登録)。**_lock 保持中に呼ぶ**。
+
+        session-scoped fencing (Issue #125): channel sidecar は起動時に
+        :meth:`register_delivery_instance` で generation を +1 し自分を現世代に登録
+        する。0 は「まだどの sidecar も register していない」= claim 不可を表す。
+        """
+        return self._delivery_generations.get(owner, 0)
+
+    def _note_poll_locked(
+        self, owner: str, instance_id: str, now: float
+    ) -> list[tuple[str, dict]]:
+        """poll した sidecar instance を記録し duplicate claimer を検知する。
+
+        **_lock 保持中に呼ぶ** (I/O はしない)。lease window 内に owner へ複数の
+        distinct instance が poll したら duplicate とみなし、``duplicate_sidecar_detected``
+        の journal イベントタプルを return する (呼び元が lock 解放後に journal)。
+        毎 poll のスパムを避けるため instance pair ごと cooldown (= lease window) を
+        置く (Codex review Minor #10)。stale 世代の poll も記録する: fence で claim は
+        拒否されても「二重 sidecar が生きている」運用シグナルは残す (Major #5)。
+        """
+        window = self.lease_seconds
+        # emit cooldown / seen map を lease window で prune (無制限成長を防ぐ)。
+        for k in [k for k, ts in self._duplicate_emit_at.items() if now - ts > window]:
+            del self._duplicate_emit_at[k]
+        seen = self._delivery_poll_seen.setdefault(owner, {})
+        for iid in [i for i, ts in seen.items() if now - ts > window]:
+            del seen[iid]
+        others = [i for i in seen if i != instance_id]
+        seen[instance_id] = now
+        journal: list[tuple[str, dict]] = []
+        for other in others:
+            lo, hi = sorted((instance_id, other))
+            key = (owner, lo, hi)
+            last = self._duplicate_emit_at.get(key, 0.0)
+            if now - last > window:
+                self._duplicate_emit_at[key] = now
+                journal.append((
+                    "duplicate_sidecar_detected",
+                    {"owner": owner, "instances": [lo, hi]},
+                ))
+        return journal
 
     def _delivery_owner_locked(self, token: str) -> str | None:
         """delivery cred token を owner へ解決し **liveness を検証** する。
@@ -240,59 +290,126 @@ class StoreMixin:
             self._journal("queue_drained", agent_id=bind.agent_id, count=len(out))
         return out
 
+    # ------------------------------------------------------ delivery register
+    def register_delivery_instance(self, token: str, instance_id: str) -> dict:
+        """channel sidecar instance を登録し owner の delivery generation を +1 する。
+
+        session-scoped fencing (Issue #125): session fork/resume で **同一 delivery
+        cred** を持つ sidecar が二重に生きうる (cred は replay で同一なので token だけ
+        では新旧を識別できない — Codex review Blocker #1)。sidecar は起動時に本 endpoint
+        を叩き、daemon は owner の generation を単調 +1 して呼び手の ``instance_id`` を
+        現世代の claimer として記録する。以後の :meth:`poll_claims` /
+        :meth:`confirm_delivered` は **現世代のみ** 許可し、旧世代 (fork 元 / 古い session)
+        の sidecar を fence する。
+
+        ``token`` は delivery cred で owner を **_lock 下で**解決する (revoke fence と
+        同型)。旧世代の in-flight ``CLAIMED`` 行は ``UNDELIVERED`` へ即差し戻す
+        (:meth:`flip_mode` の原子的 flip と同型 — lease 失効を待たず新 sidecar / pull で
+        再配達させる。Codex review Blocker #3)。register 応答で generation を返し、
+        sidecar はこれを以後の poll/confirm に載せる。
+        """
+        journal: tuple[str, dict] | None = None
+        owner: str | None = None
+        with self._lock:
+            owner = self._delivery_owner_locked(token)
+            if owner is None:
+                return {"ok": False, "error": "unauthorized"}
+            gen = self._generation_of(owner) + 1
+            self._delivery_generations[owner] = gen
+            self._delivery_instances[owner] = instance_id
+            # 旧世代の CLAIMED 行を差し戻す (新 generation != claim_generation の全て)。
+            for row in self._rows.values():
+                if (row.state == CLAIMED and row.to_id == owner
+                        and row.claim_generation != gen):
+                    row.state = UNDELIVERED
+                    row.owner = None
+            journal = ("delivery_generation_registered",
+                       {"owner": owner, "generation": gen, "instance": instance_id})
+        if journal is not None:
+            self._journal(journal[0], **journal[1])
+        return {"ok": True, "owner": owner, "generation": gen,
+                "instance_id": instance_id}
+
     # ----------------------------------------------------------- poll-claims
-    def poll_claims(self, token: str) -> dict:
+    def poll_claims(self, token: str, generation: int, instance_id: str) -> dict:
         """delivery-scoped credential で owner 宛 ``UNDELIVERED`` 行を claim して返す。
 
         ``token`` は **delivery cred** で、owner は token から **_lock 下で**解決+検証
         する (revoke を claim 発行に対する原子的 fence にする。Codex review Major)。
-        §9.3 claim-with-lease: 各行を ``CLAIMED(lease=now+T, owner, epoch=現 mode-epoch)``
-        にして返す。PUSH->PULL flip 後 (mode != PUSH) は **新規 claim の発行を拒否**
-        する (claim-issuance ゲート)。返す各行は ``{id, entry, epoch}``。
+        ``generation`` / ``instance_id`` は :meth:`register_delivery_instance` の応答で
+        得た session-scoped fencing 値で、**現世代のみ** claim を許可する (旧 session /
+        fork 元の sidecar は ``stale_sidecar`` で拒否 — Issue #125)。§9.3 claim-with-lease:
+        各行を ``CLAIMED(lease=now+T, owner, epoch=現 mode-epoch, generation)`` にして
+        返す。PUSH->PULL flip 後 (mode != PUSH) は **新規 claim の発行を拒否** する。
+        返す各行は ``{id, entry, epoch}``。
         """
+        reaped: list[tuple[str, int]] = []
+        dup_journal: list[tuple[str, dict]] = []
+        claimed: list[dict] = []
+        claimed_epoch = 0
+        owner: str | None = None
         with self._lock:
             owner = self._delivery_owner_locked(token)
             if owner is None:
                 return {"error": "unauthorized", "rows": []}
-            mode = self._mode_of(owner)
-            epoch = self._epoch_of(owner)
-            if mode != PUSH:
-                return {"error": "push_disabled", "rows": [], "epoch": epoch}
-            if not self._owner_registered_locked(owner):
-                # 受信側 session が live でない (initialize 前 / do_DELETE 後)。claim を
-                # 発行せず行を UNDELIVERED のまま残す: re-initialize で registered に
-                # 戻れば次 poll で claim され、フォールバックの check_messages も同行を
-                # 拾える。死にかけ session への emit->confirm 喪失窓を閉じる (Codex Major)。
-                return {"error": "owner_unregistered", "rows": [], "epoch": epoch}
-            reaped = self._reap_locked()
             now = time.time()
-            claimed: list[dict] = []
-            for row in self._rows.values():
-                if row.state == UNDELIVERED and row.to_id == owner:
-                    row.state = CLAIMED
-                    row.lease_until = now + self.lease_seconds
-                    row.owner = owner
-                    row.claim_epoch = epoch
-                    claimed.append(
-                        {"id": row.id, "entry": row.entry, "epoch": epoch}
-                    )
+            # 記録 + duplicate 検知は fence 判定より前に行う (stale 世代の poll でも
+            # 「二重 sidecar が生きている」シグナルを残す — Major #5 / #10)。
+            dup_journal = self._note_poll_locked(owner, instance_id, now)
+            cur_gen = self._generation_of(owner)
+            if cur_gen == 0 or generation != cur_gen:
+                # 未登録 (cur_gen==0) / 旧世代の sidecar。claim を発行しない (fence)。
+                result: dict = {"error": "stale_sidecar", "rows": [],
+                                "generation": cur_gen}
+            else:
+                mode = self._mode_of(owner)
+                epoch = self._epoch_of(owner)
+                if mode != PUSH:
+                    result = {"error": "push_disabled", "rows": [], "epoch": epoch}
+                elif not self._owner_registered_locked(owner):
+                    # 受信側 session が live でない (initialize 前 / do_DELETE 後)。claim を
+                    # 発行せず行を UNDELIVERED のまま残す: re-initialize で registered に
+                    # 戻れば次 poll で claim され、check_messages も同行を拾える。死にかけ
+                    # session への emit->confirm 喪失窓を閉じる (Codex Major)。
+                    result = {"error": "owner_unregistered", "rows": [], "epoch": epoch}
+                else:
+                    reaped = self._reap_locked()
+                    for row in self._rows.values():
+                        if row.state == UNDELIVERED and row.to_id == owner:
+                            row.state = CLAIMED
+                            row.lease_until = now + self.lease_seconds
+                            row.owner = owner
+                            row.claim_epoch = epoch
+                            row.claim_generation = generation
+                            claimed.append(
+                                {"id": row.id, "entry": row.entry, "epoch": epoch}
+                            )
+                    claimed_epoch = epoch
+                    result = {"rows": claimed, "epoch": epoch}
         self._journal_reaped(reaped)
+        for ev, fields in dup_journal:
+            self._journal(ev, **fields)
         if claimed:
             self._journal(
                 "claimed", owner=owner,
-                ids=[c["id"] for c in claimed], epoch=epoch,
+                ids=[c["id"] for c in claimed], epoch=claimed_epoch,
             )
-        return {"rows": claimed, "epoch": epoch}
+        return result
 
     # ------------------------------------------------------- confirm-delivered
-    def confirm_delivered(self, token: str, rid: str, epoch: int) -> dict:
+    def confirm_delivered(
+        self, token: str, rid: str, epoch: int, generation: int, instance_id: str
+    ) -> dict:
         """emit が resolve した行を ``DELIVERED`` に確定する (id で冪等、§9.3)。
 
         ``token`` は **delivery cred** で、owner は token から **_lock 下で**解決+検証
         する (revoke を confirm に対する原子的 fence にする。Codex review Major)。
         confirm は **live な claim** に紐づくことを daemon が強制する: 未 claim /
-        lease reap 後 / 別 owner・別 epoch の claim は確定できない。stale epoch
-        (mode flip があった) は当該行を再 eligible 化して拒否する (mode-epoch fencing)。
+        lease reap 後 / 別 owner・別 epoch・別 generation の claim は確定できない。
+        stale generation (旧 session / fork 元の sidecar) は当該 claim を再 eligible 化
+        して ``stale_sidecar`` で拒否する (session fencing — 旧 sidecar が register 前に
+        claim した行を後から confirm できないようにする。Codex review Blocker #2)。
+        stale epoch (mode flip) は従来どおり mode-epoch fencing で拒否する。
         """
         journal: tuple[str, dict] | None = None
         with self._lock:
@@ -301,11 +418,24 @@ class StoreMixin:
                 return {"ok": False, "error": "unauthorized"}
             reaped = self._reap_locked()
             cur_epoch = self._epoch_of(owner)
+            cur_gen = self._generation_of(owner)
             row = self._rows.get(rid)
             if row is None:
                 result: dict = {"ok": False, "error": "unknown_row"}
             elif row.to_id != owner:
                 result = {"ok": False, "error": "not_owner"}
+            elif cur_gen == 0 or generation != cur_gen:
+                # stale sidecar (superseded by newer generation / 未登録)。拒否し、
+                # **この stale sidecar 自身の live claim だけ** を再 eligible 化する
+                # (現世代 sidecar の claim は claim_generation で守られ剥がれない)。
+                # register 側の差し戻しと二重でも冪等 (既に UNDELIVERED なら no-op)。
+                if (row.state == CLAIMED and row.owner == owner
+                        and row.claim_generation == generation):
+                    row.state = UNDELIVERED
+                    row.owner = None
+                journal = ("confirm_stale_sidecar",
+                           {"id": rid, "row_generation": generation, "cur": cur_gen})
+                result = {"ok": False, "error": "stale_sidecar", "generation": cur_gen}
             elif epoch != cur_epoch:
                 # stale epoch (PUSH<->PULL flip があった) -> 拒否。再 eligible 化は
                 # **この stale confirm に対応する claim だけ** に限る: 行が既に新しい
@@ -323,7 +453,8 @@ class StoreMixin:
             elif row.state == DELIVERED:
                 result = {"ok": True, "idempotent": True}   # 冪等
             elif (row.state != CLAIMED or row.owner != owner
-                    or row.claim_epoch != epoch):
+                    or row.claim_epoch != epoch
+                    or row.claim_generation != generation):
                 result = {"ok": False, "error": "not_claimed",
                           "state": row.state, "owner": row.owner}
             else:
@@ -398,6 +529,13 @@ class StoreMixin:
         with self._lock:
             self._delivery_modes.pop(owner, None)
             self._epochs.pop(owner, None)
+            # session-scoped fencing state も落とす (Issue #125 Major #8): 残ると同名
+            # respawn 後に誤 fence (旧 generation を継承) / 誤 duplicate 検知になる。
+            self._delivery_generations.pop(owner, None)
+            self._delivery_instances.pop(owner, None)
+            self._delivery_poll_seen.pop(owner, None)
+            for k in [k for k in self._duplicate_emit_at if k[0] == owner]:
+                del self._duplicate_emit_at[k]
             for row in self._rows.values():
                 if row.state == CLAIMED and row.to_id == owner:
                     row.state = UNDELIVERED
@@ -419,6 +557,10 @@ class StoreMixin:
                 "by_state": by_state,
                 "modes": dict(self._delivery_modes),
                 "epochs": dict(self._epochs),
+                # session-scoped fencing 診断 (Issue #125 Minor #9): owner ごとの
+                # 現世代と active instance を出す (二重 sidecar / stale fence の切り分け)。
+                "generations": dict(self._delivery_generations),
+                "instances": dict(self._delivery_instances),
                 "rows": [
                     {"id": r.id, "to_id": r.to_id, "state": r.state,
                      "owner": r.owner, "reclaim": r.reclaim_count}

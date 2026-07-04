@@ -58,25 +58,36 @@ def _row_states(b: Broker, to_id: str) -> list[str]:
     return [r.state for r in b._rows.values() if r.to_id == to_id]
 
 
+def _sidecar(b: Broker, owner: str, instance: str = "i1"):
+    """delivery cred を発行し 1 つの sidecar instance を register する (Issue #125)。
+
+    session-scoped fencing で poll/confirm は register 済 generation を要求するため、
+    テストはまず register してから (cred, generation, instance) を得る。
+    """
+    dc = b.issue_delivery_cred(owner)
+    reg = b.register_delivery_instance(dc, instance)
+    return dc, reg["generation"], instance
+
+
 # ===================================================================== R4 store
 def test_claim_then_confirm_lifecycle(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     src, dst = _registered(b, "src"), _registered(b, "dst")
-    dc = b.issue_delivery_cred("dst")
+    dc, gen, iid = _sidecar(b, "dst")
     b.enqueue(src, "dst", "hello")
     assert _row_states(b, "dst") == [UNDELIVERED]
 
-    res = b.poll_claims(dc)
+    res = b.poll_claims(dc, gen, iid)
     assert len(res["rows"]) == 1 and res["epoch"] == 0
     rid = res["rows"][0]["id"]
     assert res["rows"][0]["entry"]["message"] == "hello"
     assert _row_states(b, "dst") == [CLAIMED]
 
-    conf = b.confirm_delivered(dc, rid, res["epoch"])
+    conf = b.confirm_delivered(dc, rid, res["epoch"], gen, iid)
     assert conf["ok"] is True
     assert _row_states(b, "dst") == [DELIVERED]
     # id 冪等: 二度目の confirm は idempotent。
-    assert b.confirm_delivered(dc, rid, res["epoch"]) == {"ok": True, "idempotent": True}
+    assert b.confirm_delivered(dc, rid, res["epoch"], gen, iid) == {"ok": True, "idempotent": True}
 
 
 def test_check_messages_respects_live_claim(tmp_path):
@@ -84,7 +95,8 @@ def test_check_messages_respects_live_claim(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.enqueue(src, "dst", "m1")
-    b.poll_claims(b.issue_delivery_cred("dst"))  # CLAIMED, lease 30s (まだ live)
+    dc, gen, iid = _sidecar(b, "dst")
+    b.poll_claims(dc, gen, iid)  # CLAIMED, lease 30s (まだ live)
     # check_messages は live claim を見送る (空)。
     assert b.drain(dst) == []
     assert _row_states(b, "dst") == [CLAIMED]
@@ -106,7 +118,8 @@ def test_lease_reap_recovers_dead_sidecar(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.enqueue(src, "dst", "survive-me")
-    res = b.poll_claims(b.issue_delivery_cred("dst"))  # CLAIMED (sidecar 死亡で confirm せず)
+    dc, gen, iid = _sidecar(b, "dst")
+    res = b.poll_claims(dc, gen, iid)  # CLAIMED (sidecar 死亡で confirm せず)
     assert _row_states(b, "dst") == [CLAIMED]
     time.sleep(0.1)  # lease 失効を待つ
     # check_messages (pull fallback) が reap して再配達する = 喪失しない。
@@ -121,12 +134,12 @@ def test_confirm_after_lease_expiry_rejected(tmp_path):
     """lease 失効後の confirm は not_claimed で拒否 (reap で UNDELIVERED へ戻る)。"""
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
-    dc = b.issue_delivery_cred("dst")
+    dc, gen, iid = _sidecar(b, "dst")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims(dc)
+    res = b.poll_claims(dc, gen, iid)
     rid = res["rows"][0]["id"]
     time.sleep(0.1)
-    conf = b.confirm_delivered(dc, rid, res["epoch"])
+    conf = b.confirm_delivered(dc, rid, res["epoch"], gen, iid)
     assert conf["ok"] is False and conf["error"] == "not_claimed"
 
 
@@ -134,14 +147,14 @@ def test_mode_epoch_fencing_rejects_stale_confirm(tmp_path):
     """flip で epoch が進み、旧 epoch の confirm は stale_epoch で拒否される。"""
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
-    dc = b.issue_delivery_cred("dst")
+    dc, gen, iid = _sidecar(b, "dst")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims(dc)  # epoch 0, CLAIMED
+    res = b.poll_claims(dc, gen, iid)  # epoch 0, CLAIMED
     rid = res["rows"][0]["id"]
     flip = b.flip_mode("dst", PULL)  # epoch -> 1、CLAIMED -> UNDELIVERED
     assert flip["epoch"] == 1 and flip["mode"] == PULL
     assert _row_states(b, "dst") == [UNDELIVERED]
-    conf = b.confirm_delivered(dc, rid, res["epoch"])  # epoch 0 (stale)
+    conf = b.confirm_delivered(dc, rid, res["epoch"], gen, iid)  # epoch 0 (stale)
     assert conf["ok"] is False and conf["error"] == "stale_epoch" and conf["epoch"] == 1
 
 
@@ -153,20 +166,20 @@ def test_stale_confirm_does_not_strip_newer_claim(tmp_path):
     """
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
     src, dst = _registered(b, "src"), _registered(b, "dst")
-    dc = b.issue_delivery_cred("dst")
+    dc, gen, iid = _sidecar(b, "dst")
     b.enqueue(src, "dst", "x")
-    first = b.poll_claims(dc)             # epoch 0, CLAIMED
+    first = b.poll_claims(dc, gen, iid)  # epoch 0, CLAIMED
     rid = first["rows"][0]["id"]
     b.flip_mode("dst", PULL)              # epoch 1, row -> UNDELIVERED
     b.flip_mode("dst", PUSH)             # epoch 2
-    second = b.poll_claims(dc)            # epoch 2, 再 CLAIMED
+    second = b.poll_claims(dc, gen, iid)  # epoch 2, 再 CLAIMED
     assert second["epoch"] == 2 and len(second["rows"]) == 1
     # 古い epoch 0 confirm: 拒否されるが epoch 2 の claim は剥がさない。
-    stale = b.confirm_delivered(dc, rid, first["epoch"])
+    stale = b.confirm_delivered(dc, rid, first["epoch"], gen, iid)
     assert stale["error"] == "stale_epoch"
     assert _row_states(b, "dst") == [CLAIMED]   # 新 claim 無傷
     # 現 sidecar の epoch 2 confirm は成功する (剥がされていない証拠)。
-    assert b.confirm_delivered(dc, rid, second["epoch"])["ok"] is True
+    assert b.confirm_delivered(dc, rid, second["epoch"], gen, iid)["ok"] is True
 
 
 def test_pull_mode_disables_claim_issuance(tmp_path):
@@ -175,7 +188,8 @@ def test_pull_mode_disables_claim_issuance(tmp_path):
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.flip_mode("dst", PULL)
     b.enqueue(src, "dst", "m1")
-    res = b.poll_claims(b.issue_delivery_cred("dst"))
+    dc, gen, iid = _sidecar(b, "dst")
+    res = b.poll_claims(dc, gen, iid)
     assert res["error"] == "push_disabled" and res["rows"] == []
     # check_messages は mode に依らず claim-respecting drain (フォールバック健在)。
     assert [m["message"] for m in b.drain(dst)] == ["m1"]
@@ -190,19 +204,19 @@ def test_poll_claims_gated_on_registered_owner(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     # full token は発行するが register しない (= initialize 前 / DELETE 後を模す)。
     full = b.issue_token("dst", "dst", "worker")
-    dc = b.issue_delivery_cred("dst")
+    dc, gen, iid = _sidecar(b, "dst")   # delivery sidecar は register 済 (generation live)
     src = _registered(b, "src")
     # registered な src 経由で enqueue (宛先解決のため dst を一時 register して戻す)。
     b.register_local(full)
     b.enqueue(src, "dst", "do-not-lose-me")
     # ここで dst が DELETE された状況を模す (registered=False)。
     b.get_bind(full).registered = False
-    res = b.poll_claims(dc)
+    res = b.poll_claims(dc, gen, iid)
     assert res["error"] == "owner_unregistered" and res["rows"] == []
     assert _row_states(b, "dst") == [UNDELIVERED]   # 行は残る (喪失しない)
     # re-initialize (registered に戻る) で claim 可能になる。
     b.get_bind(full).registered = True
-    res2 = b.poll_claims(dc)
+    res2 = b.poll_claims(dc, gen, iid)
     assert [r["entry"]["message"] for r in res2["rows"]] == ["do-not-lose-me"]
 
 
@@ -213,7 +227,8 @@ def test_poll_claims_only_returns_owner_rows(tmp_path):
     _registered(b, "dst2")
     b.enqueue(src, "dst", "for-dst")
     b.enqueue(src, "dst2", "for-dst2")
-    res = b.poll_claims(b.issue_delivery_cred("dst"))
+    dc, gen, iid = _sidecar(b, "dst")
+    res = b.poll_claims(dc, gen, iid)
     assert [r["entry"]["message"] for r in res["rows"]] == ["for-dst"]
 
 
@@ -223,11 +238,14 @@ def test_confirm_not_owner_rejected(tmp_path):
     _registered(b, "dst")
     _registered(b, "other")
     b.enqueue(src, "dst", "x")
-    res = b.poll_claims(b.issue_delivery_cred("dst"))
+    dc, gen, iid = _sidecar(b, "dst")
+    res = b.poll_claims(dc, gen, iid)
     rid = res["rows"][0]["id"]
     # 別 owner の cred は他人宛の行を confirm できない (owner=cred.agent_id で判定)。
-    other_cred = b.issue_delivery_cred("other")
-    assert b.confirm_delivered(other_cred, rid, res["epoch"])["error"] == "not_owner"
+    # not_owner は generation fence より前に効く (別 owner なので generation は無関係)。
+    other_cred, other_gen, other_iid = _sidecar(b, "other", instance="io")
+    assert b.confirm_delivered(
+        other_cred, rid, res["epoch"], other_gen, other_iid)["error"] == "not_owner"
 
 
 def test_revoked_delivery_cred_cannot_claim_or_confirm(tmp_path):
@@ -242,18 +260,257 @@ def test_revoked_delivery_cred_cannot_claim_or_confirm(tmp_path):
     dc = b.issue_delivery_cred("dst")
     b.enqueue(src, "dst", "x")
     b.revoke_delivery_creds("dst")  # close_pane の revoke_delivery_creds 相当
-    res = b.poll_claims(dc)
+    # revoked cred は owner が None に解決され unauthorized (generation fence より前)。
+    res = b.poll_claims(dc, 1, "i1")
     assert res["error"] == "unauthorized" and res["rows"] == []
     assert _row_states(b, "dst") == [UNDELIVERED]   # revoked cred では claim されない
-    assert b.confirm_delivered(dc, "anyid", 0)["error"] == "unauthorized"
+    assert b.confirm_delivered(dc, "anyid", 0, 1, "i1")["error"] == "unauthorized"
     # 完全に未知の token も同様。
-    assert b.poll_claims("bogus-token")["error"] == "unauthorized"
+    assert b.poll_claims("bogus-token", 1, "i1")["error"] == "unauthorized"
 
 
 def test_flip_mode_invalid(tmp_path):
     b = Broker(state_dir=tmp_path, adapter=None)
     res = b.flip_mode("dst", "SHOVE")
     assert res["ok"] is False and "invalid_mode" in res["error"]
+
+
+# ================================================ Issue #125 session fencing
+def test_register_bumps_generation_monotonically(tmp_path):
+    """register ごとに generation が単調 +1 する (daemon 再起動なしで増加)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    assert b.register_delivery_instance(dc, "i1")["generation"] == 1
+    assert b.register_delivery_instance(dc, "i2")["generation"] == 2
+    # 別 owner は独立した世代空間を持つ。
+    _registered(b, "other")
+    oc = b.issue_delivery_cred("other")
+    assert b.register_delivery_instance(oc, "io")["generation"] == 1
+
+
+def test_register_requires_delivery_scope(tmp_path):
+    """Issue #125 Major #4: register は delivery cred のみ。full/revoked/bogus token は
+    unauthorized で拒否し、他 owner の generation を bump できない (横取り fence 防御)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    # full-scope token は register できない (scope != delivery -> owner None)。
+    full = b.issue_token("dst", "dst", "worker")
+    assert b.register_delivery_instance(full, "i1") == {"ok": False, "error": "unauthorized"}
+    # 完全に未知の token も同様。
+    assert b.register_delivery_instance("bogus", "i1")["error"] == "unauthorized"
+    # revoke 済 delivery cred も register できない。
+    dc = b.issue_delivery_cred("dst")
+    b.revoke_delivery_creds("dst")
+    assert b.register_delivery_instance(dc, "i1")["error"] == "unauthorized"
+    # どの拒否経路でも generation は bump されない (他 owner の fence を乗っ取れない)。
+    assert "dst" not in b._delivery_generations
+
+
+def test_claim_owner_rejects_full_token_over_http(broker):
+    """Issue #125 Major #4: /claim-owner は delivery scope bearer のみ (full token は 401)。"""
+    full = broker.issue_token("agent", "agent", "worker")
+    status, _ = _post(broker.base_url + "/claim-owner", full, {"instance_id": "i1"})
+    assert status == 401
+    # delivery cred は通る。
+    delivery = broker.issue_delivery_cred("agent")
+    status, body = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "i1"})
+    assert status == 200 and body["ok"] is True and body["generation"] == 1
+
+
+def test_old_generation_poll_rejected(tmp_path):
+    """Issue #125: fork 元 (旧 generation) の sidecar poll は stale_sidecar で拒否。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    # 二重 sidecar: 同一 cred (fork replay) を別 instance で 2 度 register。
+    dc = b.issue_delivery_cred("dst")
+    reg_old = b.register_delivery_instance(dc, "old-inst")   # generation 1
+    reg_new = b.register_delivery_instance(dc, "new-inst")   # generation 2 (現世代)
+    b.enqueue(src, "dst", "for-current-session")
+    # 旧世代 sidecar の poll は claim を発行しない (fence)。
+    res_old = b.poll_claims(dc, reg_old["generation"], "old-inst")
+    assert res_old["error"] == "stale_sidecar" and res_old["generation"] == 2
+    assert res_old["rows"] == []
+    assert _row_states(b, "dst") == [UNDELIVERED]   # 旧 sidecar は claim していない
+    # 現世代 sidecar だけが claim できる (二重 claim による消失が消える)。
+    res_new = b.poll_claims(dc, reg_new["generation"], "new-inst")
+    assert [r["entry"]["message"] for r in res_new["rows"]] == ["for-current-session"]
+
+
+def test_old_generation_confirm_rejected(tmp_path):
+    """Issue #125 Blocker #2: 旧 generation が register 前に claim した行を後から
+    confirm できない。旧 claim は現世代へ再 eligible 化され現 sidecar が届ける。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    reg_old = b.register_delivery_instance(dc, "old-inst")   # generation 1
+    b.enqueue(src, "dst", "x")
+    # 旧 sidecar が (新 sidecar 登場前に) claim する。
+    claimed = b.poll_claims(dc, reg_old["generation"], "old-inst")
+    rid = claimed["rows"][0]["id"]
+    assert _row_states(b, "dst") == [CLAIMED]
+    # 新 sidecar が register -> generation 2、旧 CLAIMED 行は UNDELIVERED へ差し戻し。
+    reg_new = b.register_delivery_instance(dc, "new-inst")
+    assert reg_new["generation"] == 2
+    assert _row_states(b, "dst") == [UNDELIVERED]   # 旧 claim を待たず即差し戻し
+    # 旧 sidecar が後から confirm しても拒否される (lost にならない)。
+    conf = b.confirm_delivered(dc, rid, claimed["epoch"], reg_old["generation"], "old-inst")
+    assert conf["ok"] is False and conf["error"] == "stale_sidecar" and conf["generation"] == 2
+    assert _row_states(b, "dst") == [UNDELIVERED]   # 依然 UNDELIVERED (現 sidecar 用)
+    # 現世代 sidecar が claim -> confirm すると DELIVERED になる。
+    c2 = b.poll_claims(dc, reg_new["generation"], "new-inst")
+    assert c2["rows"][0]["id"] == rid
+    assert b.confirm_delivered(dc, rid, c2["epoch"], reg_new["generation"], "new-inst")["ok"]
+    assert _row_states(b, "dst") == [DELIVERED]
+
+
+def test_register_requeues_old_generation_claim(tmp_path):
+    """Issue #125 Blocker #3: 新 generation register で旧 CLAIMED を UNDELIVERED へ即戻す
+    (lease 失効を待たない)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)  # lease は長い
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    reg_old = b.register_delivery_instance(dc, "old")
+    b.enqueue(src, "dst", "m")
+    b.poll_claims(dc, reg_old["generation"], "old")
+    assert _row_states(b, "dst") == [CLAIMED]
+    # 長い lease でも register 時に即 requeue される (fence が lease 失効遅延を作らない)。
+    b.register_delivery_instance(dc, "new")
+    assert _row_states(b, "dst") == [UNDELIVERED]
+
+
+def test_duplicate_sidecar_detected_journaled(tmp_path):
+    """Issue #125 Major #5: 同一 owner を複数 instance が lease window 内に poll したら
+    duplicate_sidecar_detected を journal する (pair ごと初回のみ、毎 poll スパムなし)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    reg1 = b.register_delivery_instance(dc, "inst-a")
+    reg2 = b.register_delivery_instance(dc, "inst-b")   # 現世代
+    # 両 instance が poll する (旧 inst-a は stale だが記録はされる)。
+    b.poll_claims(dc, reg1["generation"], "inst-a")
+    b.poll_claims(dc, reg2["generation"], "inst-b")
+    b.poll_claims(dc, reg1["generation"], "inst-a")   # 再度 (cooldown で追加 emit なし)
+
+    lines = (b.state_dir / "queue.jsonl").read_text(encoding="utf-8").splitlines()
+    dups = [json.loads(x) for x in lines
+            if json.loads(x)["event"] == "duplicate_sidecar_detected"]
+    assert len(dups) == 1   # pair {inst-a, inst-b} は 1 回だけ
+    assert set(dups[0]["instances"]) == {"inst-a", "inst-b"}
+    assert dups[0]["owner"] == "dst"
+
+
+def test_single_sidecar_never_flags_duplicate(tmp_path):
+    """Issue #125: 正常系 (単一 instance が繰り返し poll) は duplicate を一切出さない
+    (false-positive しない = 通常配備で毎 poll スパムしない)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    reg = b.register_delivery_instance(dc, "solo")
+    for _ in range(3):
+        b.poll_claims(dc, reg["generation"], "solo")
+    lines = (b.state_dir / "queue.jsonl").read_text(encoding="utf-8").splitlines()
+    dups = [x for x in lines if json.loads(x)["event"] == "duplicate_sidecar_detected"]
+    assert dups == []
+
+
+def test_duplicate_detection_cooldown_reemit_and_distinct_pairs(tmp_path):
+    """Issue #125 Major #5/#10: duplicate 検知は (a) cooldown 内は再 emit しない
+    (anti-spam) (b) cooldown 経過後は再 emit する (持続的二重の liveness シグナル)
+    (c) distinct instance pair ごとに別 emit する。
+
+    ``_note_poll_locked`` を制御した ``now`` で直接呼び (単一スレッド・純ロジック)、
+    時間依存の flakiness なしに両半分を固定する。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=10.0)
+    W = b.lease_seconds
+    T = 1000.0   # 非ゼロ基準 (emit cooldown の既定 0.0 と衝突させない)
+    # t=T: a -> b。pair {a,b} を 1 回 emit。
+    assert b._note_poll_locked("dst", "a", T) == []
+    j = b._note_poll_locked("dst", "b", T)
+    assert [e[0] for e in j] == ["duplicate_sidecar_detected"]
+    assert set(j[0][1]["instances"]) == {"a", "b"}
+    # cooldown 内 (< W) の再 poll は追加 emit しない (anti-spam)。
+    assert b._note_poll_locked("dst", "a", T + 1.0) == []
+    # 両 instance を window 内に保ちつつ cooldown をまたぐ。
+    assert b._note_poll_locked("dst", "b", T + 9.0) == []      # b alive、まだ cooldown 内
+    reemit = b._note_poll_locked("dst", "a", T + W + 1.0)      # cooldown 経過 -> 再 emit
+    assert [e[0] for e in reemit] == ["duplicate_sidecar_detected"]
+    assert set(reemit[0][1]["instances"]) == {"a", "b"}
+    # distinct pair: 新 instance c は {a,c} / {b,c} を別々に emit する。
+    c = b._note_poll_locked("dst", "c", T + W + 1.0)
+    pairs = {tuple(sorted(e[1]["instances"])) for e in c}
+    assert pairs == {("a", "c"), ("b", "c")}
+
+
+def test_delivery_dump_exposes_generation_and_instance(tmp_path):
+    """Issue #125 Minor #9: delivery_dump に owner ごとの現世代と active instance。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    b.register_delivery_instance(dc, "inst-x")
+    dump = b.delivery_dump()
+    assert dump["generations"]["dst"] == 1
+    assert dump["instances"]["dst"] == "inst-x"
+
+
+def test_reset_delivery_state_clears_fencing(tmp_path):
+    """Issue #125 Major #8: reset で generation/instance/duplicate tracking も消える
+    (同名 respawn 後の誤 fence / 誤 duplicate を防ぐ)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    b.register_delivery_instance(dc, "inst-x")
+    assert "dst" in b._delivery_generations
+    b.reset_delivery_state("dst")
+    assert "dst" not in b._delivery_generations
+    assert "dst" not in b._delivery_instances
+    assert "dst" not in b._delivery_poll_seen
+    # 同名 respawn は generation 1 から再開する (旧世代を継承しない)。
+    dc2 = b.issue_delivery_cred("dst")
+    assert b.register_delivery_instance(dc2, "inst-y")["generation"] == 1
+
+
+def test_double_sidecar_over_http_only_current_claims(broker):
+    """Issue #125 Blocker #7: 同一 delivery cred + 異なる instance の二重 sidecar を
+    HTTP 経由で再現し、現世代のみ claim すること (旧世代は stale_sidecar) を固定する。"""
+    src = broker.issue_token("src", "src", "worker")
+    broker.register_local(src)
+    dst = broker.issue_token("dst", "dst", "worker")
+    broker.register_local(dst)
+    delivery = broker.issue_delivery_cred("dst")   # fork replay で共有される単一 cred
+
+    # 旧 session の sidecar (instance old) が register。
+    _, reg_old = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "old"})
+    # fork/resume で立った新 sidecar (instance new) が register -> 世代交代。
+    _, reg_new = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "new"})
+    assert reg_old["generation"] == 1 and reg_new["generation"] == 2
+
+    broker.enqueue(broker.get_bind(src), "dst", "human-facing-message")
+
+    # 旧 sidecar の poll は stale_sidecar (claim しない = 二重 claim 消失が起きない)。
+    st_old, body_old = _post(broker.base_url + "/poll-claims", delivery,
+                             {"generation": 1, "instance_id": "old"})
+    assert st_old == 200 and body_old["error"] == "stale_sidecar"
+    assert body_old["rows"] == []
+
+    # 現世代 sidecar だけが claim できる。
+    st_new, body_new = _post(broker.base_url + "/poll-claims", delivery,
+                             {"generation": 2, "instance_id": "new"})
+    assert st_new == 200 and len(body_new["rows"]) == 1
+    row = body_new["rows"][0]
+    assert row["entry"]["message"] == "human-facing-message"
+
+    # 旧 sidecar が後から confirm しても拒否 (row は現世代のもの)。
+    st_c, conf = _post(broker.base_url + "/confirm-delivered", delivery,
+                       {"id": row["id"], "epoch": row["epoch"],
+                        "generation": 1, "instance_id": "old"})
+    assert st_c == 200 and conf["error"] == "stale_sidecar"
+    # 現世代 confirm は成功。
+    _, conf2 = _post(broker.base_url + "/confirm-delivered", delivery,
+                     {"id": row["id"], "epoch": row["epoch"],
+                      "generation": 2, "instance_id": "new"})
+    assert conf2["ok"] is True
 
 
 # ============================================================ R4 HTTP endpoints
@@ -277,10 +534,14 @@ def test_delivery_endpoints_require_delivery_scope(broker):
     full = broker.issue_token("agent", "agent", "worker")
     delivery = broker.issue_delivery_cred("agent")
     # full token は delivery endpoint に入れない (least-privilege の双方向遮断)。
-    status, _ = _post(broker.base_url + "/poll-claims", full, {})
+    status, _ = _post(broker.base_url + "/poll-claims", full,
+                      {"generation": 1, "instance_id": "i1"})
     assert status == 401
-    # delivery cred は通る。
-    status, body = _post(broker.base_url + "/poll-claims", delivery, {})
+    # delivery cred は register して現世代で poll できる。
+    status, reg = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "i1"})
+    assert status == 200 and reg["ok"] is True and reg["generation"] == 1
+    status, body = _post(broker.base_url + "/poll-claims", delivery,
+                        {"generation": reg["generation"], "instance_id": "i1"})
     assert status == 200 and body["rows"] == []
 
 
@@ -312,20 +573,26 @@ def test_delivery_endpoint_roundtrip_over_http(broker):
     broker.enqueue(broker.get_bind(src), "dst", "wire-hello")
     delivery = broker.issue_delivery_cred("dst")
 
-    status, body = _post(broker.base_url + "/poll-claims", delivery, {})
+    status, reg = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "i1"})
+    assert status == 200 and reg["ok"] is True
+    gen = reg["generation"]
+
+    status, body = _post(broker.base_url + "/poll-claims", delivery,
+                        {"generation": gen, "instance_id": "i1"})
     assert status == 200 and len(body["rows"]) == 1
     row = body["rows"][0]
     assert row["entry"]["message"] == "wire-hello"
 
     status, conf = _post(broker.base_url + "/confirm-delivered", delivery,
-                         {"id": row["id"], "epoch": row["epoch"]})
+                         {"id": row["id"], "epoch": row["epoch"],
+                          "generation": gen, "instance_id": "i1"})
     assert status == 200 and conf["ok"] is True
 
 
 def test_confirm_invalid_id_400(broker):
     delivery = broker.issue_delivery_cred("dst")
     status, body = _post(broker.base_url + "/confirm-delivered", delivery,
-                         {"id": 123, "epoch": 0})
+                         {"id": 123, "epoch": 0, "generation": 1, "instance_id": "i1"})
     assert status == 400 and "invalid_id" in body["error"]
 
 
