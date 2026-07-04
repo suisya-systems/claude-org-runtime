@@ -5,9 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.36] - 2026-07-04
 
 ### Fixed
+
+- `broker`: push channel delivery is now bound to the **observed live session**,
+  so a config-replay fork/resume or a background-hosted session can no longer
+  hijack or silently destroy an owner's messages (runtime Issue #129, building
+  on the #125 session fencing). Two failure modes are closed: (A) a
+  forked/resumed session replays the persisted `--mcp-config` (delivery cred
+  included), re-registers, and under last-register-wins bumps the owner's
+  delivery generation to fence the real observed session out of claiming; and
+  (B) a background-hosted session's sidecar claims and "delivers"
+  (emit == stdout flush) messages the host never surfaces, destroying them under
+  at-most-once. The fix adds a per-owner **ObserverLease** to daemon state: a
+  human-facing launcher (`org up` / an admin-minted secretary via the new
+  `mint_token(observer=True)` opt-in) asserts a lease and receives a
+  non-replayable `observer_secret`, injected into the child env
+  (`ORG_BROKER_CHANNEL_OBSERVER`) and **never** into the persisted mcp-config;
+  only a sidecar presenting the current secret may bump the generation while a
+  lease is active, and a config-replay fork is refused with `unobserved` and
+  stands down. Owners with no active lease (child panes) keep the legacy
+  last-register-wins path, so existing push delivery is not regressed. As an
+  interim guard for (B), the sidecar honours an explicit
+  `ORG_BROKER_CHANNEL_BG_HOSTED` marker: when set it registers `bg_hosted`, the
+  daemon journals `delivery_suppressed_bg_hosted`, refuses to bump the
+  generation, and the sidecar stands down. No heuristic bg detection
+  (`isatty` / process-tree) is used -- unknown is always treated as foreground so
+  a misclassification never stops delivery. The lease is **armed**
+  (never-expiring) until the first observed register activates it, then governed
+  by TTL + poll heartbeat, so a slow secretary boot cannot let it lapse before
+  the first claim. `list_peers` now reports per-agent `receive_mode`
+  (`push`/`pull`) instead of the constant `push` for diagnosability. *Out of
+  scope:* Phase 3 host-accept gating on confirm (Issue #81 family) -- the
+  emit == stdout-flush boundary means (B) cannot be fully closed without a
+  host-accept signal, tracked in a follow-up.
 
 - `dispatcher`: the `delegate-plan` helper now accepts **Herdr** pane handles
   (runtime Issue #133). The Herdr backend's `list_panes` emits pane ids of the
@@ -17,6 +49,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside the existing renga numeric (`1`, `"2"`) and tmux (`"%0"`) formats and
   reduced to its trailing pane number (the deterministic `choose_split`
   tie-breaker), restoring the automated spawn path on the Herdr backend.
+
+- `terminal` + `broker`: org-spawned role panes (worker / dispatcher) and the
+  root secretary TUI now **inherit the workspace virtualenv** (`VIRTUAL_ENV`
+  plus `.venv/bin` on `PATH`), so venv-assuming tooling no longer breaks inside
+  them (runtime Issue #130). Injecting the adapter env dict alone was
+  insufficient: tmux (`new-session -e`) and herdr (`agent.start` `env`) pass it
+  as the *parent* environment, and the pane's login-shell profile then rebuilds
+  `PATH` and drops `.venv/bin`. So on POSIX the `PATH` prepend now runs **after**
+  profile init via a post-profile login-shell wrapper
+  (`login_shell_venv_wrapper`), while native Windows uses the env dict with
+  `%PATH%` and resolves `argv[0]` against the venv `Scripts` dir via
+  `shutil.which`. New `terminal/base.py` helpers (`find_workspace_venv` --
+  `cwd/.venv` preferred, `root_cwd/.venv` fallback; `venv_bin_dir`;
+  `login_shell_venv_wrapper`; `venv_pane_prep`) are a complete no-op when there
+  is no `.venv` (conda etc. untouched). The wrapper uses `$SHELL` only when it is
+  POSIX-family (else `/bin/sh`, so a fish/csh login shell cannot break the
+  launch) and `cd`s back to the pane's own cwd after profile init (so a profile
+  ending in an unconditional `cd` cannot relocate the agent out of its worktree).
+  `Broker` now holds `root_cwd` (from `serve --root-cwd`) to anchor the prep.
+  (Follow-up hotfix #137 made the #130 tests portable on native Windows CI --
+  test-only, no production change.)
 
 ## [0.1.35] - 2026-07-04
 
