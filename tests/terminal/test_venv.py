@@ -9,15 +9,28 @@ post-profile login-shell PATH wrapper, and the platform split in
 
 from __future__ import annotations
 
+import os
 import shlex
 
 import pytest
 
 from claude_org_runtime.terminal import base
 
+# These tests force os.name to exercise both the POSIX and native-Windows
+# branches on any host (monkeypatching the shared os module is global). os.path
+# stays host-native, so path expectations are always derived from the code's own
+# helpers (base.venv_bin_dir / shlex.quote / str(Path)) rather than hardcoding a
+# separator -- that is what keeps them green on both Linux and Windows runners.
+
 
 def _make_venv(root, *, windows: bool = False):
-    """Create a fake ``.venv`` under ``root`` with the platform interpreter."""
+    """Create a fake ``.venv`` under ``root`` matching the (possibly forced)
+    platform layout: ``Scripts/python.exe`` for Windows, else ``bin/python``.
+
+    Pass ``windows`` matching whatever ``os.name`` the test forces so that
+    :func:`base.find_workspace_venv` (which keys the interpreter path off
+    ``os.name``) finds it.
+    """
     venv = root / ".venv"
     if windows:
         (venv / "Scripts").mkdir(parents=True)
@@ -36,16 +49,22 @@ def test_find_venv_none_when_absent(tmp_path):
     assert base.find_workspace_venv(None, str(tmp_path), None) is None
 
 
+# The discovery tests run against the *real* host os.name, so they create the
+# host-native layout (Scripts on Windows, bin elsewhere) -- this exercises the
+# real branch the running platform takes.
+_HOST_WINDOWS = os.name == "nt"
+
+
 def test_find_venv_in_cwd(tmp_path):
-    venv = _make_venv(tmp_path)
+    venv = _make_venv(tmp_path, windows=_HOST_WINDOWS)
     assert base.find_workspace_venv(str(tmp_path)) == str(venv)
 
 
 def test_find_venv_prefers_cwd_over_root(tmp_path):
     cwd = tmp_path / "worker"; cwd.mkdir()
     root = tmp_path / "root"; root.mkdir()
-    _make_venv(cwd)
-    _make_venv(root)
+    _make_venv(cwd, windows=_HOST_WINDOWS)
+    _make_venv(root, windows=_HOST_WINDOWS)
     # cwd/.venv wins when both exist (pane's own env takes precedence).
     assert base.find_workspace_venv(str(cwd), str(root)) == str(cwd / ".venv")
 
@@ -55,7 +74,7 @@ def test_find_venv_falls_back_to_root_cwd(tmp_path):
     # a cwd-only design would re-open the bug here, so the fallback must fire.
     cwd = tmp_path / "worker"; cwd.mkdir()
     root = tmp_path / "root"; root.mkdir()
-    _make_venv(root)
+    _make_venv(root, windows=_HOST_WINDOWS)
     assert base.find_workspace_venv(str(cwd), str(root)) == str(root / ".venv")
 
 
@@ -124,6 +143,9 @@ def test_wrapper_omits_cd_without_run_cwd(monkeypatch):
     assert "cd " not in wrapped[2]
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX login shell (/bin/sh) is not available on Windows"
+)
 def test_wrapper_end_to_end_prepends_path_and_restores_cwd(tmp_path, monkeypatch):
     # Hermetic end-to-end proof against a real login shell: after profile init the
     # venv bin is FIRST on PATH and the process runs in run_cwd (both Blocker 2 and
@@ -166,21 +188,30 @@ def test_pane_prep_noop_without_venv(tmp_path):
     assert out_argv == argv and env == {}
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX login-shell wrapper branch (natural os.name; no forcing)"
+)
 def test_pane_prep_posix_wraps_argv_and_sets_virtual_env(tmp_path, monkeypatch):
-    monkeypatch.setattr(base.os, "name", "posix")
     monkeypatch.setenv("SHELL", "/bin/bash")
-    venv = _make_venv(tmp_path)
+    venv = _make_venv(tmp_path, windows=False)
     out_argv, env = base.venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
     # VIRTUAL_ENV rides the env dict; PATH rides the wrapped argv (post-profile).
     assert env == {"VIRTUAL_ENV": str(venv)}
     assert out_argv[0] == "/bin/bash" and out_argv[1] == "-lc"
     # run_cwd = the pane cwd -> cd restores it after profile, then PATH prepend.
-    assert out_argv[2] == \
-        f'cd {tmp_path}; export PATH={venv}/bin:"$PATH"; exec "$@"'
+    # Expectation derived from the code's own helpers so it is separator-agnostic.
+    bin_dir = base.venv_bin_dir(str(venv))
+    assert out_argv[2] == (
+        f"cd {shlex.quote(str(tmp_path))}; "
+        f'export PATH={shlex.quote(bin_dir)}:"$PATH"; exec "$@"'
+    )
     assert out_argv[-2:] == ["claude", "--flag"]
 
 
 def test_pane_prep_windows_uses_env_path_percent(tmp_path, monkeypatch):
+    # Forcing os.name="nt" is safe here (unlike the Broker tests): venv_pane_prep
+    # uses os.path, not pathlib.Path, so no PosixPath/WindowsPath is instantiated
+    # while forced. This lets Linux/macOS CI cover the native-Windows branch too.
     monkeypatch.setattr(base.os, "name", "nt")
     venv = _make_venv(tmp_path, windows=True)
     out_argv, env = base.venv_pane_prep(["claude"], str(tmp_path), None)
@@ -192,14 +223,19 @@ def test_pane_prep_windows_uses_env_path_percent(tmp_path, monkeypatch):
     assert env["PATH"] == f"{base.venv_bin_dir(str(venv))};%PATH%"
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX login-shell wrapper branch (natural os.name; no forcing)"
+)
 def test_pane_prep_fallback_to_root_cwd(tmp_path, monkeypatch):
-    monkeypatch.setattr(base.os, "name", "posix")
     monkeypatch.setenv("SHELL", "/bin/bash")
     cwd = tmp_path / "worker"; cwd.mkdir()
     root = tmp_path / "root"; root.mkdir()
-    venv = _make_venv(root)
+    venv = _make_venv(root, windows=False)
     out_argv, env = base.venv_pane_prep(["claude"], str(cwd), str(root))
     assert env == {"VIRTUAL_ENV": str(venv)}
     # pane runs in its own cwd (worker worktree), just borrows root's .venv/bin.
-    assert out_argv[2] == \
-        f'cd {cwd}; export PATH={venv}/bin:"$PATH"; exec "$@"'
+    bin_dir = base.venv_bin_dir(str(venv))
+    assert out_argv[2] == (
+        f"cd {shlex.quote(str(cwd))}; "
+        f'export PATH={shlex.quote(bin_dir)}:"$PATH"; exec "$@"'
+    )

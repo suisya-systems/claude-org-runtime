@@ -9,6 +9,7 @@ the benign-vs-fatal error policy of ``list_panes``.
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -160,6 +161,10 @@ def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
     assert "-e" not in _args(adapter._fake.last)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only login-shell wrapper (tmux is a POSIX-only backend)",
+)
 def test_spawn_carries_venv_login_shell_wrapper(
     adapter: TmuxAdapter, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -168,22 +173,26 @@ def test_spawn_carries_venv_login_shell_wrapper(
     # command string, so `export PATH=<venv>/bin` survives into the pane; the
     # -e env carries VIRTUAL_ENV. This pins that the wrapper reaches the tmux
     # command intact (the export is what actually re-activates the venv after
-    # the login shell rebuilds PATH).
+    # the login shell rebuilds PATH). POSIX-only: skipped on Windows (natural
+    # os.name is used; forcing it would risk the pathlib PosixPath pitfall).
+    from claude_org_runtime.terminal import base
     from claude_org_runtime.terminal.base import venv_pane_prep
 
     monkeypatch.setenv("SHELL", "/bin/bash")
     (tmp_path / ".venv" / "bin").mkdir(parents=True)
     (tmp_path / ".venv" / "bin" / "python").write_text("")
     wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
+    venv = str(tmp_path / ".venv")
 
     adapter._fake.queue((0, "%6\t@5\tclaude-org-broker-9-5", ""))
     adapter.spawn(wrapped, env=env)
     args = _args(adapter._fake.last)
     # VIRTUAL_ENV via -e (env dict channel, same as ORG_BROKER_STATE_DIR).
-    assert f"VIRTUAL_ENV={tmp_path}/.venv" in args
+    assert f"VIRTUAL_ENV={venv}" in args
     # PATH prepend rides the shlex-joined command string (post-profile export).
     cmd_str = args[-1]
-    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in cmd_str
+    assert base.venv_bin_dir(venv) in cmd_str
+    assert "export PATH=" in cmd_str
     assert "/bin/bash -lc" in cmd_str and 'exec "$@"' in cmd_str
 
 
