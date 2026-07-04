@@ -83,7 +83,7 @@ def test_org_up_reuses_live_healthy_daemon(live_daemon):
         spawn_calls.append((a, k))
         raise AssertionError("spawn_daemon must not run when reusing a live daemon")
 
-    def fake_launch(argv, state_dir=None, observer_secret=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
         captured["argv"] = argv
         captured["state_dir"] = state_dir
         captured["observer_secret"] = observer_secret
@@ -112,7 +112,7 @@ def test_org_up_reused_secretary_named_secretary(live_daemon):
     b, state_dir = live_daemon
     launcher.org_up(_up_args(state_dir, name="secretary"),
                     spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-                    launch=lambda argv, state_dir=None, observer_secret=None: 0)
+                    launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0)
     # mint された bind の agent_id は 'secretary' (root name 契約)。
     assert any(bnd.agent_id == "secretary" and bnd.auth_role == "secretary"
                for bnd in b._binds.values())
@@ -128,7 +128,7 @@ def test_org_up_noop_when_secretary_already_registered(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, name="secretary"),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
     )
     assert rc == 0
     assert launched == []                          # 二人目の secretary を起動しない
@@ -144,7 +144,7 @@ def test_org_up_errors_on_live_backend_conflict(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, backend=other),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
     )
     assert rc == 2                                 # 競合エラー
     assert launched == []                          # 起動しない
@@ -167,7 +167,7 @@ def test_org_up_fails_fast_on_herdr_native_windows(tmp_path, monkeypatch, capsys
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unsupported backend")
         ),
-        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []                          # secretary TUI not launched
@@ -190,7 +190,7 @@ def test_org_up_errors_on_unknown_backend(tmp_path, capsys):
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unknown backend")
         ),
-        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -215,7 +215,7 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
 
     captured = {}
 
-    def fake_launch(argv, state_dir=None, observer_secret=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
         captured["argv"] = argv
         return 0
 
@@ -297,7 +297,7 @@ def test_org_up_wires_channel_into_secretary(live_daemon):
     b, state_dir = live_daemon
     captured = {}
 
-    def fake_launch(argv, state_dir=None, observer_secret=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
         captured["argv"] = argv
         captured["observer_secret"] = observer_secret
         return 0
@@ -395,7 +395,7 @@ def test_org_up_does_not_cold_start_when_admin_token_missing(tmp_path, monkeypat
         raise AssertionError("must not spawn a second daemon over a claimed state_dir")
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
-                         launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0)
+                         launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0)
     assert rc == 2                                 # token_missing → 明示エラー
     assert launched == []                          # TUI も起動しない
     assert not os.path.exists(os.path.join(state_dir, "secretary-mcp.json"))
@@ -474,7 +474,7 @@ def test_org_up_errors_when_mcp_surface_unhealthy(live_daemon, monkeypatch):
     rc = launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -487,7 +487,7 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
     launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
     )
     # admin-* の probe bind は close() で registered=False に落ちている。
     registered_admin = [
@@ -617,6 +617,89 @@ def test_launch_claude_posix_exec_injects_broker_state_dir(monkeypatch):
     launcher._launch_claude(["claude"], state_dir="/abs/state")
     assert captured["env"]["ORG_BROKER_STATE_DIR"] == "/abs/state"
     assert captured["env"]["ORG_TRANSPORT"] == "broker"
+
+
+def test_launch_claude_posix_activates_root_cwd_venv(monkeypatch, tmp_path):
+    """Issue #130: root_cwd/.venv があれば secretary もそれを継承する (POSIX exec)。
+
+    server._adapter_spawn (worker/dispatcher の本丸) に対する secretary 用の補助整合。
+    VIRTUAL_ENV は env dict、PATH は argv を post-profile login-shell wrapper に包む。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(file=file, argv=argv, env=env),
+    )
+    launcher._launch_claude(["claude", "--mcp-config", "{}"], root_cwd=str(tmp_path))
+    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
+    # argv is wrapped in the login-shell PATH prepend; file is the shell now.
+    assert captured["file"] == "/bin/bash"
+    assert captured["argv"][1] == "-lc"
+    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in captured["argv"][2]
+    assert captured["argv"][-2:] == ["claude", "--mcp-config"] or \
+        captured["argv"][-3:] == ["claude", "--mcp-config", "{}"]
+
+
+def test_launch_claude_posix_noop_without_root_cwd_venv(monkeypatch, tmp_path):
+    """Issue #130: root_cwd に .venv が無ければ完全 no-op (argv/env 不変で従来挙動)。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(file=file, argv=argv, env=env),
+    )
+    launcher._launch_claude(["claude", "--mcp-config", "{}"], root_cwd=str(tmp_path))
+    assert captured["file"] == "claude"
+    assert captured["argv"] == ["claude", "--mcp-config", "{}"]
+    assert "VIRTUAL_ENV" not in captured["env"]
+
+
+def test_launch_claude_windows_activates_root_cwd_venv(monkeypatch, tmp_path):
+    """Issue #130: native Windows は subprocess.call(env=) が子環境を直接決めるため、
+    PATH を env dict へ直接前置する (cmd profile による PATH 再構築が無く %PATH% 不要)。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("")
+    captured = {}
+
+    def fake_call(argv, *, env):
+        captured.update(argv=argv, env=env)
+        return 0
+
+    monkeypatch.setattr(launcher.subprocess, "call", fake_call)
+    launcher._launch_claude(["claude"], root_cwd=str(tmp_path))
+    scripts = launcher.venv_bin_dir(f"{tmp_path}/.venv")
+    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
+    # Windows は argv を包まず、PATH を env dict に os.pathsep で前置する (%PATH% なし)。
+    # claude が venv Scripts に無い通常形では argv[0] は不変 (ambient PATH 解決のまま)。
+    assert captured["argv"] == ["claude"]
+    assert captured["env"]["PATH"].startswith(scripts + os.pathsep)
+
+
+def test_launch_claude_windows_resolves_exe_in_venv_scripts(monkeypatch, tmp_path):
+    """Codex P2: Windows subprocess.call は env= の PATH で argv[0] を解決しないため、
+    venv Scripts にしか無い実行体を明示解決する。venv 内でヒットしたら argv[0] を差し替える。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("")
+    fake_exe = str(tmp_path / ".venv" / "Scripts" / "claude.cmd")
+    # shutil.which(path=<venv Scripts>) が venv 内の実行体を返す状況を模す。
+    monkeypatch.setattr(
+        launcher.shutil, "which",
+        lambda cmd, path=None: fake_exe if cmd == "claude" else None,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        launcher.subprocess, "call",
+        lambda argv, *, env: captured.update(argv=argv, env=env) or 0,
+    )
+    launcher._launch_claude(["claude", "--x"], root_cwd=str(tmp_path))
+    # argv[0] は venv 内の実行体へ解決され、残りの引数は保たれる。
+    assert captured["argv"] == [fake_exe, "--x"]
+    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
 
 
 def test_launch_claude_omits_state_dir_when_not_given(monkeypatch):

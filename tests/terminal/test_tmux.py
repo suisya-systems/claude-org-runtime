@@ -160,6 +160,33 @@ def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
     assert "-e" not in _args(adapter._fake.last)
 
 
+def test_spawn_carries_venv_login_shell_wrapper(
+    adapter: TmuxAdapter, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #130: the broker wraps argv in a post-profile login-shell PATH
+    # prepend (venv_pane_prep). tmux shlex-joins the wrapped argv into its
+    # command string, so `export PATH=<venv>/bin` survives into the pane; the
+    # -e env carries VIRTUAL_ENV. This pins that the wrapper reaches the tmux
+    # command intact (the export is what actually re-activates the venv after
+    # the login shell rebuilds PATH).
+    from claude_org_runtime.terminal.base import venv_pane_prep
+
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
+
+    adapter._fake.queue((0, "%6\t@5\tclaude-org-broker-9-5", ""))
+    adapter.spawn(wrapped, env=env)
+    args = _args(adapter._fake.last)
+    # VIRTUAL_ENV via -e (env dict channel, same as ORG_BROKER_STATE_DIR).
+    assert f"VIRTUAL_ENV={tmp_path}/.venv" in args
+    # PATH prepend rides the shlex-joined command string (post-profile export).
+    cmd_str = args[-1]
+    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in cmd_str
+    assert "/bin/bash -lc" in cmd_str and 'exec "$@"' in cmd_str
+
+
 # --------------------------------------------------------------------------
 # list-panes parsing + error policy
 # --------------------------------------------------------------------------

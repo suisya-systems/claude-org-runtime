@@ -40,6 +40,7 @@ from ..terminal import (
     PaneId,
     TerminalAdapter,
     classify_pane_state,
+    venv_pane_prep,
 )
 from . import sidecar, surface
 from .store import ObserverLease, QueueRow, StoreMixin
@@ -64,9 +65,15 @@ class Broker(TokenMixin, StoreMixin):
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
+        root_cwd: str | None = None,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        # root workspace cwd (serve の --root-cwd)。spawn 時の venv 探索フォールバック
+        # 基準に使う (Issue #130): pane 自身の cwd/.venv を優先し、無ければ
+        # root_cwd/.venv に落とす。worker worktree に .venv が無い通常形をここで拾う。
+        # state_dir は broker state の場所であり作業 repo ではないので探索基準にしない。
+        self.root_cwd = root_cwd
         self.adapter = adapter
         self.host = host
         self.port = port
@@ -1179,8 +1186,19 @@ class Broker(TokenMixin, StoreMixin):
         ``peer_notify``) が、非既定 ``--state-dir`` で起動された daemon の queue を
         発見できるようにするため。値は daemon 自身の state dir なので backend を問わず
         単一の出所から与える。
+
+        さらに workspace virtualenv を pane に継承させる (Issue #130)。pane cwd/.venv
+        優先・無ければ root_cwd/.venv フォールバックで ``.venv`` を探し、見つかれば
+        ``VIRTUAL_ENV`` を env dict に足し、``PATH`` は POSIX では argv を
+        post-profile login-shell wrapper に包んで prepend する
+        (:func:`~claude_org_runtime.terminal.base.venv_pane_prep`)。``.venv`` が無ければ
+        完全 no-op (argv/env 不変)。PATH を env dict に直に載せないのは、login shell の
+        profile 初期化が ``-e`` 相当で渡した PATH を後から再構築して ``.venv/bin`` を
+        消すため (Blocker 2)。
         """
         env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
+        argv, venv_env = venv_pane_prep(argv, cwd, self.root_cwd)
+        env.update(venv_env)
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
             return self.adapter.spawn(

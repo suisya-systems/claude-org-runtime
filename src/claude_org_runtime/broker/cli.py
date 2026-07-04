@@ -174,12 +174,18 @@ def run(args: argparse.Namespace) -> int:
     # admin HTTP RPC (token mint / graceful shutdown) の認証 token。root token とは
     # 別系統で生成し sidecar に 0600 で書く (平文 journal 禁止。Codex review)。
     admin_token = secrets.token_urlsafe(32)
+    # root_cwd は spawn 儀式より前に確定させ Broker に持たせる (Issue #130): pane
+    # の venv 探索フォールバック基準 (pane cwd に .venv が無ければ root_cwd/.venv)。
+    # 決定は下の manual-test token 発行と同じ規則 (--root-cwd 明示は absolute 化、
+    # 省略時は daemon 起動 cwd)。詳細な理由は issue_root_token 呼出直前のコメント参照。
+    root_cwd = sidecar.absolutize(args.root_cwd) if args.root_cwd is not None else os.getcwd()
     broker = Broker(
         state_dir=state_dir,
         adapter=adapter,
         host=args.host,
         port=args.port,
         admin_token=admin_token,
+        root_cwd=root_cwd,
     )
     # run スライスの起点: この run の開始前の journal バイト長 (broker.start が
     # broker_started を append する前に取る)。down はこのオフセット以降だけを見て
@@ -217,7 +223,7 @@ def run(args: argparse.Namespace) -> int:
     # absolute passthrough で、state_dir 等 他経路も absolutize に揃えている。
     # os.path.abspath だと Windows daemon で posix-absolute に drive letter を前置して
     # しまい契約からずれる (codex review round 2 Minor: CLI だけ解釈ずれ)。
-    root_cwd = sidecar.absolutize(args.root_cwd) if args.root_cwd is not None else os.getcwd()
+    # root_cwd は Broker 構築時に同じ規則で確定済 (Issue #130 の venv 探索基準と共用)。
     tok = issue_root_token(broker, args.root_role, root_cwd)
     print(f"manual test token ({args.root_role}):", tok)
     print(f"root pane cwd (relative spawn anchor): {root_cwd}")

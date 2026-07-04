@@ -38,6 +38,7 @@ backend ごとの「打鍵の小細工」の差はここで吸収する:
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import time
 from collections.abc import Sequence
@@ -320,6 +321,146 @@ def wait_for_state(
             return True
         time.sleep(interval)
     return False
+
+
+# ---------------------------------------------------------------------------
+# workspace virtualenv inheritance (Issue #130)
+# ---------------------------------------------------------------------------
+
+def find_workspace_venv(*bases: "str | None") -> str | None:
+    """Return the absolute path of the first workspace ``.venv`` that owns the
+    platform interpreter, scanning ``bases`` in order; ``None`` if none.
+
+    Issue #130: org-spawned panes (worker / dispatcher) must inherit the
+    workspace virtualenv, or venv-assuming tooling breaks. Discovery prefers the
+    pane's own ``cwd/.venv`` and falls back to the daemon ``root_cwd/.venv`` --
+    worker worktrees typically have no ``.venv`` of their own, so the fallback is
+    the usual hit (Codex review Major). ``state_dir`` is deliberately NOT a base:
+    it points at broker sidecar/state, not the work repo.
+
+    Detection is a complete no-op unless a real venv interpreter exists
+    (``.venv/bin/python`` on POSIX, ``.venv\\Scripts\\python.exe`` on native
+    Windows). conda and other layouts have no ``.venv`` and are left untouched
+    (Codex review Minor). native Windows (``os.name == "nt"``) uses
+    ``Scripts`` + ``;``; WSL/Linux/macOS use ``bin`` + ``:`` (WSL is a Linux
+    process, so it takes the POSIX layout).
+    """
+    for base in bases:
+        if not base:
+            continue
+        venv = os.path.abspath(os.path.join(base, ".venv"))
+        if os.name == "nt":
+            interp = os.path.join(venv, "Scripts", "python.exe")
+        else:
+            interp = os.path.join(venv, "bin", "python")
+        if os.path.isfile(interp):
+            return venv
+    return None
+
+
+def venv_bin_dir(venv: str) -> str:
+    """The venv's executables dir (``Scripts`` on native Windows, else ``bin``)."""
+    return os.path.join(venv, "Scripts" if os.name == "nt" else "bin")
+
+
+# $SHELL values whose syntax the wrapper script relies on (``export`` builtin,
+# ``"$PATH"`` / ``"$@"`` expansion, combined ``-lc``). All POSIX-family shells
+# honour these; fish / csh / tcsh / xonsh / nu / powershell do NOT (fish uses
+# ``set -gx`` and has no ``$@``; csh uses ``setenv`` and rejects ``-lc``). Using
+# the user's ``$SHELL`` blindly would make the wrapper unparseable and leave the
+# pane / secretary unable to launch at all for those users -- a hard regression
+# vs. launching claude directly (self-review MAJOR). So we only borrow ``$SHELL``
+# when it is POSIX-family, else fall back to ``/bin/sh`` (always present, POSIX).
+_POSIX_WRAPPER_SHELLS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "ksh93", "pdksh", "mksh", "ash", "busybox",
+})
+
+
+def _venv_wrapper_shell() -> str:
+    """Pick a POSIX-syntax login shell for :func:`login_shell_venv_wrapper`.
+
+    Prefer the operator's ``$SHELL`` (so its login profile -- the one that
+    rebuilds ``PATH`` -- is the one we supersede) but only when it is a
+    POSIX-family shell whose syntax the wrapper script needs; otherwise
+    ``/bin/sh`` (self-review MAJOR: a fish/csh ``$SHELL`` cannot parse the
+    script and would break every venv-workspace pane launch).
+    """
+    shell = os.environ.get("SHELL")
+    if shell and os.path.basename(shell) in _POSIX_WRAPPER_SHELLS:
+        return shell
+    return "/bin/sh"
+
+
+def login_shell_venv_wrapper(
+    argv: list[str], bin_dir: str, run_cwd: "str | None" = None,
+) -> list[str]:
+    """Wrap ``argv`` so ``bin_dir`` is prepended to ``PATH`` AFTER the login
+    shell's profile init runs (POSIX only).
+
+    Issue #130 / Codex review Blocker 2: prepending ``PATH`` through the adapter
+    env mechanism (tmux ``new-session -e`` / herdr ``agent.start env``) is not
+    enough -- those pass the value as the *parent* environment, and the pane's
+    login shell then sources the user's profile, which rebuilds ``PATH`` from
+    scratch and drops ``.venv/bin`` (the 2026-07-04 incident mechanism). So the
+    prepend must run *after* profile init: invoke a login shell whose ``-c``
+    script exports the venv ``PATH`` and then ``exec``s the real argv. ``-l``
+    sources the profile *before* ``-c`` runs, so our export always wins. The
+    ``$0`` label is cosmetic (it only shows in ``ps``); the real argv follows
+    and is exec'd via ``"$@"``.
+
+    ``run_cwd`` (when given) is re-entered right after profile init and before
+    ``exec``: ``-l`` sources a login profile, and a profile that ends in an
+    unconditional ``cd`` would otherwise relocate the pane away from the cwd the
+    adapter placed it in (self-review MINOR). ``cd`` uses ``;`` (best-effort) so
+    a missing dir still falls through to the ``exec`` rather than aborting.
+
+    The shell is chosen by :func:`_venv_wrapper_shell` (POSIX-family ``$SHELL``
+    or ``/bin/sh``), never a non-POSIX ``$SHELL`` that cannot parse the script.
+    """
+    shell = _venv_wrapper_shell()
+    steps = []
+    if run_cwd:
+        steps.append(f"cd {shlex.quote(run_cwd)}")
+    steps.append(f'export PATH={shlex.quote(bin_dir)}:"$PATH"')
+    steps.append('exec "$@"')
+    script = "; ".join(steps)
+    return [shell, "-lc", script, "claude-org-runtime-venv", *argv]
+
+
+def venv_pane_prep(
+    argv: list[str], cwd: "str | None", root_cwd: "str | None",
+) -> "tuple[list[str], dict[str, str]]":
+    """Prepare ``(argv, extra_env)`` so an adapter-spawned pane inherits the
+    workspace ``.venv`` (Issue #130). Complete no-op ``(list(argv), {})`` when no
+    ``.venv`` is found (conda etc. untouched).
+
+    ``VIRTUAL_ENV`` rides the adapter env dict -- the same channel as
+    ``ORG_BROKER_STATE_DIR`` (Issue #122). A login shell's profile does not
+    clobber ``VIRTUAL_ENV``, only ``PATH``, so the env dict is safe for it.
+
+    The ``PATH`` prepend is platform-split because the two spawn transports
+    rebuild ``PATH`` differently:
+
+    - POSIX (tmux / wezterm / herdr): the pane runs a login shell that rebuilds
+      ``PATH``, so the prepend is folded into the argv via a post-profile login
+      shell (:func:`login_shell_venv_wrapper`). It stays in the env dict's
+      sibling -- the argv -- so it survives the rebuild.
+    - native Windows (wezterm): ``cmd`` has no ``PATH``-rebuilding profile, so
+      the prepend rides the env dict as ``<Scripts>;%PATH%``. The wezterm
+      adapter's ``cmd /d /c set "PATH=..."`` wrapper (``_env_wrapped_argv``)
+      expands ``%PATH%`` at launch time, so a login-shell wrapper is unneeded
+      (and ``cmd`` cannot express one anyway).
+    """
+    venv = find_workspace_venv(cwd, root_cwd)
+    if venv is None:
+        return list(argv), {}
+    bin_dir = venv_bin_dir(venv)
+    if os.name == "nt":
+        return list(argv), {"VIRTUAL_ENV": venv, "PATH": f"{bin_dir};%PATH%"}
+    # run_cwd = the pane's own cwd (not the venv location -- for the root_cwd
+    # fallback the pane still runs in its own worktree, it just borrows root's
+    # .venv), so a profile ``cd`` cannot move claude out of its worktree.
+    return login_shell_venv_wrapper(argv, bin_dir, run_cwd=cwd), {"VIRTUAL_ENV": venv}
 
 
 # ---------------------------------------------------------------------------

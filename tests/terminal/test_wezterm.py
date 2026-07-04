@@ -212,6 +212,36 @@ def test_spawn_injects_env_via_posix_env_prefix(
     ]
 
 
+def test_spawn_carries_venv_login_shell_wrapper_posix(
+    adapter: WezTermAdapter, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #130: on POSIX the broker wraps argv in a post-profile login shell
+    # (venv_pane_prep). wezterm's `_env_wrapped_argv` then prefixes `env
+    # VIRTUAL_ENV=...` in front of that wrapper, so the pane gets both the
+    # VIRTUAL_ENV and the `export PATH=<venv>/bin` after `--`.
+    from claude_org_runtime.terminal.base import venv_pane_prep
+
+    monkeypatch.setattr(wez_mod.os, "name", "posix")
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
+
+    adapter._fake.queue(
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+    )
+    adapter.spawn(wrapped, env=env)
+    spawn_args = _args(adapter._fake.calls[0])
+    after = spawn_args[spawn_args.index("--") + 1:]
+    # env prefix carries VIRTUAL_ENV, then the login-shell PATH-prepend wrapper.
+    assert after[0] == "env"
+    assert f"VIRTUAL_ENV={tmp_path}/.venv" in after
+    assert "/bin/bash" in after and "-lc" in after
+    assert any(f'export PATH={tmp_path}/.venv/bin:"$PATH"' in tok for tok in after)
+    assert after[-2:] == ["claude", "--flag"]
+
+
 def test_env_wrapped_argv_windows_uses_cmd_set(monkeypatch: pytest.MonkeyPatch) -> None:
     # native Windows には `env` が無いので `cmd /d /c set "K=V"&& <argv>` で注入する。
     # helper を直接検証する (os.name='nt' を spawn 経路に流すと GUI-suppress の
