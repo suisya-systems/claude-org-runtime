@@ -30,7 +30,11 @@ from .base import (
     backend_unavailable_reason,
     classify_pane_state,
     default_backend,
+    find_workspace_venv,
+    login_shell_venv_wrapper,
     make_adapter,
+    venv_bin_dir,
+    venv_pane_prep,
     wait_for_state,
 )
 from .herdr import HerdrAdapter
@@ -53,6 +57,10 @@ __all__ = [
     "backend_unavailable_reason",
     "classify_pane_state",
     "default_backend",
+    "find_workspace_venv",
+    "login_shell_venv_wrapper",
     "make_adapter",
+    "venv_bin_dir",
+    "venv_pane_prep",
     "wait_for_state",
 ]

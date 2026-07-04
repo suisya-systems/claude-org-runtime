@@ -51,6 +51,9 @@ from ..terminal import (
     WezTermAdapter,
     backend_unavailable_reason,
     default_backend,
+    find_workspace_venv,
+    login_shell_venv_wrapper,
+    venv_bin_dir,
 )
 from . import sidecar, surface
 from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
@@ -248,6 +251,7 @@ def build_up_argv(
 def _launch_claude(
     argv: list[str], state_dir: str | None = None,
     observer_secret: str | None = None,
+    root_cwd: str | None = None,
 ) -> int:
     """secretary TUI を起動する。POSIX は exec で置換、Windows は subprocess。
 
@@ -269,6 +273,10 @@ def _launch_claude(
     (Issue #122)。root secretary 内で起動される CLI subprocess (例 ``broker send``)
     が、非既定 ``--state-dir`` で起動した daemon の queue を発見できるようにするため。
     daemon-spawned pane と対称の注入 (server._adapter_spawn)。
+
+    ``root_cwd`` が渡され、そこに ``.venv`` があれば secretary もそれを継承する
+    (Issue #130)。daemon-spawned worker/dispatcher ペイン (server._adapter_spawn が
+    本丸) に対する secretary 用の補助整合で、``.venv`` が無ければ完全 no-op。
 
     ``observer_secret`` が渡されれば ``ORG_BROKER_CHANNEL_OBSERVER`` を子環境へ注入する
     (Issue #129 問題 A)。これは **mcp-config には載せない** observed-session binding の
@@ -300,6 +308,24 @@ def _launch_claude(
         env["ORG_BROKER_STATE_DIR"] = sidecar.absolutize(state_dir)
     if observer_secret:
         env["ORG_BROKER_CHANNEL_OBSERVER"] = observer_secret
+    # Issue #130: secretary も workspace の .venv を継承させる (root_cwd = secretary の
+    # cwd)。これは daemon-spawned worker/dispatcher ペイン (server._adapter_spawn が主戦場)
+    # に対する secretary 用の補助整合で、root TUI を子ペインと揃える。.venv が無ければ
+    # 完全 no-op (env/argv 不変で従来挙動)。VIRTUAL_ENV は env dict に載せ、PATH は
+    # POSIX では argv を post-profile login-shell wrapper に包んで prepend する
+    # (login shell の profile 再構築後に効かせるため — Blocker 2)。Windows は
+    # subprocess.call(env=) が子環境を直接決めるため (cmd profile による PATH 再構築が
+    # 無い) PATH を env dict に直に前置してよい (%PATH% 展開は不要)。
+    venv = find_workspace_venv(root_cwd)
+    if venv is not None:
+        bin_dir = venv_bin_dir(venv)
+        env["VIRTUAL_ENV"] = venv
+        if os.name == "nt":
+            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        else:
+            # run_cwd = root_cwd so a login profile that cd's cannot move the
+            # secretary out of its workspace root (self-review MINOR).
+            argv = login_shell_venv_wrapper(argv, bin_dir, run_cwd=root_cwd)
     if os.name != "nt":
         os.execvpe(argv[0], argv, env)  # 返らない (プロセス置換)
         return 0  # pragma: no cover (execvpe 成功時は到達しない)
@@ -502,7 +528,8 @@ def org_up(
     # observed-session binding (Issue #129 問題 A): channel mint が返した observer 秘密を
     # 子環境へ注入する (mcp-config には載せない非 replay 信号)。channel 非要求 mint や
     # 旧 daemon 応答では None で、その場合は従来の last-register-wins に委ねる。
-    return launch(argv, state_dir, observer_secret=mint.get("observer_secret"))
+    return launch(argv, state_dir, observer_secret=mint.get("observer_secret"),
+                  root_cwd=root_cwd)
 
 
 # ===========================================================================

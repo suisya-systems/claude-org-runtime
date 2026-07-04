@@ -331,6 +331,31 @@ def test_spawn_without_env_omits_agent_start_env_param(
     assert "env" not in server.params_for("agent.start")
 
 
+def test_spawn_carries_venv_login_shell_wrapper(
+    server: FakeHerdrServer, tmp_path, monkeypatch
+) -> None:
+    # Issue #130: the broker's post-profile login-shell wrapper (venv_pane_prep)
+    # rides Herdr's `agent.start` argv verbatim, and VIRTUAL_ENV rides the `env`
+    # param. Herdr's own login shell rebuilds PATH, so the `export PATH` inside
+    # the wrapped argv is what re-activates the venv.
+    from claude_org_runtime.terminal.base import venv_pane_prep
+
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
+
+    _wire_spawn(server, pane_id="w1:p2")
+    a = _adapter(server)
+    a.spawn(wrapped, cwd=str(tmp_path), env=env)
+    ap = server.params_for("agent.start")
+    assert ap["env"] == {"VIRTUAL_ENV": f"{tmp_path}/.venv"}
+    # wrapped argv reaches agent.start verbatim (Herdr does not rewrite argv).
+    assert ap["argv"][0] == "/bin/bash" and ap["argv"][1] == "-lc"
+    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in ap["argv"][2]
+    assert ap["argv"][-2:] == ["claude", "--flag"]
+
+
 def test_spawn_second_reuses_workspace_no_recreate(
     server: FakeHerdrServer, tmp_path
 ) -> None:

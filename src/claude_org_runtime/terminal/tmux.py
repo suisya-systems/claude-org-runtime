@@ -193,9 +193,17 @@ class TmuxAdapter:
         tmux では常に新 session を作る (既存 renga 等の pane には触らない)。
 
         ``env`` (Issue #122): pane プロセスへ **追加注入する** 環境変数。tmux 一級の
-        ``new-session -e KEY=VALUE`` で渡す (``VAR=... command`` の shell 前置は使わない
-        -- backend 間で挙動を割らないため native 機構に載せる)。``-e`` は指定した変数
-        のみを上書きし、残りは tmux サーバー環境から継承する。
+        ``new-session -e KEY=VALUE`` で渡す。``-e`` は指定した変数のみを上書きし、残りは
+        tmux サーバー環境から継承する。env dict はそのまま親環境へ載せる値専用
+        (``ORG_BROKER_STATE_DIR`` / ``VIRTUAL_ENV``) で、この経路では ``VAR=... command``
+        の shell 前置はしない (backend 間で挙動を割らないため native 機構に載せる)。
+
+        ただし Issue #130 の ``PATH`` の venv prepend は **env dict では行わない**:
+        login shell の profile 初期化が ``-e`` で渡した ``PATH`` を後から再構築して
+        ``.venv/bin`` を消すため、PATH prepend は argv を post-profile login-shell wrapper
+        に包む上位層 (:func:`~claude_org_runtime.terminal.base.venv_pane_prep`) が担う。
+        その wrapper は broker が渡す ``argv`` に既に織り込まれており、本メソッドは
+        それを shlex-join してそのまま実行する (adapter 側は argv を素通しするだけ)。
         """
         session = self._new_session_name()
         # argv を 1 本の shell-command 文字列にして渡す (tmux はこれを既定 shell
