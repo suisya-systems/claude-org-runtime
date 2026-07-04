@@ -10,6 +10,7 @@ construction: the always-present ``--pane-id`` target, the bracketed-paste vs
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -212,20 +213,26 @@ def test_spawn_injects_env_via_posix_env_prefix(
     ]
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX login-shell wrapper branch (native Windows uses %PATH% env)"
+)
 def test_spawn_carries_venv_login_shell_wrapper_posix(
     adapter: WezTermAdapter, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Issue #130: on POSIX the broker wraps argv in a post-profile login shell
     # (venv_pane_prep). wezterm's `_env_wrapped_argv` then prefixes `env
     # VIRTUAL_ENV=...` in front of that wrapper, so the pane gets both the
-    # VIRTUAL_ENV and the `export PATH=<venv>/bin` after `--`.
+    # VIRTUAL_ENV and the `export PATH=<venv>/bin` after `--`. Uses the natural
+    # (POSIX) os.name and is skipped on Windows -- forcing os.name would risk the
+    # pathlib PosixPath pitfall; the Windows env-PATH branch has its own tests.
+    from claude_org_runtime.terminal import base
     from claude_org_runtime.terminal.base import venv_pane_prep
 
-    monkeypatch.setattr(wez_mod.os, "name", "posix")
     monkeypatch.setenv("SHELL", "/bin/bash")
     (tmp_path / ".venv" / "bin").mkdir(parents=True)
     (tmp_path / ".venv" / "bin" / "python").write_text("")
     wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
+    venv = str(tmp_path / ".venv")
 
     adapter._fake.queue(
         (0, "5\n", ""),
@@ -236,9 +243,10 @@ def test_spawn_carries_venv_login_shell_wrapper_posix(
     after = spawn_args[spawn_args.index("--") + 1:]
     # env prefix carries VIRTUAL_ENV, then the login-shell PATH-prepend wrapper.
     assert after[0] == "env"
-    assert f"VIRTUAL_ENV={tmp_path}/.venv" in after
+    assert f"VIRTUAL_ENV={venv}" in after
     assert "/bin/bash" in after and "-lc" in after
-    assert any(f'export PATH={tmp_path}/.venv/bin:"$PATH"' in tok for tok in after)
+    assert any("export PATH=" in tok and base.venv_bin_dir(venv) in tok
+               for tok in after)
     assert after[-2:] == ["claude", "--flag"]
 
 

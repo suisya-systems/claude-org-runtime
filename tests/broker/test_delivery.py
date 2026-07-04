@@ -34,6 +34,7 @@ from claude_org_runtime.broker import sidecar
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.store import CLAIMED, DELIVERED, PULL, PUSH, UNDELIVERED
 from claude_org_runtime.broker.surface import dispatch_tool
+from claude_org_runtime.terminal import base as terminal_base
 
 from .conftest import FakeAdapter
 
@@ -674,11 +675,38 @@ def test_spawn_injects_broker_state_dir_on_space_layout_branch(tmp_path):
     assert spawned["env"]["ORG_BROKER_STATE_DIR"] == sidecar.absolutize(tmp_path / "sd")
 
 
-def _make_venv(root):
-    """Create a fake POSIX ``.venv`` (bin/python) under ``root`` (Issue #130)."""
-    (root / ".venv" / "bin").mkdir(parents=True)
-    (root / ".venv" / "bin" / "python").write_text("")
+def _make_venv(root, *, windows=None):
+    """Create a fake ``.venv`` under ``root`` (Issue #130), layout matching the
+    host ``os.name`` by default: ``Scripts/python.exe`` under nt, else
+    ``bin/python``. Using the host layout (not a forced os.name) keeps these
+    tests off the pathlib pitfall -- forcing os.name would make ``Broker``'s
+    ``pathlib.Path`` build a ``PosixPath`` on Windows and raise (Codex P1)."""
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        (root / ".venv" / "Scripts").mkdir(parents=True)
+        (root / ".venv" / "Scripts" / "python.exe").write_text("")
+    else:
+        (root / ".venv" / "bin").mkdir(parents=True)
+        (root / ".venv" / "bin" / "python").write_text("")
     return root / ".venv"
+
+
+def _assert_pane_venv_activated(sp, venv):
+    """Assert the pane env activated ``venv`` for the running host's branch
+    (platform-adaptive; no os.name forcing). Path expectations derive from
+    ``terminal_base.venv_bin_dir`` so they are separator-safe on both OSes."""
+    assert sp["env"]["VIRTUAL_ENV"] == str(venv)
+    bin_dir = terminal_base.venv_bin_dir(str(venv))
+    if os.name == "nt":
+        # Windows: PATH rides the env dict as "<Scripts>;%PATH%" (wezterm's cmd
+        # `set` expands %PATH%); argv is not wrapped.
+        assert sp["env"]["PATH"] == f"{bin_dir};%PATH%"
+    else:
+        # POSIX: PATH prepend rides the post-profile login-shell wrapper argv.
+        assert sp["argv"][1] == "-lc"
+        assert "export PATH=" in sp["argv"][2]
+        assert bin_dir in sp["argv"][2]
 
 
 def test_broker_stores_root_cwd(tmp_path):
@@ -688,18 +716,16 @@ def test_broker_stores_root_cwd(tmp_path):
 
 
 def test_adapter_spawn_activates_pane_cwd_venv(tmp_path, fake_adapter):
-    """Issue #130: pane cwd/.venv があれば argv を login-shell wrapper に包み PATH を
-    prepend し、VIRTUAL_ENV を env dict に注入する (POSIX host)。#122 の env も残る。"""
+    """Issue #130: pane cwd/.venv があれば venv を活性化する。POSIX は argv を
+    login-shell wrapper に包み PATH prepend、Windows は env dict %PATH%。#122 の env も残る。"""
     venv = _make_venv(tmp_path)
     b = Broker(state_dir=tmp_path / "sd", adapter=fake_adapter)
     b._adapter_spawn(["claude", "--flag"], str(tmp_path), "worker", None)
     sp = fake_adapter.spawned[-1]
-    assert sp["env"]["VIRTUAL_ENV"] == str(venv)
+    _assert_pane_venv_activated(sp, venv)
     # #122 の ORG_BROKER_STATE_DIR は env dict にそのまま残る (退行なし)。
     assert sp["env"]["ORG_BROKER_STATE_DIR"] == sidecar.absolutize(tmp_path / "sd")
-    # argv は post-profile login-shell wrapper に包まれ、PATH prepend を後段で効かせる。
-    assert sp["argv"][1] == "-lc"
-    assert f'export PATH={venv}/bin:"$PATH"' in sp["argv"][2]
+    # 元の claude argv は保たれる (Windows: そのまま / POSIX: wrapper 末尾)。
     assert sp["argv"][-2:] == ["claude", "--flag"]
 
 
@@ -712,8 +738,7 @@ def test_adapter_spawn_falls_back_to_root_cwd_venv(tmp_path, fake_adapter):
     b = Broker(state_dir=tmp_path / "sd", adapter=fake_adapter, root_cwd=str(root))
     b._adapter_spawn(["claude"], str(worker), "worker", None)
     sp = fake_adapter.spawned[-1]
-    assert sp["env"]["VIRTUAL_ENV"] == str(venv)
-    assert f'export PATH={venv}/bin:"$PATH"' in sp["argv"][2]
+    _assert_pane_venv_activated(sp, venv)
 
 
 def test_adapter_spawn_noop_without_venv(tmp_path, fake_adapter):
@@ -729,7 +754,7 @@ def test_adapter_spawn_noop_without_venv(tmp_path, fake_adapter):
 
 def test_spawn_claude_pane_activates_venv_end_to_end(tmp_path, fake_adapter):
     """Issue #130: spawn_claude_pane ツール経路 (cwd 解決込み) でも venv を継承し、
-    channel/mcp-config flag を保ったまま argv が wrapper に包まれる。"""
+    channel/mcp-config flag を保ったまま活性化する。"""
     venv = _make_venv(tmp_path)
     b = Broker(state_dir=tmp_path / "sd", adapter=fake_adapter)
     fake_adapter.add_pane(active=True)
@@ -739,10 +764,11 @@ def test_spawn_claude_pane_activates_venv_end_to_end(tmp_path, fake_adapter):
     })
     sp = fake_adapter.spawned[-1]
     assert sp["env"]["VIRTUAL_ENV"] == str(venv)
-    assert sp["argv"][1] == "-lc"
-    # 元の claude argv (channel/mcp-config) は wrapper の末尾にそのまま残る。
+    # 元の claude argv (channel/mcp-config) は保たれる (POSIX は wrapper 末尾)。
     assert "--mcp-config" in sp["argv"]
     assert "--dangerously-load-development-channels" in sp["argv"]
+    if os.name != "nt":
+        assert sp["argv"][1] == "-lc"
 
 
 def test_spawn_claude_injects_channel_sidecar_and_dev_channel(tmp_path, fake_adapter):

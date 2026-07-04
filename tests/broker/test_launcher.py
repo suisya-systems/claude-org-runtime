@@ -619,12 +619,16 @@ def test_launch_claude_posix_exec_injects_broker_state_dir(monkeypatch):
     assert captured["env"]["ORG_TRANSPORT"] == "broker"
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX exec / login-shell wrapper (Windows uses subprocess + env PATH)"
+)
 def test_launch_claude_posix_activates_root_cwd_venv(monkeypatch, tmp_path):
     """Issue #130: root_cwd/.venv があれば secretary もそれを継承する (POSIX exec)。
 
     server._adapter_spawn (worker/dispatcher の本丸) に対する secretary 用の補助整合。
-    VIRTUAL_ENV は env dict、PATH は argv を post-profile login-shell wrapper に包む。"""
-    monkeypatch.setattr(launcher.os, "name", "posix")
+    VIRTUAL_ENV は env dict、PATH は argv を post-profile login-shell wrapper に包む。
+    POSIX 専用経路 (execvpe) のため native os.name を使い Windows では skip する
+    (os.name を強制すると pathlib PosixPath の罠を踏む恐れがあるため)。"""
     monkeypatch.setenv("SHELL", "/bin/bash")
     (tmp_path / ".venv" / "bin").mkdir(parents=True)
     (tmp_path / ".venv" / "bin" / "python").write_text("")
@@ -634,18 +638,22 @@ def test_launch_claude_posix_activates_root_cwd_venv(monkeypatch, tmp_path):
         lambda file, argv, env: captured.update(file=file, argv=argv, env=env),
     )
     launcher._launch_claude(["claude", "--mcp-config", "{}"], root_cwd=str(tmp_path))
-    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
+    venv = str(tmp_path / ".venv")
+    assert captured["env"]["VIRTUAL_ENV"] == venv
     # argv is wrapped in the login-shell PATH prepend; file is the shell now.
+    # Path expectation derived from launcher.venv_bin_dir so it is separator-agnostic.
     assert captured["file"] == "/bin/bash"
     assert captured["argv"][1] == "-lc"
-    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in captured["argv"][2]
-    assert captured["argv"][-2:] == ["claude", "--mcp-config"] or \
-        captured["argv"][-3:] == ["claude", "--mcp-config", "{}"]
+    assert "export PATH=" in captured["argv"][2]
+    assert launcher.venv_bin_dir(venv) in captured["argv"][2]
+    assert captured["argv"][-3:] == ["claude", "--mcp-config", "{}"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX exec path (native os.name; no forcing)"
+)
 def test_launch_claude_posix_noop_without_root_cwd_venv(monkeypatch, tmp_path):
     """Issue #130: root_cwd に .venv が無ければ完全 no-op (argv/env 不変で従来挙動)。"""
-    monkeypatch.setattr(launcher.os, "name", "posix")
     captured = {}
     monkeypatch.setattr(
         launcher.os, "execvpe",
@@ -659,7 +667,11 @@ def test_launch_claude_posix_noop_without_root_cwd_venv(monkeypatch, tmp_path):
 
 def test_launch_claude_windows_activates_root_cwd_venv(monkeypatch, tmp_path):
     """Issue #130: native Windows は subprocess.call(env=) が子環境を直接決めるため、
-    PATH を env dict へ直接前置する (cmd profile による PATH 再構築が無く %PATH% 不要)。"""
+    PATH を env dict へ直接前置する (cmd profile による PATH 再構築が無く %PATH% 不要)。
+
+    os.name="nt" 強制は安全: この経路は state_dir を渡さず (sidecar.absolutize 不発火)
+    pathlib.Path を構築しないため、強制中に WindowsPath が実体化されない。これで
+    Linux/macOS CI でも native-Windows branch を被覆できる。"""
     monkeypatch.setattr(launcher.os, "name", "nt")
     (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
     (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("")
@@ -671,8 +683,9 @@ def test_launch_claude_windows_activates_root_cwd_venv(monkeypatch, tmp_path):
 
     monkeypatch.setattr(launcher.subprocess, "call", fake_call)
     launcher._launch_claude(["claude"], root_cwd=str(tmp_path))
-    scripts = launcher.venv_bin_dir(f"{tmp_path}/.venv")
-    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
+    venv = str(tmp_path / ".venv")
+    scripts = launcher.venv_bin_dir(venv)
+    assert captured["env"]["VIRTUAL_ENV"] == venv
     # Windows は argv を包まず、PATH を env dict に os.pathsep で前置する (%PATH% なし)。
     # claude が venv Scripts に無い通常形では argv[0] は不変 (ambient PATH 解決のまま)。
     assert captured["argv"] == ["claude"]
@@ -699,7 +712,7 @@ def test_launch_claude_windows_resolves_exe_in_venv_scripts(monkeypatch, tmp_pat
     launcher._launch_claude(["claude", "--x"], root_cwd=str(tmp_path))
     # argv[0] は venv 内の実行体へ解決され、残りの引数は保たれる。
     assert captured["argv"] == [fake_exe, "--x"]
-    assert captured["env"]["VIRTUAL_ENV"] == f"{tmp_path}/.venv"
+    assert captured["env"]["VIRTUAL_ENV"] == str(tmp_path / ".venv")
 
 
 def test_launch_claude_omits_state_dir_when_not_given(monkeypatch):
