@@ -42,7 +42,7 @@ from ..terminal import (
     classify_pane_state,
 )
 from . import sidecar, surface
-from .store import QueueRow, StoreMixin
+from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
 
@@ -60,6 +60,7 @@ class Broker(TokenMixin, StoreMixin):
         nudge_defer_max_tries: int = 30,
         admin_token: str | None = None,
         lease_seconds: float = 30.0,
+        observer_lease_seconds: float = 90.0,
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
@@ -75,6 +76,10 @@ class Broker(TokenMixin, StoreMixin):
         # worst-case emit+confirm 往復より保守的に取る (sidecar 死亡時の reap 遅延と
         # の trade-off)。reclaim_warn_threshold 超で reclaim された行は印字する。
         self.lease_seconds = lease_seconds
+        # observed-session binding (Issue #129 問題 A): observer lease の TTL。observed
+        # sidecar の register/poll heartbeat (~POLL_INTERVAL 毎) が renew するため、
+        # session 継続中は失効せず、poll が止まった dead session のみ TTL 経過で解放する。
+        self.observer_lease_seconds = observer_lease_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
@@ -98,6 +103,10 @@ class Broker(TokenMixin, StoreMixin):
         self._delivery_instances: dict[str, str] = {}     # owner -> current-gen instance id
         self._delivery_poll_seen: dict[str, dict[str, float]] = {}  # owner -> {instance: ts}
         self._duplicate_emit_at: dict[tuple[str, str, str], float] = {}  # dup emit cooldown
+        # observed-session binding (Issue #129 問題 A)。owner -> ObserverLease。human
+        # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
+        # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。
+        self._observer_leases: dict[str, ObserverLease] = {}
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -264,11 +273,21 @@ class Broker(TokenMixin, StoreMixin):
         # 持ち、root Claude Code にも push 一次が届くようにする (本タスクの本丸)。
         # control-plane の probe / down ctrl token は channel を要求しないため、使い捨て
         # token に未使用 delivery cred を leak させない。
+        observer_secret: str | None = None
         if channel:
             delivery_cred = self.issue_delivery_cred(agent_id)
             mcp_config["mcpServers"]["org-broker-channel"] = (
                 self.channel_server_config(delivery_cred, agent_id)
             )
+            # observed-session binding (Issue #129 問題 A): channel mint = human-facing
+            # observed session の起動。observer lease を assert し秘密を返す。呼び元
+            # (org up) はこれを **mcp-config ではなく子プロセス env** に注入する
+            # (assert_observer の非 replay 契約)。この session の sidecar だけが秘密を
+            # 提示でき generation を bump できる。fork replay は mcp_config (delivery
+            # cred 込み) を継承しても process env の秘密を持たないため takeover 不可。
+            # 秘密は mcp_config に **入れない** (persisted secretary-mcp.json は replay
+            # 面なので、そこへ入れると fork が復元でき束縛が破れる)。
+            observer_secret = self.assert_observer(agent_id)
         return {
             "ok": True,
             "token": token,
@@ -276,6 +295,7 @@ class Broker(TokenMixin, StoreMixin):
             "name": agent_id,
             "role": role,
             "mcp_config": mcp_config,
+            "observer_secret": observer_secret,
         }
 
     @property
@@ -1541,7 +1561,21 @@ class _McpHandler(BaseHTTPRequestHandler):
             return
         if path == "/claim-owner":
             # sidecar register: owner の delivery generation を +1 し現世代に登録する。
-            self._send_json(200, broker.register_delivery_instance(token, instance_id))
+            # Issue #129: observer 秘密 (非 replay 信号、Phase 2) と bg_hosted marker
+            # (Phase 1) を任意で受ける。observer は文字列、bg_hosted は厳密に bool の時
+            # のみ True 扱い (truthy 文字列/数値で suppress が誤発火しないよう防御)。
+            observer = req.get("observer")
+            if observer is not None and not isinstance(observer, str):
+                self._send_json(400, {"ok": False, "error": "[invalid_observer] "
+                                      "observer must be a string"})
+                return
+            bg_hosted = req.get("bg_hosted", False)
+            if not isinstance(bg_hosted, bool):
+                self._send_json(400, {"ok": False, "error": "[invalid_bg_hosted] "
+                                      "bg_hosted must be a boolean"})
+                return
+            self._send_json(200, broker.register_delivery_instance(
+                token, instance_id, observer=observer, bg_hosted=bg_hosted))
             return
         # poll / confirm は generation を必須にする (fence の根拠)。
         try:

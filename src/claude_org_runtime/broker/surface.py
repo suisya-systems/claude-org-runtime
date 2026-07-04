@@ -49,6 +49,7 @@ from ..terminal.base import (
     project_space_key,
 )
 from ..terminal.keys import normalize_key
+from .store import PULL
 
 if TYPE_CHECKING:  # 循環 import 回避 (server -> surface -> server を型のみで切る)
     from .server import Broker
@@ -765,6 +766,11 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
 
     if name == "list_peers":
         with broker._lock:
+            # receive_mode は per-agent の実 delivery_mode を反映する (Issue #129 診断性):
+            # PUSH 一次配送中は "push"、admin flip_mode(PULL) で pull フォールバックへ
+            # 移行した agent は "pull"。従来は定数 "push" 固定で、PULL 移行 (bg-hosted
+            # suppress の interim operation 等) が list 表示と実状態で乖離していた。
+            # _mode_of は _lock 保持中に呼ぶ契約 (ここは with broker._lock 内)。
             peers = [
                 {
                     "id": b.agent_id,
@@ -773,7 +779,11 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
                     "summary": b.summary,
                     "cwd": b.cwd,
                     "kind": b.kind,
-                    "receive_mode": RECEIVE_MODE,
+                    "receive_mode": (
+                        FALLBACK_RECEIVE_MODE
+                        if broker._mode_of(b.agent_id) == PULL
+                        else RECEIVE_MODE
+                    ),
                 }
                 for b in broker._binds.values()
                 if b.registered and not b.revoked

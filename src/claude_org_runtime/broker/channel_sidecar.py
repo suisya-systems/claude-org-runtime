@@ -50,6 +50,19 @@ LOG_PATH = os.environ.get("ORG_BROKER_CHANNEL_LOG", "")
 # テスト専用 fault injection: "skip-confirm" = emit はするが confirm しない
 # (emit と confirm の間で sidecar が死亡したケースの再現。lease reaping の回復を検証する)
 FAULT = os.environ.get("ORG_BROKER_CHANNEL_FAULT", "")
+# observed-session binding (Issue #129 問題 A): human launcher (org up) が **子プロセス
+# env** に注入する非 replay 秘密。register 時に提示すると observed generation として
+# claim できる。fork/resume は mcp-config を verbatim replay しても process env の本秘密は
+# 継承しない (空になる) ため、daemon が generation bump を拒否して stand-down させる。
+# mcp-config の DAEMON_URL/CRED/OWNER と違い、これは env だけに存在し config には載らない。
+OBSERVER_SECRET = os.environ.get("ORG_BROKER_CHANNEL_OBSERVER", "")
+# 明示 bg-hosted marker (Issue #129 問題 B / Phase 1): background-hosted host が明示的に
+# セットした時だけ register/claim を抑止する。**heuristic 判定 (isatty / process tree 等)
+# はしない**: foreground を bg と誤判定した瞬間に claim が止まり push 配信が停止する事故側に
+# 倒れるため。不明時は foreground 扱いで claim 継続する (安全側 = 配信継続)。
+BG_HOSTED = os.environ.get("ORG_BROKER_CHANNEL_BG_HOSTED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # session-scoped fencing (Issue #125): このプロセス固有の instance id。fork/resume は
 # 同一 delivery cred (env) を replay するが、main() は新プロセスで毎回走るので instance id
@@ -66,6 +79,11 @@ _REGISTER_RETRY_DELAY = 0.5
 
 _stdout_lock = threading.Lock()
 _started = threading.Event()
+# stand-down (Issue #129): register が ``suppressed_bg_hosted`` (Phase 1) / ``unobserved``
+# (Phase 2) を返したらセットする。この sidecar は claim loop を起動せず沈黙する
+# (何も claim/emit/confirm しない = background-hosted host や fork replay が message を
+# claim->silent-drop で破壊するのを断つ)。stdin は読み続け MCP transport は生かす。
+_stood_down = threading.Event()
 
 # MCP protocolVersion negotiation (blind mirror を避ける)
 _SUPPORTED_PROTO = frozenset((
@@ -148,17 +166,36 @@ def _daemon_post(path: str, payload: dict) -> dict:
 
 
 # ------------------------------------------------------------- register (fence)
-def _register_owner() -> int:
+def _register_owner() -> int | None:
     """daemon へ ``/claim-owner`` を打ち owner の delivery generation を取得する。
 
     session-scoped fencing (Issue #125): これが owner の generation を +1 し、この
     instance を現世代の唯一の claimer として daemon に登録する。fork/resume で生まれた
     旧 sidecar は旧世代のまま残り、以後の poll/confirm を daemon が ``stale_sidecar`` で
-    拒否する (二重 claim による沈黙喪失を断つ)。成功した generation を返し、失敗時は
-    例外を送出する (呼び元がリトライ判断)。
+    拒否する (二重 claim による沈黙喪失を断つ)。成功した generation を返し、transient
+    失敗時は例外を送出する (呼び元がリトライ判断)。
+
+    register には Issue #129 の 2 信号を任意で載せる: ``observer`` (非 replay 秘密、
+    Phase 2 observed-session binding) と ``bg_hosted`` (明示 bg-hosted marker、Phase 1)。
+    daemon が register/claim を抑止した場合 (``suppressed_bg_hosted`` / ``unobserved``)
+    は :data:`_stood_down` をセットして ``None`` を返す (再試行せず claim もしない)。
     """
     global _generation
-    res = _daemon_post("/claim-owner", {"instance_id": INSTANCE_ID})
+    payload: dict = {"instance_id": INSTANCE_ID}
+    if OBSERVER_SECRET:
+        payload["observer"] = OBSERVER_SECRET
+    if BG_HOSTED:
+        payload["bg_hosted"] = True
+    res = _daemon_post("/claim-owner", payload)
+    err = res.get("error")
+    if err in ("suppressed_bg_hosted", "unobserved"):
+        # Phase 1 (bg-hosted) / Phase 2 (fork replay で observer 秘密を持たない unobserved
+        # sidecar)。この instance は claim しない = 沈黙 (message を破壊しない)。再試行も
+        # しない (状態は transient ではないため retry で覆らない)。
+        _stood_down.set()
+        _log(f"delivery not claimed: {err} "
+             f"(standing down; not entering claim loop)")
+        return None
     gen = res.get("generation")
     if not res.get("ok") or gen is None:
         raise RuntimeError(f"claim-owner rejected: {res}")
@@ -183,12 +220,20 @@ def _register_with_retries() -> bool:
     """
     for attempt in range(1, _REGISTER_RETRIES + 1):
         try:
-            _register_owner()
-            return True
+            gen = _register_owner()
         except Exception as exc:
             _log(f"register attempt {attempt}/{_REGISTER_RETRIES} failed: {exc}")
             if attempt < _REGISTER_RETRIES:
                 time.sleep(_REGISTER_RETRY_DELAY)
+            continue
+        # daemon が register/claim を抑止した (Issue #129 stand-down)。transient では
+        # ないので再試行しない。呼び元は claim loop を起動しない。
+        if _stood_down.is_set():
+            return False
+        if gen is not None:
+            return True
+        # gen None かつ非 stand-down は想定外。失敗として扱い再試行しない。
+        return False
     return False
 
 
@@ -206,15 +251,26 @@ def _push_loop() -> None:
     claim せず静かに待機する (再 register はしない — 上記の通り generation war を招く)。
     """
     _started.wait()   # client の initialized を待ってから配送開始
+    if _stood_down.is_set():
+        # Issue #129: register で抑止された (bg-hosted / unobserved fork)。claim loop を
+        # 起動せず沈黙する (message を claim->破壊しない)。stdin loop は生きたまま。
+        _log("standing down (delivery suppressed at register); claim loop not started")
+        return
     _log(f"push loop start: daemon={DAEMON_URL} owner={OWNER} "
          f"instance={INSTANCE_ID} interval={POLL_INTERVAL}s")
     while True:
+        if _stood_down.is_set():
+            _log("standing down; exiting claim loop")
+            return
         try:
             gen = _current_generation()
             if gen is None:
                 # 起動時 register が transient に失敗した場合のみここで再試行する
                 # (まだ一度も成功していない間だけ = generation war を起こさない)。
                 if not _register_with_retries():
+                    if _stood_down.is_set():
+                        _log("standing down after register; exiting claim loop")
+                        return
                     time.sleep(POLL_INTERVAL)
                     continue
                 gen = _current_generation()
@@ -286,7 +342,11 @@ def _handle(msg: dict) -> dict | None:
         # register は **成功後は二度と行わない** (再 register は generation を上げ、
         # 自分の in-flight claim を差し戻して不要な再配達を招く)。conformant client は
         # initialized を 1 回だけ送るが、重複通知でも再 register しないよう guard する。
-        if _current_generation() is not None:
+        if _stood_down.is_set():
+            # Issue #129: 既に抑止済 (bg-hosted / unobserved)。重複 initialized でも
+            # 再 register せず沈黙を保つ (daemon への suppress 再 journal も避ける)。
+            _log("client re-initialized (stood down); not registering")
+        elif _current_generation() is not None:
             _log(f"client re-initialized (already registered "
                  f"gen={_current_generation()}); not re-registering")
         elif _register_with_retries():
