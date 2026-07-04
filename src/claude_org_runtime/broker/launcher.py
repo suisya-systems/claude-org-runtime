@@ -171,10 +171,18 @@ def _mint_secretary(
     持ち push が届く (本タスク: secretary 起動経路の channel 配線欠落の修正)。
     control-plane の probe / down ctrl token は別経路 (channel 非要求) なので
     使い捨て token に未使用 delivery cred を leak しない。
+
+    ``observer: True`` を要求し、observed-session binding (Issue #129 問題 A) の
+    observer lease を assert させて ``observer_secret`` を受け取る。org up はこの秘密を
+    子プロセス env (``ORG_BROKER_CHANNEL_OBSERVER``) へ handoff し、この observed
+    secretary session だけが delivery generation を bump できるようにする (fork replay の
+    takeover を断つ)。observer は org up の human-facing 経路だけが指定する opt-in で、
+    他の admin channel mint (secret handoff を持たない) は従来どおり last-register-wins。
     """
     return _admin_rpc(
         host, port, admin_token, "mint_token",
-        {"role": "secretary", "name": name, "cwd": root_cwd, "channel": True},
+        {"role": "secretary", "name": name, "cwd": root_cwd,
+         "channel": True, "observer": True},
     )
 
 

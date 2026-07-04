@@ -228,6 +228,11 @@ class Broker(TokenMixin, StoreMixin):
         push 一次配送の channel sidecar (``org-broker-channel``, OWNER=この agent) を
         積み delivery-scoped credential を発行する (spawn_claude の子経路ミラー)。
         secretary(窓口) 起動経路がこれで dev-channel sidecar を持ち push が届く。
+
+        ``observer`` (任意、既定 False): observed-session binding (Issue #129 問題 A) を
+        有効にする。``channel`` を要し、True の時だけ observer lease を assert して
+        ``observer_secret`` を返す。呼び元はこの秘密を子プロセス env へ handoff する契約
+        (org up 経路)。指定しない channel mint は従来の last-register-wins のまま。
         """
         role = params.get("role", "worker")
         if role not in surface.ROOT_ROLE_CHOICES:
@@ -254,6 +259,19 @@ class Broker(TokenMixin, StoreMixin):
         channel = params.get("channel", False)
         if not isinstance(channel, bool):
             return {"ok": False, "error": "[invalid_params] channel must be a boolean"}
+        # observer (任意、既定 False): observed-session binding を有効にする (Issue #129
+        # 問題 A)。**明示 opt-in の時だけ** observer lease を assert し秘密を返す。これは
+        # 呼び元が秘密を子プロセス env (ORG_BROKER_CHANNEL_OBSERVER) へ handoff する契約と
+        # ペアで、org up の human-facing 経路だけが指定する。channel だけの mint (secret
+        # handoff を持たない admin caller が mcp_config だけで起動する) に lease を張ると、
+        # その sidecar が秘密を提示できず unobserved で stand-down し push が止まるため、
+        # ここは opt-in に閉じる (Codex review P2)。observer は channel を要する。
+        observer = params.get("observer", False)
+        if not isinstance(observer, bool):
+            return {"ok": False, "error": "[invalid_params] observer must be a boolean"}
+        if observer and not channel:
+            return {"ok": False,
+                    "error": "[invalid_params] observer requires channel"}
         # 既定 agent_id は毎回一意にする: 固定名だと複数回 mint した token が同一
         # agent として bind/queue を共有し配送先が曖昧化する (agent_id 基準の
         # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使うが、
@@ -279,15 +297,17 @@ class Broker(TokenMixin, StoreMixin):
             mcp_config["mcpServers"]["org-broker-channel"] = (
                 self.channel_server_config(delivery_cred, agent_id)
             )
-            # observed-session binding (Issue #129 問題 A): channel mint = human-facing
-            # observed session の起動。observer lease を assert し秘密を返す。呼び元
+            # observed-session binding (Issue #129 問題 A): observer 明示 opt-in の時だけ
+            # lease を assert し秘密を返す (= human-facing observed session の起動)。呼び元
             # (org up) はこれを **mcp-config ではなく子プロセス env** に注入する
             # (assert_observer の非 replay 契約)。この session の sidecar だけが秘密を
             # 提示でき generation を bump できる。fork replay は mcp_config (delivery
             # cred 込み) を継承しても process env の秘密を持たないため takeover 不可。
             # 秘密は mcp_config に **入れない** (persisted secretary-mcp.json は replay
-            # 面なので、そこへ入れると fork が復元でき束縛が破れる)。
-            observer_secret = self.assert_observer(agent_id)
+            # 面なので、そこへ入れると fork が復元でき束縛が破れる)。observer を指定しない
+            # channel mint は従来の last-register-wins のまま (secret handoff 不要)。
+            if observer:
+                observer_secret = self.assert_observer(agent_id)
         return {
             "ok": True,
             "token": token,

@@ -923,19 +923,48 @@ def test_bg_hosted_suppress_does_not_regress_normal_register(tmp_path):
 
 
 # ============================== Issue #129 admin mint observer wiring
-def test_admin_mint_channel_asserts_observer_and_returns_secret(tmp_path):
-    """channel mint は observer lease を assert し秘密を返す。秘密は mcp_config に載らない
-    (非 replay 信号)。channel 非要求 mint は observer 束縛しない。"""
+def test_admin_mint_observer_optin_asserts_lease_and_returns_secret(tmp_path):
+    """observer=True の channel mint だけが observer lease を assert し秘密を返す。秘密は
+    mcp_config に載らない (非 replay 信号 = 子プロセス env handoff とペア)。"""
     b = Broker(state_dir=tmp_path, adapter=None)
-    res = b.admin_mint_token({"role": "secretary", "name": "sec", "channel": True})
+    res = b.admin_mint_token({"role": "secretary", "name": "sec",
+                              "channel": True, "observer": True})
     assert res["ok"] is True
     secret = res["observer_secret"]
     assert secret and isinstance(secret, str)
     assert "sec" in b._observer_leases
     assert secret not in json.dumps(res["mcp_config"])   # persisted 面に秘密を残さない
-    # channel 非要求では observer を束縛せず秘密も返さない。
-    res2 = b.admin_mint_token({"role": "secretary", "name": "sec2"})
-    assert res2["observer_secret"] is None and "sec2" not in b._observer_leases
+
+
+def test_admin_mint_channel_without_observer_does_not_bind(tmp_path):
+    """Codex P2: observer opt-in の無い channel mint は lease を張らず秘密も返さない。
+
+    secret handoff を持たない admin caller が mcp_config だけで起動しても sidecar が
+    unobserved で止まらない (従来の last-register-wins のまま)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec", "channel": True})
+    assert res["ok"] is True
+    assert res["observer_secret"] is None
+    assert "sec" not in b._observer_leases
+    # その sidecar は observer 無しでも register して generation を bump できる (配信継続)。
+    cred = res["mcp_config"]["mcpServers"]["org-broker-channel"]["env"][
+        "ORG_BROKER_CHANNEL_CRED"]
+    assert b.register_delivery_instance(cred, "i1")["generation"] == 1
+
+
+def test_admin_mint_observer_requires_channel(tmp_path):
+    """observer=True を channel 無しで要求したら [invalid_params] で拒否する
+    (観測束縛は delivery cred を要するため、無意味な組合せを loud に落とす)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec", "observer": True})
+    assert res["ok"] is False and "observer requires channel" in res["error"]
+
+
+def test_admin_mint_channel_not_requested_has_no_observer_secret(tmp_path):
+    """channel 非要求 mint は observer_secret=None (delivery cred も lease も無し)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec2"})
+    assert res["observer_secret"] is None and "sec2" not in b._observer_leases
 
 
 # ============================== Issue #129 HTTP wire (observer / bg_hosted)
