@@ -61,6 +61,34 @@ PULL = "PULL"
 
 
 @dataclass
+class ObserverLease:
+    """observed live session を delivery generation に束ねる lease (Issue #129 問題 A)。
+
+    human-facing launcher (``org up``) が起動する observed session だけが delivery
+    generation を bump し ``/claim-owner`` できるようにするための **非 replay 秘密**。
+    launcher はこの ``secret`` を **mcp-config ではなく子プロセス env** に注入する
+    (:meth:`~claude_org_runtime.broker.store.StoreMixin.assert_observer`)。fork/resume は
+    mcp-config (delivery cred 込み) を verbatim replay するが process env の秘密は
+    継承しないため lease を提示できず、:meth:`register_delivery_instance` が generation
+    bump を拒否する (fork による observed session の takeover を断つ)。
+
+    ``expires_at`` は 2 相のライフサイクルを持つ:
+    - **armed** (``None``): assert 直後〜初回 observed register まで。**失効しない**。
+      secretary の起動が遅い (段1 folder-trust プロンプト放置等で TTL 超) 場合でも lease が
+      消えず、初回 register まで fork/replay 保護を保つ (register 前に wall-clock で失効
+      させると保護が黙って外れる — Codex review P2)。
+    - **activated** (``float``): 初回 observed register が ``now + observer_lease_seconds``
+      を打ち、以後 observed sidecar の register/poll heartbeat が renew する。poll が止まった
+      (session 死亡) 後に TTL 経過で失効し、dead session の stale lease が将来の観測束縛や
+      recovery register を塞がないようにする。
+    """
+
+    secret: str
+    # None = armed (未 activate、失効しない)。float = activated 後の失効時刻。
+    expires_at: float | None
+
+
+@dataclass
 class QueueRow:
     """1 メッセージの配送行 (§9.3 三状態ライフサイクル)。
 
@@ -101,8 +129,11 @@ class StoreMixin:
     # duplicate-claimer 検知: owner -> {instance_id: last poll ts} と emit cooldown。
     _delivery_poll_seen: dict[str, dict[str, float]]
     _duplicate_emit_at: dict[tuple[str, str, str], float]  # (owner, iA, iB) -> last emit ts
+    # observed-session binding (Issue #129 問題 A)。owner -> 現在の observer lease。
+    _observer_leases: dict[str, ObserverLease]
     state_dir: Path
     lease_seconds: float
+    observer_lease_seconds: float
     reclaim_warn_threshold: int
 
     def _journal(self, event: str, **fields) -> None:
@@ -129,6 +160,45 @@ class StoreMixin:
         する。0 は「まだどの sidecar も register していない」= claim 不可を表す。
         """
         return self._delivery_generations.get(owner, 0)
+
+    def _observer_active_locked(self, owner: str, now: float) -> ObserverLease | None:
+        """owner の未失効 observer lease を返す (無ければ None)。**_lock 保持中に呼ぶ**。
+
+        observed-session binding (Issue #129 問題 A): lease が active な owner は
+        「human launcher が observed live session を assert 済」= その lease 秘密を提示
+        できる sidecar だけが generation を bump できる。lease 不在 / 失効時は None を
+        返し、:meth:`register_delivery_instance` は従来の last-register-wins に委ねる
+        (子 pane 等 launcher が束縛していない owner の push 配信を回帰させない安全側)。
+        """
+        lease = self._observer_leases.get(owner)
+        if lease is None:
+            return None
+        # armed (expires_at is None) は失効しない (初回 register までの arming window)。
+        # activated 後のみ wall-clock で失効させる (dead session の cleanup)。
+        if lease.expires_at is not None and lease.expires_at <= now:
+            return None
+        return lease
+
+    def assert_observer(self, owner: str) -> str:
+        """owner の observer lease を assert / rotate し、その秘密を返す (Issue #129 問題 A)。
+
+        human-facing launcher (``org up`` / admin-minted secretary) が observed live
+        session を起動する直前に呼ぶ。返る秘密は **mcp-config ではなく子プロセス env**
+        (``ORG_BROKER_CHANNEL_OBSERVER``) に載せる非 replay 信号で、その session の
+        channel sidecar だけが register 時に提示できる。fork/resume は mcp-config を
+        verbatim replay しても process env の秘密を継承しないため lease を提示できず、
+        :meth:`register_delivery_instance` が generation bump を拒否する (takeover を断つ)。
+        呼ぶたびに秘密を rotate する: 新しい launcher 起動が旧 observed session を
+        supersede し、旧 session の秘密は以後 unobserved になる。expires_at は
+        observed sidecar の register / poll heartbeat が renew する。
+        """
+        secret = secrets.token_urlsafe(32)
+        with self._lock:
+            # armed で置く (expires_at=None): 初回 observed register が TTL 計時を開始する
+            # まで失効させない (slow startup で保護が黙って外れるのを防ぐ — Codex P2)。
+            self._observer_leases[owner] = ObserverLease(secret=secret, expires_at=None)
+        self._journal("observer_lease_asserted", owner=owner)
+        return secret
 
     def _note_poll_locked(
         self, owner: str, instance_id: str, now: float
@@ -291,7 +361,10 @@ class StoreMixin:
         return out
 
     # ------------------------------------------------------ delivery register
-    def register_delivery_instance(self, token: str, instance_id: str) -> dict:
+    def register_delivery_instance(
+        self, token: str, instance_id: str, *,
+        observer: str | None = None, bg_hosted: bool = False,
+    ) -> dict:
         """channel sidecar instance を登録し owner の delivery generation を +1 する。
 
         session-scoped fencing (Issue #125): session fork/resume で **同一 delivery
@@ -307,28 +380,65 @@ class StoreMixin:
         (:meth:`flip_mode` の原子的 flip と同型 — lease 失効を待たず新 sidecar / pull で
         再配達させる。Codex review Blocker #3)。register 応答で generation を返し、
         sidecar はこれを以後の poll/confirm に載せる。
+
+        **Issue #129 問題 B (Phase 1) — 明示 bg-hosted marker suppress**: ``bg_hosted``
+        (sidecar が明示 marker env を受け取った時だけ True) の register は generation を
+        bump せず claim も発行しない。``delivery_suppressed_bg_hosted`` を journal して
+        観測性を残し、sidecar に stand-down (claim loop 不起動) を指示する。bg 判定は
+        **明示 marker のみ** で行い heuristic (isatty / process tree) は使わない
+        (foreground 誤判定で push が止まる事故側に倒れるため。不明時は foreground 扱い)。
+
+        **Issue #129 問題 A (Phase 2) — observed-session binding**: owner に active な
+        observer lease がある (human launcher が :meth:`assert_observer` 済) 場合、
+        ``observer`` 秘密が一致する sidecar だけが generation を bump できる。秘密を
+        提示できない register (= mcp-config を replay しただけの fork/resume で process
+        env の秘密を持たない sidecar) は generation を bump せず ``unobserved`` を返し
+        stand-down させる (observed live session の takeover を断つ)。lease 不在 / 失効の
+        owner は従来の last-register-wins に委ねる (子 pane 等の push 配信を回帰させない)。
         """
         journal: tuple[str, dict] | None = None
-        owner: str | None = None
         with self._lock:
             owner = self._delivery_owner_locked(token)
             if owner is None:
                 return {"ok": False, "error": "unauthorized"}
-            gen = self._generation_of(owner) + 1
-            self._delivery_generations[owner] = gen
-            self._delivery_instances[owner] = instance_id
-            # 旧世代の CLAIMED 行を差し戻す (新 generation != claim_generation の全て)。
-            for row in self._rows.values():
-                if (row.state == CLAIMED and row.to_id == owner
-                        and row.claim_generation != gen):
-                    row.state = UNDELIVERED
-                    row.owner = None
-            journal = ("delivery_generation_registered",
-                       {"owner": owner, "generation": gen, "instance": instance_id})
+            now = time.time()
+            if bg_hosted:
+                # Phase 1: 明示 bg-hosted marker -> register/claim 抑止 (generation 不変)。
+                journal = ("delivery_suppressed_bg_hosted",
+                           {"owner": owner, "instance": instance_id})
+                result: dict = {"ok": False, "error": "suppressed_bg_hosted",
+                                "owner": owner}
+            else:
+                lease = self._observer_active_locked(owner, now)
+                if lease is not None and observer != lease.secret:
+                    # Phase 2: observer lease が active だが秘密不一致 (未提示含む)。
+                    # unobserved sidecar (fork replay 等) -> generation を bump しない。
+                    journal = ("delivery_register_unobserved",
+                               {"owner": owner, "instance": instance_id})
+                    result = {"ok": False, "error": "unobserved", "owner": owner}
+                else:
+                    gen = self._generation_of(owner) + 1
+                    self._delivery_generations[owner] = gen
+                    self._delivery_instances[owner] = instance_id
+                    # 旧世代の CLAIMED 行を差し戻す (新 generation != claim_generation)。
+                    for row in self._rows.values():
+                        if (row.state == CLAIMED and row.to_id == owner
+                                and row.claim_generation != gen):
+                            row.state = UNDELIVERED
+                            row.owner = None
+                    observed = lease is not None
+                    if observed:
+                        # observed sidecar の register で lease を activate (armed->TTL 計時
+                        # 開始) / renew する。以後 poll heartbeat が renew し続ける。
+                        lease.expires_at = now + self.observer_lease_seconds
+                    journal = ("delivery_generation_registered",
+                               {"owner": owner, "generation": gen,
+                                "instance": instance_id, "observed": observed})
+                    result = {"ok": True, "owner": owner, "generation": gen,
+                              "instance_id": instance_id}
         if journal is not None:
             self._journal(journal[0], **journal[1])
-        return {"ok": True, "owner": owner, "generation": gen,
-                "instance_id": instance_id}
+        return result
 
     # ----------------------------------------------------------- poll-claims
     def poll_claims(self, token: str, generation: int, instance_id: str) -> dict:
@@ -369,6 +479,12 @@ class StoreMixin:
                 result: dict = {"error": "stale_sidecar", "rows": [],
                                 "generation": cur_gen}
             else:
+                # 現世代 instance の poll は observed session が live な heartbeat。
+                # observer lease があれば renew する (Issue #129: session 継続中は束縛を
+                # 維持し、poll が止まった dead session のみ TTL 経過で失効させる)。
+                lease = self._observer_active_locked(owner, now)
+                if lease is not None:
+                    lease.expires_at = now + self.observer_lease_seconds
                 mode = self._mode_of(owner)
                 epoch = self._epoch_of(owner)
                 if mode != PUSH:
@@ -547,6 +663,10 @@ class StoreMixin:
             self._delivery_generations.pop(owner, None)
             self._delivery_instances.pop(owner, None)
             self._delivery_poll_seen.pop(owner, None)
+            # observed-session binding も落とす (Issue #129): 残ると同名 respawn 後に
+            # 旧 observer lease を継承し、新 session の sidecar が unobserved 扱いで
+            # claim できなくなる (誤束縛)。
+            self._observer_leases.pop(owner, None)
             for k in [k for k in self._duplicate_emit_at if k[0] == owner]:
                 del self._duplicate_emit_at[k]
             for row in self._rows.values():
@@ -574,6 +694,10 @@ class StoreMixin:
                 # 現世代と active instance を出す (二重 sidecar / stale fence の切り分け)。
                 "generations": dict(self._delivery_generations),
                 "instances": dict(self._delivery_instances),
+                # observed-session binding 診断 (Issue #129): owner ごとの observer lease
+                # 失効時刻 (active な束縛の有無と残 TTL の切り分け)。秘密自体は晒さない。
+                "observers": {o: l.expires_at
+                              for o, l in self._observer_leases.items()},
                 "rows": [
                     {"id": r.id, "to_id": r.to_id, "state": r.state,
                      "owner": r.owner, "reclaim": r.reclaim_count}

@@ -800,6 +800,220 @@ def test_spawn_rejects_collision_with_bind_only_agent(tmp_path, fake_adapter):
     assert fake_adapter.spawned == []
 
 
+# ============================== Issue #129 observed-session binding (問題 A)
+def test_observer_lease_gates_generation_bump(tmp_path):
+    """assert_observer 済 owner は、秘密を提示する sidecar だけが generation を bump できる。
+    秘密無し / 不一致の register (fork replay 相当) は ``unobserved`` で拒否し generation
+    不変 (observed live session の takeover を断つ)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    # observed sidecar: 正しい秘密 -> generation 1。
+    reg = b.register_delivery_instance(dc, "obs", observer=secret)
+    assert reg["ok"] is True and reg["generation"] == 1
+    assert b._delivery_generations["sec"] == 1
+    # fork replay: 秘密無し -> unobserved、generation は 1 のまま、現世代 instance も不変。
+    forked = b.register_delivery_instance(dc, "fork", observer=None)
+    assert forked["ok"] is False and forked["error"] == "unobserved"
+    assert b._delivery_generations["sec"] == 1
+    assert b._delivery_instances["sec"] == "obs"
+    # 間違った秘密でも同様に拒否する。
+    wrong = b.register_delivery_instance(dc, "fork2", observer="not-the-secret")
+    assert wrong["error"] == "unobserved" and b._delivery_generations["sec"] == 1
+
+
+def test_observer_fork_cannot_take_over_delivery(tmp_path):
+    """問題 A の核心: observed session が claim 中に fork が register を試みても generation を
+    奪えず、observed sidecar が message を届け続ける (二重 claim による沈黙喪失が起きない)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, sec = _registered(b, "src"), _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
+    b.enqueue(src, "sec", "human-facing-message")
+    # fork が秘密無しで register (unobserved) — generation を奪えない。
+    assert b.register_delivery_instance(dc, "fork", observer=None)["error"] == "unobserved"
+    # observed sidecar は現世代のまま claim できる (message 喪失しない)。
+    res = b.poll_claims(dc, gen, "obs")
+    assert [r["entry"]["message"] for r in res["rows"]] == ["human-facing-message"]
+    # fork は (奪えていないので現世代番号 gen を replay しても) instance 照合で拒否される。
+    assert b.poll_claims(dc, gen, "fork")["error"] == "stale_sidecar"
+
+
+def test_no_observer_lease_keeps_last_register_wins(tmp_path):
+    """lease 未 assert の owner (子 pane 等) は従来の last-register-wins が不変。
+
+    Phase 2 が observer 束縛の無い owner の push 配信を回帰させないことの回帰ガード
+    (observer lease は org up secretary 経路だけが assert し、spawn_claude 子は assert
+    しない = 従来どおり generation を bump して claim できる)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "w")
+    dc = b.issue_delivery_cred("w")
+    assert b.register_delivery_instance(dc, "i1")["generation"] == 1
+    assert b.register_delivery_instance(dc, "i2")["generation"] == 2   # bump 継続
+
+
+def test_observer_lease_armed_survives_slow_startup(tmp_path):
+    """Codex P2: assert から初回 register までの起動遅延が TTL を超えても、armed lease は
+    失効しない (register 前に wall-clock で失効すると fork/replay 保護が黙って外れる)。
+    初回 observed register まで fork は unobserved で弾かれ続ける。"""
+    b = Broker(state_dir=tmp_path, adapter=None, observer_lease_seconds=0.1)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    time.sleep(0.2)   # TTL(0.1) を超える起動遅延 (段1 folder-trust 放置等)
+    # armed lease は失効していない: 秘密無し fork は依然 unobserved。
+    assert b.register_delivery_instance(dc, "fork", observer=None)["error"] == "unobserved"
+    # 秘密を持つ observed sidecar は register できる (保護が失われていない)。
+    assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
+    # register で activate されるので、以後は TTL 計時が始まる (dump に失効時刻が入る)。
+    assert isinstance(b.delivery_dump()["observers"]["sec"], float)
+
+
+def test_observer_lease_renewed_by_poll_and_expires(tmp_path):
+    """observer lease は現世代 poll heartbeat で renew し、poll が止まると TTL 経過で失効する
+    (dead observed session の stale lease が将来の register を永久に塞がない)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+               observer_lease_seconds=0.2)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
+    # poll が renew するので、TTL 超の合計時間でも lease は生き続ける。
+    for _ in range(4):
+        time.sleep(0.1)
+        b.poll_claims(dc, gen, "obs")
+    assert "sec" in b.delivery_dump()["observers"]      # まだ束縛されている
+    # poll を止めて TTL 経過 -> 失効。以後は last-register-wins に戻り、秘密無し register が
+    # 通る (dead session を lease が塞がない)。
+    time.sleep(0.3)
+    assert b.register_delivery_instance(dc, "recover", observer=None)["ok"] is True
+
+
+def test_reset_delivery_state_clears_observer_lease(tmp_path):
+    """close_pane 相当の reset で observer lease も消える (同名 respawn の誤束縛を防ぐ)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    assert "sec" in b._observer_leases
+    b.reset_delivery_state("sec")
+    assert "sec" not in b._observer_leases
+
+
+def test_assert_observer_rotates_secret(tmp_path):
+    """assert_observer は呼ぶたびに秘密を rotate する (新 launcher が旧 session を supersede)。
+    旧秘密は以後 unobserved になり、新秘密だけが generation を bump できる。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    s1 = b.assert_observer("sec")
+    s2 = b.assert_observer("sec")
+    assert s1 != s2
+    dc = b.issue_delivery_cred("sec")
+    assert b.register_delivery_instance(dc, "old", observer=s1)["error"] == "unobserved"
+    assert b.register_delivery_instance(dc, "new", observer=s2)["ok"] is True
+
+
+# ============================== Issue #129 bg-hosted suppress guard (問題 B / Phase 1)
+def test_bg_hosted_marker_suppresses_register(tmp_path):
+    """Phase 1: 明示 bg_hosted marker の register は generation を bump せず claim も許さず、
+    ``delivery_suppressed_bg_hosted`` を journal する (heuristic ではなく明示 marker のみ)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    dc = b.issue_delivery_cred("sec")
+    res = b.register_delivery_instance(dc, "bg", bg_hosted=True)
+    assert res["ok"] is False and res["error"] == "suppressed_bg_hosted"
+    assert "sec" not in b._delivery_generations   # generation 不変 (claim 権を得ない)
+    events = [json.loads(x)["event"]
+              for x in (b.state_dir / "queue.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert "delivery_suppressed_bg_hosted" in events
+
+
+def test_bg_hosted_suppress_does_not_regress_normal_register(tmp_path):
+    """bg_hosted 未指定 (既定 False) の register は従来どおり generation を bump する
+    (suppress は明示 marker がある時だけ = 不明時は foreground 扱いで claim 継続)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    dc = b.issue_delivery_cred("sec")
+    assert b.register_delivery_instance(dc, "fg")["generation"] == 1
+
+
+# ============================== Issue #129 admin mint observer wiring
+def test_admin_mint_observer_optin_asserts_lease_and_returns_secret(tmp_path):
+    """observer=True の channel mint だけが observer lease を assert し秘密を返す。秘密は
+    mcp_config に載らない (非 replay 信号 = 子プロセス env handoff とペア)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec",
+                              "channel": True, "observer": True})
+    assert res["ok"] is True
+    secret = res["observer_secret"]
+    assert secret and isinstance(secret, str)
+    assert "sec" in b._observer_leases
+    assert secret not in json.dumps(res["mcp_config"])   # persisted 面に秘密を残さない
+
+
+def test_admin_mint_channel_without_observer_does_not_bind(tmp_path):
+    """Codex P2: observer opt-in の無い channel mint は lease を張らず秘密も返さない。
+
+    secret handoff を持たない admin caller が mcp_config だけで起動しても sidecar が
+    unobserved で止まらない (従来の last-register-wins のまま)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec", "channel": True})
+    assert res["ok"] is True
+    assert res["observer_secret"] is None
+    assert "sec" not in b._observer_leases
+    # その sidecar は observer 無しでも register して generation を bump できる (配信継続)。
+    cred = res["mcp_config"]["mcpServers"]["org-broker-channel"]["env"][
+        "ORG_BROKER_CHANNEL_CRED"]
+    assert b.register_delivery_instance(cred, "i1")["generation"] == 1
+
+
+def test_admin_mint_observer_requires_channel(tmp_path):
+    """observer=True を channel 無しで要求したら [invalid_params] で拒否する
+    (観測束縛は delivery cred を要するため、無意味な組合せを loud に落とす)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec", "observer": True})
+    assert res["ok"] is False and "observer requires channel" in res["error"]
+
+
+def test_admin_mint_channel_not_requested_has_no_observer_secret(tmp_path):
+    """channel 非要求 mint は observer_secret=None (delivery cred も lease も無し)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.admin_mint_token({"role": "secretary", "name": "sec2"})
+    assert res["observer_secret"] is None and "sec2" not in b._observer_leases
+
+
+# ============================== Issue #129 HTTP wire (observer / bg_hosted)
+def test_claim_owner_observer_and_bg_over_http(broker):
+    """/claim-owner が observer 秘密 (Phase 2) と bg_hosted marker (Phase 1) を配線する。"""
+    broker.register_local(broker.issue_token("sec", "sec", "secretary"))
+    secret = broker.assert_observer("sec")
+    delivery = broker.issue_delivery_cred("sec")
+    # observed 秘密ありは generation を bump する。
+    st, body = _post(broker.base_url + "/claim-owner", delivery,
+                     {"instance_id": "obs", "observer": secret})
+    assert st == 200 and body["ok"] is True and body["generation"] == 1
+    # 秘密無し (fork replay) は unobserved。
+    st, body = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "fork"})
+    assert st == 200 and body["error"] == "unobserved"
+    # bg_hosted marker は suppress。
+    st, body = _post(broker.base_url + "/claim-owner", delivery,
+                     {"instance_id": "bg", "bg_hosted": True})
+    assert st == 200 and body["error"] == "suppressed_bg_hosted"
+
+
+def test_claim_owner_rejects_bad_observer_and_bg_types(broker):
+    """observer は文字列、bg_hosted は bool を要求する (truthy 文字列で誤発火しない)。"""
+    delivery = broker.issue_delivery_cred("sec")
+    st, body = _post(broker.base_url + "/claim-owner", delivery,
+                     {"instance_id": "i", "observer": 123})
+    assert st == 400 and "invalid_observer" in body["error"]
+    st, body = _post(broker.base_url + "/claim-owner", delivery,
+                     {"instance_id": "i", "bg_hosted": "yes"})
+    assert st == 400 and "invalid_bg_hosted" in body["error"]
+
+
 # ============================ R3<->R4 cross-process integration (real sidecar)
 def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
     """実 channel sidecar を subprocess で起こし、poll->emit->confirm の往復を検証。

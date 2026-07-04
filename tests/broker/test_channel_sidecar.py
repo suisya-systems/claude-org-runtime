@@ -91,3 +91,92 @@ def test_channel_payload_tolerates_missing_entry_fields():
     # 欠落 sent_at は degenerate なので空文字 (None を載せて schema 違反にしない)。
     assert content == "" and meta["msg_id"] == "x" and meta["from_id"] is None
     assert meta["sent_at"] == ""
+
+
+# ===================================================== Issue #129 stand-down guard
+def _reset_sidecar_state():
+    cs._stood_down.clear()
+    cs._started.clear()
+    with cs._gen_lock:
+        cs._generation = None
+
+
+def test_register_owner_includes_observer_and_bg_signals(monkeypatch):
+    """register payload に observer 秘密 (Phase 2) を載せる。BG_HOSTED False の間は
+    bg_hosted を載せない (明示 marker のみ suppress を発火させる)。"""
+    captured = {}
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: captured.update(path=path, payload=payload)
+                        or {"ok": True, "generation": 1})
+    monkeypatch.setattr(cs, "OBSERVER_SECRET", "sekret")
+    monkeypatch.setattr(cs, "BG_HOSTED", False)
+    _reset_sidecar_state()
+    try:
+        assert cs._register_owner() == 1
+        assert captured["path"] == "/claim-owner"
+        assert captured["payload"]["observer"] == "sekret"
+        assert "bg_hosted" not in captured["payload"]
+    finally:
+        _reset_sidecar_state()
+
+
+def test_register_owner_stands_down_on_unobserved(monkeypatch):
+    """daemon の unobserved (fork replay で observer 秘密を持たない) は stand-down させ、
+    None を返す (claim しない = message を破壊しない)。"""
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: {"ok": False, "error": "unobserved"})
+    _reset_sidecar_state()
+    try:
+        assert cs._register_owner() is None
+        assert cs._stood_down.is_set()
+        assert cs._current_generation() is None
+    finally:
+        _reset_sidecar_state()
+
+
+def test_register_owner_stands_down_on_bg_suppress(monkeypatch):
+    """明示 bg_hosted marker: payload に bg_hosted=True を載せ、suppressed_bg_hosted で
+    stand-down する (daemon に marker を伝えて観測性を残しつつ claim しない)。"""
+    posted = []
+    monkeypatch.setattr(cs, "BG_HOSTED", True)
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: posted.append(payload)
+                        or {"ok": False, "error": "suppressed_bg_hosted"})
+    _reset_sidecar_state()
+    try:
+        assert cs._register_owner() is None
+        assert cs._stood_down.is_set()
+        assert posted[0]["bg_hosted"] is True
+    finally:
+        _reset_sidecar_state()
+
+
+def test_register_with_retries_no_retry_on_stand_down(monkeypatch):
+    """stand-down は transient ではないので再試行しない (即 False、1 回のみ post)。"""
+    calls = []
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: calls.append(1)
+                        or {"ok": False, "error": "unobserved"})
+    _reset_sidecar_state()
+    try:
+        assert cs._register_with_retries() is False
+        assert cs._stood_down.is_set()
+        assert len(calls) == 1
+    finally:
+        _reset_sidecar_state()
+
+
+def test_initialized_stands_down_without_registering(monkeypatch):
+    """stand-down 済なら重複 initialized でも再 register しない (suppress / 沈黙を保つ)。"""
+    def _boom() -> bool:
+        raise AssertionError("must not register while stood down")
+
+    monkeypatch.setattr(cs, "_register_with_retries", _boom)
+    _reset_sidecar_state()
+    cs._stood_down.set()
+    try:
+        assert cs._handle({"jsonrpc": "2.0",
+                           "method": "notifications/initialized"}) is None
+        assert cs._started.is_set()   # push loop は arm するが中で stand-down して抜ける
+    finally:
+        _reset_sidecar_state()

@@ -83,9 +83,10 @@ def test_org_up_reuses_live_healthy_daemon(live_daemon):
         spawn_calls.append((a, k))
         raise AssertionError("spawn_daemon must not run when reusing a live daemon")
 
-    def fake_launch(argv, state_dir=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None):
         captured["argv"] = argv
         captured["state_dir"] = state_dir
+        captured["observer_secret"] = observer_secret
         return 0
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
@@ -111,7 +112,7 @@ def test_org_up_reused_secretary_named_secretary(live_daemon):
     b, state_dir = live_daemon
     launcher.org_up(_up_args(state_dir, name="secretary"),
                     spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-                    launch=lambda argv, state_dir=None: 0)
+                    launch=lambda argv, state_dir=None, observer_secret=None: 0)
     # mint された bind の agent_id は 'secretary' (root name 契約)。
     assert any(bnd.agent_id == "secretary" and bnd.auth_role == "secretary"
                for bnd in b._binds.values())
@@ -127,7 +128,7 @@ def test_org_up_noop_when_secretary_already_registered(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, name="secretary"),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
     )
     assert rc == 0
     assert launched == []                          # 二人目の secretary を起動しない
@@ -143,7 +144,7 @@ def test_org_up_errors_on_live_backend_conflict(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, backend=other),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
     )
     assert rc == 2                                 # 競合エラー
     assert launched == []                          # 起動しない
@@ -166,7 +167,7 @@ def test_org_up_fails_fast_on_herdr_native_windows(tmp_path, monkeypatch, capsys
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unsupported backend")
         ),
-        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []                          # secretary TUI not launched
@@ -189,7 +190,7 @@ def test_org_up_errors_on_unknown_backend(tmp_path, capsys):
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unknown backend")
         ),
-        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -214,7 +215,7 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
 
     captured = {}
 
-    def fake_launch(argv, state_dir=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None):
         captured["argv"] = argv
         return 0
 
@@ -296,8 +297,9 @@ def test_org_up_wires_channel_into_secretary(live_daemon):
     b, state_dir = live_daemon
     captured = {}
 
-    def fake_launch(argv, state_dir=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None):
         captured["argv"] = argv
+        captured["observer_secret"] = observer_secret
         return 0
 
     rc = launcher.org_up(
@@ -319,6 +321,16 @@ def test_org_up_wires_channel_into_secretary(live_daemon):
     argv = captured["argv"]
     assert "--dangerously-load-development-channels" in argv
     assert "server:org-broker-channel" in argv
+    # observed-session binding (Issue #129 問題 A): channel mint が observer 秘密を返し、
+    # それが launch へ threaded される (子プロセス env 注入の材料)。
+    observer_secret = captured["observer_secret"]
+    assert observer_secret and isinstance(observer_secret, str)
+    # 秘密は **persisted mcp-config には載らない** (fork replay 面。ここに入ると
+    # observed 束縛が復元でき破れる)。非 replay の env 信号であることを固定する。
+    raw_cfg = open(cfg_path, encoding="utf-8").read()
+    assert observer_secret not in raw_cfg
+    # daemon 側に observer lease が assert されている (delivery_dump の observers)。
+    assert "secretary" in b.delivery_dump()["observers"]
 
 
 # ===================================================================== down
@@ -383,7 +395,7 @@ def test_org_up_does_not_cold_start_when_admin_token_missing(tmp_path, monkeypat
         raise AssertionError("must not spawn a second daemon over a claimed state_dir")
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
-                         launch=lambda argv, state_dir=None: launched.append(argv) or 0)
+                         launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0)
     assert rc == 2                                 # token_missing → 明示エラー
     assert launched == []                          # TUI も起動しない
     assert not os.path.exists(os.path.join(state_dir, "secretary-mcp.json"))
@@ -462,7 +474,7 @@ def test_org_up_errors_when_mcp_surface_unhealthy(live_daemon, monkeypatch):
     rc = launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -475,7 +487,7 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
     launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None: 0,
     )
     # admin-* の probe bind は close() で registered=False に落ちている。
     registered_admin = [
@@ -630,3 +642,46 @@ def test_launch_claude_fallback_prefixes_state_dir(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "ORG_BROKER_STATE_DIR=/abs/state" in out
     assert "ORG_TRANSPORT=broker" in out
+
+
+# ============ up: observed-session binding secret injection (Issue #129 問題 A)
+def test_launch_claude_posix_exec_injects_observer_secret(monkeypatch):
+    """POSIX exec 経路: observer_secret 指定時、子環境へ ORG_BROKER_CHANNEL_OBSERVER を
+    注入する (mcp-config には載らない非 replay 信号 = observed session だけが提示できる)。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(env=env),
+    )
+    launcher._launch_claude(["claude"], observer_secret="obs-secret")
+    assert captured["env"]["ORG_BROKER_CHANNEL_OBSERVER"] == "obs-secret"
+
+
+def test_launch_claude_omits_observer_when_not_given(monkeypatch):
+    """observer_secret 未指定 (None) なら ORG_BROKER_CHANNEL_OBSERVER は注入しない。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.delenv("ORG_BROKER_CHANNEL_OBSERVER", raising=False)
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(env=env),
+    )
+    launcher._launch_claude(["claude"])
+    assert "ORG_BROKER_CHANNEL_OBSERVER" not in captured["env"]
+
+
+def test_launch_claude_fallback_includes_observer_secret(monkeypatch, capsys):
+    """claude 不在 fallback の 1 行コマンドに ORG_BROKER_CHANNEL_OBSERVER 前置を **含める**
+    (Codex P2: daemon は lease を assert 済なので、秘密無しで手起動すると sidecar が
+    unobserved で止まり push が届かない。手起動でも observed になるよう secret を渡す)。"""
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    monkeypatch.setattr(
+        launcher.subprocess, "call",
+        lambda argv, *, env: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    rc = launcher._launch_claude(
+        ["claude", "--mcp-config", "{}"], observer_secret="obs-handoff-secret")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ORG_BROKER_CHANNEL_OBSERVER=obs-handoff-secret" in out

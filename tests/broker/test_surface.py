@@ -168,6 +168,22 @@ def test_list_peers_includes_cwd_and_receive_mode(tmp_path):
     assert peers["worker-x"]["receive_mode"] == "push"
 
 
+def test_list_peers_receive_mode_reflects_pull_flip(tmp_path):
+    """Issue #129 診断性: admin flip_mode(PULL) した agent の receive_mode は "pull"、
+    未 flip の agent は "push" (従来の定数固定を廃し per-agent 実状態を反映する)。"""
+    from claude_org_runtime.broker.store import PULL
+
+    b = Broker(state_dir=tmp_path, adapter=None)
+    b.register_local(b.issue_token("push-w", "push-w", "worker"))
+    b.register_local(b.issue_token("pull-w", "pull-w", "worker"))
+    b.flip_mode("pull-w", PULL)   # interim operation (bg-hosted suppress 等) の PULL 移行
+    src = _bind(b, "src")
+    peers = {p["id"]: p for p in
+             json.loads(dispatch_tool(b, src, "list_peers", {})["content"][0]["text"])["peers"]}
+    assert peers["push-w"]["receive_mode"] == "push"
+    assert peers["pull-w"]["receive_mode"] == "pull"
+
+
 # --------------------------------------------------------------- claude builder
 def test_build_claude_argv_injects_mcp_config_and_structured_fields():
     argv = build_claude_argv(

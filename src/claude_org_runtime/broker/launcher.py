@@ -171,10 +171,18 @@ def _mint_secretary(
     持ち push が届く (本タスク: secretary 起動経路の channel 配線欠落の修正)。
     control-plane の probe / down ctrl token は別経路 (channel 非要求) なので
     使い捨て token に未使用 delivery cred を leak しない。
+
+    ``observer: True`` を要求し、observed-session binding (Issue #129 問題 A) の
+    observer lease を assert させて ``observer_secret`` を受け取る。org up はこの秘密を
+    子プロセス env (``ORG_BROKER_CHANNEL_OBSERVER``) へ handoff し、この observed
+    secretary session だけが delivery generation を bump できるようにする (fork replay の
+    takeover を断つ)。observer は org up の human-facing 経路だけが指定する opt-in で、
+    他の admin channel mint (secret handoff を持たない) は従来どおり last-register-wins。
     """
     return _admin_rpc(
         host, port, admin_token, "mint_token",
-        {"role": "secretary", "name": name, "cwd": root_cwd, "channel": True},
+        {"role": "secretary", "name": name, "cwd": root_cwd,
+         "channel": True, "observer": True},
     )
 
 
@@ -237,7 +245,10 @@ def build_up_argv(
     )
 
 
-def _launch_claude(argv: list[str], state_dir: str | None = None) -> int:
+def _launch_claude(
+    argv: list[str], state_dir: str | None = None,
+    observer_secret: str | None = None,
+) -> int:
     """secretary TUI を起動する。POSIX は exec で置換、Windows は subprocess。
 
     POSIX: ``os.execvpe`` で現プロセスを claude に置換する (TUI が端末を引き継ぐ。
@@ -259,6 +270,18 @@ def _launch_claude(argv: list[str], state_dir: str | None = None) -> int:
     が、非既定 ``--state-dir`` で起動した daemon の queue を発見できるようにするため。
     daemon-spawned pane と対称の注入 (server._adapter_spawn)。
 
+    ``observer_secret`` が渡されれば ``ORG_BROKER_CHANNEL_OBSERVER`` を子環境へ注入する
+    (Issue #129 問題 A)。これは **mcp-config には載せない** observed-session binding の
+    非 replay 秘密で、この org up が起動する observed live session の channel sidecar
+    だけが register 時に提示できる。fork/resume は persisted mcp-config (delivery cred
+    込み) を replay しても、この process env の秘密は継承しないため generation を bump
+    できず (daemon が ``unobserved`` で拒否)、observed session を takeover できない。
+    claude が見つからない fallback の 1 行コマンドにも ``ORG_BROKER_CHANNEL_OBSERVER``
+    前置を **含める**: daemon は mint 時に observer lease を assert 済で、秘密無しで手起動
+    すると sidecar が ``unobserved`` で止まり push が届かなくなるため、手起動でも observed
+    になるよう secret を渡す (Codex review P2)。表示 argv は既に delivery cred 入りの
+    mcp-config を含む (どちらも localhost-only 信頼前提の秘密) ため追加の露出増ではない。
+
     **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
     secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
     出すが、本関数はそこへ Enter を**送らない**。exec/subprocess で launcher 自身が
@@ -275,6 +298,8 @@ def _launch_claude(argv: list[str], state_dir: str | None = None) -> int:
     env = {**os.environ, "ORG_TRANSPORT": "broker"}
     if state_dir:
         env["ORG_BROKER_STATE_DIR"] = sidecar.absolutize(state_dir)
+    if observer_secret:
+        env["ORG_BROKER_CHANNEL_OBSERVER"] = observer_secret
     if os.name != "nt":
         os.execvpe(argv[0], argv, env)  # 返らない (プロセス置換)
         return 0  # pragma: no cover (execvpe 成功時は到達しない)
@@ -285,6 +310,10 @@ def _launch_claude(argv: list[str], state_dir: str | None = None) -> int:
         prefix = "ORG_TRANSPORT=broker "
         if state_dir:
             prefix += f"ORG_BROKER_STATE_DIR={shlex.quote(sidecar.absolutize(state_dir))} "
+        if observer_secret:
+            # observed になるよう secret を前置する (無しだと sidecar が unobserved で
+            # 止まり push が届かない — Codex P2)。argv は既に delivery cred 入り。
+            prefix += f"ORG_BROKER_CHANNEL_OBSERVER={shlex.quote(observer_secret)} "
         print("claude を起動できませんでした。以下を手動で実行してください:")
         print("  " + prefix + " ".join(shlex.quote(a) for a in argv))
         return 0
@@ -470,7 +499,10 @@ def org_up(
     print(f"org up: minted secretary token (agent_id={mint['agent_id']})")
     print(f"org up: wrote mcp-config to {cfg_path} (0600)")
     print(f"org up: launching claude secretary TUI ({len(argv)} argv tokens)")
-    return launch(argv, state_dir)
+    # observed-session binding (Issue #129 問題 A): channel mint が返した observer 秘密を
+    # 子環境へ注入する (mcp-config には載せない非 replay 信号)。channel 非要求 mint や
+    # 旧 daemon 応答では None で、その場合は従来の last-register-wins に委ねる。
+    return launch(argv, state_dir, observer_secret=mint.get("observer_secret"))
 
 
 # ===========================================================================
