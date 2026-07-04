@@ -44,6 +44,33 @@ from .base import (  # noqa: F401
 WEZTERM_DEFAULT_EXE = r"C:\Program Files\WezTerm\wezterm.exe"
 
 
+def _cmd_line_from_argv(argv: list[str]) -> str:
+    """Render argv into a ``cmd.exe /c`` command line that reaches the target
+    program's argv verbatim, with cmd's own metacharacters neutralised (#122).
+
+    Two escaping layers (the well-known "quote for CommandLineToArgvW, then
+    caret-escape for cmd.exe" technique):
+
+      1. ``subprocess.list2cmdline`` applies MSVCRT / ``CommandLineToArgvW``
+         quoting (spaces, embedded quotes, backslashes) so each element parses
+         back to one argv token in the launched program.
+      2. Every ``cmd.exe`` metacharacter is caret-escaped so ``cmd`` does not
+         interpret ``& | < > ( )`` (or a stray quote) as a separator /
+         redirection BEFORE launching the program. ``cmd`` strips the carets and
+         hands the rest to the program, so ``^"`` still arrives as ``"`` and the
+         MSVCRT quoting survives. Without this, a caller-supplied argv value
+         containing e.g. ``&`` (flag *values* are not allowlist-checked) would
+         let ``cmd`` run an injected command.
+
+    Known residual: ``%`` cannot be fully neutralised on a ``cmd`` command line
+    (only ``%VAR%`` of an already-defined env var could still expand -- a value
+    substitution, never arbitrary command execution).
+    """
+    line = subprocess.list2cmdline(argv)
+    meta = set('()%!^"<>&|')
+    return "".join("^" + ch if ch in meta else ch for ch in line)
+
+
 def _env_wrapped_argv(argv: list[str], env: dict[str, str] | None) -> list[str]:
     """argv を「環境変数を先に設定してから argv を exec する」形に包む (Issue #122)。
 
@@ -55,7 +82,11 @@ def _env_wrapped_argv(argv: list[str], env: dict[str, str] | None) -> list[str]:
     - POSIX: ``env KEY=VALUE ... <argv>`` (``env`` は最初の非オプション語で option 解析を
       止めるので ``--`` は不要)。
     - native Windows: ``cmd /d /c set "KEY=VALUE"&& <argv>`` (Windows には ``env`` が無い)。
-      ``set`` は cmd 組込みなので追加バイナリ依存を持ち込まない。
+      ``set`` は cmd 組込みなので追加バイナリ依存を持ち込まない。program 部は
+      :func:`_cmd_line_from_argv` で cmd メタ文字を caret エスケープし、caller 由来の
+      argv 値に含まれる ``&`` 等を cmd が区切りとして解釈する injection を遮断する。
+      ``set "K=V"`` の値は二重引用符で囲むため cmd のメタ文字解析から保護される
+      (Windows パスに ``"`` は現れない)。
 
     値は追加分のみを重ねる (親環境全体を渡さない)。default-deny guard は
     :func:`surface.build_claude_argv` で **包む前** の argv に既に適用済み。
@@ -64,7 +95,7 @@ def _env_wrapped_argv(argv: list[str], env: dict[str, str] | None) -> list[str]:
         return list(argv)
     if os.name == "nt":
         assigns = "".join(f'set "{k}={v}"&& ' for k, v in env.items())
-        return ["cmd", "/d", "/c", assigns + subprocess.list2cmdline(argv)]
+        return ["cmd", "/d", "/c", assigns + _cmd_line_from_argv(argv)]
     return ["env", *(f"{k}={v}" for k, v in env.items()), *argv]
 
 

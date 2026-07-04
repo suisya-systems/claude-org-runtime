@@ -225,7 +225,27 @@ def test_env_wrapped_argv_windows_uses_cmd_set(monkeypatch: pytest.MonkeyPatch) 
     assert "claude" in wrapped[3]
 
 
-def test_env_wrapped_argv_empty_is_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_wrapped_argv_windows_escapes_cmd_metachars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Injection guard (#122): a caller-supplied argv value containing a cmd
+    # separator ('&') must be caret-escaped so cmd.exe cannot run an injected
+    # command. The intentional '&&' after `set` must stay intact.
+    monkeypatch.setattr(wez_mod.os, "name", "nt")
+    wrapped = wez_mod._env_wrapped_argv(
+        ["claude", "--append-system-prompt", "x & calc"],
+        {"ORG_BROKER_STATE_DIR": "/s"},
+    )
+    line = wrapped[3]
+    assert line.startswith('set "ORG_BROKER_STATE_DIR=/s"&& ')
+    prog = line.split("&& ", 1)[1]
+    # every '&' in the program portion is caret-escaped (never a bare separator);
+    # list2cmdline quotes the spaced value, and those quotes are caret-escaped too.
+    assert "^&" in prog
+    for i, ch in enumerate(prog):
+        if ch == "&":
+            assert i > 0 and prog[i - 1] == "^", f"bare '&' at {i} in {prog!r}"
+    assert '^"' in prog
     # 空 / None は argv をそのまま返す (両 OS 分岐で従来挙動)。
     monkeypatch.setattr(wez_mod.os, "name", "nt")
     assert wez_mod._env_wrapped_argv(["claude"], None) == ["claude"]
