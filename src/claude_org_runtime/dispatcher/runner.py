@@ -63,6 +63,16 @@ from claude_org_runtime import schema as _schema  # noqa: F401
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALL_DIGITS = re.compile(r"^\d+$")
 
+# Matches a Herdr pane handle ``w<workspace>:p<pane>`` (e.g. ``"w1W:p2"``,
+# ``"w_live:p2"``). The workspace segment is everything between the leading
+# ``w`` and the ``:p`` separator: the Herdr adapter does not constrain it to
+# alphanumerics (its ids include ``w_live`` / ``w_old``) and ``_workspace_of``
+# just splits on the first colon, so match any non-colon run here rather than a
+# fixed char class. The pane segment is numeric. The captured group is the
+# trailing pane number, which :func:`_parse_pane_id` reduces to its int
+# tie-breaker key (see terminal/herdr.py ``_workspace_of`` and ``list_panes``).
+_HERDR_PANE_ID = re.compile(r"^w[^:]+:p([0-9]+)$")
+
 # Balanced split constants -- keep in sync with
 # claude-org-ja `.claude/skills/org-delegate/references/pane-layout.md`.
 MIN_PANE_WIDTH = 20
@@ -348,18 +358,25 @@ _DEFAULT_LOCALE = LocaleConfig.english()
 
 
 def _parse_pane_id(raw: Any) -> int:
-    """Normalise a pane id to an int, accepting both transports' formats.
+    """Normalise a pane id to an int, accepting all three transports' formats.
 
     renga emits numeric pane ids (``1``, ``"2"``); the broker/tmux backend
-    emits tmux ``pane_id`` strings of the form ``%N`` (``"%0"``, ``"%1"``).
-    Both are accepted and reduced to the integer ``N`` -- the value is used
-    only as the deterministic tie-breaker in :func:`choose_split` (the spawn
-    itself targets by ``target_name``), so the leading ``%`` carries no
-    information worth preserving and a single integer key keeps the sort total.
+    emits tmux ``pane_id`` strings of the form ``%N`` (``"%0"``, ``"%1"``);
+    the Herdr backend emits ``w<workspace>:p<pane>`` handles (``"w1W:p2"``,
+    ``"w_live:p2"``). All three are accepted and reduced to the
+    integer ``N`` -- for Herdr ``N`` is the trailing pane number. The value is
+    used only as the deterministic tie-breaker in :func:`choose_split` (the
+    spawn itself targets by ``target_name``), so the ``%`` prefix / Herdr
+    workspace segment carry no information worth preserving and a single
+    integer key keeps the sort total.
 
     A single ``delegate-plan`` call only ever sees panes from one transport,
-    so the fact that tmux ``%1`` and renga ``1`` collapse to the same int is
-    harmless -- they never coexist in one ``panes`` list.
+    so the fact that tmux ``%1``, renga ``1`` and Herdr ``w9:p1`` collapse to
+    the same int is harmless -- they never coexist in one ``panes`` list. Two
+    Herdr panes from different workspaces (``w1:p2`` / ``w2:p2``) can collapse
+    likewise; that only affects tie-break ordering among otherwise-equal
+    candidates (a stable sort keeps their input order), never which pane is
+    spawned into, so it is harmless for the same reason.
     """
     if isinstance(raw, bool):
         # bool is an int subclass; reject it explicitly so ``True``/``False``
@@ -372,9 +389,13 @@ def _parse_pane_id(raw: Any) -> int:
         body = s[1:] if s.startswith("%") else s
         if body.isdigit():
             return int(body)
+        herdr = _HERDR_PANE_ID.match(s)
+        if herdr is not None:
+            return int(herdr.group(1))
     raise ValueError(
         f"unrecognised pane id {raw!r}: expected a renga numeric id "
-        f"(e.g. 1, \"2\") or a tmux pane_id (e.g. \"%0\", \"%1\")"
+        f"(e.g. 1, \"2\"), a tmux pane_id (e.g. \"%0\", \"%1\") or a Herdr "
+        f"handle (e.g. \"w1W:p2\")"
     )
 
 

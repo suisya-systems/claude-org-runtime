@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `dispatcher`: the `delegate-plan` helper now accepts **Herdr** pane handles
+  (runtime Issue #133). The Herdr backend's `list_panes` emits pane ids of the
+  form `w<workspace>:p<pane>` (e.g. `"w1W:p2"`, `"w_live:p2"`), which
+  `_parse_pane_id` rejected as an unrecognised pane id -- so **every**
+  Herdr dispatch fell back to manual degraded mode. The handle is now recognised
+  alongside the existing renga numeric (`1`, `"2"`) and tmux (`"%0"`) formats and
+  reduced to its trailing pane number (the deterministic `choose_split`
+  tie-breaker), restoring the automated spawn path on the Herdr backend.
+
 ## [0.1.35] - 2026-07-04
 
 ### Fixed
