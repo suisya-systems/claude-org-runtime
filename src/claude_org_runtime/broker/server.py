@@ -1132,11 +1132,21 @@ class Broker(TokenMixin, StoreMixin):
         :class:`SpaceDescriptor` を ``space=`` で渡し、持たない backend (tmux/wezterm) には
         ``space`` を渡さず従来の flat spawn を呼ぶ (完全不変)。分岐は ``getattr`` で読む
         (``isolated_session`` 等と同じ能力フラグ規約)。
+
+        全 spawn 経路 (claude / codex / generic) で pane プロセスへ
+        ``ORG_BROKER_STATE_DIR`` (この daemon の state dir 絶対パス) を注入する
+        (Issue #122)。pane 内で走る CLI subprocess (例 ``broker send`` を叩く ja
+        ``peer_notify``) が、非既定 ``--state-dir`` で起動された daemon の queue を
+        発見できるようにするため。値は daemon 自身の state dir なので backend を問わず
+        単一の出所から与える。
         """
+        env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
-            return self.adapter.spawn(argv, cwd=cwd, new_window=True, space=space)
-        return self.adapter.spawn(argv, cwd=cwd, new_window=True)
+            return self.adapter.spawn(
+                argv, cwd=cwd, new_window=True, space=space, env=env
+            )
+        return self.adapter.spawn(argv, cwd=cwd, new_window=True, env=env)
 
     def spawn_claude(
         self, caller: AgentBind, direction: str, target: str, name: str | None,

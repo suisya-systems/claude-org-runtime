@@ -194,6 +194,75 @@ def test_spawn_backfills_window_and_tab(adapter: WezTermAdapter) -> None:
     assert spawn_args[-3:] == ["--", "claude", "--flag"]
 
 
+def test_spawn_injects_env_via_posix_env_prefix(
+    adapter: WezTermAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #122: WezTerm mux は cli client の env を pane に届けないため、起動 argv 自体に
+    # env 設定を織り込む。POSIX: `env KEY=VALUE <argv>` を -- の後に置く。
+    monkeypatch.setattr(wez_mod.os, "name", "posix")
+    adapter._fake.queue(
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+    )
+    adapter.spawn(["claude", "--flag"], env={"ORG_BROKER_STATE_DIR": "/abs/state"})
+    spawn_args = _args(adapter._fake.calls[0])
+    sep = spawn_args.index("--")
+    assert spawn_args[sep + 1:] == [
+        "env", "ORG_BROKER_STATE_DIR=/abs/state", "claude", "--flag"
+    ]
+
+
+def test_env_wrapped_argv_windows_uses_cmd_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    # native Windows には `env` が無いので `cmd /d /c set "K=V"&& <argv>` で注入する。
+    # helper を直接検証する (os.name='nt' を spawn 経路に流すと GUI-suppress の
+    # CREATE_NO_WINDOW 分岐が非 Windows で AttributeError になるため)。
+    monkeypatch.setattr(wez_mod.os, "name", "nt")
+    wrapped = wez_mod._env_wrapped_argv(
+        ["claude", "--flag"], {"ORG_BROKER_STATE_DIR": r"C:\st ate"}
+    )
+    assert wrapped[:3] == ["cmd", "/d", "/c"]
+    assert wrapped[3].startswith('set "ORG_BROKER_STATE_DIR=C:\\st ate"&& ')
+    assert "claude" in wrapped[3]
+
+
+def test_env_wrapped_argv_windows_escapes_cmd_metachars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Injection guard (#122): a caller-supplied argv value containing a cmd
+    # separator ('&') must be caret-escaped so cmd.exe cannot run an injected
+    # command. The intentional '&&' after `set` must stay intact.
+    monkeypatch.setattr(wez_mod.os, "name", "nt")
+    wrapped = wez_mod._env_wrapped_argv(
+        ["claude", "--append-system-prompt", "x & calc"],
+        {"ORG_BROKER_STATE_DIR": "/s"},
+    )
+    line = wrapped[3]
+    assert line.startswith('set "ORG_BROKER_STATE_DIR=/s"&& ')
+    prog = line.split("&& ", 1)[1]
+    # every '&' in the program portion is caret-escaped (never a bare separator);
+    # list2cmdline quotes the spaced value, and those quotes are caret-escaped too.
+    assert "^&" in prog
+    for i, ch in enumerate(prog):
+        if ch == "&":
+            assert i > 0 and prog[i - 1] == "^", f"bare '&' at {i} in {prog!r}"
+    assert '^"' in prog
+    # 空 / None は argv をそのまま返す (両 OS 分岐で従来挙動)。
+    monkeypatch.setattr(wez_mod.os, "name", "nt")
+    assert wez_mod._env_wrapped_argv(["claude"], None) == ["claude"]
+    monkeypatch.setattr(wez_mod.os, "name", "posix")
+    assert wez_mod._env_wrapped_argv(["claude"], {}) == ["claude"]
+
+
+def test_spawn_without_env_leaves_argv_verbatim(adapter: WezTermAdapter) -> None:
+    adapter._fake.queue(
+        (0, "5\n", ""),
+        (0, json.dumps([{"pane_id": 5, "tab_id": 2, "window_id": 1}]), ""),
+    )
+    adapter.spawn(["claude", "--flag"])  # no env -> unchanged (backward compat)
+    spawn_args = _args(adapter._fake.calls[0])
+    assert spawn_args[-3:] == ["--", "claude", "--flag"]
+
+
 def test_spawn_without_new_window(adapter: WezTermAdapter) -> None:
     adapter._fake.queue(
         (0, "7\n", ""),

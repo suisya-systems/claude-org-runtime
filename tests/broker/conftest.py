@@ -113,10 +113,11 @@ class FakeAdapter:
             p["active"] = (h == handle)
 
     # TerminalAdapter Protocol --------------------------------------------
-    def spawn(self, argv, cwd=None, new_window=True, space=None) -> PaneRef:
+    def spawn(self, argv, cwd=None, new_window=True, space=None, env=None) -> PaneRef:
         handle = self.add_pane()
         self.spawned.append(
-            {"argv": list(argv), "cwd": cwd, "handle": handle, "space": space}
+            {"argv": list(argv), "cwd": cwd, "handle": handle, "space": space,
+             "env": dict(env) if env else None}
         )
         tid = f"term_{handle}" if self._provides_terminal_id else None
         if tid is not None:

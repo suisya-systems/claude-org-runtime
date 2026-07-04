@@ -240,6 +240,54 @@ Windows, use the renga transport instead.
 | `1` | down: shutdown requested but `broker_stopped` not observed / daemon unreachable. |
 | `2` | up: unknown backend, a backend unsupported on this platform (e.g. `herdr` on native Windows), backend conflict with a live daemon, or admin mint / MCP surface unhealthy. |
 
+## `broker send`
+
+Enqueue one message to another agent through a running broker daemon. This is a
+thin, **best-effort** bridge for plain CLI subprocesses (e.g. a pane's
+`pr-watch` or `claude-org-ja`'s `tools/peer_notify.py`) that cannot call the
+`mcp__org-broker__send_message` MCP tool directly.
+
+```
+claude-org-runtime broker send --to <agent_id> --message <text> [--state-dir PATH]
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--to AGENT_ID` | Recipient agent id or name (resolved by the broker queue). Required. |
+| `--message TEXT` | Message text to enqueue. Required. |
+| `--state-dir PATH` | Daemon state dir used to discover the sidecar. Optional; see resolution order below. |
+
+### State-dir resolution order
+
+The daemon's state dir is resolved with the precedence:
+
+1. the `--state-dir` flag (when explicitly passed);
+2. the `ORG_BROKER_STATE_DIR` environment variable;
+3. the default `.state/broker` (relative to the current working directory).
+
+When the broker spawns a pane, it injects `ORG_BROKER_STATE_DIR` (the daemon's
+**absolute** state dir) into the pane's environment. A CLI subprocess running
+inside that pane therefore reaches the correct daemon **without** having to
+thread `--state-dir` through — this is what lets `broker send` work when the
+daemon was started with a non-default `--state-dir` (Issue #122). The env var
+name is a contract shared with the `claude-org-ja` consumer; do not rename it.
+
+### Exit codes and diagnostics
+
+`broker send` never raises: every failure is absorbed into a non-zero exit and a
+short one-line ASCII diagnostic on stderr (the message body is never echoed).
+
+| Code | Meaning |
+|------|---------|
+| `0` | Enqueued (delivered to the broker queue). |
+| non-0 | Undelivered (no sidecar / auth failure / unknown recipient / daemon unreachable). |
+
+If the recorded daemon pid is no longer alive when the daemon is unreachable,
+the diagnostic appends a `stale sidecar? pass --state-dir or set
+ORG_BROKER_STATE_DIR` hint pointing at the two resolution knobs above.
+
 ## Migration from `claude-org-ja`'s `tools/`
 
 If your `claude-org-ja` checkout was previously calling either of the

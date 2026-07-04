@@ -184,12 +184,18 @@ class TmuxAdapter:
         argv: list[str],
         cwd: str | None = None,
         new_window: bool = True,
+        env: dict[str, str] | None = None,
     ) -> PaneRef:
         """新しい detached session に argv を起動し PaneRef を返す。
 
         tmux の「ウィンドウ」相当は session (本 backend は常に専用 socket 上の
         新規 session で検証する)。new_window は WezTerm 面との互換のため受けるが、
         tmux では常に新 session を作る (既存 renga 等の pane には触らない)。
+
+        ``env`` (Issue #122): pane プロセスへ **追加注入する** 環境変数。tmux 一級の
+        ``new-session -e KEY=VALUE`` で渡す (``VAR=... command`` の shell 前置は使わない
+        -- backend 間で挙動を割らないため native 機構に載せる)。``-e`` は指定した変数
+        のみを上書きし、残りは tmux サーバー環境から継承する。
         """
         session = self._new_session_name()
         # argv を 1 本の shell-command 文字列にして渡す (tmux はこれを既定 shell
@@ -200,6 +206,8 @@ class TmuxAdapter:
             "-x", str(self.width), "-y", str(self.height),
             "-P", "-F", "#{pane_id}\t#{window_id}\t#{session_name}",
         ]
+        for key, value in (env or {}).items():
+            args += ["-e", f"{key}={value}"]
         if cwd:
             args += ["-c", cwd]
         args += [cmd_str]

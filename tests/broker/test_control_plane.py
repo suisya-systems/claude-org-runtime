@@ -440,3 +440,29 @@ def test_admin_shutdown_clean_stop_via_run(tmp_path, monkeypatch):
     # sidecar (daemon.json + admin.token) は停止時に削除される。
     assert sidecar.read_sidecar(state_dir) is None
     assert sidecar.read_admin_token(state_dir) is None
+
+
+# ============================================== pid liveness helper (Issue #122)
+def test_pid_alive_true_for_self():
+    """本プロセスの pid は生存中と判定される。"""
+    import os
+
+    assert sidecar.pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_reaped_child():
+    """終了済み子プロセスの pid は非生存と判定される (broker send の stale hint 根拠)。"""
+    import subprocess
+    import sys
+
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    # reaped child -> no such live process. (pid reuse within this window is
+    # vanishingly unlikely on a test box.)
+    assert sidecar.pid_alive(p.pid) is False
+
+
+@pytest.mark.parametrize("bad", [0, -1, "123", None])
+def test_pid_alive_false_for_nonpositive_or_nonint(bad):
+    """0 / 負値 / 非 int は非生存 (壊れた sidecar pid を alive と誤認しない)。"""
+    assert sidecar.pid_alive(bad) is False

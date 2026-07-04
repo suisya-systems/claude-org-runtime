@@ -26,6 +26,7 @@ echo しない)。
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import urllib.error
 
@@ -33,6 +34,12 @@ from . import sidecar
 from .rpc import _McpClient, _admin_rpc
 
 DEFAULT_STATE_DIR = ".state/broker"
+# pane プロセスに broker が注入する env 変数名 (Issue #122)。ja 側 consumer
+# (peer_notify.py) との契約なので名前は固定 (ja#674 と対で維持する)。
+STATE_DIR_ENV = "ORG_BROKER_STATE_DIR"
+# unreachable / stale sidecar 時に stderr へ足す短い固定 ASCII hint (Nit 10)。
+# message 本文や token は含めない。
+_STALE_HINT = "stale sidecar? pass --state-dir or set " + STATE_DIR_ENV
 # notify は best-effort な装飾で、呼び元 (ja#590) は subprocess 全体を ~5s で timeout
 # する。各 RPC leg (mint / initialize / send / close) を **個別に** この上限で縛り、
 # stale sidecar が dead port を指して connect が張り付く環境 (一部 Windows) でも 1 leg
@@ -61,6 +68,37 @@ def _fail(reason: str) -> int:
     return 1
 
 
+def _resolve_state_dir(flag_value: str | None) -> str:
+    """Resolve the broker state dir with precedence flag > env > default (Issue #122).
+
+    ``--state-dir`` now defaults to ``None`` (a sentinel) so an explicit flag is
+    distinguishable from omission. When omitted, fall back to the
+    ``ORG_BROKER_STATE_DIR`` env var (injected into the pane by the broker when it
+    spawned this pane), then to :data:`DEFAULT_STATE_DIR`. This lets a CLI
+    subprocess inside a pane reach a daemon started with a **non-default**
+    ``--state-dir`` without the caller having to thread the flag through.
+    """
+    if flag_value is not None:
+        return flag_value
+    env_value = os.environ.get(STATE_DIR_ENV)
+    if env_value:
+        return env_value
+    return DEFAULT_STATE_DIR
+
+
+def _stale_hint(sc: dict | None) -> str:
+    """Append the stale-sidecar hint iff the recorded daemon pid is confidently dead.
+
+    Best-effort pid liveness lives in :func:`sidecar.pid_alive` (no ad-hoc probing
+    here). Emitting the hint only when the pid is dead keeps it actionable rather
+    than noisy on transient connect failures where the daemon is actually alive.
+    """
+    pid = (sc or {}).get("pid")
+    if isinstance(pid, int) and not sidecar.pid_alive(pid):
+        return f" ({_STALE_HINT})"
+    return ""
+
+
 def broker_send(args: argparse.Namespace) -> int:
     """``broker send`` 本体。best-effort: 例外を投げず未配送は非0 return。
 
@@ -78,7 +116,8 @@ def broker_send(args: argparse.Namespace) -> int:
 def _broker_send(args: argparse.Namespace) -> int:
     to_id = args.to
     message = args.message
-    state_dir = sidecar.absolutize(args.state_dir)
+    # 解決順 flag > ORG_BROKER_STATE_DIR env > default (Issue #122)。
+    state_dir = sidecar.absolutize(_resolve_state_dir(args.state_dir))
 
     # --- sidecar 発見 (broker daemon 不在は no-op 非0。renga の RENGA_SOCKET 未設定と対称)
     sc = sidecar.read_sidecar(state_dir)
@@ -96,7 +135,7 @@ def _broker_send(args: argparse.Namespace) -> int:
             {"role": _SENDER_ROLE}, timeout=_RPC_TIMEOUT,
         )
     except urllib.error.URLError:
-        return _fail(f"broker daemon unreachable at {host}:{port}")
+        return _fail(f"broker daemon unreachable at {host}:{port}{_stale_hint(sc)}")
     if not (minted and minted.get("ok")):
         err = (minted or {}).get("error", "no response")
         return _fail(f"admin mint_token failed: {err}")
@@ -112,7 +151,9 @@ def _broker_send(args: argparse.Namespace) -> int:
         client.initialize()
         result = client.send_message(to_id, message)
     except urllib.error.URLError:
-        return _fail(f"broker MCP surface unreachable at {host}:{port}")
+        return _fail(
+            f"broker MCP surface unreachable at {host}:{port}{_stale_hint(sc)}"
+        )
     finally:
         # 使い捨て token を de-register (idle な登録を残さない)。cleanup の失敗は
         # **配送結果 (exit code) を上書きしない**: enqueue 成功後に close() が例外を
@@ -149,10 +190,16 @@ def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
         help="Message text to enqueue.",
     )
     send_p.add_argument(
-        "--state-dir", default=DEFAULT_STATE_DIR,
+        # default None (sentinel) so an explicit flag is distinguishable from
+        # omission; resolution order is flag > ORG_BROKER_STATE_DIR env > default
+        # (Issue #122), applied in _resolve_state_dir.
+        "--state-dir", default=None,
         help=(
-            "broker daemon state dir to discover the sidecar. "
-            f"Default: {DEFAULT_STATE_DIR} (relative to CWD)."
+            "broker daemon state dir to discover the sidecar. Resolution order: "
+            f"this flag > {STATE_DIR_ENV} env > default {DEFAULT_STATE_DIR} "
+            "(relative to CWD). The broker injects "
+            f"{STATE_DIR_ENV} into panes it spawns so a subprocess can reach a "
+            "daemon started with a non-default --state-dir."
         ),
     )
     send_p.set_defaults(func=broker_send)

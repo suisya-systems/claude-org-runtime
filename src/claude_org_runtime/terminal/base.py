@@ -212,6 +212,17 @@ class TerminalAdapter(Protocol):
     他は無視する。**この追加は Set D Surface 1 (spawn) の契約変更**だが default None で
     後方互換であり、契約 ratify は本体取り込みスコープ (別 PR)、本タスクは flag のみ
     (§10)。
+
+    :meth:`spawn` の ``env`` 引数 (optional, Issue #122): pane プロセスの親環境へ
+    **追加注入する環境変数** の辞書 (既定 ``None`` = 追加なしで後方互換)。broker は
+    ここに ``ORG_BROKER_STATE_DIR`` (daemon の state dir 絶対パス) を載せ、pane 内で
+    走る CLI subprocess (例 ``broker send`` を叩く ja ``peer_notify``) が非既定
+    ``--state-dir`` の daemon を発見できるようにする (``mcp_config`` への env 追加では
+    pane 内 subprocess に届かない)。値は **追加分のみ** で、親環境全体ではない
+    (backend は自 backend の env 伝搬機構で既存環境の上に重ねる)。backend ごとの
+    伝搬機構は異なる (tmux=``new-session -e`` / wezterm=argv の env 前置 / herdr=
+    ``agent.start`` の env param) が、**観測挙動 (pane subprocess に届く) は backend
+    間で一致させる**。``None`` / 空 dict は完全に従来挙動。
     """
 
     def spawn(
@@ -220,6 +231,7 @@ class TerminalAdapter(Protocol):
         cwd: str | None = ...,
         new_window: bool = ...,
         space: "SpaceDescriptor | None" = ...,
+        env: "dict[str, str] | None" = ...,
     ) -> PaneRef: ...
 
     def list_panes(self) -> list[dict]: ...

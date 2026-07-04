@@ -30,6 +30,7 @@ import urllib.request
 
 import pytest
 
+from claude_org_runtime.broker import sidecar
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.store import CLAIMED, DELIVERED, PULL, PUSH, UNDELIVERED
 from claude_org_runtime.broker.surface import dispatch_tool
@@ -625,6 +626,54 @@ def test_confirm_invalid_id_400(broker):
 
 
 # ================================================================ R3 spawn 儀式
+def test_spawn_claude_injects_broker_state_dir_env(tmp_path, fake_adapter):
+    """spawn_claude_pane が pane 親環境へ ORG_BROKER_STATE_DIR(絶対) を注入する (#122)。
+
+    pane 内で走る CLI subprocess (broker send を叩く ja peer_notify) が、非既定
+    --state-dir daemon の queue を発見できるようにするための本丸。channel sidecar 用の
+    mcp_config env とは別物 (これは actual pane env = fake_adapter.spawned[-1]['env'])。
+    """
+    b = Broker(state_dir=tmp_path / "sd", adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane", {
+        "direction": "vertical", "name": "worker-foo", "cwd": "/repo",
+    })
+    env = fake_adapter.spawned[-1]["env"]
+    assert env["ORG_BROKER_STATE_DIR"] == sidecar.absolutize(tmp_path / "sd")
+    assert sidecar.is_absolute(env["ORG_BROKER_STATE_DIR"])
+
+
+def test_spawn_generic_injects_broker_state_dir_env(tmp_path, fake_adapter):
+    """spawn_pane (generic, secretary tier) も同じ ORG_BROKER_STATE_DIR を注入する (#122)。"""
+    b = Broker(state_dir=tmp_path / "sd", adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    sec = _ops(b, "s", "secretary")
+    dispatch_tool(b, sec, "spawn_pane",
+                  {"direction": "horizontal", "command": "watch ls", "name": "w"})
+    env = fake_adapter.spawned[-1]["env"]
+    assert env["ORG_BROKER_STATE_DIR"] == sidecar.absolutize(tmp_path / "sd")
+
+
+def test_spawn_injects_broker_state_dir_on_space_layout_branch(tmp_path):
+    """space-layout backend (Herdr 経路) の spawn 分岐でも env が注入される (#122)。
+
+    _adapter_spawn には flat 分岐と space 分岐があり、supports_space_layout=True の
+    backend (Herdr) は space 分岐を通る。この分岐の env=env が将来落ちると Herdr の
+    #122 が silently 再発するため、space 分岐の env 注入を回帰で固定する。
+    """
+    adapter = FakeAdapter(supports_space_layout=True)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "worker-foo", "cwd": "/repo"})
+    spawned = adapter.spawned[-1]
+    # took the space branch (space descriptor present) AND still got env.
+    assert spawned["space"] is not None
+    assert spawned["env"]["ORG_BROKER_STATE_DIR"] == sidecar.absolutize(tmp_path / "sd")
+
+
 def test_spawn_claude_injects_channel_sidecar_and_dev_channel(tmp_path, fake_adapter):
     """spawn_claude が channel sidecar + dev-channel flag + delivery cred を仕込む。"""
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
@@ -710,7 +759,7 @@ def test_close_pane_purges_undelivered_rows(tmp_path, fake_adapter):
 def test_spawn_failure_revokes_delivery_cred(tmp_path):
     """spawn (adapter) 失敗時に発行済み delivery cred も掃除される (orphan なし)。"""
     class BoomAdapter(FakeAdapter):
-        def spawn(self, argv, cwd=None, new_window=True):
+        def spawn(self, argv, cwd=None, new_window=True, space=None, env=None):
             raise RuntimeError("boom")
 
     adapter = BoomAdapter()

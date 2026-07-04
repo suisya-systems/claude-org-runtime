@@ -237,7 +237,7 @@ def build_up_argv(
     )
 
 
-def _launch_claude(argv: list[str]) -> int:
+def _launch_claude(argv: list[str], state_dir: str | None = None) -> int:
     """secretary TUI を起動する。POSIX は exec で置換、Windows は subprocess。
 
     POSIX: ``os.execvpe`` で現プロセスを claude に置換する (TUI が端末を引き継ぐ。
@@ -254,6 +254,11 @@ def _launch_claude(argv: list[str]) -> int:
     fallback の表示コマンドにも env 前置を含め、手で起動しても同じ transport に
     なるようにする。
 
+    ``state_dir`` が渡されれば ``ORG_BROKER_STATE_DIR`` (絶対パス) も注入する
+    (Issue #122)。root secretary 内で起動される CLI subprocess (例 ``broker send``)
+    が、非既定 ``--state-dir`` で起動した daemon の queue を発見できるようにするため。
+    daemon-spawned pane と対称の注入 (server._adapter_spawn)。
+
     **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
     secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
     出すが、本関数はそこへ Enter を**送らない**。exec/subprocess で launcher 自身が
@@ -268,6 +273,8 @@ def _launch_claude(argv: list[str]) -> int:
     docs/broker-bootstrap-stage1-folder-trust-design.md)。
     """
     env = {**os.environ, "ORG_TRANSPORT": "broker"}
+    if state_dir:
+        env["ORG_BROKER_STATE_DIR"] = sidecar.absolutize(state_dir)
     if os.name != "nt":
         os.execvpe(argv[0], argv, env)  # 返らない (プロセス置換)
         return 0  # pragma: no cover (execvpe 成功時は到達しない)
@@ -275,8 +282,11 @@ def _launch_claude(argv: list[str]) -> int:
         return subprocess.call(argv, env=env)
     except (FileNotFoundError, OSError):
         import shlex
+        prefix = "ORG_TRANSPORT=broker "
+        if state_dir:
+            prefix += f"ORG_BROKER_STATE_DIR={shlex.quote(sidecar.absolutize(state_dir))} "
         print("claude を起動できませんでした。以下を手動で実行してください:")
-        print("  ORG_TRANSPORT=broker " + " ".join(shlex.quote(a) for a in argv))
+        print("  " + prefix + " ".join(shlex.quote(a) for a in argv))
         return 0
 
 
@@ -460,7 +470,7 @@ def org_up(
     print(f"org up: minted secretary token (agent_id={mint['agent_id']})")
     print(f"org up: wrote mcp-config to {cfg_path} (0600)")
     print(f"org up: launching claude secretary TUI ({len(argv)} argv tokens)")
-    return launch(argv)
+    return launch(argv, state_dir)
 
 
 # ===========================================================================

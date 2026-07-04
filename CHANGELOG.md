@@ -32,6 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limitation:* fencing guarantees a single consistent claimer (the last session to
   register); which forked session is the human-visible foreground is a Claude Code
   session-focus concern and out of scope for this fix.
+
+- `broker` + `terminal`: a `broker send` from a CLI subprocess inside a pane
+  now reaches a daemon started with a **non-default `--state-dir`** (runtime
+  Issue #122). Previously the subprocess resolved the sidecar under the default
+  `.state/broker` and silently missed the real queue. Three coordinated changes:
+  (1) the broker injects `ORG_BROKER_STATE_DIR` (its **absolute** state dir) into
+  every pane it spawns via a new `env=` argument on the `TerminalAdapter.spawn`
+  contract — propagated per backend (`tmux new-session -e` / a WezTerm argv env
+  prefix / the `herdr` `agent.start` `env` param), and into the root secretary
+  launched by `org up`; (2) `broker send`'s `--state-dir` now resolves in the
+  order **flag > `ORG_BROKER_STATE_DIR` env > default `.state/broker`** (the
+  parser default became a `None` sentinel so an explicit flag is distinguishable
+  from omission); (3) when an unreachable sidecar records a dead pid, the stderr
+  diagnostic appends an actionable `stale sidecar? pass --state-dir or set
+  ORG_BROKER_STATE_DIR` hint (best-effort pid liveness lives in `sidecar.py`).
+  The `broker send` exit contract is unchanged (non-zero = undelivered). The
+  `ORG_BROKER_STATE_DIR` name is a contract shared with the `claude-org-ja`
+  consumer and must not be renamed. `docs/cli.md` gains a `broker send` section.
+
 - `broker` + `terminal.herdr`: `org up --backend herdr` on **native Windows**
   no longer degrades into a 20s no-info sidecar timeout (runtime Issue #120).
   The `herdr` backend needs a stdlib `AF_UNIX` Unix domain socket, which native

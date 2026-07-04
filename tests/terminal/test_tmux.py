@@ -142,6 +142,24 @@ def test_spawn_without_cwd_omits_c_flag(adapter: TmuxAdapter) -> None:
     assert "-c" not in _args(adapter._fake.last)
 
 
+def test_spawn_injects_env_via_new_session_e_flag(adapter: TmuxAdapter) -> None:
+    # Issue #122: env は tmux 一級の `new-session -e KEY=VALUE` で渡す (shell 前置しない)。
+    adapter._fake.queue((0, "%4\t@3\tclaude-org-broker-9-3", ""))
+    adapter.spawn(["claude"], env={"ORG_BROKER_STATE_DIR": "/abs/state"})
+    args = _args(adapter._fake.last)
+    assert args[0] == "new-session"
+    idx = args.index("-e")
+    assert args[idx + 1] == "ORG_BROKER_STATE_DIR=/abs/state"
+    # -e is applied to new-session (env), never a shell 'VAR=... cmd' prefix.
+    assert args[-1] == "claude"
+
+
+def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
+    adapter._fake.queue((0, "%5\t@4\tclaude-org-broker-9-4", ""))
+    adapter.spawn(["cat"])
+    assert "-e" not in _args(adapter._fake.last)
+
+
 # --------------------------------------------------------------------------
 # list-panes parsing + error policy
 # --------------------------------------------------------------------------
