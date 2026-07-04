@@ -855,6 +855,23 @@ def test_no_observer_lease_keeps_last_register_wins(tmp_path):
     assert b.register_delivery_instance(dc, "i2")["generation"] == 2   # bump 継続
 
 
+def test_observer_lease_armed_survives_slow_startup(tmp_path):
+    """Codex P2: assert から初回 register までの起動遅延が TTL を超えても、armed lease は
+    失効しない (register 前に wall-clock で失効すると fork/replay 保護が黙って外れる)。
+    初回 observed register まで fork は unobserved で弾かれ続ける。"""
+    b = Broker(state_dir=tmp_path, adapter=None, observer_lease_seconds=0.1)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    time.sleep(0.2)   # TTL(0.1) を超える起動遅延 (段1 folder-trust 放置等)
+    # armed lease は失効していない: 秘密無し fork は依然 unobserved。
+    assert b.register_delivery_instance(dc, "fork", observer=None)["error"] == "unobserved"
+    # 秘密を持つ observed sidecar は register できる (保護が失われていない)。
+    assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
+    # register で activate されるので、以後は TTL 計時が始まる (dump に失効時刻が入る)。
+    assert isinstance(b.delivery_dump()["observers"]["sec"], float)
+
+
 def test_observer_lease_renewed_by_poll_and_expires(tmp_path):
     """observer lease は現世代 poll heartbeat で renew し、poll が止まると TTL 経過で失効する
     (dead observed session の stale lease が将来の register を永久に塞がない)。"""

@@ -70,13 +70,22 @@ class ObserverLease:
     (:meth:`~claude_org_runtime.broker.store.StoreMixin.assert_observer`)。fork/resume は
     mcp-config (delivery cred 込み) を verbatim replay するが process env の秘密は
     継承しないため lease を提示できず、:meth:`register_delivery_instance` が generation
-    bump を拒否する (fork による observed session の takeover を断つ)。``expires_at`` は
-    observed sidecar の register/poll heartbeat で renew され、session 死後は TTL 経過で
-    自然失効する (dead session の stale lease が将来の観測束縛を塞がない)。
+    bump を拒否する (fork による observed session の takeover を断つ)。
+
+    ``expires_at`` は 2 相のライフサイクルを持つ:
+    - **armed** (``None``): assert 直後〜初回 observed register まで。**失効しない**。
+      secretary の起動が遅い (段1 folder-trust プロンプト放置等で TTL 超) 場合でも lease が
+      消えず、初回 register まで fork/replay 保護を保つ (register 前に wall-clock で失効
+      させると保護が黙って外れる — Codex review P2)。
+    - **activated** (``float``): 初回 observed register が ``now + observer_lease_seconds``
+      を打ち、以後 observed sidecar の register/poll heartbeat が renew する。poll が止まった
+      (session 死亡) 後に TTL 経過で失効し、dead session の stale lease が将来の観測束縛や
+      recovery register を塞がないようにする。
     """
 
     secret: str
-    expires_at: float
+    # None = armed (未 activate、失効しない)。float = activated 後の失効時刻。
+    expires_at: float | None
 
 
 @dataclass
@@ -162,7 +171,11 @@ class StoreMixin:
         (子 pane 等 launcher が束縛していない owner の push 配信を回帰させない安全側)。
         """
         lease = self._observer_leases.get(owner)
-        if lease is None or lease.expires_at <= now:
+        if lease is None:
+            return None
+        # armed (expires_at is None) は失効しない (初回 register までの arming window)。
+        # activated 後のみ wall-clock で失効させる (dead session の cleanup)。
+        if lease.expires_at is not None and lease.expires_at <= now:
             return None
         return lease
 
@@ -181,9 +194,9 @@ class StoreMixin:
         """
         secret = secrets.token_urlsafe(32)
         with self._lock:
-            self._observer_leases[owner] = ObserverLease(
-                secret=secret, expires_at=time.time() + self.observer_lease_seconds,
-            )
+            # armed で置く (expires_at=None): 初回 observed register が TTL 計時を開始する
+            # まで失効させない (slow startup で保護が黙って外れるのを防ぐ — Codex P2)。
+            self._observer_leases[owner] = ObserverLease(secret=secret, expires_at=None)
         self._journal("observer_lease_asserted", owner=owner)
         return secret
 
@@ -415,7 +428,8 @@ class StoreMixin:
                             row.owner = None
                     observed = lease is not None
                     if observed:
-                        # observed sidecar の register は lease を renew する (heartbeat)。
+                        # observed sidecar の register で lease を activate (armed->TTL 計時
+                        # 開始) / renew する。以後 poll heartbeat が renew し続ける。
                         lease.expires_at = now + self.observer_lease_seconds
                     journal = ("delivery_generation_registered",
                                {"owner": owner, "generation": gen,

@@ -276,8 +276,11 @@ def _launch_claude(
     だけが register 時に提示できる。fork/resume は persisted mcp-config (delivery cred
     込み) を replay しても、この process env の秘密は継承しないため generation を bump
     できず (daemon が ``unobserved`` で拒否)、observed session を takeover できない。
-    fallback の表示コマンドには秘密を **含めない** (端末履歴/画面へ観測束縛の秘密を
-    出さない。手起動時は observer 束縛なしの last-register-wins にフォールバックする)。
+    claude が見つからない fallback の 1 行コマンドにも ``ORG_BROKER_CHANNEL_OBSERVER``
+    前置を **含める**: daemon は mint 時に observer lease を assert 済で、秘密無しで手起動
+    すると sidecar が ``unobserved`` で止まり push が届かなくなるため、手起動でも observed
+    になるよう secret を渡す (Codex review P2)。表示 argv は既に delivery cred 入りの
+    mcp-config を含む (どちらも localhost-only 信頼前提の秘密) ため追加の露出増ではない。
 
     **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
     secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
@@ -307,6 +310,10 @@ def _launch_claude(
         prefix = "ORG_TRANSPORT=broker "
         if state_dir:
             prefix += f"ORG_BROKER_STATE_DIR={shlex.quote(sidecar.absolutize(state_dir))} "
+        if observer_secret:
+            # observed になるよう secret を前置する (無しだと sidecar が unobserved で
+            # 止まり push が届かない — Codex P2)。argv は既に delivery cred 入り。
+            prefix += f"ORG_BROKER_CHANNEL_OBSERVER={shlex.quote(observer_secret)} "
         print("claude を起動できませんでした。以下を手動で実行してください:")
         print("  " + prefix + " ".join(shlex.quote(a) for a in argv))
         return 0

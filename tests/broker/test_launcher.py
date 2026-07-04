@@ -671,16 +671,17 @@ def test_launch_claude_omits_observer_when_not_given(monkeypatch):
     assert "ORG_BROKER_CHANNEL_OBSERVER" not in captured["env"]
 
 
-def test_launch_claude_fallback_does_not_leak_observer_secret(monkeypatch, capsys):
-    """claude 不在 fallback の 1 行コマンドに observer 秘密を **含めない** (端末履歴/画面へ
-    観測束縛の秘密を晒さない。手起動は observer 無しの last-register-wins に degrade)。"""
+def test_launch_claude_fallback_includes_observer_secret(monkeypatch, capsys):
+    """claude 不在 fallback の 1 行コマンドに ORG_BROKER_CHANNEL_OBSERVER 前置を **含める**
+    (Codex P2: daemon は lease を assert 済なので、秘密無しで手起動すると sidecar が
+    unobserved で止まり push が届かない。手起動でも observed になるよう secret を渡す)。"""
     monkeypatch.setattr(launcher.os, "name", "nt")
     monkeypatch.setattr(
         launcher.subprocess, "call",
         lambda argv, *, env: (_ for _ in ()).throw(FileNotFoundError()),
     )
     rc = launcher._launch_claude(
-        ["claude", "--mcp-config", "{}"], observer_secret="TOP-SECRET-OBSERVER")
+        ["claude", "--mcp-config", "{}"], observer_secret="obs-handoff-secret")
     assert rc == 0
     out = capsys.readouterr().out
-    assert "TOP-SECRET-OBSERVER" not in out
+    assert "ORG_BROKER_CHANNEL_OBSERVER=obs-handoff-secret" in out
