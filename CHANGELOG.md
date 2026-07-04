@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `broker`: session **fork/resume** no longer silently loses push-delivered
+  messages (runtime Issue #125). A `claude --fork-session --resume` replays the
+  original `--mcp-config`, spawning a **second channel sidecar with the same
+  delivery credential**; the two sidecars raced `/poll-claims` and each message
+  was claimed+confirmed by whichever polled first, so rows destined for the other
+  (often the background fork) were recorded `delivered` but never surfaced to the
+  session the human was watching. Delivery creds are now **session-scoped
+  fenced**: a sidecar calls the new `POST /claim-owner` at startup, which bumps
+  the owner's monotonic *delivery generation* and registers that process's
+  `instance_id` as the sole current-generation claimer (and immediately requeues
+  any older-generation `CLAIMED` rows to `UNDELIVERED`, no lease-expiry wait).
+  Every `/poll-claims` and `/confirm-delivered` now carries `generation` +
+  `instance_id`; older generations are rejected with `stale_sidecar` (both for
+  claim issuance and for confirming a row claimed before the newer sidecar
+  registered), so exactly one sidecar drains an owner and the double-claim loss is
+  gone. The daemon also emits `duplicate_sidecar_detected` (once per instance-pair
+  per lease window) when it observes two live instances polling one owner, and
+  `delivery_dump` now exposes per-owner `generations` / `instances` for diagnosis.
+  The existing PULL fallback (`check_messages`), mode-epoch (PUSH/PULL) fencing,
+  lease reaping, and renga / worker / dispatcher delivery are unchanged. *Known
+  limitation:* fencing guarantees a single consistent claimer (the last session to
+  register); which forked session is the human-visible foreground is a Claude Code
+  session-focus concern and out of scope for this fix.
 - `broker` + `terminal.herdr`: `org up --backend herdr` on **native Windows**
   no longer degrades into a 20s no-info sidecar timeout (runtime Issue #120).
   The `herdr` backend needs a stdlib `AF_UNIX` Unix domain socket, which native

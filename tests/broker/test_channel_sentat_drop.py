@@ -104,7 +104,9 @@ def test_enqueue_to_channel_payload_end_to_end_survives_host(tmp_path):
     b.register_local(dst)
     b.enqueue(b.get_bind(src), "dst", "hello-over-channel")
 
-    res = b.poll_claims(b.issue_delivery_cred("dst"))
+    dc = b.issue_delivery_cred("dst")
+    reg = b.register_delivery_instance(dc, "i1")
+    res = b.poll_claims(dc, reg["generation"], "i1")
     row = res["rows"][0]
     # store が打つ sent_at は float (= 本 Issue の混入源)。
     assert isinstance(row["entry"]["sent_at"], float)

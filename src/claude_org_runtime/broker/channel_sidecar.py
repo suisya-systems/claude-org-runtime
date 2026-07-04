@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -49,6 +50,19 @@ LOG_PATH = os.environ.get("ORG_BROKER_CHANNEL_LOG", "")
 # テスト専用 fault injection: "skip-confirm" = emit はするが confirm しない
 # (emit と confirm の間で sidecar が死亡したケースの再現。lease reaping の回復を検証する)
 FAULT = os.environ.get("ORG_BROKER_CHANNEL_FAULT", "")
+
+# session-scoped fencing (Issue #125): このプロセス固有の instance id。fork/resume は
+# 同一 delivery cred (env) を replay するが、main() は新プロセスで毎回走るので instance id
+# は新旧で必ず異なる (cred だけでは識別できない旧/新 sidecar を daemon が区別できる根拠)。
+INSTANCE_ID = secrets.token_hex(8)
+# register 成功で daemon から得た delivery generation。以後の poll/confirm に載せる。
+# None = まだ register 成功していない (poll loop が register を再試行する)。
+_gen_lock = threading.Lock()
+_generation: int | None = None
+# 起動時 register の同期試行回数 / 間隔 (Major #5: initialized 後・push loop 起動前に
+# register を同期完了させる。transient な daemon 未起動のみ短くリトライする)。
+_REGISTER_RETRIES = 3
+_REGISTER_RETRY_DELAY = 0.5
 
 _stdout_lock = threading.Lock()
 _started = threading.Event()
@@ -133,6 +147,51 @@ def _daemon_post(path: str, payload: dict) -> dict:
         return json.loads(resp.read() or b"{}")
 
 
+# ------------------------------------------------------------- register (fence)
+def _register_owner() -> int:
+    """daemon へ ``/claim-owner`` を打ち owner の delivery generation を取得する。
+
+    session-scoped fencing (Issue #125): これが owner の generation を +1 し、この
+    instance を現世代の唯一の claimer として daemon に登録する。fork/resume で生まれた
+    旧 sidecar は旧世代のまま残り、以後の poll/confirm を daemon が ``stale_sidecar`` で
+    拒否する (二重 claim による沈黙喪失を断つ)。成功した generation を返し、失敗時は
+    例外を送出する (呼び元がリトライ判断)。
+    """
+    global _generation
+    res = _daemon_post("/claim-owner", {"instance_id": INSTANCE_ID})
+    gen = res.get("generation")
+    if not res.get("ok") or gen is None:
+        raise RuntimeError(f"claim-owner rejected: {res}")
+    with _gen_lock:
+        _generation = int(gen)
+    _log(f"registered owner={OWNER} instance={INSTANCE_ID} generation={_generation}")
+    return int(gen)
+
+
+def _current_generation() -> int | None:
+    with _gen_lock:
+        return _generation
+
+
+def _register_with_retries() -> bool:
+    """register を短くリトライする (transient な daemon 未起動のみ想定)。成功で True。
+
+    **register は生涯 1 回だけ成功させる** のが fencing の要: 一度でも成功したら
+    二度と register し直さない (再 register は generation を再度上げ、他の live sidecar を
+    fence して generation war を起こす)。よって呼び元は ``_current_generation() is None``
+    の間だけ本関数を呼ぶ。
+    """
+    for attempt in range(1, _REGISTER_RETRIES + 1):
+        try:
+            _register_owner()
+            return True
+        except Exception as exc:
+            _log(f"register attempt {attempt}/{_REGISTER_RETRIES} failed: {exc}")
+            if attempt < _REGISTER_RETRIES:
+                time.sleep(_REGISTER_RETRY_DELAY)
+    return False
+
+
 # ----------------------------------------------------------------- push loop
 def _push_loop() -> None:
     """~1s で daemon を claim->emit->confirm する配送トランスデューサ (§9.3)。
@@ -141,12 +200,34 @@ def _push_loop() -> None:
     から sidecar の生存を推測できる)。配達確定 (/confirm-delivered) は emit が成功した
     *後* にのみ行う。sidecar が emit 途中で死んでも当該行は lease 失効で UNDELIVERED
     へ戻り (daemon 側 reaping)、lost-message window が閉じる。
+
+    poll/confirm には register で得た ``generation`` と自身の ``instance_id`` を必ず
+    載せる (Issue #125 session fencing)。旧世代の sidecar は ``stale_sidecar`` を受け、
+    claim せず静かに待機する (再 register はしない — 上記の通り generation war を招く)。
     """
     _started.wait()   # client の initialized を待ってから配送開始
-    _log(f"push loop start: daemon={DAEMON_URL} owner={OWNER} interval={POLL_INTERVAL}s")
+    _log(f"push loop start: daemon={DAEMON_URL} owner={OWNER} "
+         f"instance={INSTANCE_ID} interval={POLL_INTERVAL}s")
     while True:
         try:
-            res = _daemon_post("/poll-claims", {})
+            gen = _current_generation()
+            if gen is None:
+                # 起動時 register が transient に失敗した場合のみここで再試行する
+                # (まだ一度も成功していない間だけ = generation war を起こさない)。
+                if not _register_with_retries():
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                gen = _current_generation()
+            res = _daemon_post("/poll-claims",
+                               {"generation": gen, "instance_id": INSTANCE_ID})
+            if res.get("error") == "stale_sidecar":
+                # 新しい session の sidecar に世代交代された (fork 元 / 旧 session)。
+                # 再 register せず待機する (この instance は superseded。session が
+                # 終われば自然に消える)。沈黙喪失ではなく単に claim しない。
+                _log(f"stale_sidecar: superseded (current gen="
+                     f"{res.get('generation')}); standing down")
+                time.sleep(POLL_INTERVAL)
+                continue
             rows = res.get("rows", [])
             for row in rows:
                 content, meta = _channel_payload(row)
@@ -158,13 +239,14 @@ def _push_loop() -> None:
                 # 配達確定は emit (stdout flush) の後にのみ。confirm 失敗時は再配達
                 # されうるため結果を検査する。
                 conf = _daemon_post("/confirm-delivered",
-                                    {"id": row["id"], "epoch": row.get("epoch", -1)})
+                                    {"id": row["id"], "epoch": row.get("epoch", -1),
+                                     "generation": gen, "instance_id": INSTANCE_ID})
                 if conf.get("ok"):
                     _log(f"confirmed row {row['id']}")
                 else:
-                    # 既に emit 済。stale_epoch (PUSH->PULL flip) 等で行は UNDELIVERED
-                    # へ戻り pull/次 push で再配達されうる (msg_id で受信側 dedup 可能)。
-                    # 沈黙喪失ではなく重複側に倒れる。
+                    # 既に emit 済。stale_epoch (PUSH->PULL flip) / stale_sidecar 等で行は
+                    # UNDELIVERED へ戻り pull/次 push で再配達されうる (msg_id で受信側
+                    # dedup 可能)。沈黙喪失ではなく重複側に倒れる。
                     _log(f"WARN confirm not ok for {row['id']}: {conf} (may redeliver; dedup via msg_id)")
         except Exception as exc:    # daemon 一時停止等でクラッシュさせない
             _log(f"poll error: {exc}")
@@ -198,8 +280,21 @@ def _handle(msg: dict) -> dict | None:
         }
 
     if method == "notifications/initialized":
+        # session fencing (Issue #125 Major #5): register を **push loop 起動前** に
+        # 同期完了させる。先に _started を立てると未登録 generation で poll する起動
+        # race が残る。transient 失敗時は push loop 側が (未登録の間だけ) 再試行する。
+        # register は **成功後は二度と行わない** (再 register は generation を上げ、
+        # 自分の in-flight claim を差し戻して不要な再配達を招く)。conformant client は
+        # initialized を 1 回だけ送るが、重複通知でも再 register しないよう guard する。
+        if _current_generation() is not None:
+            _log(f"client re-initialized (already registered "
+                 f"gen={_current_generation()}); not re-registering")
+        elif _register_with_retries():
+            _log("client initialized -> registered -> push loop armed")
+        else:
+            _log("client initialized -> register deferred (daemon unreachable); "
+                 "push loop will retry")
         _started.set()        # client ready -> push loop 開始
-        _log("client initialized -> push loop armed")
         return None           # 通知には応答しない
 
     if method == "ping":

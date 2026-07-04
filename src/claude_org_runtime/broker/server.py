@@ -90,6 +90,14 @@ class Broker(TokenMixin, StoreMixin):
         self._rows: dict[str, QueueRow] = {}          # row id -> QueueRow
         self._delivery_modes: dict[str, str] = {}     # agent_id -> PUSH/PULL (既定 PUSH)
         self._epochs: dict[str, int] = {}             # agent_id -> mode-epoch (既定 0)
+        # session-scoped delivery fencing (Issue #125)。channel sidecar は起動時に
+        # register して owner の generation を +1 し自分を現世代に登録する。以後の
+        # poll/confirm は現世代のみ許可 (fork replay で同一 cred の二重 sidecar を fence)。
+        # _lock で守る (mixin の暗黙属性にせず __init__ で明示確立 — Codex review Major)。
+        self._delivery_generations: dict[str, int] = {}   # owner -> current generation (既定 0)
+        self._delivery_instances: dict[str, str] = {}     # owner -> current-gen instance id
+        self._delivery_poll_seen: dict[str, dict[str, float]] = {}  # owner -> {instance: ts}
+        self._duplicate_emit_at: dict[tuple[str, str, str], float] = {}  # dup emit cooldown
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -1485,13 +1493,20 @@ class _McpHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_delivery(self, path: str):
-        """delivery endpoint (``/poll-claims`` / ``/confirm-delivered``) — §9.3 / §9.4。
+        """delivery endpoint (``/claim-owner`` / ``/poll-claims`` / ``/confirm-delivered``)。
 
-        channel sidecar 専用。**delivery-scoped credential** (``scope == "delivery"``)
-        の bearer のみ受理し、operate できるのは ``to_id == bind.agent_id (= owner)``
-        の行に限る (poll_claims / confirm_delivered が owner で構造的に絞る)。full
-        token (agent / admin) はこの経路を使えない (least-privilege の双方向遮断)。
-        body は ``{"id", "epoch"}`` (confirm) の小さな JSON。MCP ではなく素の HTTP RPC。
+        §9.3 / §9.4 / Issue #125。channel sidecar 専用。**delivery-scoped credential**
+        (``scope == "delivery"``) の bearer のみ受理し、operate できるのは
+        ``to_id == bind.agent_id (= owner)`` の行に限る (store 側が owner で構造的に絞る)。
+        full token (agent / admin) はこの経路を使えない (least-privilege の双方向遮断)。
+        body: ``{"instance_id"}`` (claim-owner) / ``{"generation", "instance_id"}``
+        (poll) / ``{"id", "epoch", "generation", "instance_id"}`` (confirm)。素の HTTP RPC。
+
+        owner は store 側が token から **_lock 下で**再解決+検証する (revoke を
+        register/claim/confirm に対する原子的 fence にするため owner ではなく token を渡す。
+        ここでの get_bind は早期 401 の cheap gate)。``generation`` / ``instance_id`` は
+        session-scoped fencing 値 (Issue #125 Blocker #1): register 応答の generation を
+        sidecar が poll/confirm に載せ、daemon は現世代のみ許可する。
         """
         broker = self.broker
         auth = self.headers.get("Authorization", "")
@@ -1509,12 +1524,24 @@ class _McpHandler(BaseHTTPRequestHandler):
         if not isinstance(req, dict):
             self._send_json(400, {"error": "[invalid_body] body must be a json object"})
             return
-        # owner は store 側が token から **_lock 下で**再解決+検証する (revoke を
-        # claim/confirm に対する原子的 fence にするため owner ではなく token を渡す。
-        # ここでの get_bind は早期 401 の cheap gate で、authoritative な liveness 検査は
-        # poll_claims / confirm_delivered の _lock スコープ内 — Codex review Major)。
+        instance_id = req.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            self._send_json(400, {"ok": False, "error": "[invalid_instance] "
+                                  "instance_id must be a non-empty string"})
+            return
+        if path == "/claim-owner":
+            # sidecar register: owner の delivery generation を +1 し現世代に登録する。
+            self._send_json(200, broker.register_delivery_instance(token, instance_id))
+            return
+        # poll / confirm は generation を必須にする (fence の根拠)。
+        try:
+            generation = int(req["generation"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "[invalid_generation] "
+                                  "generation must be an int"})
+            return
         if path == "/poll-claims":
-            self._send_json(200, broker.poll_claims(token))
+            self._send_json(200, broker.poll_claims(token, generation, instance_id))
             return
         # /confirm-delivered
         rid = req.get("id")
@@ -1526,14 +1553,15 @@ class _McpHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_json(400, {"ok": False, "error": "[invalid_epoch] epoch must be an int"})
             return
-        self._send_json(200, broker.confirm_delivered(token, rid, epoch))
+        self._send_json(200, broker.confirm_delivered(
+            token, rid, epoch, generation, instance_id))
 
     def do_POST(self):
         path = self.path.rstrip("/")
         if path == "/admin":
             self._handle_admin()
             return
-        if path in ("/poll-claims", "/confirm-delivered"):
+        if path in ("/claim-owner", "/poll-claims", "/confirm-delivered"):
             self._handle_delivery(path)
             return
         if path != "/mcp":

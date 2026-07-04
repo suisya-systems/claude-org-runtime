@@ -33,8 +33,26 @@ def test_tools_list_is_empty():
     assert resp["result"]["tools"] == []
 
 
-def test_notifications_initialized_returns_none():
-    assert cs._handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+def test_notifications_initialized_registers_before_arming(monkeypatch):
+    """Issue #125 Major #5: initialized は register を **同期** 完了させてから
+    _started (push loop) を arm する。返り値は None (通知には応答しない)。"""
+    calls: list[bool] = []
+
+    def _fake_register() -> bool:
+        # _started はまだ立っていない (register が先) ことを確認する。
+        assert not cs._started.is_set()
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr(cs, "_register_with_retries", _fake_register)
+    cs._started.clear()
+    try:
+        assert cs._handle({"jsonrpc": "2.0",
+                           "method": "notifications/initialized"}) is None
+        assert calls == [True]          # register を試みた
+        assert cs._started.is_set()     # その後 push loop を arm した
+    finally:
+        cs._started.clear()
 
 
 def test_unknown_method_with_id_errors():
