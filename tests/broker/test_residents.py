@@ -410,6 +410,33 @@ def test_preflight_reap_terminates_owned_live_and_deletes(resident_dir, monkeypa
     assert not (rdir / "live.json").exists()
 
 
+def test_preflight_reap_message_honest_when_delete_fails(resident_dir, monkeypatch):
+    """terminate 成功後に登録簿が差し替わって削除できなかった場合、"removed" と誤報せず
+    "left in place" と述べる (codex P3)。プロセス停止の事実は別に述べる。"""
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    root = str(resident_dir)
+    monkeypatch.setattr(residents, "_hostname", lambda: "H")
+    p = _write(rdir, "live", _record(str(resident_dir), root, name="live", pid=10,
+                                     started_at=1000.0))
+
+    def term_then_swap(pid, **k):
+        # terminate 中に登録側が同名で live 登録を差し替えた状況を模す。
+        _write(rdir, "live", _record(str(resident_dir), root, name="live", pid=99,
+                                     started_at=2000.0))
+        return "terminated"
+
+    buf = io.StringIO()
+    rep = residents.preflight_residents(
+        str(resident_dir), root, reap=True, stream=buf, os_name="linux",
+        alive=lambda p: True,
+        observe=lambda p, **k: ProcObservation(1000.0, None, None),
+        terminate=term_then_swap,
+    )
+    out = buf.getvalue()
+    assert "left in place" in out and "registration removed" not in out
+    assert rep.deleted == 0 and p.exists()             # 差し替わった登録は残す
+
+
 def test_preflight_reap_leaves_foreign_and_unknown(resident_dir, monkeypatch):
     rdir = resident_dir / residents.RESIDENTS_DIRNAME
     root = str(resident_dir)

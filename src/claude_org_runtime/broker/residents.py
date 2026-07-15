@@ -673,7 +673,9 @@ def _handle_row(
         if reap:
             if _delete_registration(path, pid, started_at):
                 report.deleted += 1
-            _emit(stream, prefix, f"reap: removed stale registration name={name} pid={pid} (PID recycled by an unrelated process; not killed).")
+                _emit(stream, prefix, f"reap: removed stale registration name={name} pid={pid} (PID recycled by an unrelated process; not killed).")
+            else:
+                _emit(stream, prefix, f"reap: registration name={name} pid={pid} changed during sweep; left in place (PID recycled; not killed).")
         else:
             _emit(stream, prefix, f"pre-flight:   name={name} pid={pid} PID reused by a different process (identity mismatch); registration STALE.")
         return
@@ -690,16 +692,22 @@ def _handle_row(
             deleted = _delete_registration(path, pid, started_at)
             if deleted:
                 report.deleted += 1
+            # 登録簿の削除可否は message に忠実に反映する (削除失敗を「removed」と誤報しない
+            # — codex P3)。プロセス停止自体は成功しているので termination の事実は別に述べる。
+            reg_note = (
+                "registration removed" if deleted
+                else "registration left in place (changed during sweep)"
+            )
             if result == "terminated":
                 report.terminated += 1
-                _emit(stream, prefix, f"reap: terminated name={name} pid={pid} (SIGTERM); registration removed.")
+                _emit(stream, prefix, f"reap: terminated name={name} pid={pid} (SIGTERM); {reg_note}.")
             elif result == "escalated":
                 report.terminated += 1
-                _emit(stream, prefix, f"reap: name={name} pid={pid} did not exit after SIGTERM; escalated to SIGKILL; registration removed.")
+                _emit(stream, prefix, f"reap: name={name} pid={pid} did not exit after SIGTERM; escalated to SIGKILL; {reg_note}.")
             elif result == "recycled":
-                _emit(stream, prefix, f"reap: name={name} pid={pid} exited during reap and the PID was recycled; not killed; registration removed.")
+                _emit(stream, prefix, f"reap: name={name} pid={pid} exited during reap and the PID was recycled; not killed; {reg_note}.")
             else:  # gone
-                _emit(stream, prefix, f"reap: name={name} pid={pid} exited before termination; registration removed.")
+                _emit(stream, prefix, f"reap: name={name} pid={pid} exited before termination; {reg_note}.")
         elif result == "guidance":
             report.skipped += 1
             _emit(stream, prefix, f"reap: name={name} pid={pid} matched but auto-reap is not performed on windows; stop manually: taskkill /F /PID {pid}")
