@@ -847,6 +847,13 @@ def org_down(args: argparse.Namespace) -> int:
     **全経路**で回す (sidecar が無くても resident は存在しうる)。ownership アンカー root_cwd は
     ``--root-cwd`` 明示 > daemon.json の root_cwd > ``os.getcwd()`` の順で解決する
     (teardown が sidecar を消す前に読んでおく)。
+
+    **回収 (--reap) は daemon 停止が確証できたときだけ**行う (codex P1)。``_org_down_daemon``
+    が rc 0 を返すのは (a) ``broker_stopped`` 検証済 = daemon 確実に停止、または (b) sidecar
+    不在 = そもそも動いていない、のいずれか。rc 非 0 は「半死 (admin.token 欠落 + pid 生存)」
+    「shutdown 要求したが未確認」など **daemon が生存している可能性がある** 状態で、そこで reap
+    すると停止していない現世代 org 自身の生きた resident を kill しうる。よって rc 非 0 では reap
+    を **告知のみに降格** する (安全側 under-reap; daemon を落としてから再実行すればよい)。
     """
     state_dir = sidecar.absolutize(args.state_dir)
     sc_before = sidecar.read_sidecar(state_dir)
@@ -856,8 +863,18 @@ def org_down(args: argparse.Namespace) -> int:
         if getattr(args, "root_cwd", None) is not None
         else ((sc_before.get("root_cwd") if sc_before else None) or os.getcwd())
     )
+    reap = getattr(args, "reap", False)
+    if reap and rc != 0:
+        # daemon 停止が未確証。生存している可能性があるので reap せず告知のみに降格。
+        print(
+            "org down: daemon stop was not confirmed (see above); skipping --reap and "
+            "only announcing residents. Re-run 'org down --reap' once the daemon is "
+            "confirmed stopped.",
+            file=sys.stderr,
+        )
+        reap = False
     residents.preflight_residents(
-        state_dir, root_cwd, reap=getattr(args, "reap", False), prefix="org down",
+        state_dir, root_cwd, reap=reap, prefix="org down",
     )
     return rc
 

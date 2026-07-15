@@ -1082,15 +1082,29 @@ def test_org_up_conflict_does_not_sweep_residents(live_daemon, monkeypatch):
 
 
 def test_org_down_sweeps_residents_postflight_and_preserves_rc(tmp_path, monkeypatch):
-    """down は teardown の **後** に sweep を回し、停止の rc を sweep で変えない。"""
+    """down は teardown の **後** に sweep を回し、停止の rc を sweep で変えない。
+    停止が確証できた (rc 0) ので --reap はそのまま転送される。"""
     calls = _spy_preflight(monkeypatch)
     state_dir = str(tmp_path / "broker")
-    # teardown 本体をスタブし、sentinel rc を返させる (wrapper の配線だけを検証)。
-    monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 7)
+    # teardown 本体をスタブし、clean stop (rc 0) を返させる (wrapper の配線だけを検証)。
+    monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 0)
     rc = launcher.org_down(_down_args(state_dir, reap=True))
-    assert rc == 7                                     # sweep は rc を変えない
+    assert rc == 0
     assert len(calls) == 1
     assert calls[0]["reap"] is True and calls[0]["prefix"] == "org down"
+
+
+def test_org_down_reap_downgraded_when_stop_unconfirmed(tmp_path, monkeypatch, capsys):
+    """停止が未確証 (rc != 0: 半死 / timeout) のとき --reap は告知のみに降格する
+    (稼働中の現世代 daemon 自身の生きた resident を kill しない — codex P1)。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")
+    monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 1)
+    rc = launcher.org_down(_down_args(state_dir, reap=True))
+    assert rc == 1                                     # 停止の rc は保持
+    assert len(calls) == 1
+    assert calls[0]["reap"] is False                   # reap は降格された
+    assert "skipping --reap" in capsys.readouterr().err
 
 
 def test_org_down_sweeps_even_without_sidecar(tmp_path, monkeypatch):
