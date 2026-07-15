@@ -39,16 +39,16 @@ from .conftest import FakeAdapter
 
 # --------------------------------------------------------------------- helpers
 def _up_args(state_dir, *, backend=None, name="secretary", root_cwd=None,
-             model=None, permission_mode=None, claude_arg=None):
+             model=None, permission_mode=None, claude_arg=None, reap=False):
     return argparse.Namespace(
         state_dir=str(state_dir), backend=backend, name=name,
         root_cwd=root_cwd, model=model, permission_mode=permission_mode,
-        claude_arg=claude_arg,
+        claude_arg=claude_arg, reap=reap,
     )
 
 
-def _down_args(state_dir):
-    return argparse.Namespace(state_dir=str(state_dir))
+def _down_args(state_dir, *, reap=False, root_cwd=None):
+    return argparse.Namespace(state_dir=str(state_dir), reap=reap, root_cwd=root_cwd)
 
 
 @pytest.fixture
@@ -1011,3 +1011,124 @@ def test_launch_claude_fallback_includes_observer_secret(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "ORG_BROKER_CHANNEL_OBSERVER=obs-handoff-secret" in out
+
+
+# ================================ resident pre-flight wiring (Issue #142)
+def _spy_preflight(monkeypatch):
+    """launcher.residents.preflight_residents をスパイに差し替え、呼び出しを記録する。"""
+    calls = []
+
+    def spy(state_dir, root_cwd, *, reap=False, prefix="org up", **kw):
+        calls.append({"state_dir": state_dir, "root_cwd": root_cwd,
+                      "reap": reap, "prefix": prefix})
+
+    monkeypatch.setattr(launcher.residents, "preflight_residents", spy)
+    return calls
+
+
+def test_org_up_sweeps_residents_only_on_cold_path(tmp_path, monkeypatch):
+    """cold start では preflight が spawn 前に 1 回走り、reap フラグを転送する。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")
+    started: list[Broker] = []
+
+    def fake_spawn(sd, backend, root_cwd):
+        # cold sweep は spawn より前に走っている必要がある。
+        assert len(calls) == 1, "resident sweep must run BEFORE spawn_daemon"
+        b = Broker(state_dir=sd, adapter=None, port=0, admin_token="A")
+        b.start()
+        started.append(b)
+        return b.host, b.port, "A"
+
+    rc = launcher.org_up(
+        _up_args(state_dir, reap=True), spawn_daemon=fake_spawn,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+    )
+    try:
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["reap"] is True and calls[0]["prefix"] == "org up"
+        assert calls[0]["state_dir"] == sidecar.absolutize(state_dir)
+    finally:
+        for b in started:
+            b.stop()
+
+
+def test_org_up_reuse_does_not_sweep_residents(live_daemon, monkeypatch):
+    """健全な daemon を再利用する経路では preflight を **走らせない** (稼働中 org 自身の
+    生きた resident を誤って告知/回収しないため — red-team Blocker 対策)。"""
+    b, state_dir = live_daemon
+    calls = _spy_preflight(monkeypatch)
+    rc = launcher.org_up(
+        _up_args(state_dir, reap=True),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+    )
+    assert rc == 0
+    assert calls == []                                 # reuse では sweep しない
+
+
+def test_org_up_conflict_does_not_sweep_residents(live_daemon, monkeypatch):
+    """backend 競合など cold 以外の分岐でも sweep しない。"""
+    b, state_dir = live_daemon
+    calls = _spy_preflight(monkeypatch)
+    other = "wezterm" if default_backend() != "wezterm" else "tmux"
+    launcher.org_up(
+        _up_args(state_dir, backend=other),
+        spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+    )
+    assert calls == []
+
+
+def test_org_down_sweeps_residents_postflight_and_preserves_rc(tmp_path, monkeypatch):
+    """down は teardown の **後** に sweep を回し、停止の rc を sweep で変えない。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")
+    # teardown 本体をスタブし、sentinel rc を返させる (wrapper の配線だけを検証)。
+    monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 7)
+    rc = launcher.org_down(_down_args(state_dir, reap=True))
+    assert rc == 7                                     # sweep は rc を変えない
+    assert len(calls) == 1
+    assert calls[0]["reap"] is True and calls[0]["prefix"] == "org down"
+
+
+def test_org_down_sweeps_even_without_sidecar(tmp_path, monkeypatch):
+    """sidecar が無く「nothing to stop」で終わる経路でも sweep は走る
+    (resident は sidecar 有無に依らず存在しうる)。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")            # sidecar 不在
+    rc = launcher.org_down(_down_args(state_dir))
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["root_cwd"] == os.getcwd()      # 既定は getcwd
+
+
+def test_org_down_root_cwd_resolution_prefers_flag_then_sidecar(tmp_path, monkeypatch):
+    """root_cwd 解決順序: --root-cwd 明示 > daemon.json.root_cwd > getcwd。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=os.getpid(), host="127.0.0.1", port=1, backend=None,
+        started_at=1.0, journal_offset=0, root_cwd="/daemon/root",
+    )
+    monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 0)
+
+    # 明示 --root-cwd が最優先。
+    launcher.org_down(_down_args(state_dir, root_cwd="/override"))
+    assert calls[-1]["root_cwd"] == sidecar.absolutize("/override")
+
+    # --root-cwd 無し → sidecar の root_cwd。
+    launcher.org_down(_down_args(state_dir))
+    assert calls[-1]["root_cwd"] == "/daemon/root"
+
+
+def test_write_sidecar_persists_root_cwd(tmp_path):
+    """daemon.json に root_cwd が (絶対化されて) 永続化され、省略時は None。"""
+    sd = str(tmp_path / "broker")
+    sidecar.write_sidecar(sd, pid=1, host="127.0.0.1", port=2, backend=None,
+                          started_at=1.0, journal_offset=0, root_cwd="/repo/root")
+    assert sidecar.read_sidecar(sd)["root_cwd"] == "/repo/root"
+    sidecar.write_sidecar(sd, pid=1, host="127.0.0.1", port=2, backend=None,
+                          started_at=1.0, journal_offset=0)
+    assert sidecar.read_sidecar(sd)["root_cwd"] is None

@@ -206,6 +206,9 @@ def run(args: argparse.Namespace) -> int:
         backend=backend_name,
         started_at=started_at,
         journal_offset=journal_offset,
+        # resident pre-flight (Issue #142) の ownership アンカー: org down は --root-cwd を
+        # 持たないので daemon.json 経由で daemon の root_cwd を受け取る。
+        root_cwd=root_cwd,
     )
     sidecar.write_admin_token(state_dir, admin_token)
     print(f"org-broker listening on {broker.url}")
