@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -635,6 +636,76 @@ def _wait_for_stop(
     return False
 
 
+def _half_dead_daemon_guidance(state_dir: str, host, port, pid) -> str:
+    """admin.token 欠落 (半死 daemon) 時の ``org down`` 案内文を組み立てる (Issue #140)。
+
+    従来の「investigate the daemon, then retry」は具体手段を欠いていた。sidecar の
+    ``pid`` / ``host:port`` と ``sidecar.pid_alive`` を使い、(1) プロセス生存確認、
+    (2) LISTEN 確認、(3) 生存なら SIGTERM で止めて retry / 死んでいれば stale
+    sidecar を掃除、という追跡可能な手掛かりを提示する。
+
+    - 出力は stderr。実端末 (cp932 コンソール等) でも壊れないよう **ASCII のみ**で
+      構成する (em-dash 等 non-ascii 禁止。CLAUDE.md)。
+    - コマンド例は OS で分岐する: Linux は ``ps`` / ``ss`` / ``kill``、macOS は
+      LISTEN 確認のみ ``lsof`` (Darwin に ``ss`` は既定で無い)、Windows は
+      ``tasklist`` / ``netstat`` / ``taskkill``。誤った OS のコマンドを案内して
+      利用者を惑わせない。
+    - ``pid_alive`` は保守的 (不確実なら生存扱い) なので、DEAD 判定が出たときだけ
+      stale sidecar の削除を勧める。
+    """
+    win = os.name == "nt"
+    sidecar_path = os.path.join(state_dir, sidecar.SIDECAR_NAME)
+    # LISTEN 確認は OS で使えるツールが異なる: Linux=ss, macOS=lsof (ss 不在),
+    # Windows=netstat。
+    if win:
+        port_probe = f"netstat -ano | findstr :{port}"
+    elif sys.platform == "darwin":
+        port_probe = f"lsof -nP -iTCP:{port} -sTCP:LISTEN"
+    else:
+        port_probe = f"ss -ltnp | grep {port}"
+    # path はスペースや引用符を含みうるので、そのまま貼れるよう対象シェル流に
+    # quote する。POSIX は shlex.quote (単一引用符の混入も安全に escape)、Windows は
+    # 二重引用符 (``"`` は Windows のファイル名で不正 = path に混入しえない)。
+    rm_cmd = (f'del "{sidecar_path}"' if win else f"rm {shlex.quote(sidecar_path)}")
+    lines = [
+        "org down: no admin.token found, so shutdown could not be requested; "
+        "the daemon may still be live. Leaving the sidecar in place "
+        f"({sidecar.SIDECAR_NAME}) so a live daemon is not orphaned.",
+    ]
+    if isinstance(pid, int) and pid > 0:
+        proc_probe = (f'tasklist /FI "PID eq {pid}"' if win
+                      else f"ps -p {pid}")
+        # graceful stop: POSIX は kill = SIGTERM、Windows は taskkill (/F で強制)。
+        stop_cmd = (f"taskkill /PID {pid}" if win else f"kill {pid}")
+        stop_note = "add /F to force" if win else "SIGTERM"
+        if sidecar.pid_alive(pid):
+            lines += [
+                f"  recorded pid {pid} looks ALIVE. To confirm and stop it:",
+                f"    1) confirm the process:   {proc_probe}",
+                f"    2) confirm it listens:    {port_probe}",
+                f"    3) stop it ({stop_note}), then rerun 'org down':   "
+                f"{stop_cmd}",
+            ]
+        else:
+            lines += [
+                f"  recorded pid {pid} looks DEAD (no such process); the sidecar "
+                "is probably stale. Verify, then clean up:",
+                f"    1) confirm no process:    {proc_probe}",
+                f"    2) confirm nothing binds: {port_probe}",
+                f"    3) if nothing holds {host}:{port}, remove the stale "
+                f"sidecar:   {rm_cmd}",
+            ]
+    else:
+        lines += [
+            "  the sidecar records no usable pid; probe the endpoint instead:",
+            f"    1) check the listener:    {port_probe}",
+            f"    2) if a process holds {host}:{port}, stop it, then rerun "
+            "'org down';",
+            f"       otherwise remove the stale sidecar:   {rm_cmd}",
+        ]
+    return "\n".join(lines)
+
+
 def org_down(args: argparse.Namespace) -> int:
     """``org down`` 本体。sidecar 発見 → pane close → shutdown → 検証 → 後始末。"""
     state_dir = sidecar.absolutize(args.state_dir)
@@ -701,10 +772,11 @@ def org_down(args: argparse.Namespace) -> int:
         return 1
     if not attempted_admin:
         # admin.token が無く shutdown を要求できない。daemon が生存している可能性が
-        # あるため sidecar は **残す** (誤って生存 daemon を孤立させない)。
-        print("org down: no admin.token found, so shutdown could not be requested; "
-              "the daemon may still be live. Leaving the sidecar in place — "
-              "investigate the daemon, then retry.", file=sys.stderr)
+        # あるため sidecar は **残す** (誤って生存 daemon を孤立させない)。案内は
+        # 「investigate」で終わらせず、pid / host:port から生存確認・停止・掃除の
+        # 具体的な手掛かりを提示する (Issue #140)。
+        print(_half_dead_daemon_guidance(state_dir, host, port, sc.get("pid")),
+              file=sys.stderr)
         return 1
     # admin には到達できたが broker_stopped が timeout 内に観測できない。daemon は
     # まだ停止中 / 生存しているかもしれないので sidecar は残し、再試行に委ねる。
