@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import signal
 import socket
@@ -325,10 +326,14 @@ def identity_match(record: dict, obs: ProcObservation | None) -> str:
     再利用とみなし ``'mismatch'``。exe/cwd は**両側にあって食い違うときだけ** mismatch に
     降格させる補助材料。cmdline は照合に一切使わない (constraint 2)。
     """
-    if obs is None or obs.start_time is None:
+    if obs is None or obs.start_time is None or not math.isfinite(obs.start_time):
         return "unknown"
     reg = record.get("started_at")
-    if not isinstance(reg, (int, float)) or isinstance(reg, bool):
+    # 非有限 (NaN / inf) は不可: json.loads は非標準の ``NaN`` を受理し jsonschema の
+    # ``number`` も通すが、``abs(x - NaN) > tol`` は **常に False** なので、そのまま比較すると
+    # 任意の live 再利用 PID を identity match と誤判定し --reap で無関係プロセスを kill しうる
+    # (codex P1)。NaN/inf は照合前に弾いて fail-closed (unknown = kill 対象外) にする。
+    if not isinstance(reg, (int, float)) or isinstance(reg, bool) or not math.isfinite(reg):
         return "unknown"
     if abs(obs.start_time - reg) > START_TIME_TOLERANCE:
         return "mismatch"  # PID 再利用 (別プロセスが後から起動)
@@ -473,10 +478,15 @@ def _terminate_process(
     開始時刻を再観測し、ずれていたら ``'recycled'`` を返して kill を中止する。
     """
     if expected_start_time is not None:
+        # 非有限な expected は照合の担保にならない (identity_match が既に弾くが、seam を直接
+        # 呼ぶ経路もあるため防御的に abort する)。
+        if not math.isfinite(expected_start_time):
+            return "recycled"
         obs = observe(pid, os_name=os_name, proc_root=proc_root)
         if obs is None:
             return "gone"
-        if obs.start_time is None or abs(obs.start_time - expected_start_time) > START_TIME_TOLERANCE:
+        if (obs.start_time is None or not math.isfinite(obs.start_time)
+                or abs(obs.start_time - expected_start_time) > START_TIME_TOLERANCE):
             return "recycled"
 
     if os_name == "windows":

@@ -108,6 +108,27 @@ def test_identity_unknown_when_started_at_not_numeric():
     assert residents.identity_match({"started_at": True}, obs) == "unknown"  # bool rejected
 
 
+def test_identity_unknown_on_non_finite_started_at():
+    """NaN/inf started_at は照合前に unknown へ倒す (abs(x-NaN)>tol は常に False で match と
+    誤判定し --reap が無関係プロセスを kill しうる — codex P1)。"""
+    obs = ProcObservation(1000.0, None, None)
+    assert residents.identity_match({"started_at": float("nan")}, obs) == "unknown"
+    assert residents.identity_match({"started_at": float("inf")}, obs) == "unknown"
+    assert residents.identity_match({"started_at": float("-inf")}, obs) == "unknown"
+    # obs.start_time が非有限でも unknown (防御)。
+    assert residents.identity_match({"started_at": 1000.0},
+                                    ProcObservation(float("nan"), None, None)) == "unknown"
+
+
+def test_terminate_non_finite_expected_aborts():
+    """seam を直接叩く経路でも非有限 expected は kill せず recycled で中止する。"""
+    assert residents._terminate_process(
+        1, os_name="linux", expected_start_time=float("nan"),
+        observe=lambda *a, **k: pytest.fail("must not observe/kill on non-finite expected"),
+        kill=lambda *a: pytest.fail("must not kill"), sleep=lambda *_: None,
+    ) == "recycled"
+
+
 def test_identity_mismatch_on_start_time_drift():
     obs = ProcObservation(1000.0 + residents.START_TIME_TOLERANCE + 1, None, None)
     assert residents.identity_match({"started_at": 1000.0}, obs) == "mismatch"
@@ -510,6 +531,26 @@ def test_preflight_recycled_deletes_not_kills(resident_dir, monkeypatch):
         terminate=lambda *a, **k: pytest.fail("recycled must not be killed"),
     )
     assert rep.rows == ["recycled"] and not (rdir / "recy.json").exists()
+
+
+def test_preflight_nan_started_at_not_terminated(resident_dir, monkeypatch):
+    """owned + live + NaN started_at は identity unknown → row unverifiable。--reap でも
+    terminate されない (fail-closed; codex P1 の end-to-end 回帰)。"""
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    root = str(resident_dir)
+    monkeypatch.setattr(residents, "_hostname", lambda: "H")
+    rec = _record(str(resident_dir), root, name="nan", pid=15, started_at=1000.0)
+    # json.dumps は allow_nan 既定 True で "NaN" を出す (json.loads も受理する)。
+    (rdir / "nan.json").write_text(
+        json.dumps({**rec, "started_at": float("nan")}), encoding="utf-8")
+    buf = io.StringIO()
+    rep = residents.preflight_residents(
+        str(resident_dir), root, reap=True, stream=buf, os_name="linux",
+        alive=lambda p: True,
+        observe=lambda p, **k: ProcObservation(9999.0, None, None),  # 全く違う開始時刻
+        terminate=lambda *a, **k: pytest.fail("NaN started_at must never be terminated"),
+    )
+    assert rep.rows == ["unverifiable"] and (rdir / "nan.json").exists()
 
 
 def test_preflight_unverifiable_skipped_under_reap(resident_dir, monkeypatch):
