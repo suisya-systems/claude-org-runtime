@@ -237,6 +237,87 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
             b.stop()
 
 
+# ================================================ up: stale sidecar cold notice (#141)
+def test_org_up_notifies_when_discarding_stale_sidecar(tmp_path, monkeypatch, capsys):
+    """到達不能な stale sidecar を無警告で cold 上書きしない (Issue #141)。
+
+    前回 daemon が clean に終われば org down が daemon.json を消しているはずで、
+    残存 sidecar + 到達不能はクラッシュ / 強制終了のサイン。org up はそこへ到達
+    できず cold へ倒れ、新 daemon を起動する。その際 stderr に 1 行の告知を残す。
+
+    stale host/port への probe **だけ** を URLError にし、新 daemon への mint は
+    本物の ``_admin_rpc`` で通す (グローバル os/sys の monkeypatch はしない。#143)。
+    """
+    import urllib.error
+
+    state_dir = str(tmp_path / "broker")
+    stale_pid = 4321
+    stale_host, stale_port = "127.0.0.1", 59999
+    # daemon.json + admin.token を書く (admin.token 有 → 半公開ではなく probe へ進む)。
+    sidecar.write_sidecar(
+        state_dir, pid=stale_pid, host=stale_host, port=stale_port,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    sidecar.write_admin_token(state_dir, "STALE-ADMIN")
+
+    # stale host/port への RPC だけ到達不能にし、新 daemon への mint は素通しする。
+    real_rpc = launcher._admin_rpc
+
+    def selective_rpc(host, port, *a, **k):
+        if (host, port) == (stale_host, stale_port):
+            raise urllib.error.URLError("refused")
+        return real_rpc(host, port, *a, **k)
+
+    monkeypatch.setattr(launcher, "_admin_rpc", selective_rpc)
+
+    started: list[Broker] = []
+
+    def fake_spawn(sd, backend, root_cwd):
+        b = Broker(state_dir=sd, adapter=None, port=0, admin_token="FRESH-ADMIN")
+        b.start()
+        started.append(b)
+        return b.host, b.port, "FRESH-ADMIN"
+
+    rc = launcher.org_up(
+        _up_args(state_dir), spawn_daemon=fake_spawn,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+    )
+    try:
+        assert rc == 0
+        assert len(started) == 1                       # stale を捨てて新規起動
+        err = capsys.readouterr().err
+        assert f"discarded stale sidecar for dead pid={stale_pid}" in err
+        assert "did not shut down cleanly" in err
+        assert "starting fresh" in err
+    finally:
+        for b in started:
+            b.stop()
+
+
+def test_org_up_no_stale_notice_on_clean_first_start(tmp_path, capsys):
+    """sidecar 不在の正常な初回起動では stale 告知を出さない (誤警告を避ける)。"""
+    state_dir = str(tmp_path / "broker")
+    started: list[Broker] = []
+
+    def fake_spawn(sd, backend, root_cwd):
+        b = Broker(state_dir=sd, adapter=None, port=0, admin_token="FRESH-ADMIN")
+        b.start()
+        started.append(b)
+        return b.host, b.port, "FRESH-ADMIN"
+
+    rc = launcher.org_up(
+        _up_args(state_dir), spawn_daemon=fake_spawn,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+    )
+    try:
+        assert rc == 0
+        assert len(started) == 1
+        assert "stale sidecar" not in capsys.readouterr().err
+    finally:
+        for b in started:
+            b.stop()
+
+
 # =============================================================== up: 0600 config
 def test_secretary_mcp_config_written_0600(tmp_path):
     cfg = {"mcpServers": {"org-broker": {"type": "http", "url": "http://x",
