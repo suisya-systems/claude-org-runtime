@@ -352,6 +352,21 @@ def test_delete_registration_removes_when_unchanged(resident_dir):
     assert not p.exists()
 
 
+def test_delete_registration_skips_when_reread_torn_or_gone(resident_dir):
+    """再読込が破損/非dict/消滅なら削除しない (fail-closed; codex P2)。"""
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    # torn / malformed re-read -> must NOT unlink.
+    torn = _write(rdir, "torn", "{partial")
+    assert residents._delete_registration(torn, 5, 1.0) is False
+    assert torn.exists()
+    # non-dict JSON -> must NOT unlink.
+    arr = _write(rdir, "arr", [1, 2, 3])
+    assert residents._delete_registration(arr, 5, 1.0) is False
+    assert arr.exists()
+    # already gone -> returns False (nothing deleted), no crash.
+    assert residents._delete_registration(rdir / "missing.json", 5, 1.0) is False
+
+
 # ============================================= preflight_residents (sweep)
 def test_preflight_empty_dir_is_silent(tmp_path):
     buf = io.StringIO()

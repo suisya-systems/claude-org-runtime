@@ -507,14 +507,21 @@ def _terminate_process(
 def _delete_registration(path: Path, expected_pid, expected_started_at) -> bool:
     """stale レコードを削除する。**削除直前に再読込**し、pid + started_at が分類時と同一の
     ときだけ unlink する (scan と unlink の間に登録側が同名で live 登録を差し替える窓を
-    閉じる — red-team Minor)。内容が変わっていれば削除しない。"""
+    閉じる — red-team Minor / codex P2)。
+
+    再読込が **できない場合 (I/O エラー / JSON 破損 / 非 dict) も削除しない**: 差し替え途中
+    の torn write や消滅の可能性があり、分類時の pid/started_at と一致する確証が無いものを
+    unlink するのは TOCTOU ガードの趣旨に反する。一致を **積極的に確認できたときだけ** 消す
+    (fail-closed)。
+    """
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        record = None
-    if isinstance(record, dict):
-        if record.get("pid") != expected_pid or record.get("started_at") != expected_started_at:
-            return False
+        return False  # 再読込不能 = 差し替え中/消滅。触らない。
+    if not isinstance(record, dict):
+        return False
+    if record.get("pid") != expected_pid or record.get("started_at") != expected_started_at:
+        return False
     try:
         path.unlink()
         return True
