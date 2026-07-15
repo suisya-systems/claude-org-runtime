@@ -285,6 +285,16 @@ def test_terminate_posix_sigterm_clean(monkeypatch):
     assert killed == [(321, signal.SIGTERM)]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "SIGTERM->SIGKILL エスカレーションは POSIX 専用: signal.SIGKILL は Windows に存在せず、"
+        "os_name='linux' 分岐 (_terminate_process) が実行時に signal.SIGKILL を評価して "
+        "AttributeError になる。本番は platform seam (_current_os()=='windows' → taskkill 分岐) が "
+        "Windows で POSIX 分岐に到達させないため実装は安全 (テスト専用の露出)。Windows の停止経路は "
+        "test_terminate_windows_guidance_when_still_alive がカバーする。"
+    ),
+)
 def test_terminate_posix_escalates_to_sigkill():
     killed = []
     r = residents._terminate_process(
