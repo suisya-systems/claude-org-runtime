@@ -323,6 +323,27 @@ def test_load_record_malformed_json(resident_dir):
     assert residents._load_record(p)[0] == "malformed"
 
 
+def test_load_record_invalid_utf8_is_malformed(resident_dir):
+    """不正 UTF-8 バイトの登録簿は crash させず malformed 扱い (codex P2)。"""
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    p = rdir / "binary.json"
+    p.write_bytes(b'\xff\xfe{"version": 1}')          # invalid UTF-8 leading bytes
+    assert residents._load_record(p)[0] == "malformed"
+    # delete guard も不正 UTF-8 で crash せず False を返す。
+    assert residents._delete_registration(p, 1, 1.0) is False and p.exists()
+
+
+def test_preflight_survives_invalid_utf8_file(resident_dir, monkeypatch):
+    """不正 UTF-8 の登録簿が 1 つ混じっても sweep は crash せず告知して続行する。"""
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    (rdir / "binary.json").write_bytes(b'\xff\xfe\x00garbage')
+    buf = io.StringIO()
+    rep = residents.preflight_residents(
+        str(resident_dir), str(resident_dir), reap=True, stream=buf, os_name="linux",
+    )
+    assert rep.malformed == 1 and "malformed" in buf.getvalue()
+
+
 def test_load_record_missing_required_is_malformed(resident_dir):
     rdir = resident_dir / residents.RESIDENTS_DIRNAME
     p = _write(rdir, "partial", {"version": 1, "name": "x"})  # missing pid/started_at/owner

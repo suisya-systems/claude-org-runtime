@@ -403,7 +403,7 @@ def _load_record(path: Path):
     判定する (未知 version の未来レコードを 'malformed' と誤標識しない — red-team Minor)。"""
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):  # 不正 UTF-8 は ValueError 系で OSError では拾えない
         return ("malformed", None, None)
     try:
         record = json.loads(raw)
@@ -516,8 +516,8 @@ def _delete_registration(path: Path, expected_pid, expected_started_at) -> bool:
     """
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False  # 再読込不能 = 差し替え中/消滅。触らない。
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False  # 再読込不能 (I/O / 不正 UTF-8 / JSON 破損) = 差し替え中/消滅。触らない。
     if not isinstance(record, dict):
         return False
     if record.get("pid") != expected_pid or record.get("started_at") != expected_started_at:
