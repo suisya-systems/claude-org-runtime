@@ -385,7 +385,9 @@ def _resolve_existing_daemon(
     """既存 sidecar から走行中 daemon を解決し、org up の分岐を 1 つ決める。
 
     返り値 ``{"kind": ...}``:
-    - ``cold``      — daemon 不在 / 到達不能 (stale) → 新規起動する。
+    - ``cold``      — daemon 不在 / 到達不能 (stale) → 新規起動する。到達不能で
+      stale sidecar を捨てた場合は ``stale_pid`` (元 sidecar の pid) を伴い、
+      org_up が 1 行告知する。sidecar 不在の初回起動では ``stale_pid`` を持たない。
     - ``token_missing`` — daemon.json はあるが admin.token が grace 内に現れない
       (半公開 / クラッシュ疑い)。生存 daemon が同 state_dir を所有しているかも
       しれないため **新規起動しない** (split-brain 回避)。
@@ -414,7 +416,10 @@ def _resolve_existing_daemon(
     try:
         probe = _admin_rpc(host, port, admin_token, "mint_token", {"role": "secretary"})
     except urllib.error.URLError:
-        return {"kind": "cold"}
+        # 到達不能 = stale sidecar。sc["pid"] を運んで org_up 側で 1 行告知する
+        # (無警告の cold 上書きを避ける。Issue #141)。sidecar 不在の cold とは
+        # ``stale_pid`` キーの有無で区別する。
+        return {"kind": "cold", "stale_pid": sc.get("pid")}
     if not (probe and probe.get("ok")):
         return {"kind": "unhealthy", "host": host}
     try:
@@ -511,6 +516,17 @@ def org_up(
 
     # --- 新規起動 (kind == "cold": sidecar 不在 / 到達不能 = stale) ----------
     if not reused:
+        # 到達不能な stale sidecar を無警告で上書きしない。前回 daemon が clean に
+        # 終われば org down が sidecar を消しているはずで、残存 + 到達不能は
+        # クラッシュ / 強制終了のサイン。原因追跡の手掛かりに 1 行残す (Issue #141)。
+        # sidecar 不在の正常な初回起動 (stale_pid キー無し) では出さない。
+        if "stale_pid" in decision:
+            print(
+                f"org up: discarded stale sidecar for dead "
+                f"pid={decision['stale_pid']} (previous daemon did not shut down "
+                f"cleanly); starting fresh",
+                file=sys.stderr,
+            )
         host, port, admin_token = spawn_daemon(state_dir, requested_backend, root_cwd)
         try:
             res = _mint_secretary(host, port, admin_token, name, root_cwd)
