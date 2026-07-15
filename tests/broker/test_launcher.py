@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import stat
 import threading
 import time
@@ -463,6 +464,154 @@ def test_org_down_keeps_sidecar_when_admin_token_missing(tmp_path, monkeypatch):
     rc = launcher.org_down(_down_args(state_dir))
     assert rc == 1
     assert sidecar.read_sidecar(state_dir) is not None    # discovery 経路を残す
+
+
+# ============================= down: half-dead daemon guidance (Issue #140)
+def _pin_os(monkeypatch, os_name):
+    """ガイダンスの OS 分岐 seam (``launcher._current_os``) **だけ** を固定し、
+    コマンド期待値をどの CI ランナー (Linux/macOS/Windows) でも決定的にする。
+
+    ``os_name`` は ``'linux'`` / ``'darwin'`` / ``'windows'``。グローバルな
+    ``os.name`` / ``sys.platform`` は patch しない: Windows ランナーで
+    ``os.name='posix'`` を注入すると ``pathlib`` が壊れ pytest 自体が
+    ``INTERNALERROR`` になるため (CI #143 3周目)。"""
+    monkeypatch.setattr(launcher, "_current_os", lambda: os_name)
+
+
+def test_current_os_returns_known_token():
+    """platform seam は既知 3 値のいずれかを返す (どのランナーでも成立)。分岐の
+    期待値は _pin_os でこの seam を差し替えて決定的に検証する。"""
+    assert launcher._current_os() in {"linux", "darwin", "windows"}
+
+
+def test_org_down_guidance_when_pid_alive_gives_stop_hint(
+        tmp_path, monkeypatch, capsys):
+    """admin.token 欠落かつ pid が生存とみなせる半死状態では、案内に生存確認
+    (ps -p) / LISTEN 確認 (ss ... grep) / SIGTERM 停止 (kill) の具体手掛かりを
+    含める。sidecar は残す (生存 daemon を孤立させない)。"""
+    _pin_os(monkeypatch, "linux")  # Linux ツール期待値を決定的に
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59997,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    # pid 生存判定を確定的に固定する (実プロセスに依存しない)。
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(launcher, "STOP_WAIT_TIMEOUT", 0.3)
+
+    rc = launcher.org_down(_down_args(state_dir))
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "ALIVE" in err
+    assert "ps -p 4321" in err            # (1) プロセス生存確認
+    assert "ss -ltnp | grep 59997" in err  # (2) LISTEN 確認
+    assert "kill 4321" in err              # (3) SIGTERM 停止
+    assert "SIGTERM" in err
+    assert sidecar.read_sidecar(state_dir) is not None
+
+
+def test_org_down_guidance_when_pid_dead_suggests_stale_cleanup(
+        tmp_path, monkeypatch, capsys):
+    """pid が「確実に死んでいる」ときは stale sidecar の掃除 (rm daemon.json) を
+    案内する。ただし down 自体は保守側で sidecar を残す (誤削除しない)。"""
+    _pin_os(monkeypatch, "linux")  # rm/ss 期待値を決定的に
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59996,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: False)
+    monkeypatch.setattr(launcher, "STOP_WAIT_TIMEOUT", 0.3)
+
+    rc = launcher.org_down(_down_args(state_dir))
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "DEAD" in err
+    assert "stale" in err
+    # 掃除コマンドは実装と同じ変換 (os.path.join + shlex.quote) で期待値を作る。
+    # Windows では tmp_path が backslash を含み、shlex.quote が path を quote する
+    # (backslash は shlex 的に unsafe) ため、直書き `rm <path>` だと不一致で落ちる。
+    # 実装の変換を鏡写しにすることで全 OS で決定的に一致させる (CI #143 4周目)。
+    sidecar_path = os.path.join(state_dir, sidecar.SIDECAR_NAME)
+    assert f"rm {shlex.quote(sidecar_path)}" in err
+    # 保守: 案内はしても down 自体は sidecar を残す (確証なき削除をしない)。
+    assert sidecar.read_sidecar(state_dir) is not None
+
+
+def test_half_dead_guidance_alive_linux_commands(monkeypatch):
+    """Linux では ps -p / ss ... grep <port> / kill <pid> (SIGTERM) を提示する。"""
+    _pin_os(monkeypatch, "linux")
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
+    msg = launcher._half_dead_daemon_guidance(
+        "/tmp/isolated/broker", "127.0.0.1", 59997, 4321)
+    assert "ALIVE" in msg
+    assert "ps -p 4321" in msg
+    assert "ss -ltnp | grep 59997" in msg
+    assert "kill 4321" in msg
+    assert "SIGTERM" in msg
+
+
+def test_half_dead_guidance_macos_uses_lsof_not_ss(monkeypatch):
+    """macOS (Darwin) は ss が既定で無いので LISTEN 確認に lsof を提示する。
+    プロセス確認・停止は POSIX 共通 (ps -p / kill) のまま。"""
+    _pin_os(monkeypatch, "darwin")
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
+    msg = launcher._half_dead_daemon_guidance(
+        "/tmp/isolated/broker", "127.0.0.1", 59997, 4321)
+    assert "lsof -nP -iTCP:59997 -sTCP:LISTEN" in msg
+    assert "ss -ltnp" not in msg           # Linux 専用ツールを macOS に出さない
+    assert "ps -p 4321" in msg and "kill 4321" in msg
+
+
+def test_half_dead_guidance_windows_commands(monkeypatch):
+    """Windows では tasklist / netstat / taskkill を提示し、POSIX コマンドを
+    誤案内しない。"""
+    _pin_os(monkeypatch, "windows")
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
+    msg = launcher._half_dead_daemon_guidance(
+        "C:/state/broker", "127.0.0.1", 59997, 4321)
+    assert "tasklist" in msg
+    assert "netstat -ano" in msg
+    assert "taskkill /PID 4321" in msg
+    assert "ss -ltnp" not in msg and "kill 4321" not in msg
+
+
+def test_half_dead_guidance_missing_pid_probes_endpoint(monkeypatch):
+    """pid が無い (古い/壊れた sidecar) 場合は endpoint 探索の手掛かりに切り替える。"""
+    _pin_os(monkeypatch, "linux")
+    msg = launcher._half_dead_daemon_guidance(
+        "/tmp/isolated/broker", "127.0.0.1", 59997, None)
+    assert "no usable pid" in msg
+    assert "ss -ltnp | grep 59997" in msg
+    assert "127.0.0.1:59997" in msg
+    # pid 依存のコマンドは出さない。
+    assert "ps -p" not in msg and "kill " not in msg
+
+
+def test_half_dead_guidance_posix_cleanup_path_is_shell_safe(monkeypatch):
+    """POSIX の掃除コマンドは、スペース / 単一引用符を含む state-dir でも貼り付け
+    安全 (shlex.quote 相当) であること。素朴な 'path' 囲みでは壊れる edge を守る。"""
+    _pin_os(monkeypatch, "linux")
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: False)
+    state_dir = "/tmp/weird ' dir/broker"
+    msg = launcher._half_dead_daemon_guidance(state_dir, "127.0.0.1", 59997, 999999)
+    sidecar_path = os.path.join(state_dir, sidecar.SIDECAR_NAME)
+    quoted = shlex.quote(sidecar_path)
+    assert f"rm {quoted}" in msg
+    # 貼り付け安全性: 提示トークンをシェル解釈すると元の path 1 個に戻る。
+    assert shlex.split(quoted) == [sidecar_path]
+
+
+@pytest.mark.parametrize("pid", [4321, None])
+def test_half_dead_guidance_is_ascii_only(monkeypatch, pid):
+    """案内文は実端末 (cp932 コンソール) でも壊れないよう ASCII のみで構成する。"""
+    monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
+    msg = launcher._half_dead_daemon_guidance(
+        "/tmp/isolated/broker", "127.0.0.1", 59997, pid)
+    assert msg.isascii()
+    msg.encode("cp932")  # cp932 で encode 不能な文字がないことを保証する
 
 
 # =================================================== up: unhealthy live daemon
