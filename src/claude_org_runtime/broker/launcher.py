@@ -848,12 +848,16 @@ def org_down(args: argparse.Namespace) -> int:
     ``--root-cwd`` 明示 > daemon.json の root_cwd > ``os.getcwd()`` の順で解決する
     (teardown が sidecar を消す前に読んでおく)。
 
-    **回収 (--reap) は daemon 停止が確証できたときだけ**行う (codex P1)。``_org_down_daemon``
-    が rc 0 を返すのは (a) ``broker_stopped`` 検証済 = daemon 確実に停止、または (b) sidecar
-    不在 = そもそも動いていない、のいずれか。rc 非 0 は「半死 (admin.token 欠落 + pid 生存)」
-    「shutdown 要求したが未確認」など **daemon が生存している可能性がある** 状態で、そこで reap
-    すると停止していない現世代 org 自身の生きた resident を kill しうる。よって rc 非 0 では reap
-    を **告知のみに降格** する (安全側 under-reap; daemon を落としてから再実行すればよい)。
+    **回収 (--reap) は daemon が停止/死亡と確証できたときだけ**行う (codex P1/P2)。判定は rc
+    ではなく **teardown 後に sidecar が消えているか** で行う: ``_org_down_daemon`` は daemon が
+    確実に停止 (``broker_stopped`` 検証済) または確実に死亡 (admin 到達不能 = stale と判明) した
+    ときにだけ sidecar を削除し、生存の可能性が残る状態 (admin.token 欠落の半死 / shutdown 未確認
+    の timeout) では **敢えて sidecar を残す** (生存 daemon を孤立させない既存契約)。この「sidecar
+    が消えた ⟺ daemon 確証 down」の不変条件をそのまま reap ゲートに使う。これにより、クラッシュ後
+    の主用途である「到達不能な stale daemon を掃除しつつ orphan resident を回収する」一発の
+    ``org down --reap`` が正しく reap する (rc は 1 でも sidecar は消えている = 安全)。一方、半死 /
+    timeout では sidecar が残り、reap は **告知のみに降格** する (安全側 under-reap; daemon を確実に
+    落としてから再実行すればよい)。停止の戻り値 rc は sweep で変えない。
     """
     state_dir = sidecar.absolutize(args.state_dir)
     sc_before = sidecar.read_sidecar(state_dir)
@@ -864,12 +868,14 @@ def org_down(args: argparse.Namespace) -> int:
         else ((sc_before.get("root_cwd") if sc_before else None) or os.getcwd())
     )
     reap = getattr(args, "reap", False)
-    if reap and rc != 0:
-        # daemon 停止が未確証。生存している可能性があるので reap せず告知のみに降格。
+    # teardown 後に sidecar が残っている = daemon が生存している可能性 → reap 不可 (現世代 org
+    # 自身の生きた resident を kill しないため)。消えている = 停止/死亡が確証済 → reap 可。
+    daemon_confirmed_down = sidecar.read_sidecar(state_dir) is None
+    if reap and not daemon_confirmed_down:
         print(
-            "org down: daemon stop was not confirmed (see above); skipping --reap and "
-            "only announcing residents. Re-run 'org down --reap' once the daemon is "
-            "confirmed stopped.",
+            "org down: daemon stop was not confirmed (its sidecar is still present); "
+            "skipping --reap and only announcing residents. Re-run 'org down --reap' "
+            "once the daemon is confirmed stopped.",
             file=sys.stderr,
         )
         reap = False

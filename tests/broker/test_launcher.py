@@ -1094,17 +1094,41 @@ def test_org_down_sweeps_residents_postflight_and_preserves_rc(tmp_path, monkeyp
     assert calls[0]["reap"] is True and calls[0]["prefix"] == "org down"
 
 
-def test_org_down_reap_downgraded_when_stop_unconfirmed(tmp_path, monkeypatch, capsys):
-    """停止が未確証 (rc != 0: 半死 / timeout) のとき --reap は告知のみに降格する
-    (稼働中の現世代 daemon 自身の生きた resident を kill しない — codex P1)。"""
+def test_org_down_reap_downgraded_when_sidecar_still_present(tmp_path, monkeypatch, capsys):
+    """teardown 後に sidecar が **残っている** (半死 / timeout = daemon 生存の可能性) とき、
+    --reap は告知のみに降格する (現世代 daemon 自身の生きた resident を kill しない — codex P1)。"""
     calls = _spy_preflight(monkeypatch)
     state_dir = str(tmp_path / "broker")
+    # daemon 生存疑いの状態を模す: teardown が sidecar を残したまま rc 1 を返す。
+    sidecar.write_sidecar(state_dir, pid=os.getpid(), host="127.0.0.1", port=1,
+                          backend=None, started_at=1.0, journal_offset=0)
     monkeypatch.setattr(launcher, "_org_down_daemon", lambda args, sd: 1)
     rc = launcher.org_down(_down_args(state_dir, reap=True))
     assert rc == 1                                     # 停止の rc は保持
     assert len(calls) == 1
     assert calls[0]["reap"] is False                   # reap は降格された
     assert "skipping --reap" in capsys.readouterr().err
+
+
+def test_org_down_reap_allowed_after_stale_sidecar_cleanup(tmp_path, monkeypatch):
+    """到達不能 = 死亡確定で teardown が stale sidecar を **消して** rc 1 を返す crash-recovery
+    経路では、一発の org down --reap で orphan resident を回収できる (codex P2)。判定は rc では
+    なく「sidecar が消えたか」で行うため rc 1 でも reap は許可される。"""
+    calls = _spy_preflight(monkeypatch)
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(state_dir, pid=1, host="127.0.0.1", port=1, backend=None,
+                          started_at=1.0, journal_offset=0, root_cwd="/daemon/root")
+
+    def teardown_removes_sidecar(args, sd):
+        sidecar.remove_sidecar(sd)                     # 死亡確定 → stale sidecar を掃除
+        return 1
+
+    monkeypatch.setattr(launcher, "_org_down_daemon", teardown_removes_sidecar)
+    rc = launcher.org_down(_down_args(state_dir, reap=True))
+    assert rc == 1
+    assert len(calls) == 1
+    assert calls[0]["reap"] is True                    # sidecar が消えた = 確証 down → reap 許可
+    assert calls[0]["root_cwd"] == "/daemon/root"      # root_cwd は teardown 前に読んだ値
 
 
 def test_org_down_sweeps_even_without_sidecar(tmp_path, monkeypatch):
