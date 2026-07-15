@@ -636,6 +636,23 @@ def _wait_for_stop(
     return False
 
 
+def _current_os() -> str:
+    """実行 OS を ``'windows'`` / ``'darwin'`` / ``'linux'`` に正規化する platform
+    seam。半死 daemon 案内のコマンド分岐 (ss / lsof / netstat 等) はこの関数経由で
+    行う。
+
+    テストがグローバルな ``os.name`` / ``sys.platform`` を monkeypatch すると、
+    Windows ランナーで ``os.name='posix'`` を注入した瞬間に ``pathlib`` が壊れ
+    (``PosixPath`` を生成できず) pytest の失敗レポート生成すら ``INTERNALERROR`` に
+    なる。分岐点を関数へ切り出し、テストはここ **だけ** を差し替える (CI #143)。
+    """
+    if os.name == "nt" or sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
 def _half_dead_daemon_guidance(state_dir: str, host, port, pid) -> str:
     """admin.token 欠落 (半死 daemon) 時の ``org down`` 案内文を組み立てる (Issue #140)。
 
@@ -653,13 +670,14 @@ def _half_dead_daemon_guidance(state_dir: str, host, port, pid) -> str:
     - ``pid_alive`` は保守的 (不確実なら生存扱い) なので、DEAD 判定が出たときだけ
       stale sidecar の削除を勧める。
     """
-    win = os.name == "nt"
+    cur_os = _current_os()
+    win = cur_os == "windows"
     sidecar_path = os.path.join(state_dir, sidecar.SIDECAR_NAME)
     # LISTEN 確認は OS で使えるツールが異なる: Linux=ss, macOS=lsof (ss 不在),
     # Windows=netstat。
     if win:
         port_probe = f"netstat -ano | findstr :{port}"
-    elif sys.platform == "darwin":
+    elif cur_os == "darwin":
         port_probe = f"lsof -nP -iTCP:{port} -sTCP:LISTEN"
     else:
         port_probe = f"ss -ltnp | grep {port}"

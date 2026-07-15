@@ -467,13 +467,21 @@ def test_org_down_keeps_sidecar_when_admin_token_missing(tmp_path, monkeypatch):
 
 
 # ============================= down: half-dead daemon guidance (Issue #140)
-def _pin_platform(monkeypatch, os_name, platform):
-    """OS 検出 (launcher.os.name / launcher.sys.platform) を固定し、ガイダンス
-    コマンドの期待値をどの CI ランナー (Linux/macOS/Windows) でも決定的にする。
-    実装が実ランナーの OS を見て ss/lsof/netstat を切り替えるため、pin しないと
-    Linux 期待値の直書き assert が macOS/Windows ランナーで落ちる (CI #143)。"""
-    monkeypatch.setattr(launcher.os, "name", os_name)
-    monkeypatch.setattr(launcher.sys, "platform", platform)
+def _pin_os(monkeypatch, os_name):
+    """ガイダンスの OS 分岐 seam (``launcher._current_os``) **だけ** を固定し、
+    コマンド期待値をどの CI ランナー (Linux/macOS/Windows) でも決定的にする。
+
+    ``os_name`` は ``'linux'`` / ``'darwin'`` / ``'windows'``。グローバルな
+    ``os.name`` / ``sys.platform`` は patch しない: Windows ランナーで
+    ``os.name='posix'`` を注入すると ``pathlib`` が壊れ pytest 自体が
+    ``INTERNALERROR`` になるため (CI #143 3周目)。"""
+    monkeypatch.setattr(launcher, "_current_os", lambda: os_name)
+
+
+def test_current_os_returns_known_token():
+    """platform seam は既知 3 値のいずれかを返す (どのランナーでも成立)。分岐の
+    期待値は _pin_os でこの seam を差し替えて決定的に検証する。"""
+    assert launcher._current_os() in {"linux", "darwin", "windows"}
 
 
 def test_org_down_guidance_when_pid_alive_gives_stop_hint(
@@ -481,7 +489,7 @@ def test_org_down_guidance_when_pid_alive_gives_stop_hint(
     """admin.token 欠落かつ pid が生存とみなせる半死状態では、案内に生存確認
     (ps -p) / LISTEN 確認 (ss ... grep) / SIGTERM 停止 (kill) の具体手掛かりを
     含める。sidecar は残す (生存 daemon を孤立させない)。"""
-    _pin_platform(monkeypatch, "posix", "linux")  # Linux ツール期待値を決定的に
+    _pin_os(monkeypatch, "linux")  # Linux ツール期待値を決定的に
     state_dir = str(tmp_path / "broker")
     sidecar.write_sidecar(
         state_dir, pid=4321, host="127.0.0.1", port=59997,
@@ -507,7 +515,7 @@ def test_org_down_guidance_when_pid_dead_suggests_stale_cleanup(
         tmp_path, monkeypatch, capsys):
     """pid が「確実に死んでいる」ときは stale sidecar の掃除 (rm daemon.json) を
     案内する。ただし down 自体は保守側で sidecar を残す (誤削除しない)。"""
-    _pin_platform(monkeypatch, "posix", "linux")  # rm/ss 期待値を決定的に
+    _pin_os(monkeypatch, "linux")  # rm/ss 期待値を決定的に
     state_dir = str(tmp_path / "broker")
     sidecar.write_sidecar(
         state_dir, pid=4321, host="127.0.0.1", port=59996,
@@ -530,7 +538,7 @@ def test_org_down_guidance_when_pid_dead_suggests_stale_cleanup(
 
 def test_half_dead_guidance_alive_linux_commands(monkeypatch):
     """Linux では ps -p / ss ... grep <port> / kill <pid> (SIGTERM) を提示する。"""
-    _pin_platform(monkeypatch, "posix", "linux")
+    _pin_os(monkeypatch, "linux")
     monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
     msg = launcher._half_dead_daemon_guidance(
         "/tmp/isolated/broker", "127.0.0.1", 59997, 4321)
@@ -544,7 +552,7 @@ def test_half_dead_guidance_alive_linux_commands(monkeypatch):
 def test_half_dead_guidance_macos_uses_lsof_not_ss(monkeypatch):
     """macOS (Darwin) は ss が既定で無いので LISTEN 確認に lsof を提示する。
     プロセス確認・停止は POSIX 共通 (ps -p / kill) のまま。"""
-    _pin_platform(monkeypatch, "posix", "darwin")
+    _pin_os(monkeypatch, "darwin")
     monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
     msg = launcher._half_dead_daemon_guidance(
         "/tmp/isolated/broker", "127.0.0.1", 59997, 4321)
@@ -556,7 +564,7 @@ def test_half_dead_guidance_macos_uses_lsof_not_ss(monkeypatch):
 def test_half_dead_guidance_windows_commands(monkeypatch):
     """Windows では tasklist / netstat / taskkill を提示し、POSIX コマンドを
     誤案内しない。"""
-    _pin_platform(monkeypatch, "nt", "win32")
+    _pin_os(monkeypatch, "windows")
     monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: True)
     msg = launcher._half_dead_daemon_guidance(
         "C:/state/broker", "127.0.0.1", 59997, 4321)
@@ -568,7 +576,7 @@ def test_half_dead_guidance_windows_commands(monkeypatch):
 
 def test_half_dead_guidance_missing_pid_probes_endpoint(monkeypatch):
     """pid が無い (古い/壊れた sidecar) 場合は endpoint 探索の手掛かりに切り替える。"""
-    _pin_platform(monkeypatch, "posix", "linux")
+    _pin_os(monkeypatch, "linux")
     msg = launcher._half_dead_daemon_guidance(
         "/tmp/isolated/broker", "127.0.0.1", 59997, None)
     assert "no usable pid" in msg
@@ -581,7 +589,7 @@ def test_half_dead_guidance_missing_pid_probes_endpoint(monkeypatch):
 def test_half_dead_guidance_posix_cleanup_path_is_shell_safe(monkeypatch):
     """POSIX の掃除コマンドは、スペース / 単一引用符を含む state-dir でも貼り付け
     安全 (shlex.quote 相当) であること。素朴な 'path' 囲みでは壊れる edge を守る。"""
-    _pin_platform(monkeypatch, "posix", "linux")
+    _pin_os(monkeypatch, "linux")
     monkeypatch.setattr(launcher.sidecar, "pid_alive", lambda _pid: False)
     state_dir = "/tmp/weird ' dir/broker"
     msg = launcher._half_dead_daemon_guidance(state_dir, "127.0.0.1", 59997, 999999)
