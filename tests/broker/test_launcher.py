@@ -530,8 +530,12 @@ def test_org_down_guidance_when_pid_dead_suggests_stale_cleanup(
     assert rc == 1
     assert "DEAD" in err
     assert "stale" in err
-    # 掃除コマンドは対象 path を含む (tmp_path は特殊文字なし = shlex.quote は素通し)。
-    assert f"rm {os.path.join(state_dir, sidecar.SIDECAR_NAME)}" in err
+    # 掃除コマンドは実装と同じ変換 (os.path.join + shlex.quote) で期待値を作る。
+    # Windows では tmp_path が backslash を含み、shlex.quote が path を quote する
+    # (backslash は shlex 的に unsafe) ため、直書き `rm <path>` だと不一致で落ちる。
+    # 実装の変換を鏡写しにすることで全 OS で決定的に一致させる (CI #143 4周目)。
+    sidecar_path = os.path.join(state_dir, sidecar.SIDECAR_NAME)
+    assert f"rm {shlex.quote(sidecar_path)}" in err
     # 保守: 案内はしても down 自体は sidecar を残す (確証なき削除をしない)。
     assert sidecar.read_sidecar(state_dir) is not None
 
