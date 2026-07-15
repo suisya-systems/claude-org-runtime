@@ -210,7 +210,14 @@ def test_observe_linux_reads_exe_cwd(tmp_path, monkeypatch):
     _fake_proc(proc, 7, starttime_ticks=0, btime=10, exe=str(real_exe),
                cwd=str(real_cwd))
     obs = residents._observe_process_identity(7, os_name="linux", proc_root=str(proc))
-    assert obs.exe == str(real_exe) and obs.cwd == str(real_cwd)
+    # obs.exe / obs.cwd は os.readlink の生値で、Windows ランナーでは拡張長パス
+    # (``\\?\C:\...``) 形式になり得るため生文字列比較はできない (#143/#144)。identity_match が
+    # exe を比較するのと同じ正規化 (realpath+normcase) を **両辺**に通し、指すファイルが同一で
+    # あることを検証する (期待値は実装の変換を鏡写しにする)。
+    def _canon(p):
+        return os.path.normcase(os.path.realpath(p))
+    assert _canon(obs.exe) == _canon(str(real_exe))
+    assert _canon(obs.cwd) == _canon(str(real_cwd))
 
 
 # ============================================= observe: darwin (inject run)
