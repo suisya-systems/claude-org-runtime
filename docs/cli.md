@@ -203,6 +203,25 @@ generic `spawn_pane` panes like the attention watcher); on a global-mux
 backend (wezterm) only `claude` / `codex` agent children are closed to
 avoid killing unrelated panes. With no sidecar it is a no-op.
 
+### Resident pre-flight (Issue #142)
+
+Both commands run a **pre-flight** over the broker-*unmanaged* resident
+registry at `<state-dir>/residents/*.json` -- processes that live outside
+the daemon's lifecycle (e.g. a queue / attention watcher) and can be left
+behind by a crashed generation. `org up` sweeps **only on a cold start**
+(never on a healthy-daemon reuse, so it cannot terminate a running org's own
+live residents); `org down` sweeps **after** teardown and never changes its
+own return code. The default is **announce-only**: it prints what it found
+and leaves everything in place. `--reap` (opt-in) terminates residents whose
+ownership *and* identity both verify and removes stale registrations; it
+never touches records owned by a different org instance, and never kills on
+an unknown schema version or an unverifiable identity. On Windows a matched
+resident is stopped with a graceful `taskkill` and, if it survives, manual
+`taskkill /F` guidance is printed rather than an auto hard-kill. An
+absent/empty registry prints nothing. The registry schema, ownership /
+identity model, and full decision matrix are the contract in
+[`docs/broker-residents-registry-contract.md`](broker-residents-registry-contract.md).
+
 ### `org up` flags
 
 | Flag | Description |
@@ -214,6 +233,7 @@ avoid killing unrelated panes. With no sidecar it is a no-op.
 | `--model VALUE` | Forwarded to the secretary TUI as `--model <value>`. |
 | `--permission-mode VALUE` | Forwarded to the secretary TUI as `--permission-mode <value>`. |
 | `--claude-arg ARG` | Extra interactive `claude` flag appended after the structured fields (repeatable). Reserved / headless flags are rejected by the builder. |
+| `--reap` | Terminate broker-unmanaged residents whose ownership **and** identity both verify, and remove stale registrations (default: announce only). Cold start only. See resident pre-flight above. |
 
 #### Backend support
 
@@ -231,6 +251,8 @@ Windows, use the renga transport instead.
 | Flag | Description |
 |------|-------------|
 | `--state-dir PATH` | Daemon state dir to discover the sidecar. Default: `.state/broker`. |
+| `--reap` | Terminate broker-unmanaged residents whose ownership **and** identity both verify, and remove stale registrations (default: announce only). See resident pre-flight above. |
+| `--root-cwd PATH` | Repo root used to match resident ownership. Default: read from the daemon sidecar, else the directory `org down` runs in. |
 
 ### Exit codes
 

@@ -40,6 +40,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -57,7 +58,7 @@ from ..terminal import (
     login_shell_venv_wrapper,
     venv_bin_dir,
 )
-from . import sidecar, surface
+from . import residents, sidecar, surface
 from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
 
 DEFAULT_STATE_DIR = ".state/broker"
@@ -516,6 +517,17 @@ def org_up(
 
     # --- 新規起動 (kind == "cold": sidecar 不在 / 到達不能 = stale) ----------
     if not reused:
+        # broker 管理外 resident の pre-flight は **cold パスでのみ** 走らせる (Issue #142)。
+        # kind=="cold" はこの ownership の daemon が確実に不在/到達不能 = live な所有
+        # resident は前世代クラッシュの genuine な orphan、と判定できる。reuse/already_up
+        # 等では走らせない: ownership+identity は「クラッシュした前世代の orphan」と「今
+        # 健全な現世代が所有する live resident」を区別できない (resident は daemon boot を
+        # 跨いで生き残る設計) ため、reuse で走らせると org up --reap が **稼働中 org 自身の
+        # 生きた watcher を SIGTERM してしまう** (red-team Blocker)。live resident の回収は
+        # daemon 停止後の org down が本来の担い手。
+        residents.preflight_residents(
+            state_dir, root_cwd, reap=args.reap, prefix="org up",
+        )
         # 到達不能な stale sidecar を無警告で上書きしない。前回 daemon が clean に
         # 終われば org down が sidecar を消しているはずで、残存 + 到達不能は
         # クラッシュ / 強制終了のサイン。原因追跡の手掛かりに 1 行残す (Issue #141)。
@@ -740,9 +752,14 @@ def _half_dead_daemon_guidance(state_dir: str, host, port, pid) -> str:
     return "\n".join(lines)
 
 
-def org_down(args: argparse.Namespace) -> int:
-    """``org down`` 本体。sidecar 発見 → pane close → shutdown → 検証 → 後始末。"""
-    state_dir = sidecar.absolutize(args.state_dir)
+def _org_down_daemon(args: argparse.Namespace, state_dir: str) -> int:
+    """daemon 停止本体 (sidecar 発見 → pane close → shutdown → 検証 → 後始末)。
+
+    ``org_down`` から抽出した (Issue #142)。resident pre-flight は ``org_down`` が本関数の
+    **後** に post-flight として回すので、停止の成否 (戻り値) は sweep で変えない。
+    ``org_down`` は teardown 前に sidecar を読んでおり (root_cwd の取得)、本関数が sidecar を
+    消しても ownership アンカーは失われない。
+    """
     sc = sidecar.read_sidecar(state_dir)
     if sc is None:
         print(f"org down: no daemon sidecar under {state_dir!r}; nothing to stop.")
@@ -820,6 +837,54 @@ def org_down(args: argparse.Namespace) -> int:
     return 1
 
 
+def org_down(args: argparse.Namespace) -> int:
+    """``org down`` 本体。daemon 停止 (:func:`_org_down_daemon`) の **後** に broker 管理外
+    resident の pre-flight sweep を回す (Issue #142)。
+
+    sweep は teardown の post-flight で回す (daemon が既に止まっているので、live resident の
+    回収はここが本来の担い手)。停止の戻り値 (rc) は sweep で **変えない**: down の本務は
+    teardown で、reap の不調が停止の成否を覆い隠してはならない。sweep は sidecar 有無に依らず
+    **全経路**で回す (sidecar が無くても resident は存在しうる)。ownership アンカー root_cwd は
+    ``--root-cwd`` 明示 > daemon.json の root_cwd > ``os.getcwd()`` の順で解決する
+    (teardown が sidecar を消す前に読んでおく)。
+
+    **回収 (--reap) は daemon が停止/死亡と確証できたときだけ**行う (codex P1/P2)。判定は rc
+    ではなく **teardown 後に sidecar が消えているか** で行う: ``_org_down_daemon`` は daemon が
+    確実に停止 (``broker_stopped`` 検証済) または確実に死亡 (admin 到達不能 = stale と判明) した
+    ときにだけ sidecar を削除し、生存の可能性が残る状態 (admin.token 欠落の半死 / shutdown 未確認
+    の timeout) では **敢えて sidecar を残す** (生存 daemon を孤立させない既存契約)。この「sidecar
+    が消えた ⟺ daemon 確証 down」の不変条件をそのまま reap ゲートに使う。これにより、クラッシュ後
+    の主用途である「到達不能な stale daemon を掃除しつつ orphan resident を回収する」一発の
+    ``org down --reap`` が正しく reap する (rc は 1 でも sidecar は消えている = 安全)。一方、半死 /
+    timeout では sidecar が残り、reap は **告知のみに降格** する (安全側 under-reap; daemon を確実に
+    落としてから再実行すればよい)。停止の戻り値 rc は sweep で変えない。
+    """
+    state_dir = sidecar.absolutize(args.state_dir)
+    sc_before = sidecar.read_sidecar(state_dir)
+    rc = _org_down_daemon(args, state_dir)
+    root_cwd = (
+        sidecar.absolutize(args.root_cwd)
+        if getattr(args, "root_cwd", None) is not None
+        else ((sc_before.get("root_cwd") if sc_before else None) or os.getcwd())
+    )
+    reap = getattr(args, "reap", False)
+    # teardown 後に sidecar が残っている = daemon が生存している可能性 → reap 不可 (現世代 org
+    # 自身の生きた resident を kill しないため)。消えている = 停止/死亡が確証済 → reap 可。
+    daemon_confirmed_down = sidecar.read_sidecar(state_dir) is None
+    if reap and not daemon_confirmed_down:
+        print(
+            "org down: daemon stop was not confirmed (its sidecar is still present); "
+            "skipping --reap and only announcing residents. Re-run 'org down --reap' "
+            "once the daemon is confirmed stopped.",
+            file=sys.stderr,
+        )
+        reap = False
+    residents.preflight_residents(
+        state_dir, root_cwd, reap=reap, prefix="org down",
+    )
+    return rc
+
+
 # ===========================================================================
 # CLI wiring
 # ===========================================================================
@@ -864,12 +929,34 @@ def _add_up_arguments(parser: argparse.ArgumentParser) -> None:
             "(repeatable). Reserved/headless flags are rejected by the builder."
         ),
     )
+    parser.add_argument(
+        "--reap", action="store_true", default=False,
+        help=(
+            "terminate broker-unmanaged residents whose ownership AND identity both "
+            "verify, and remove stale registrations (default: announce only). On a "
+            "cold start only (never touches a reused live org's own residents)."
+        ),
+    )
 
 
 def _add_down_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--state-dir", default=DEFAULT_STATE_DIR,
         help=f"daemon state dir to discover the sidecar. Default: {DEFAULT_STATE_DIR}.",
+    )
+    parser.add_argument(
+        "--reap", action="store_true", default=False,
+        help=(
+            "terminate broker-unmanaged residents whose ownership AND identity both "
+            "verify, and remove stale registrations (default: announce only)."
+        ),
+    )
+    parser.add_argument(
+        "--root-cwd", default=None,
+        help=(
+            "repo root used to match resident ownership (default: read from the daemon "
+            "sidecar, else the directory org down runs in)."
+        ),
     )
 
 

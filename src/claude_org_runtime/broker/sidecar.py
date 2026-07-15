@@ -77,6 +77,7 @@ def write_sidecar(
     backend: str | None,
     started_at: float,
     journal_offset: int,
+    root_cwd: str | None = None,
 ) -> Path:
     """daemon.json を atomic に書く (発見用メタデータ)。秘密は含めない。
 
@@ -84,6 +85,13 @@ def write_sidecar(
     ``default_backend()`` の結果)。``--no-nudge`` で adapter を持たない場合は
     ``None`` (= terminal backend 無し)。健全性判定 (タスク 2) が「同 backend」を
     照合できるよう、要求値 (``args.backend`` の ``None``) ではなく実値を記録する。
+
+    ``root_cwd`` (任意, 追加フィールド) は daemon の relative-spawn 解決アンカー
+    (= 概ね repo root)。org down の resident pre-flight (Issue #142) が ownership 指紋を
+    算出するためのアンカーとして読む: down は ``--root-cwd`` を持たないので daemon.json
+    経由で受け取る。省略時は ``None`` を記録し、旧 reader は無視する (additive)。
+    ``started_at`` はこの daemon の **wall-clock** 起動時刻 (``time.time()``) であり、
+    resident 登録簿の ``started_at`` (= kernel プロセス開始時刻) とは**意味が異なる**。
     """
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +103,7 @@ def write_sidecar(
         "backend": backend,
         "started_at": started_at,
         "journal_offset": journal_offset,
+        "root_cwd": absolutize(root_cwd) if root_cwd else None,
     }
     path = state_dir / SIDECAR_NAME
     tmp = state_dir / (SIDECAR_NAME + ".tmp")
