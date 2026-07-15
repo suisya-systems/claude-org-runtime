@@ -202,6 +202,17 @@ def test_observe_linux_missing_pid_returns_none(tmp_path):
                                                proc_root=str(proc)) is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Linux 観測器の fake-/proc exe/cwd 読取テストは POSIX 専用。Windows では "
+        "os.readlink が symlink の substitute name を \\?\\ 拡張接頭辞付きで返し "
+        "(realpath でも吸収不能)、偽 /proc symlink の意味論を Windows で再現できない。"
+        "本番は platform seam が Windows で Linux 観測器を呼ばない (os_name='windows' → "
+        "_observe_windows) ため、この POSIX 専用テストの skip はカバレッジを損なわない。"
+        "Windows 観測器自体は test_observe_windows_* が別途検証する。"
+    ),
+)
 def test_observe_linux_reads_exe_cwd(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     real_exe = tmp_path / "python3"; real_exe.write_text("x")
@@ -210,10 +221,9 @@ def test_observe_linux_reads_exe_cwd(tmp_path, monkeypatch):
     _fake_proc(proc, 7, starttime_ticks=0, btime=10, exe=str(real_exe),
                cwd=str(real_cwd))
     obs = residents._observe_process_identity(7, os_name="linux", proc_root=str(proc))
-    # obs.exe / obs.cwd は os.readlink の生値で、Windows ランナーでは拡張長パス
-    # (``\\?\C:\...``) 形式になり得るため生文字列比較はできない (#143/#144)。identity_match が
-    # exe を比較するのと同じ正規化 (realpath+normcase) を **両辺**に通し、指すファイルが同一で
-    # あることを検証する (期待値は実装の変換を鏡写しにする)。
+    # POSIX では os.readlink は渡した target 文字列をそのまま返す。identity_match が exe を
+    # 比較するのと同じ正規化 (realpath+normcase) を両辺に通し、指すファイルが同一であることを
+    # 検証する (macOS の /var -> /private/var symlink 差も吸収)。
     def _canon(p):
         return os.path.normcase(os.path.realpath(p))
     assert _canon(obs.exe) == _canon(str(real_exe))
