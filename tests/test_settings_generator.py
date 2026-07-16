@@ -2549,6 +2549,65 @@ def test_worker_role_required_allow_contains_git_merge_for_post_fetch_sync() -> 
         assert "Bash(git merge:*)" in allow
 
 
+# ---------------------------------------------------------------------------
+# Worker Docker build allow set (runtime Issue #147, refs ja #723)
+#
+# Workers building org Docker images were hitting the auto-mode classifier on
+# every docker command pattern. A deliberately narrow allow set (Codex-reviewed,
+# 2 rounds) is added to the mutating worker templates only. It excludes
+# `docker inspect:*` (reaches containers/networks/secrets via --type),
+# `docker buildx:*` at large (registry-write imagetools, prune/rm), and
+# run/compose/push/login/rmi/prune, which stay on per-command human approval.
+# `doc-audit` is read-only, and `roles.worker.required_allow` is intentionally
+# untouched (it would force editing the byte-frozen ja permissions.md anchor).
+# ---------------------------------------------------------------------------
+
+DOCKER_BUILD_ALLOW = (
+    "Bash(docker build:*)",
+    "Bash(docker buildx build:*)",
+    "Bash(docker images:*)",
+    "Bash(docker image inspect:*)",
+)
+
+
+def test_mutating_worker_templates_contain_narrow_docker_build_allow() -> None:
+    """Both mutating worker templates gain the narrow Docker build allow set."""
+    schema = _bundled_schema()
+    for template in ("default", "claude-org-self-edit"):
+        allow = schema["worker_roles"][template]["permissions"]["allow"]
+        for entry in DOCKER_BUILD_ALLOW:
+            assert entry in allow, f"{entry} missing from {template} allow"
+
+
+def test_docker_build_allow_stays_narrow() -> None:
+    """The Docker allow set must not broaden to the rejected wide patterns."""
+    schema = _bundled_schema()
+    forbidden = {
+        "Bash(docker inspect:*)",
+        "Bash(docker buildx:*)",
+        "Bash(docker run:*)",
+        "Bash(docker compose:*)",
+        "Bash(docker push:*)",
+        "Bash(docker login:*)",
+        "Bash(docker rmi:*)",
+        "Bash(docker system prune:*)",
+    }
+    for template in ("default", "claude-org-self-edit"):
+        allow = set(schema["worker_roles"][template]["permissions"]["allow"])
+        assert not (forbidden & allow), f"{template} allow broadened beyond narrow set"
+
+
+def test_docker_build_allow_excluded_from_read_only_and_frozen_surfaces() -> None:
+    """doc-audit (read-only) and roles.worker.required_allow (ja byte-frozen
+    permissions.md anchor) must NOT gain the Docker allow entries."""
+    schema = _bundled_schema()
+    doc_audit_allow = set(schema["worker_roles"]["doc-audit"]["permissions"]["allow"])
+    worker_required = set(schema["roles"]["worker"]["required_allow"])
+    for entry in DOCKER_BUILD_ALLOW:
+        assert entry not in doc_audit_allow, f"{entry} leaked into doc-audit"
+        assert entry not in worker_required, f"{entry} leaked into worker.required_allow"
+
+
 def test_worker_role_required_allow_does_not_contain_git_push_variants() -> None:
     worker = _bundled_schema()["roles"]["worker"]
     forbidden_push_variants = {
