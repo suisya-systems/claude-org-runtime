@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.1.37] - 2026-07-17
+
+### Added
+
+- worker role templates: a deliberately narrow Docker build allow set is added
+  to both `worker_roles.default` and `worker_roles.claude-org-self-edit`
+  `permissions.allow` — `Bash(docker build:*)`, `Bash(docker buildx build:*)`,
+  `Bash(docker images:*)`, `Bash(docker image inspect:*)`. Workers building org
+  Docker images were being blocked by the auto-mode classifier on every docker
+  command pattern (runtime Issue #147, refs suisya-systems/claude-org-ja#723).
+  The set is intentionally narrow (Codex-reviewed, 2 rounds): it excludes
+  `docker inspect:*` (reaches containers/networks/secrets via `--type`),
+  `docker buildx:*` at large (registry-write `imagetools`, prune/rm), and
+  run/compose/push/login/rmi/prune, all of which stay on per-command human
+  approval. The read-only `doc-audit` template and `roles.worker.required_allow`
+  (the byte-frozen ja `permissions.md` renga anchor) are intentionally
+  untouched. A worker-role `~/.docker` denyRead was evaluated as a release gate
+  and deferred: `~/.docker` also holds `config.json` (registry credentials) and
+  the `contexts` symlink that legitimate builds pulling a private base image
+  need, so a blanket denyRead risks breaking legitimate builds — tracked as a
+  follow-up.
+
 ## [0.1.36] - 2026-07-04
 
 ### Fixed
