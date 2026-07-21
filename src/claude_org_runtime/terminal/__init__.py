@@ -34,6 +34,7 @@ from .base import (
     login_shell_venv_wrapper,
     make_adapter,
     venv_bin_dir,
+    venv_pane_env,
     venv_pane_prep,
     wait_for_state,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "login_shell_venv_wrapper",
     "make_adapter",
     "venv_bin_dir",
+    "venv_pane_env",
     "venv_pane_prep",
     "wait_for_state",
 ]

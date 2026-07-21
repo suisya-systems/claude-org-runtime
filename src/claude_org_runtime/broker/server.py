@@ -28,6 +28,7 @@ import json
 import secrets
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from ..terminal import (
     PaneId,
     TerminalAdapter,
     classify_pane_state,
+    venv_pane_env,
     venv_pane_prep,
 )
 from . import sidecar, surface
@@ -1172,6 +1174,7 @@ class Broker(TokenMixin, StoreMixin):
     def _adapter_spawn(
         self, argv: list[str], cwd: str | None,
         role: str | None, project: str | None,
+        kind: str | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1195,16 +1198,32 @@ class Broker(TokenMixin, StoreMixin):
         完全 no-op (argv/env 不変)。PATH を env dict に直に載せないのは、login shell の
         profile 初期化が ``-e`` 相当で渡した PATH を後から再構築して ``.venv/bin`` を
         消すため (Blocker 2)。
+
+        ``venv_path_via_pane_env`` を宣言する backend (Herdr, Issue #151) では argv を
+        **書き換えず** ``VIRTUAL_ENV`` のみ渡す。herdr 0.7.5 の ``agent.start`` は
+        ``argv`` を受け取らなくなり login-shell wrapper の運搬経路が消えたため、
+        ``PATH`` prepend は adapter が pane 生成後 (profile 初期化完了後) に打ち込む。
+
+        ``kind`` (Issue #151) は broker が知っている意味的な種別
+        (``"claude"`` / ``"codex"`` / generic は None)。``supports_agent_kind`` な
+        backend にのみ渡す。**argv[0] からの推測はしない** (venv wrapper 経路では
+        argv[0] がシェルに、generic spawn では任意コマンドになり破綻するため)。
         """
         env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
-        argv, venv_env = venv_pane_prep(argv, cwd, self.root_cwd)
-        env.update(venv_env)
+        if getattr(self.adapter, "venv_path_via_pane_env", False):
+            env.update(venv_pane_env(cwd, self.root_cwd))
+        else:
+            argv, venv_env = venv_pane_prep(argv, cwd, self.root_cwd)
+            env.update(venv_env)
+        extra: dict = {}
+        if getattr(self.adapter, "supports_agent_kind", False):
+            extra["kind"] = kind
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
             return self.adapter.spawn(
-                argv, cwd=cwd, new_window=True, space=space, env=env
+                argv, cwd=cwd, new_window=True, space=space, env=env, **extra
             )
-        return self.adapter.spawn(argv, cwd=cwd, new_window=True, env=env)
+        return self.adapter.spawn(argv, cwd=cwd, new_window=True, env=env, **extra)
 
     def spawn_claude(
         self, caller: AgentBind, direction: str, target: str, name: str | None,
@@ -1269,7 +1288,7 @@ class Broker(TokenMixin, StoreMixin):
                 model=model, permission_mode=permission_mode, extra_args=extra,
                 channel_server="org-broker-channel",
             )
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind="claude")
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
             # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1331,7 +1350,7 @@ class Broker(TokenMixin, StoreMixin):
                 # 原子的に拒否する。予約名は解放してから返す。
                 self._release_name(name)
                 return _err(str(e))
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind="codex")
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1373,7 +1392,7 @@ class Broker(TokenMixin, StoreMixin):
         token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind=None)  # generic: agent ではない
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1444,6 +1463,36 @@ def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _tool_name_of(params: object) -> str:
+    """tools/call params から tool 名を **決して例外を出さずに** 取り出す。
+
+    ``params`` は生のリクエスト由来なので dict とは限らない (``"params": "x"`` の
+    ような不正な JSON-RPC でも到達する)。診断経路の中で ``AttributeError`` を出すと、
+    C-1 が防ごうとしている当のもの (応答を書かないままの socket close) を診断コード
+    自身が再現してしまう。
+    """
+    if isinstance(params, dict):
+        name = params.get("name")
+        if isinstance(name, str) and name:
+            return name
+    return "?"
+
+
+def _tool_error_message(params: object, exc: BaseException) -> str:
+    """想定外例外を **診断可能な 1 行**へ落とす (Issue #151 C-1)。
+
+    tool 名と例外クラス名 + str を載せる。``HerdrError`` 等の構造化例外は str が
+    既に ``[code] message`` 形なので、そのまま原因コード (``adapter_unavailable`` /
+    ``invalid-params`` 等) がクライアント側に出る。
+
+    **引数は載せない**: tools/call の arguments には token / cred 等の秘匿値が
+    載りうるため (scrub-policy)。詳細な traceback は journal 側 (daemon ローカル)
+    にのみ残す (:meth:`_McpHandler._journal_tool_failure`)。
+    """
+    name = _tool_name_of(params)
+    return f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+
+
 class _McpHandler(BaseHTTPRequestHandler):
     """MCP streamable-HTTP (JSON-RPC over POST, application/json 応答)。"""
 
@@ -1452,6 +1501,29 @@ class _McpHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # 標準 stderr ログ抑止
         pass
+
+    def _journal_tool_failure(
+        self, bind: AgentBind, params: object, exc: BaseException
+    ) -> None:
+        """tools/call の想定外例外を journal へ残す (Issue #151 C-1 の事後診断面)。
+
+        クライアントへ返す 1 行 (:func:`_tool_error_message`) では原因の特定に
+        足りないため、traceback を daemon ローカルの queue.jsonl にのみ残す。
+        journal 書込み自体の失敗 (disk full 等) で例外が再び do_POST を貫通しては
+        本末転倒なので、ここは握り潰す。
+        """
+        try:
+            self.broker._journal(
+                "tool_call_failed",
+                agent_id=bind.agent_id,
+                tool=_tool_name_of(params),
+                error=f"{type(exc).__name__}: {exc}",
+                traceback="".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                ),
+            )
+        except Exception:  # noqa: BLE001 - 診断のための best-effort
+            pass
 
     def _send_json(self, status: int, payload: dict | None, session_id: str | None = None):
         body = b"" if payload is None else json.dumps(payload).encode("utf-8")
@@ -1776,6 +1848,29 @@ class _McpHandler(BaseHTTPRequestHandler):
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "error": {"code": -32602, "message": f"invalid params: {e}"},
+                    },
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - 意図的な最後の関門
+                # 想定外例外を **必ず JSON-RPC error として返す** (Issue #151 C-1)。
+                # これが無いと例外が do_POST を貫通してハンドラスレッドが応答を
+                # 書かないまま終了し、クライアントには「The socket connection was
+                # closed unexpectedly」しか届かない = 無診断 (Issue #151 の主因:
+                # herdr adapter の agent.start が protocol 不一致で HerdrError を
+                # 投げた時、spawn_claude の re-raise がここを素通りしていた)。
+                #
+                # ``BaseException`` は捕らない: KeyboardInterrupt / SystemExit を
+                # 握り潰すと daemon の停止経路を壊す。
+                self._journal_tool_failure(bind, params, e)
+                self._send_json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32603,
+                            "message": _tool_error_message(params, e),
+                        },
                     },
                 )
                 return

@@ -109,6 +109,84 @@ def test_missing_args_is_invalid_params(client_factory):
     assert ip["error"]["code"] == -32602
 
 
+# --- Issue #151 C-1: 想定外例外は JSON-RPC error になる (無応答クローズにしない) ---
+def test_unexpected_tool_exception_returns_jsonrpc_error(
+    broker, client_factory, monkeypatch
+):
+    """call_tool の想定外例外が HTTP 応答なしの socket close にならないこと。
+
+    回帰対象は Issue #151: herdr adapter が ``HerdrError`` を投げると
+    ``spawn_claude`` の re-raise が tools/call を貫通し、ハンドラスレッドが応答を
+    書かずに終了して、クライアントには「The socket connection was closed
+    unexpectedly」しか届かなかった (無診断 wedge の主因)。
+    """
+    a = client_factory("agent-a")
+
+    def boom(bind, name, args):
+        raise RuntimeError("[adapter_unavailable] herdr socket refused")
+
+    monkeypatch.setattr(broker, "call_tool", boom)
+    res = a.rpc("tools/call", {"name": "list_peers", "arguments": {}})
+    assert res["error"]["code"] == -32603
+    msg = res["error"]["message"]
+    # 診断可能であること: tool 名 / 例外クラス / 原因コードが 1 行に載る。
+    assert "list_peers" in msg
+    assert "RuntimeError" in msg
+    assert "adapter_unavailable" in msg
+
+
+def test_unexpected_tool_exception_is_journaled_with_traceback(
+    broker, client_factory, monkeypatch
+):
+    """事後診断のため traceback は journal (daemon ローカル) にのみ残る。"""
+    a = client_factory("agent-a")
+
+    def boom(bind, name, args):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(broker, "call_tool", boom)
+    a.rpc("tools/call", {"name": "list_peers", "arguments": {}})
+
+    rows = [
+        json.loads(line)
+        for line in (broker.state_dir / "queue.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    failed = [r for r in rows if r.get("event") == "tool_call_failed"]
+    assert len(failed) == 1
+    assert failed[0]["tool"] == "list_peers"
+    assert failed[0]["agent_id"] == "agent-a"
+    assert "RuntimeError: kaboom" in failed[0]["error"]
+    assert "Traceback" in failed[0]["traceback"]
+
+
+@pytest.mark.filterwarnings(
+    # ハンドラスレッドを貫通させるのが本テストの意図そのもの (捕らないことの検証)。
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+def test_keyboard_interrupt_is_not_swallowed(broker, client_factory, monkeypatch):
+    """``BaseException`` は捕らない: daemon の停止経路を握り潰さないこと。
+
+    C-1 の except は ``Exception`` 止まりなので ``KeyboardInterrupt`` はここを
+    通り抜ける。通り抜けた結果クライアント側は応答なしになる (= C-1 以前の挙動)
+    が、それが正しい: 停止シグナルを 200 応答に化けさせてはならない。
+    """
+    a = client_factory("agent-a")
+
+    def boom(bind, name, args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(broker, "call_tool", boom)
+    with pytest.raises(Exception):  # noqa: B017 - 応答が来ないこと自体が検証対象
+        a.rpc("tools/call", {"name": "list_peers", "arguments": {}})
+    # journal にも tool_call_failed は残らない (except を通っていない証拠)。
+    jrn = broker.state_dir / "queue.jsonl"
+    text = jrn.read_text(encoding="utf-8") if jrn.exists() else ""
+    assert "tool_call_failed" not in text
+
+
 # --------------------------------------------------------------------- [7]
 def test_call_before_initialize_is_404(broker):
     c = MiniMcpClient(broker.url, broker.issue_token("agent-c", "agent-c", "worker"))
@@ -1338,3 +1416,21 @@ def test_respawn_burst_does_not_block_distinct_names(tmp_path):
         out = dispatch_tool(b, disp, "spawn_claude_pane",
                             {"direction": "vertical", "name": f"w{i}"})
         assert out.get("isError") is not True
+
+
+def test_malformed_params_still_get_a_jsonrpc_error(broker, client_factory, monkeypatch):
+    """params が dict でなくても診断経路自身が落ちないこと (self-review Major)。
+
+    ``_tool_error_message`` / ``_journal_tool_failure`` が ``params.get`` を素で
+    呼ぶと ``AttributeError`` が except 節の中から送出され、**C-1 が防ごうとして
+    いる当のもの** (応答を書かないままの socket close) を診断コードが再現する。
+    """
+    a = client_factory("agent-a")
+
+    def boom(bind, name, args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(broker, "call_tool", boom)
+    res = a.rpc("tools/call", "not-a-dict")
+    assert res["error"]["code"] == -32603
+    assert "[tool_failed] ?" in res["error"]["message"]
