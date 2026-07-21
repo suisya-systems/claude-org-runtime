@@ -224,6 +224,24 @@ class TerminalAdapter(Protocol):
     伝搬機構は異なる (tmux=``new-session -e`` / wezterm=argv の env 前置 / herdr=
     ``agent.start`` の env param) が、**観測挙動 (pane subprocess に届く) は backend
     間で一致させる**。``None`` / 空 dict は完全に従来挙動。
+
+    agent kind (任意 ClassVar ``supports_agent_kind``、Issue #151): backend が
+    :meth:`spawn` の ``kind`` 引数 (broker の意味的な種別 ``"claude"`` / ``"codex"`` /
+    generic は ``None``) を解釈するかを宣言する。Herdr=True (herdr 0.7.5 の
+    ``agent.start`` は ``kind`` が必須で、実行ファイルをこれで決める)、tmux/wezterm=
+    False (argv をそのまま起動するので不要)。``space`` と同じく broker が
+    ``getattr(adapter, "supports_agent_kind", False)`` で読み、True の時だけ ``kind``
+    を渡す (flat backend の spawn シグネチャは不変)。**argv[0] から推測してはならない**:
+    venv wrapper 経路では argv[0] がシェルになり、generic spawn では任意コマンドに
+    なるため、broker が知っている種別を明示的に渡す唯一の経路とする。
+
+    venv の PATH 継承方式 (任意 ClassVar ``venv_path_via_pane_env``、Issue #151):
+    backend が ``PATH`` prepend を **argv の login-shell wrapper ではなく自前で**
+    (pane 生成時 env や pane への打ち込みで) 行うかを宣言する。Herdr=True (0.7.5 の
+    ``agent.start`` から ``argv`` が消え wrapper の運搬経路自体が無くなったため)、
+    tmux/wezterm=False (:func:`venv_pane_prep` の wrapper 方式のまま不変)。True の
+    backend へは broker が argv を書き換えず ``VIRTUAL_ENV`` のみ env に載せる
+    (:func:`venv_pane_env`)。
     """
 
     def spawn(
@@ -233,6 +251,7 @@ class TerminalAdapter(Protocol):
         new_window: bool = ...,
         space: "SpaceDescriptor | None" = ...,
         env: "dict[str, str] | None" = ...,
+        kind: "str | None" = ...,
     ) -> PaneRef: ...
 
     def list_panes(self) -> list[dict]: ...
@@ -461,6 +480,22 @@ def venv_pane_prep(
     # fallback the pane still runs in its own worktree, it just borrows root's
     # .venv), so a profile ``cd`` cannot move claude out of its worktree.
     return login_shell_venv_wrapper(argv, bin_dir, run_cwd=cwd), {"VIRTUAL_ENV": venv}
+
+
+def venv_pane_env(cwd: "str | None", root_cwd: "str | None") -> "dict[str, str]":
+    """``VIRTUAL_ENV`` だけを返す venv 継承 (Issue #151、``venv_path_via_pane_env``)。
+
+    :func:`venv_pane_prep` の argv 書き換えを行わない版。``PATH`` の prepend は
+    backend 自身が行う契約なのでここでは載せない (env dict に ``PATH`` を直に
+    載せると login shell の profile 初期化に潰される = Issue #130 Blocker 2)。
+
+    herdr 0.7.5 用: ``agent.start`` から ``argv`` が消え、post-profile login-shell
+    wrapper という運搬経路そのものが無くなったため、broker は argv を触らず
+    ``VIRTUAL_ENV`` のみ渡し、adapter が pane 生成後 (= profile 初期化完了後) に
+    ``PATH`` を打ち込む。``.venv`` が無ければ空 dict (完全 no-op)。
+    """
+    venv = find_workspace_venv(cwd, root_cwd)
+    return {} if venv is None else {"VIRTUAL_ENV": venv}
 
 
 # ---------------------------------------------------------------------------

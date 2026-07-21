@@ -41,6 +41,7 @@ from ..terminal import (
     PaneId,
     TerminalAdapter,
     classify_pane_state,
+    venv_pane_env,
     venv_pane_prep,
 )
 from . import sidecar, surface
@@ -1173,6 +1174,7 @@ class Broker(TokenMixin, StoreMixin):
     def _adapter_spawn(
         self, argv: list[str], cwd: str | None,
         role: str | None, project: str | None,
+        kind: str | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1196,16 +1198,32 @@ class Broker(TokenMixin, StoreMixin):
         完全 no-op (argv/env 不変)。PATH を env dict に直に載せないのは、login shell の
         profile 初期化が ``-e`` 相当で渡した PATH を後から再構築して ``.venv/bin`` を
         消すため (Blocker 2)。
+
+        ``venv_path_via_pane_env`` を宣言する backend (Herdr, Issue #151) では argv を
+        **書き換えず** ``VIRTUAL_ENV`` のみ渡す。herdr 0.7.5 の ``agent.start`` は
+        ``argv`` を受け取らなくなり login-shell wrapper の運搬経路が消えたため、
+        ``PATH`` prepend は adapter が pane 生成後 (profile 初期化完了後) に打ち込む。
+
+        ``kind`` (Issue #151) は broker が知っている意味的な種別
+        (``"claude"`` / ``"codex"`` / generic は None)。``supports_agent_kind`` な
+        backend にのみ渡す。**argv[0] からの推測はしない** (venv wrapper 経路では
+        argv[0] がシェルに、generic spawn では任意コマンドになり破綻するため)。
         """
         env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
-        argv, venv_env = venv_pane_prep(argv, cwd, self.root_cwd)
-        env.update(venv_env)
+        if getattr(self.adapter, "venv_path_via_pane_env", False):
+            env.update(venv_pane_env(cwd, self.root_cwd))
+        else:
+            argv, venv_env = venv_pane_prep(argv, cwd, self.root_cwd)
+            env.update(venv_env)
+        extra: dict = {}
+        if getattr(self.adapter, "supports_agent_kind", False):
+            extra["kind"] = kind
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
             return self.adapter.spawn(
-                argv, cwd=cwd, new_window=True, space=space, env=env
+                argv, cwd=cwd, new_window=True, space=space, env=env, **extra
             )
-        return self.adapter.spawn(argv, cwd=cwd, new_window=True, env=env)
+        return self.adapter.spawn(argv, cwd=cwd, new_window=True, env=env, **extra)
 
     def spawn_claude(
         self, caller: AgentBind, direction: str, target: str, name: str | None,
@@ -1270,7 +1288,7 @@ class Broker(TokenMixin, StoreMixin):
                 model=model, permission_mode=permission_mode, extra_args=extra,
                 channel_server="org-broker-channel",
             )
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind="claude")
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
             # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1332,7 +1350,7 @@ class Broker(TokenMixin, StoreMixin):
                 # 原子的に拒否する。予約名は解放してから返す。
                 self._release_name(name)
                 return _err(str(e))
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind="codex")
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1374,7 +1392,7 @@ class Broker(TokenMixin, StoreMixin):
         token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
-            ref = self._adapter_spawn(argv, cwd, role, project)
+            ref = self._adapter_spawn(argv, cwd, role, project, kind=None)  # generic: agent ではない
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約

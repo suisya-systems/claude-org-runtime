@@ -36,6 +36,7 @@ from claude_org_runtime.broker.store import CLAIMED, DELIVERED, PULL, PUSH, UNDE
 from claude_org_runtime.broker.surface import dispatch_tool
 from claude_org_runtime.terminal import base as terminal_base
 
+from . import conftest
 from .conftest import FakeAdapter
 
 
@@ -1198,3 +1199,80 @@ def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
                 proc.kill()
     finally:
         b.stop()
+
+
+# ---------------------------------------------------------------------------
+# Issue #151 A: 意味的 kind の受け渡しと venv 継承方式の backend 分岐
+# ---------------------------------------------------------------------------
+
+def _kind_of_last_spawn(adapter):
+    return adapter.spawned[-1]["kind"]
+
+
+def test_spawn_threads_semantic_kind_to_capable_backend(tmp_path):
+    """broker が知っている種別を spawn(kind=) で明示的に渡す (Codex Blocker 2)。
+
+    herdr 0.7.5 の agent.start は kind が必須で実行ファイルをこれで決める。
+    argv[0] からの推測は venv wrapper 経路 (argv[0] がシェルになる) や generic
+    spawn (任意コマンド) で破綻するため、broker 側の意味的な種別が唯一の出所。
+    """
+    adapter = FakeAdapter(supports_agent_kind=True)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w-claude"})
+    assert _kind_of_last_spawn(adapter) == "claude"
+
+    dispatch_tool(b, disp, "spawn_codex_pane",
+                  {"direction": "vertical", "name": "w-codex"})
+    assert _kind_of_last_spawn(adapter) == "codex"
+
+    sec = _ops(b, "s2", "secretary")
+    dispatch_tool(b, sec, "spawn_pane",
+                  {"direction": "horizontal", "command": "watch ls", "name": "w-gen"})
+    # generic は agent ではないので None (「渡されなかった」ではなく明示的に None)。
+    assert _kind_of_last_spawn(adapter) is None
+
+
+def test_spawn_omits_kind_for_backends_without_the_capability(tmp_path):
+    """tmux / wezterm の spawn シグネチャは不変に保つ (kind を渡さない)。"""
+    adapter = FakeAdapter()  # supports_agent_kind=False (既定)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w"})
+    assert _kind_of_last_spawn(adapter) is conftest._UNSET
+
+
+def test_venv_pane_env_backend_gets_virtual_env_without_argv_rewrite(tmp_path):
+    """``venv_path_via_pane_env`` な backend では argv を書き換えない (#151 A)。
+
+    herdr 0.7.5 は agent.start から argv が消えるため login-shell wrapper を運べない。
+    broker は VIRTUAL_ENV だけ env に載せ、PATH prepend は adapter が pane 生成後
+    (profile 初期化完了後) に打ち込む契約にする。**PATH を env dict に載せない**のは
+    Issue #130 Blocker 2 (profile が env 経由 PATH を再構築して .venv/bin を消す)
+    をここでも踏まないため。
+    """
+    venv = _make_venv(tmp_path)
+    adapter = FakeAdapter(venv_path_via_pane_env=True)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter, root_cwd=str(tmp_path))
+    adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": str(tmp_path)})
+    sp = adapter.spawned[-1]
+    assert sp["env"]["VIRTUAL_ENV"] == str(venv)
+    assert "PATH" not in sp["env"]          # profile に潰されるので載せない
+    assert sp["argv"][0] == "claude"        # wrapper で包まない
+
+
+def test_venv_wrapper_backend_is_unchanged(tmp_path):
+    """既定 backend (tmux/wezterm/herdr legacy) は従来の wrapper 方式のまま。"""
+    venv = _make_venv(tmp_path)
+    adapter = FakeAdapter()  # venv_path_via_pane_env=False
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter, root_cwd=str(tmp_path))
+    adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": str(tmp_path)})
+    _assert_pane_venv_activated(adapter.spawned[-1], venv)

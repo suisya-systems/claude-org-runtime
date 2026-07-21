@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -235,6 +236,73 @@ def _wire_spawn(server: FakeHerdrServer, *, pane_id: str = "w1:p2") -> None:
         },
     )
     server.on("pane.close", {"type": "ok"})
+
+
+def _wire_spawn_v075(
+    server: FakeHerdrServer,
+    *,
+    pane_id: str = "w1:p2",
+    busy_times: int = 0,
+) -> None:
+    """protocol 17 の spawn 連鎖を張る: workspace.create -> pane.split ->
+    (pane.send_text) -> agent.start -> pane.close (root cleanup)。
+
+    fake 側で herdr 0.7.5 の**バリデーションを再現する** (name 正規表現 / kind と
+    pane_id の必須性)。実バイナリが手元に無いため、これが name 短縮や必須 param の
+    退行を捕まえる唯一の関門になる。
+
+    ``busy_times`` 回だけ ``agent_pane_busy`` を返してから成功する (retry の検証)。
+    """
+    server.protocol = 17
+    server.version = "0.7.5"
+    server.on(
+        "workspace.create",
+        {
+            "type": "workspace_created",
+            "workspace": {"workspace_id": "w1", "active_tab_id": "w1:t1"},
+            "tab": {"tab_id": "w1:t1", "workspace_id": "w1"},
+            "root_pane": {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
+        },
+    )
+    server.on(
+        "pane.split",
+        lambda params: {
+            "type": "pane_info",
+            "pane": {
+                "pane_id": pane_id,
+                "terminal_id": "term_v075",
+                "workspace_id": params.get("workspace_id"),
+                "tab_id": "w1:t1",
+            },
+        },
+    )
+    server.on("pane.send_text", {"type": "ok"})
+    server.on("pane.close", {"type": "ok"})
+
+    state = {"busy": busy_times}
+
+    def agent_start(params: dict) -> dict:
+        name = params.get("name")
+        if not isinstance(name, str) or not AGENT_NAME_RE.match(name):
+            return {"error": {"code": "invalid_agent_name", "message": repr(name)}}
+        if not params.get("kind"):
+            return {"error": {"code": "invalid_request", "message": "missing kind"}}
+        if not params.get("pane_id"):
+            return {"error": {"code": "invalid_request", "message": "missing pane_id"}}
+        if state["busy"] > 0:
+            state["busy"] -= 1
+            return {"error": {"code": "agent_pane_busy", "message": "not at prompt"}}
+        return {
+            "type": "agent_started",
+            "argv": [],
+            "agent": {"pane_id": params.get("pane_id"), "name": name},
+        }
+
+    server.on("agent.start", agent_start)
+
+
+# herdr 0.7.5 が agent name に課す正規表現 (app/agents.rs)。
+AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def _adapter(server: FakeHerdrServer) -> HerdrAdapter:
@@ -1932,3 +2000,226 @@ def test_born_empty_workspace_with_foreign_pane_is_not_closed(
         a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
     assert "workspace.close" not in server.methods_called()   # foreign present -> not closed
     assert "w1" in a._pending_sweep                            # deferred (protected)
+
+
+# ---------------------------------------------------------------------------
+# herdr 0.7.5 (protocol 17) agent.start 追随 — Issue #151 A
+# ---------------------------------------------------------------------------
+
+def test_v075_spawn_splits_pane_then_starts_agent(server: FakeHerdrServer, tmp_path):
+    """0.7.5 は agent.start が pane を作らないので、先に pane.split で確保する。"""
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    ref = a.spawn(["claude", "--flag"], cwd=str(tmp_path), kind="claude")
+
+    assert server.methods_called() == [
+        "workspace.create", "pane.split", "agent.start", "pane.close",
+    ]
+    assert ref.pane_id == "w1:p2"
+    assert ref.terminal_id == "term_v075"
+
+    # pane.split は workspace / 分割元を明示するので focused 相乗りは起きない。
+    split = server.params_for("pane.split")
+    assert split["workspace_id"] == "w1"
+    assert split["target_pane_id"] == "w1:p1"   # root pane から分割
+    assert split["direction"] == "down"
+    assert split["cwd"] == str(tmp_path)        # cwd は pane 生成時にしか渡せない
+
+    # agent.start は 0.7.5 の param セットのみを送る。
+    ap = server.params_for("agent.start")
+    assert set(ap) == {"name", "kind", "pane_id", "args", "timeout_ms"}
+    assert ap["kind"] == "claude"
+    assert ap["pane_id"] == "w1:p2"
+    # 実行ファイルは kind が決めるので argv[0] は送らない。
+    assert ap["args"] == ["--flag"]
+    assert 3000 < ap["timeout_ms"] <= 300000
+
+
+def test_v075_spawn_does_not_move_pane(server: FakeHerdrServer, tmp_path):
+    """配置が決定的なので戦略 C (spawn-then-move) は使わない。"""
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert "pane.move" not in server.methods_called()
+
+
+def test_v075_root_pane_is_closed_but_never_the_agent_pane(
+    server: FakeHerdrServer, tmp_path
+):
+    """root cleanup が agent pane を殺さないこと (Codex Blocker 4)。"""
+    _wire_spawn_v075(server, pane_id="w1:p2")
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    closed = [
+        r["params"]["pane_id"]
+        for r in server.requests if r.get("method") == "pane.close"
+    ]
+    assert closed == ["w1:p1"]      # root だけ
+    assert "w1:p2" not in closed    # agent pane は決して閉じない
+
+
+def test_v075_agent_pane_equal_to_root_is_not_closed(
+    server: FakeHerdrServer, tmp_path, monkeypatch
+):
+    """agent が root pane に着地した場合は close せず所有権だけ手放す。
+
+    残したままだと **次の spawn がこの agent の pane を閉じてしまう** ため、
+    root_pane_id は必ずクリアする。
+    """
+    _wire_spawn_v075(server, pane_id="w1:p1")  # split が root と同じ id を返す縁ケース
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert "pane.close" not in server.methods_called()
+    assert a._spaces[SPACE_CONTROL].root_pane_id is None
+
+
+def test_v075_agent_pane_busy_is_retried(server: FakeHerdrServer, tmp_path, monkeypatch):
+    """pane 生成直後の shell 起動レースは retry で吸収する (Codex Blocker 5)。"""
+    slept: list[float] = []
+    monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(slept.append))
+    _wire_spawn_v075(server, busy_times=2)
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert ref.pane_id == "w1:p2"
+    assert server.methods_called().count("agent.start") == 3
+    assert slept == [0.1, 0.2]  # 指数バックオフ
+
+
+def test_v075_agent_pane_busy_exhausted_raises(
+    server: FakeHerdrServer, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
+    _wire_spawn_v075(server, busy_times=999)
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert exc.value.code == CODE_AGENT_PANE_BUSY
+    assert server.methods_called().count("agent.start") == 4  # 有界
+
+
+def test_v075_permanent_agent_error_is_not_retried(
+    server: FakeHerdrServer, tmp_path, monkeypatch
+):
+    """恒久的な引数不正 (未対応 kind) は retry せず即座に返す。"""
+    monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
+    _wire_spawn_v075(server)
+    server.on(
+        "agent.start",
+        {"error": {"code": "unsupported_agent_kind", "message": "nope"}},
+    )
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path), kind="bogus")
+    assert exc.value.code == CODE_INVALID_PARAMS
+    assert server.methods_called().count("agent.start") == 1
+
+
+# --- agent name (herdr 0.7.5 の ^[a-z][a-z0-9_-]{0,31}$) --------------------
+
+def test_v075_agent_name_matches_herdr_regex(server: FakeHerdrServer, tmp_path):
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert AGENT_NAME_RE.match(server.params_for("agent.start")["name"])
+
+
+@pytest.mark.parametrize(
+    "space_key",
+    [SPACE_CONTROL, "project:some-very-long-project-name-that-overflows", "P:X/Y"],
+)
+def test_v075_agent_name_is_compliant_and_unique(
+    server: FakeHerdrServer, space_key: str
+) -> None:
+    """短縮しても regex 適合かつ同時 spawn で衝突しないこと (Codex Major 2)。"""
+    server.protocol = 17
+    a = _adapter(server)
+    names = [a._agent_name(space_key) for _ in range(500)]
+    for n in names:
+        assert AGENT_NAME_RE.match(n), n
+        assert len(n) <= 32
+    assert len(set(names)) == len(names)  # counter が一意性を担う
+
+
+def test_legacy_agent_name_format_is_unchanged(server: FakeHerdrServer) -> None:
+    """legacy 経路の name は従来どおり (0.7.4 pin 運用の可読性を変えない)。"""
+    a = _adapter(server)  # protocol 16
+    name = a._agent_name(SPACE_CONTROL)
+    assert name.startswith(f"{a.label_prefix}/{a.org_instance_id}/g{a.generation}/")
+    assert "/" in name
+
+
+# --- venv 継承 (Issue #130 との衝突を protocol で分ける) --------------------
+
+def test_v075_venv_path_is_exported_after_pane_creation(
+    server: FakeHerdrServer, tmp_path
+):
+    """VIRTUAL_ENV は pane 生成 env、PATH は post-profile な打ち込みで渡す。
+
+    0.7.5 では agent.start から argv が消え login-shell wrapper を運べないため。
+    打ち込みは pane が prompt に戻った後に効くので、profile が PATH を再構築して
+    .venv/bin を消す Issue #130 Blocker 2 が構造的に起きない。
+    """
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    a.spawn(
+        ["claude"], cwd=str(tmp_path), kind="claude",
+        env={"VIRTUAL_ENV": "/w/.venv", "ORG_BROKER_STATE_DIR": "/s"},
+    )
+    # env は pane 生成時に渡る (0.7.5 の agent.start は env を受けない)。
+    assert server.params_for("pane.split")["env"]["VIRTUAL_ENV"] == "/w/.venv"
+    assert "env" not in server.params_for("agent.start")
+    # PATH は agent.start より前に打ち込む。
+    sent = server.params_for("pane.send_text")
+    assert sent["pane_id"] == "w1:p2"
+    assert sent["text"] == 'export PATH="$VIRTUAL_ENV/bin:$PATH"\n'
+    called = server.methods_called()
+    assert called.index("pane.send_text") < called.index("agent.start")
+
+
+def test_v075_no_venv_sends_nothing(server: FakeHerdrServer, tmp_path):
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude", env={"X": "1"})
+    assert "pane.send_text" not in server.methods_called()
+
+
+def test_venv_path_via_pane_env_flag_follows_protocol(server: FakeHerdrServer):
+    """broker が読む能力フラグは protocol に追従する (legacy は wrapper 方式のまま)。"""
+    assert _adapter(server).venv_path_via_pane_env is False
+    server.protocol = 17
+    assert _adapter(server).venv_path_via_pane_env is True
+
+
+# --- generic spawn (kind なし) ---------------------------------------------
+
+def test_v075_generic_spawn_uses_send_text_not_agent_start(
+    server: FakeHerdrServer, tmp_path
+):
+    """generic は agent ではないので agent.start を使わない。
+
+    0.7.5 の kind は許容ラベル制で任意コマンドに対応する値が無く、使うと
+    unsupported_agent_kind になるため。
+    """
+    _wire_spawn_v075(server)
+    a = _adapter(server)
+    ref = a.spawn(["sh", "-c", "echo 'a b'"], cwd=str(tmp_path), kind=None)
+    assert "agent.start" not in server.methods_called()
+    assert ref.pane_id == "w1:p2"
+    # 打ち込みはシェルが再度 word splitting するので quote が要る。
+    assert server.params_for("pane.send_text")["text"] == "sh -c 'echo '\"'\"'a b'\"'\"''\n"
+
+
+# --- legacy 経路の非退行 ----------------------------------------------------
+
+def test_legacy_spawn_wire_is_unchanged_by_kind_argument(
+    server: FakeHerdrServer, tmp_path
+):
+    """kind を受け取っても legacy の agent.start wire は一切変わらないこと。"""
+    _wire_spawn(server)
+    a = _adapter(server)
+    a.spawn(["claude", "--x"], cwd=str(tmp_path), kind="claude")
+    ap = server.params_for("agent.start")
+    assert ap["argv"] == ["claude", "--x"]   # argv をそのまま渡す (wrapper 温存)
+    assert "kind" not in ap
+    assert "pane_id" not in ap
+    assert "pane.split" not in server.methods_called()

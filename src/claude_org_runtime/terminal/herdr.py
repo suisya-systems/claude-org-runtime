@@ -73,6 +73,8 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
+import shlex
 import shutil
 import socket
 import threading
@@ -140,6 +142,32 @@ SUPPORTED_PROTOCOLS = PROTOCOL_AGENT_API_LEGACY | PROTOCOL_AGENT_API_V075
 # 構築時の ping が socket 不通で確定できなかった状態 (未確定)。恒久的な非対応と
 # 区別する: 未確定は spawn 時に再 probe され、そこで確定 or 明示エラーになる。
 _PROTOCOL_UNDETERMINED = 0
+
+# ---------------------------------------------------------------------------
+# v075 agent.start の制約 (Issue #151 A)
+# ---------------------------------------------------------------------------
+
+# herdr 0.7.5 の agent name 制約 ``^[a-z][a-z0-9_-]{0,31}$`` (= 先頭は英小文字、
+# 全体 32 文字以内)。違反すると ``invalid_agent_name``。
+_AGENT_NAME_MAX_LEN = 32
+_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# 許容外文字を潰すための表 (小文字化した後に適用する)。
+_AGENT_NAME_STRIP_RE = re.compile(r"[^a-z0-9_-]+")
+
+# ``agent_pane_busy`` (pane がまだ shell prompt に戻っていない) の retry 方針。
+# 総待ちは 0.1 + 0.2 + 0.4 = 0.7s で、既定 socket timeout (15s) に対し十分小さい。
+_AGENT_BUSY_MAX_ATTEMPTS = 4
+_AGENT_BUSY_BACKOFF_SECONDS = 0.1
+
+
+def _shell_command_line(argv: Sequence[str]) -> str:
+    """argv を pane のシェルへ打ち込める 1 行に組む (v075 の generic spawn)。
+
+    打ち込み方式ではシェルが再度 word splitting するため、``shlex.quote`` で各語を
+    クォートしないと空白や引用符を含む引数 (例 ``--mcp-config '{"...": "..."}'``)
+    が壊れる。
+    """
+    return " ".join(shlex.quote(a) for a in argv)
 
 # Herdr raw error.code → adapter 出口コード の写像表 (spike §4 実測語彙)。
 # 未知 raw code は ``adapter_unavailable`` へ**写像しない** (§4.6: adapter 不通 vs
@@ -537,6 +565,12 @@ class HerdrAdapter:
     # tmux/wezterm は本フラグを持たない (getattr フォールバック False で flat 不変)。
     supports_space_layout: ClassVar[bool] = True
 
+    # broker の意味的な種別を spawn(kind=) で受け取る (Issue #151 A)。herdr 0.7.5 の
+    # agent.start は kind が必須で、実行ファイルをこれで決めるため argv からは
+    # 復元できない。legacy 経路では受け取るだけで使わない (無害)。
+    supports_agent_kind: ClassVar[bool] = True
+
+
     # Herdr pane.send_keys が emit 可能な canonical 部分集合 (= _HERDR_KEY_MAP の key)。
     supported_named_keys: ClassVar[frozenset[str]] = frozenset(_HERDR_KEY_MAP)
 
@@ -714,6 +748,24 @@ class HerdrAdapter:
         """agent.start が 0.7.5 形 (kind/pane_id 必須) かどうか。"""
         return self._ensure_protocol() in PROTOCOL_AGENT_API_V075
 
+    @property
+    def venv_path_via_pane_env(self) -> bool:
+        """venv の ``PATH`` prepend を adapter 側で行うか (Issue #151 A)。
+
+        **protocol 依存**なので ClassVar ではなく property にする:
+
+        - legacy (14/16): False。``agent.start`` が ``argv`` を受けるので Issue #130
+          の post-profile login-shell wrapper 方式を**そのまま温存**する
+          (0.7.4 pin 運用の挙動を一切変えない)。
+        - v075 (17): True。``argv`` が廃止され wrapper の運搬経路が消えたため、
+          adapter が pane 生成後に ``PATH`` を打ち込む
+          (:meth:`_send_venv_path_export`)。
+
+        broker は ``getattr`` で読む (能力フラグ規約)。protocol 未確定ならここで
+        probe が走るが、直後に spawn で socket を叩くので前倒しにすぎない。
+        """
+        return self._uses_v075_agent_api()
+
     # -------------------------------------------------- back-compat accessors
     # 旧 single-workspace API (テスト / 後方互換)。control スペース (無ければ唯一の
     # スペース) を指す read-only アクセサ。新経路は _spaces / _owned_panes を使う。
@@ -742,11 +794,40 @@ class HerdrAdapter:
 
     # ------------------------------------------------------------------ util
     def _agent_name(self, space_key: str) -> str:
-        """agent.start の表示 name (世代 / space が読めるラベル)。"""
-        return (
-            f"{self.label_prefix}/{self.org_instance_id}/g{self.generation}/"
-            f"{space_key}/a{next(self._counter)}"
+        """agent.start の表示 name。
+
+        legacy (14/16) は従来どおり世代 / space が読める長いラベル。herdr 側に
+        制約が無く、既存運用の可読性をそのまま保つ。
+
+        v075 (17) は herdr が name を ``^[a-z][a-z0-9_-]{0,31}$`` に厳格化した
+        (Codex Major 2)。スラッシュ不可・32 文字以内・小文字のみなので、従来形は
+        確実に ``invalid_agent_name`` になる。よって短縮形を使い、世代 / org /
+        space の人間可読な文脈は :meth:`_space_label` (workspace ラベル、長さ制約
+        なし) 側に退避させる = 情報は失われない。
+
+        短縮形は ``g{gen}-{space}-{n}`` で、**一意性の根拠は ``self._counter``**
+        (``itertools.count``、``_spawn_lock`` 下でのみ進む) に置く。space_key は
+        衝突源になり得ないよう正規化した上で、全体が 32 文字に収まるよう切り詰める
+        (切り詰めるのは space 部分のみで、一意性を担う counter は削らない)。
+        """
+        n = next(self._counter)
+        if not self._uses_v075_agent_api():
+            return (
+                f"{self.label_prefix}/{self.org_instance_id}/g{self.generation}/"
+                f"{space_key}/a{n}"
+            )
+        suffix = f"-{n}"
+        prefix = f"g{self.generation}-"
+        # 許容文字だけに落とす (未知の space_key でも regex を割らない)。
+        space = _AGENT_NAME_STRIP_RE.sub("-", space_key.lower()).strip("-")
+        budget = _AGENT_NAME_MAX_LEN - len(prefix) - len(suffix)
+        name = f"{prefix}{space[:max(budget, 0)]}{suffix}" if budget > 0 else (
+            f"{prefix.rstrip('-')}{suffix}"
         )
+        if not _AGENT_NAME_RE.match(name):
+            # space_key が全て除去された等の縁ケース。counter だけで一意性は保つ。
+            name = f"a{self.generation}-{n}"[:_AGENT_NAME_MAX_LEN]
+        return name
 
     def _space_label(self, space_key: str) -> str:
         """workspace ラベル ``{prefix}/{org_instance_id}/g{gen}/{space_key}`` (§5.2)。"""
@@ -872,20 +953,27 @@ class HerdrAdapter:
         new_window: bool = True,
         space: SpaceDescriptor | None = None,
         env: dict[str, str] | None = None,
+        kind: str | None = None,
     ) -> PaneRef:
-        """argv を space の workspace/tab に起動し PaneRef を返す (戦略 C)。
+        """argv を space の workspace/tab に起動し PaneRef を返す。
 
         - **cwd 前検証** (設計書 §4.6): 不正なら socket を一切叩かず ``cwd_invalid``。
         - space (Issue #110 §6.2 Layer C): 配置先スペース。None は control スペースへ
-          集約 (後方互換)。space の workspace を lazy 確保し、``agent.start`` 後に実着地を
-          ``pane.get`` で検証、狙った workspace とずれていれば ``pane.move`` で space の
-          tab へ移送する (probe 6a: agent.start は focused に相乗り / 6c: move 可)。
+          集約 (後方互換)。space の workspace を lazy 確保する。
         - ``new_window`` は tmux/wezterm 面との互換のため受けるが Herdr では space の
           workspace/tab に置く。
-        - ``env`` (Issue #122): pane プロセスへ追加注入する環境変数。Herdr protocol は
-          ``agent.start`` の ``env`` param で任意 env 注入をサポートする (socket spike
-          実測、knowledge/curated/herdr.md)。Herdr が自動注入する ``HERDR_*`` の上に
-          重なる。空 / None なら param を付けない (従来挙動)。
+        - ``env`` (Issue #122): pane プロセスへ追加注入する環境変数。
+        - ``kind`` (Issue #151 A): broker の意味的な種別 (``"claude"`` / ``"codex"`` /
+          generic は None)。**argv[0] から推測しない**: wrapper 経路や generic spawn で
+          破綻するため、broker が知っている種別を明示的に受け取る。
+
+        agent 起動の実体は protocol で 2 経路に分かれる (:meth:`_probe_protocol`):
+
+        - **legacy (14/16)**: ``agent.start`` が pane を自分で作る。着地が focused
+          駆動になるため戦略 C (spawn-then-move) で補正する。
+        - **v075 (17)**: ``agent.start`` は pane を作らず既存 pane を ``pane_id`` で
+          指す。よって ``pane.split`` で **root pane とは別の** agent pane を先に
+          確保してから起動する。配置は決定的なので戦略 C は使わない。
         """
         if cwd is not None and not os.path.isdir(cwd):
             raise HerdrError(
@@ -895,6 +983,9 @@ class HerdrAdapter:
         space_key = self._space_key_of(space)
         split = self._split_for(space_key, space)
         with self._spawn_lock:
+            # protocol は space 確保 (= workspace.create の副作用) より前に確定させる。
+            # 未対応 herdr に対して空 workspace を作り散らかさないため。
+            uses_v075 = self._uses_v075_agent_api()
             sp, created_now = self._ensure_space(space_key, cwd)
             with self._lock:
                 self._spawn_inflight[space_key] = (
@@ -902,33 +993,15 @@ class HerdrAdapter:
                 )
             failed = False
             try:
-                params: dict[str, Any] = {
-                    "name": self._agent_name(space_key),
-                    "argv": list(argv),
-                    "workspace": sp.workspace_id,
-                    "tab": sp.tab_id,
-                    "split": split,
-                }
-                if cwd:
-                    params["cwd"] = cwd
-                if env:
-                    params["env"] = dict(env)
-                res = self._client.request("agent.start", params)
-                agent = res.get("agent") or {}
-                pane_id = agent.get("pane_id")
-                if pane_id is None:
-                    raise HerdrError(
-                        CODE_INTERNAL,
-                        f"herdr agent.start: response missing pane_id: {res!r}",
+                if uses_v075:
+                    pane_id, terminal_id = self._start_agent_v075(
+                        sp, space_key, argv, cwd, env, split, kind
                     )
-                # placement 補正 (Fix-C)。root cleanup の**前**に行う (先に root を閉じると
-                # 相乗り先が空になった space workspace が auto-close し移送先 tab が消える)。
-                # per-space split (§8) は agent.start では無視されるので pane.move へ渡す。
-                pane_id, terminal_id = self._reconcile_placement(
-                    agent, pane_id, sp, split
-                )
-                # 実配置を registry に記録 (liveness-tracking)。移送済みなので owned
-                # workspace/tab に居る。
+                else:
+                    pane_id, terminal_id = self._start_agent_legacy(
+                        sp, argv, cwd, env, split
+                    )
+                # 実配置を registry に記録 (liveness-tracking)。
                 with self._lock:
                     self._owned_panes[str(pane_id)] = _PaneRecord(
                         pane_id=str(pane_id),
@@ -938,19 +1011,7 @@ class HerdrAdapter:
                         terminal_id=terminal_id,
                         spawned_at=time.time(),
                     )
-                # workspace.create が同時生成した root shell pane を後始末する (§7.4)。
-                # ここに来た時点で agent は space.workspace_id に居る (直着地 or 移送済み)
-                # ので、root を閉じても space は auto-close しない (実配置検証ゲート充足)。
-                # 判定は _root_pane 有無で行う (transient 失敗で root が残っても次 spawn で
-                # 確実に閉じる)。cleanup なので失敗は無視。
-                if sp.root_pane_id is not None:
-                    try:
-                        self._client.request(
-                            "pane.close", {"pane_id": sp.root_pane_id}
-                        )
-                    except HerdrError:
-                        pass
-                    sp.root_pane_id = None
+                self._cleanup_root_pane(sp, pane_id)
                 return PaneRef(
                     pane_id=pane_id,
                     window_id=sp.workspace_id,
@@ -977,6 +1038,235 @@ class HerdrAdapter:
                         )
                     except HerdrError:
                         pass
+
+    # ------------------------------------------------- agent start: legacy 経路
+    def _start_agent_legacy(
+        self,
+        sp: _Space,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, str] | None,
+        split: str,
+    ) -> tuple[Any, Any]:
+        """protocol 14/16 の ``agent.start`` (pane を herdr 側が作る)。
+
+        **既存挙動を一切変えない**。0.7.4 以前を pin した運用がそのまま回り続ける
+        ことが 0.7.5 追随の前提条件 (Issue #151)。
+        """
+        params: dict[str, Any] = {
+            "name": self._agent_name(sp.space_key),
+            "argv": list(argv),
+            "workspace": sp.workspace_id,
+            "tab": sp.tab_id,
+            "split": split,
+        }
+        if cwd:
+            params["cwd"] = cwd
+        if env:
+            params["env"] = dict(env)
+        res = self._client.request("agent.start", params)
+        agent = res.get("agent") or {}
+        pane_id = agent.get("pane_id")
+        if pane_id is None:
+            raise HerdrError(
+                CODE_INTERNAL,
+                f"herdr agent.start: response missing pane_id: {res!r}",
+            )
+        # placement 補正 (Fix-C)。root cleanup の**前**に行う (先に root を閉じると
+        # 相乗り先が空になった space workspace が auto-close し移送先 tab が消える)。
+        # per-space split (§8) は agent.start では無視されるので pane.move へ渡す。
+        return self._reconcile_placement(agent, pane_id, sp, split)
+
+    # --------------------------------------------------- agent start: v075 経路
+    def _start_agent_v075(
+        self,
+        sp: _Space,
+        space_key: str,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, str] | None,
+        split: str,
+        kind: str | None,
+    ) -> tuple[Any, Any]:
+        """protocol 17 (herdr 0.7.5〜) の agent 起動。
+
+        0.7.5 の ``agent.start`` は **pane を作らない**。既存の「シェルプロンプトに
+        戻っている pane」を ``pane_id`` で指し、そこへ起動コマンドを打ち込む方式に
+        変わった (params: ``name`` / ``kind`` / ``pane_id`` / ``args`` /
+        ``timeout_ms``。``argv`` / ``cwd`` / ``env`` / ``workspace_id`` / ``tab_id`` /
+        ``split`` / ``focus`` は全廃)。よって手順は:
+
+        1. ``pane.split`` で agent pane を確保する。**root pane とは別の pane** に
+           するのが要点 (Codex Blocker 4): root を agent pane に使うと、後段の root
+           cleanup が起動直後の agent を殺す。``pane.split`` は ``target_pane_id`` /
+           ``workspace_id`` を honor するので配置は決定的 (実測確認済み)。
+           ``cwd`` / ``env`` はここで渡す (0.7.5 で agent.start から消えたため、
+           pane 生成時が唯一の受け渡し点)。
+        2. venv の ``PATH`` を打ち込む (:meth:`_send_venv_path_export`)。
+        3. ``agent.start`` を発行する。pane がまだ prompt に戻っていない場合は
+           ``agent_pane_busy`` になるので retry/backoff する (Codex Blocker 5)。
+
+        generic spawn (``kind`` が None) は agent ではないので ``agent.start`` を
+        使わず、pane にコマンドを打ち込むだけにする。0.7.5 の ``kind`` は許容
+        ラベル制で、任意コマンドに対応する値が無く ``unsupported_agent_kind`` に
+        なるため。
+        """
+        pane_id, terminal_id = self._split_agent_pane(sp, cwd, env, split)
+        self._send_venv_path_export(pane_id, env)
+        if kind is None:
+            # generic: agent 登録せず素のコマンドとして流す。
+            self._client.request(
+                "pane.send_text",
+                {"pane_id": pane_id, "text": _shell_command_line(argv) + "\n"},
+            )
+            return pane_id, terminal_id
+        params: dict[str, Any] = {
+            "name": self._agent_name(space_key),
+            "kind": kind,
+            "pane_id": pane_id,
+            # 0.7.5 は実行ファイルを kind から決めるので argv[0] は送らない。
+            "args": list(argv[1:]),
+            "timeout_ms": self._agent_start_timeout_ms(),
+        }
+        self._agent_start_with_retry(params)
+        return pane_id, terminal_id
+
+    def _split_agent_pane(
+        self,
+        sp: _Space,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        split: str,
+    ) -> tuple[Any, Any]:
+        """space 内に agent 用の新規 pane を確保する (v075 経路)。
+
+        分割元は root pane があればそれ、無ければ同 space の owned pane。どちらも
+        無ければ ``workspace_id`` だけ指定して herdr に委ねる。``workspace_id`` を
+        必ず渡すので、focused workspace への相乗りは起きない。
+        """
+        params: dict[str, Any] = {
+            "direction": split,
+            "workspace_id": sp.workspace_id,
+        }
+        anchor = sp.root_pane_id
+        if anchor is None:
+            with self._lock:
+                anchor = next(
+                    (
+                        p for p, r in self._owned_panes.items()
+                        if r.workspace_id == sp.workspace_id
+                    ),
+                    None,
+                )
+        if anchor is not None:
+            params["target_pane_id"] = anchor
+        if cwd:
+            params["cwd"] = cwd
+        if env:
+            params["env"] = dict(env)
+        res = self._client.request("pane.split", params)
+        pane = res.get("pane") or {}
+        pane_id = pane.get("pane_id")
+        if pane_id is None:
+            raise HerdrError(
+                CODE_INTERNAL,
+                f"herdr pane.split: response missing pane_id: {res!r}",
+            )
+        return pane_id, pane.get("terminal_id")
+
+    def _send_venv_path_export(
+        self, pane_id: Any, env: dict[str, str] | None
+    ) -> None:
+        """workspace venv の ``PATH`` を pane へ打ち込む (Issue #130 / #151 A)。
+
+        0.7.5 では ``agent.start`` から ``argv`` が消えたため、Issue #130 の
+        post-profile login-shell wrapper (argv に畳み込んで profile 再構築後に
+        ``PATH`` を prepend する方式) が**運搬経路ごと使えない**。代替として、
+        agent.start の前提条件そのもの (= pane が shell prompt に戻っている) を
+        利用し、``pane.send_text`` で export を打ち込む。この時点で profile 初期化
+        は必ず完了しているので、Issue #130 Blocker 2 (profile が後から ``PATH`` を
+        再構築して ``.venv/bin`` を消す) が**構造的に発生しない**。
+
+        ``VIRTUAL_ENV`` 自体は pane 生成時の ``env`` で渡している (profile は
+        ``VIRTUAL_ENV`` を潰さない)。よってここでは ``$VIRTUAL_ENV/bin`` を参照する
+        だけでよく、パスを二重に持たなくて済む。Herdr backend は POSIX 限定なので
+        ``bin`` 固定でよい。venv が無ければ完全 no-op。
+        """
+        if not env or not env.get("VIRTUAL_ENV"):
+            return
+        self._client.request(
+            "pane.send_text",
+            {"pane_id": pane_id, "text": 'export PATH="$VIRTUAL_ENV/bin:$PATH"\n'},
+        )
+
+    def _agent_start_timeout_ms(self) -> int:
+        """0.7.5 ``agent.start`` の ``timeout_ms`` (許容 3000 < x <= 300000)。
+
+        socket timeout より**長くしない**: 先に socket 側が切れると herdr 側の
+        待ちは無意味になり、adapter からは ``adapter_unavailable`` に見えるため
+        (関係を明示せよ、という Codex Minor 指摘への対応)。
+        """
+        ms = int(self.timeout * 1000)
+        return max(3001, min(ms, 300000))
+
+    def _agent_start_with_retry(self, params: dict[str, Any]) -> dict:
+        """``agent.start`` を発行し ``agent_pane_busy`` のみ retry する。
+
+        ``agent_pane_busy`` は「対象 pane がまだ shell prompt に戻っていない」= pane
+        生成直後の shell 起動レースであり、**一過性**である (Codex Blocker 5)。retry
+        しないと spawn が非決定的に失敗する。他のコード (``invalid_agent_name`` /
+        ``unsupported_agent_kind`` 等の恒久的な引数不正) は即座に透過する。
+
+        総待ち時間は socket timeout を超えないよう有界にする。
+        """
+        delay = _AGENT_BUSY_BACKOFF_SECONDS
+        last: HerdrError | None = None
+        for attempt in range(1, _AGENT_BUSY_MAX_ATTEMPTS + 1):
+            try:
+                return self._client.request("agent.start", params)
+            except HerdrError as exc:
+                if exc.code != CODE_AGENT_PANE_BUSY:
+                    raise
+                last = exc
+                if attempt < _AGENT_BUSY_MAX_ATTEMPTS:
+                    self._sleep(delay)
+                    delay *= 2
+        raise HerdrError(
+            CODE_AGENT_PANE_BUSY,
+            f"herdr agent.start: pane {params.get('pane_id')!r} was still busy "
+            f"after {_AGENT_BUSY_MAX_ATTEMPTS} attempts (shell never returned to "
+            f"a prompt): {last}",
+        )
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        """retry backoff の待ち (テストが差し替えられるよう切り出す)。"""
+        time.sleep(seconds)
+
+    # ------------------------------------------------------------ root cleanup
+    def _cleanup_root_pane(self, sp: _Space, agent_pane_id: Any) -> None:
+        """workspace.create が同時生成した root shell pane を後始末する (§7.4)。
+
+        呼ぶのは agent が ``sp.workspace_id`` に居ることが確定した後 (直着地 /
+        移送済み / v075 の pane.split 済み)。そうでないと root を閉じた時点で
+        space が空になり auto-close して移送先 tab が消える。
+
+        **agent pane そのものは決して閉じない** (Codex Blocker 4)。v075 では agent
+        pane を adapter 側で選ぶため、root と一致しうる経路が原理的に存在する。
+        一致した場合は close せず所有権だけ手放す: ``root_pane_id`` を残すと
+        **次の spawn がこの agent の pane を閉じてしまう**。
+        """
+        if sp.root_pane_id is None:
+            return
+        if str(sp.root_pane_id) == str(agent_pane_id):
+            sp.root_pane_id = None
+            return
+        # cleanup なので失敗は無視 (transient なら次 spawn で確実に閉じる)。
+        try:
+            self._client.request("pane.close", {"pane_id": sp.root_pane_id})
+        except HerdrError:
+            pass
+        sp.root_pane_id = None
 
     # ------------------------------------------------------- placement (Fix-C)
     @staticmethod
