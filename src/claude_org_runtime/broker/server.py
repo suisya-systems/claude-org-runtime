@@ -28,6 +28,7 @@ import json
 import secrets
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1444,6 +1445,21 @@ def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _tool_error_message(params: dict, exc: BaseException) -> str:
+    """想定外例外を **診断可能な 1 行**へ落とす (Issue #151 C-1)。
+
+    tool 名と例外クラス名 + str を載せる。``HerdrError`` 等の構造化例外は str が
+    既に ``[code] message`` 形なので、そのまま原因コード (``adapter_unavailable`` /
+    ``invalid-params`` 等) がクライアント側に出る。
+
+    **引数は載せない**: tools/call の arguments には token / cred 等の秘匿値が
+    載りうるため (scrub-policy)。詳細な traceback は journal 側 (daemon ローカル)
+    にのみ残す (:meth:`_McpHandler._journal_tool_failure`)。
+    """
+    name = params.get("name") or "?"
+    return f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+
+
 class _McpHandler(BaseHTTPRequestHandler):
     """MCP streamable-HTTP (JSON-RPC over POST, application/json 応答)。"""
 
@@ -1452,6 +1468,29 @@ class _McpHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # 標準 stderr ログ抑止
         pass
+
+    def _journal_tool_failure(
+        self, bind: AgentBind, params: dict, exc: BaseException
+    ) -> None:
+        """tools/call の想定外例外を journal へ残す (Issue #151 C-1 の事後診断面)。
+
+        クライアントへ返す 1 行 (:func:`_tool_error_message`) では原因の特定に
+        足りないため、traceback を daemon ローカルの queue.jsonl にのみ残す。
+        journal 書込み自体の失敗 (disk full 等) で例外が再び do_POST を貫通しては
+        本末転倒なので、ここは握り潰す。
+        """
+        try:
+            self.broker._journal(
+                "tool_call_failed",
+                agent_id=bind.agent_id,
+                tool=params.get("name") or "",
+                error=f"{type(exc).__name__}: {exc}",
+                traceback="".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                ),
+            )
+        except Exception:  # noqa: BLE001 - 診断のための best-effort
+            pass
 
     def _send_json(self, status: int, payload: dict | None, session_id: str | None = None):
         body = b"" if payload is None else json.dumps(payload).encode("utf-8")
@@ -1776,6 +1815,29 @@ class _McpHandler(BaseHTTPRequestHandler):
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "error": {"code": -32602, "message": f"invalid params: {e}"},
+                    },
+                )
+                return
+            except Exception as e:  # noqa: BLE001 - 意図的な最後の関門
+                # 想定外例外を **必ず JSON-RPC error として返す** (Issue #151 C-1)。
+                # これが無いと例外が do_POST を貫通してハンドラスレッドが応答を
+                # 書かないまま終了し、クライアントには「The socket connection was
+                # closed unexpectedly」しか届かない = 無診断 (Issue #151 の主因:
+                # herdr adapter の agent.start が protocol 不一致で HerdrError を
+                # 投げた時、spawn_claude の re-raise がここを素通りしていた)。
+                #
+                # ``BaseException`` は捕らない: KeyboardInterrupt / SystemExit を
+                # 握り潰すと daemon の停止経路を壊す。
+                self._journal_tool_failure(bind, params, e)
+                self._send_json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32603,
+                            "message": _tool_error_message(params, e),
+                        },
                     },
                 )
                 return
