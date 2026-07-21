@@ -716,8 +716,12 @@ class HerdrAdapter:
         res = self._client.request("ping", {})
         protocol = res.get("protocol")
         if not isinstance(protocol, int) or isinstance(protocol, bool):
+            # **判定不能**であって「非対応と確定」ではない。construction を落とすと
+            # pong の形が少し違うだけの herdr で broker serve ごと起動不能になるので、
+            # socket 不通と同じ扱い (未確定 → spawn 時に再 probe) にする。
+            # 実際に agent 経路の分岐が要る時に改めて確定 or 明示エラーになる。
             raise HerdrError(
-                CODE_PROTOCOL_UNSUPPORTED,
+                CODE_INTERNAL,
                 f"herdr ping: response has no usable 'protocol': {res!r}",
             )
         if protocol not in SUPPORTED_PROTOCOLS:
@@ -1112,24 +1116,67 @@ class HerdrAdapter:
         なるため。
         """
         pane_id, terminal_id = self._split_agent_pane(sp, cwd, env, split)
-        self._send_venv_path_export(pane_id, env)
-        if kind is None:
-            # generic: agent 登録せず素のコマンドとして流す。
-            self._client.request(
-                "pane.send_text",
-                {"pane_id": pane_id, "text": _shell_command_line(argv) + "\n"},
-            )
+        # split 以降で失敗したら、確保した pane を必ず回収してから透過する。
+        # この pane が registry (_owned_panes) に載るのは spawn が成功して戻った後
+        # なので、ここで閉じ損ねると **adapter からは不可視なのに herdr には実在する**
+        # 孤児 pane になる。その状態で space の掃除経路に入ると
+        # _close_workspace_if_empty が孤児を foreign と誤判定して恒久 occupied 扱いに
+        # し、workspace が _pending_sweep に永久滞留する (= org down が閉じ切れない)。
+        # legacy 経路は同じ後始末を _reconcile_placement の移送失敗時に持っている。
+        try:
+            self._send_venv_path_export(pane_id, env)
+            if kind is None:
+                # generic: agent 登録せず素のコマンドとして流す。
+                self._client.request(
+                    "pane.send_text",
+                    {"pane_id": pane_id, "text": _shell_command_line(argv) + "\n"},
+                )
+                return pane_id, terminal_id
+            params: dict[str, Any] = {
+                "name": self._agent_name(space_key),
+                "kind": kind,
+                "pane_id": pane_id,
+                # 0.7.5 は実行ファイルを kind から決めるので argv[0] は送らない。
+                "args": list(argv[1:]),
+                "timeout_ms": self._agent_start_timeout_ms(),
+            }
+            res = self._agent_start_with_retry(params)
+            self._verify_agent_landed(res, pane_id)
             return pane_id, terminal_id
-        params: dict[str, Any] = {
-            "name": self._agent_name(space_key),
-            "kind": kind,
-            "pane_id": pane_id,
-            # 0.7.5 は実行ファイルを kind から決めるので argv[0] は送らない。
-            "args": list(argv[1:]),
-            "timeout_ms": self._agent_start_timeout_ms(),
-        }
-        self._agent_start_with_retry(params)
-        return pane_id, terminal_id
+        except BaseException:
+            self._discard_pane(pane_id)
+            raise
+
+    def _discard_pane(self, pane_id: Any) -> None:
+        """確保途中で失敗した pane を best-effort で閉じる (孤児を残さない)。
+
+        cleanup なので失敗は握り潰す (元の例外を隠さない)。
+        """
+        try:
+            self._client.request("pane.close", {"pane_id": pane_id})
+        except HerdrError:
+            pass
+
+    @staticmethod
+    def _verify_agent_landed(res: dict, pane_id: Any) -> None:
+        """``agent.start`` が **指定した pane** に着いたことを応答で確認する。
+
+        v075 は pane_id を明示するので着地はずれない想定だが、応答が別 pane を指す
+        なら前提が崩れている。その PaneRef を返すと broker は起動していない pane を
+        agent として登録してしまうため、ここで落として診断可能にする。
+
+        なお 0.7.5 の起動完了待ちは ``agent.start`` の ``timeout_ms``
+        (:meth:`_agent_start_timeout_ms`) が herdr 側で担っており、起動しきらなければ
+        herdr がエラーを返す = adapter からは通常の :class:`HerdrError` になる。
+        """
+        agent = res.get("agent") or {}
+        landed = agent.get("pane_id")
+        if landed is not None and str(landed) != str(pane_id):
+            raise HerdrError(
+                CODE_INTERNAL,
+                f"herdr agent.start: agent landed in pane {landed!r} but "
+                f"{pane_id!r} was requested",
+            )
 
     def _split_agent_pane(
         self,

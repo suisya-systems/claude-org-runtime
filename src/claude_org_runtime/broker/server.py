@@ -1463,7 +1463,22 @@ def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
-def _tool_error_message(params: dict, exc: BaseException) -> str:
+def _tool_name_of(params: object) -> str:
+    """tools/call params から tool 名を **決して例外を出さずに** 取り出す。
+
+    ``params`` は生のリクエスト由来なので dict とは限らない (``"params": "x"`` の
+    ような不正な JSON-RPC でも到達する)。診断経路の中で ``AttributeError`` を出すと、
+    C-1 が防ごうとしている当のもの (応答を書かないままの socket close) を診断コード
+    自身が再現してしまう。
+    """
+    if isinstance(params, dict):
+        name = params.get("name")
+        if isinstance(name, str) and name:
+            return name
+    return "?"
+
+
+def _tool_error_message(params: object, exc: BaseException) -> str:
     """想定外例外を **診断可能な 1 行**へ落とす (Issue #151 C-1)。
 
     tool 名と例外クラス名 + str を載せる。``HerdrError`` 等の構造化例外は str が
@@ -1474,7 +1489,7 @@ def _tool_error_message(params: dict, exc: BaseException) -> str:
     載りうるため (scrub-policy)。詳細な traceback は journal 側 (daemon ローカル)
     にのみ残す (:meth:`_McpHandler._journal_tool_failure`)。
     """
-    name = params.get("name") or "?"
+    name = _tool_name_of(params)
     return f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
 
 
@@ -1488,7 +1503,7 @@ class _McpHandler(BaseHTTPRequestHandler):
         pass
 
     def _journal_tool_failure(
-        self, bind: AgentBind, params: dict, exc: BaseException
+        self, bind: AgentBind, params: object, exc: BaseException
     ) -> None:
         """tools/call の想定外例外を journal へ残す (Issue #151 C-1 の事後診断面)。
 
@@ -1501,7 +1516,7 @@ class _McpHandler(BaseHTTPRequestHandler):
             self.broker._journal(
                 "tool_call_failed",
                 agent_id=bind.agent_id,
-                tool=params.get("name") or "",
+                tool=_tool_name_of(params),
                 error=f"{type(exc).__name__}: {exc}",
                 traceback="".join(
                     traceback.format_exception(type(exc), exc, exc.__traceback__)

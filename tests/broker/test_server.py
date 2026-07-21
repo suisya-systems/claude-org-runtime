@@ -1416,3 +1416,21 @@ def test_respawn_burst_does_not_block_distinct_names(tmp_path):
         out = dispatch_tool(b, disp, "spawn_claude_pane",
                             {"direction": "vertical", "name": f"w{i}"})
         assert out.get("isError") is not True
+
+
+def test_malformed_params_still_get_a_jsonrpc_error(broker, client_factory, monkeypatch):
+    """params が dict でなくても診断経路自身が落ちないこと (self-review Major)。
+
+    ``_tool_error_message`` / ``_journal_tool_failure`` が ``params.get`` を素で
+    呼ぶと ``AttributeError`` が except 節の中から送出され、**C-1 が防ごうとして
+    いる当のもの** (応答を書かないままの socket close) を診断コードが再現する。
+    """
+    a = client_factory("agent-a")
+
+    def boom(bind, name, args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(broker, "call_tool", boom)
+    res = a.rpc("tools/call", "not-a-dict")
+    assert res["error"]["code"] == -32603
+    assert "[tool_failed] ?" in res["error"]["message"]

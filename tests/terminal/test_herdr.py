@@ -1253,11 +1253,20 @@ def test_unsupported_protocol_leaves_no_disk_side_effect(
     assert not state_dir.exists()  # makedirs / generation write の前に落ちている
 
 
-def test_malformed_pong_is_protocol_unsupported(server: FakeHerdrServer) -> None:
+def test_malformed_pong_does_not_brick_construction(server: FakeHerdrServer) -> None:
+    """protocol が読めない pong は「判定不能」であって「非対応と確定」ではない。
+
+    construction を落とすと、pong の形が少し違うだけの herdr で broker serve ごと
+    起動不能になる。socket 不通と同じく未確定として保留し、実際に分岐が要る場面で
+    改めてエラーにする。
+    """
     server.on("ping", {"type": "pong", "version": "x"})  # protocol 欠落
+    a = _adapter(server)
+    assert a._protocol == herdr_mod._PROTOCOL_UNDETERMINED
     with pytest.raises(HerdrError) as exc:
-        _adapter(server)
-    assert exc.value.code == CODE_PROTOCOL_UNSUPPORTED
+        a._ensure_protocol()
+    assert exc.value.code == CODE_INTERNAL          # 非対応とは断定しない
+    assert exc.value.code != CODE_PROTOCOL_UNSUPPORTED
 
 
 def test_unreachable_socket_does_not_block_construction(tmp_path) -> None:
@@ -2223,3 +2232,97 @@ def test_legacy_spawn_wire_is_unchanged_by_kind_argument(
     assert "kind" not in ap
     assert "pane_id" not in ap
     assert "pane.split" not in server.methods_called()
+
+
+# --- v075 失敗経路で確保した pane を必ず回収する (self-review Major) -------
+
+@pytest.mark.parametrize(
+    "wire, expected_code",
+    [
+        ({"busy_times": 999}, CODE_AGENT_PANE_BUSY),          # retry 使い切り
+        ("permanent", CODE_INVALID_PARAMS),                    # 恒久的な引数不正
+    ],
+)
+def test_v075_failed_agent_start_closes_the_split_pane(
+    server: FakeHerdrServer, tmp_path, monkeypatch, wire, expected_code
+):
+    """agent.start が失敗したら pane.split で確保した pane を閉じること。
+
+    この pane が registry に載るのは spawn 成功後なので、閉じ損ねると **adapter
+    からは不可視なのに herdr には実在する**孤児 pane になる。その状態で space の
+    掃除経路に入ると孤児が foreign と誤判定され、workspace が _pending_sweep に
+    永久滞留して org down が閉じ切れなくなる。
+    """
+    monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
+    if wire == "permanent":
+        _wire_spawn_v075(server)
+        server.on(
+            "agent.start",
+            {"error": {"code": "unsupported_agent_kind", "message": "nope"}},
+        )
+    else:
+        _wire_spawn_v075(server, **wire)
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
+                space=SpaceDescriptor("project:x"))
+    assert exc.value.code == expected_code
+    closed = [
+        r["params"]["pane_id"]
+        for r in server.requests if r.get("method") == "pane.close"
+    ]
+    assert "w1:p2" in closed          # 確保した agent pane を回収した
+    assert a._owned_panes == {}       # 孤児が registry に残っていない
+
+
+def test_v075_failed_send_text_closes_the_split_pane(
+    server: FakeHerdrServer, tmp_path
+):
+    """agent.start 以前 (venv 打ち込み) で失敗した場合も回収すること。"""
+    _wire_spawn_v075(server)
+    server.on("pane.send_text", {"error": {"code": "pane_not_found", "message": "x"}})
+    a = _adapter(server)
+    with pytest.raises(HerdrError):
+        a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
+                env={"VIRTUAL_ENV": "/w/.venv"})
+    closed = [
+        r["params"]["pane_id"]
+        for r in server.requests if r.get("method") == "pane.close"
+    ]
+    assert "w1:p2" in closed
+
+
+def test_v075_agent_landing_in_a_different_pane_is_an_error(
+    server: FakeHerdrServer, tmp_path
+):
+    """応答が別 pane を指したら PaneRef を返さない (起動していない pane を
+    agent として登録させない)。"""
+    _wire_spawn_v075(server)
+    server.on(
+        "agent.start",
+        lambda p: {"type": "agent_started", "argv": [],
+                   "agent": {"pane_id": "w9:p9", "name": p.get("name")}},
+    )
+    a = _adapter(server)
+    with pytest.raises(HerdrError) as exc:
+        a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert exc.value.code == CODE_INTERNAL
+    assert "w9:p9" in str(exc.value)
+
+
+def test_v075_timeout_ms_is_derived_from_socket_timeout(
+    server: FakeHerdrServer, tmp_path
+):
+    """timeout_ms が socket timeout 由来の実値であること (範囲だけの assert は
+    clamp のせいで常に真になり退行を捕まえられない)。"""
+    _wire_spawn_v075(server)
+    a = HerdrAdapter(socket_path=server.path, timeout=12.0)
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
+    assert server.params_for("agent.start")["timeout_ms"] == 12000
+
+    # clamp の両端も実値で押さえる。
+    assert HerdrAdapter._agent_start_timeout_ms(a) == 12000
+    a.timeout = 0.5
+    assert a._agent_start_timeout_ms() == 3001      # 下限
+    a.timeout = 9999.0
+    assert a._agent_start_timeout_ms() == 300000    # 上限
