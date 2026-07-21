@@ -6,6 +6,13 @@ docs/design/herdr-workspace-layout.md (merged PR #31, Issue #110 = workspace
 レイアウトポリシー)。実測裏付け: docs/reports/herdr-socket-spike.md (Herdr 0.7.1 /
 protocol 14) + investigation/LAYOUT_PROBE_FINDINGS.md (probe 6 配置決定性)。
 
+**対応 protocol** (Issue #151): 14 (0.7.0-0.7.1) / 16 (0.7.2-0.7.4) / 17 (0.7.5〜)。
+``__post_init__`` の ``ping`` で確定し (:meth:`HerdrAdapter._probe_protocol`)、範囲外なら
+``herdr_protocol_unsupported`` で **副作用なしに fail-fast** する。pane / workspace / tab
+系の wire schema は本 adapter が使う範囲で 14〜17 に差が無く、**差分は agent 系 API のみ**
+なので、分岐は agent.start の 2 経路 (:data:`PROTOCOL_AGENT_API_LEGACY` /
+:data:`PROTOCOL_AGENT_API_V075`) に閉じる。
+
 現行 canonical は本モジュール。WezTerm (Phase 1) / tmux (Phase 2) に続く第 3 の
 ``TerminalAdapter`` 実装で、broker / harness は同一の ``TerminalAdapter`` 面と
 ``make_adapter()`` ファクトリ経由でのみ Herdr backend に触る。
@@ -40,11 +47,20 @@ protocol 14) + investigation/LAYOUT_PROBE_FINDINGS.md (probe 6 配置決定性)�
   owned workspace ではさらに adapter-managed tab_id を要求する (per-workspace
   single-tab 不変条件 = Surface 4.2 の tab 分離を workspace 単位で維持)。
 
-配置戦略 C (spawn-then-move、Issue #114 Fix-C / probe 6): Herdr 0.7.1 の ``agent.start``
-は ``workspace`` / ``tab`` を無視し focused workspace へ相乗り配置する (probe 6a)。よって
-spawn 後に ``pane.get`` で実着地を検証し、狙った space の workspace とずれていれば
+配置戦略 C (spawn-then-move、Issue #114 Fix-C / probe 6) — **legacy protocol (14/16) 経路
+限定**: ``agent.start`` が指定 workspace を honor せず focused workspace へ相乗り配置する
+(probe 6a)。よって spawn 後に実着地を検証し、狙った space の workspace とずれていれば
 ``pane.move`` で space の tab へ移送する (probe 6c: cross-workspace move 可、pane_id は
 変わるが terminal_id は保存)。移送先 tab は明示なので focused 非依存で決定的。
+
+  注記 (Issue #151 で判明): この「無視される」挙動の主因は herdr 側の仕様ではなく
+  **adapter が送っていたキー名の不一致**の疑いが濃い。0.7.4 の実スキーマ
+  (``herdr api schema``) では ``agent.start`` の params は ``workspace_id`` /
+  ``tab_id`` だが、adapter は ``workspace`` / ``tab`` を送っていた。herdr 側の serde に
+  ``deny_unknown_fields`` が無いため未知キーは黙って捨てられ、結果として
+  「指定が無視される」ように見えていた。legacy 経路のキー名修正は現に動作している
+  重い経路への挙動変更になるため #151 のスコープ外 (別 Issue)。**v075 経路では
+  ``pane_id`` 指定になるため配置は決定的で、本戦略 C 自体が不要**になる。
 
 error code (設計書 §3.3 / §4.6): Herdr raw error を透過せず adapter 出口で Set D 語彙へ
 写像する。socket 到達不能は ``adapter_unavailable`` に分離。
@@ -97,6 +113,33 @@ CODE_INTERNAL = "internal"
 # (renga-decoupling §5 が Set D 6.2 の "New codes MAY be added" 規定内で新設)。
 # broker/MCP 不通の ``backend_unreachable`` とは別コード (§4.6 の 3/4 分離)。
 CODE_ADAPTER_UNAVAILABLE = "adapter_unavailable"
+# 接続先 herdr の wire protocol が adapter の対応範囲外 (Issue #151 B)。
+# ``adapter_unavailable`` (socket 不通) とは別物: socket は生きていて応答もするが、
+# 話す言葉が違う。分けないと運用者が「daemon が落ちている」と誤診断する。
+CODE_PROTOCOL_UNSUPPORTED = "herdr_protocol_unsupported"
+# agent.start の対象 pane が shell prompt に戻っていない (herdr 0.7.5〜)。
+# **一過性**であり呼出側の引数誤りではないので ``invalid-params`` に丸めない
+# (retry/backoff の対象として識別可能にする、Issue #151)。
+CODE_AGENT_PANE_BUSY = "agent_pane_busy"
+
+# ---------------------------------------------------------------------------
+# wire protocol 対応範囲 (Issue #151 B)
+# ---------------------------------------------------------------------------
+# herdr の protocol 番号 (herdr src wire.rs): 0.7.0-0.7.1 = 14 / 0.7.2-0.7.4 = 16 /
+# 0.7.5 = 17。pane.* / workspace.* / tab.* の schema は 14〜17 で本 adapter が使う
+# 範囲に差が無く、**差分は agent 系 API のみ**なので 2 系統に分けて分岐する。
+#
+# legacy: agent.start が pane を自分で作る (params: name/argv/cwd/workspace_id/
+#   tab_id/split/focus/env)。着地が focused 駆動になるため spawn-then-move で補正する。
+PROTOCOL_AGENT_API_LEGACY = frozenset({14, 16})
+# v075: agent.start は pane を作らず、**既存の空きシェル pane** を pane_id で指して
+#   起動コマンドを打ち込む (params: name/kind/pane_id/args/timeout_ms)。配置は決定的。
+PROTOCOL_AGENT_API_V075 = frozenset({17})
+SUPPORTED_PROTOCOLS = PROTOCOL_AGENT_API_LEGACY | PROTOCOL_AGENT_API_V075
+
+# 構築時の ping が socket 不通で確定できなかった状態 (未確定)。恒久的な非対応と
+# 区別する: 未確定は spawn 時に再 probe され、そこで確定 or 明示エラーになる。
+_PROTOCOL_UNDETERMINED = 0
 
 # Herdr raw error.code → adapter 出口コード の写像表 (spike §4 実測語彙)。
 # 未知 raw code は ``adapter_unavailable`` へ**写像しない** (§4.6: adapter 不通 vs
@@ -112,6 +155,15 @@ _RAW_CODE_MAP = {
     # 出口で name_in_use に正規化する (設計書 §3.3 命名注記)。
     "name_taken": CODE_NAME_IN_USE,
     "name_in_use": CODE_NAME_IN_USE,
+    # --- herdr 0.7.5 の agent API が返す raw code (Issue #151 B) -------------
+    # 以前はいずれも未知 raw code として ``internal`` に丸められ、運用者からは
+    # 原因が区別できなかった (無診断の一因)。
+    # 恒久的な引数不正 (retry しても直らない): agent name 正規表現違反 /
+    # 未対応の agent kind。
+    "invalid_agent_name": CODE_INVALID_PARAMS,
+    "unsupported_agent_kind": CODE_INVALID_PARAMS,
+    # 一過性 (pane がまだ shell prompt に戻っていない): retry/backoff の対象。
+    "agent_pane_busy": CODE_AGENT_PANE_BUSY,
 }
 
 
@@ -290,6 +342,10 @@ class _HerdrClient:
 # send_keys は broker preflight が Herdr backend で ``[key_unsupported]`` を返す。
 # backtab は Herdr では ``shift+tab`` token、esc は ``escape`` token で送る。
 # ctrl+a..z は 26 個すべて accept される (実測)。
+#
+# 本表は protocol 14 の実測だが、``pane.*`` の wire schema は 0.7.4 (protocol 16) の
+# ``herdr api schema`` および 0.7.5 (protocol 17) でも無変更であることを確認済み
+# (Issue #151: 0.7.4→0.7.5 の破壊的変更は agent 系 API のみ)。
 _HERDR_KEY_MAP: dict[str, str] = {
     "enter": "enter",
     "tab": "tab",
@@ -513,6 +569,9 @@ class HerdrAdapter:
     generation: int | None = None
 
     _client: _HerdrClient = field(init=False, repr=False)
+    # 接続先 herdr の wire protocol (__post_init__ の ping で確定、Issue #151 B)。
+    # agent 系 API の 2 経路 (legacy / v075) 分岐の唯一の根拠。
+    _protocol: int = field(init=False, repr=False, default=0)
     # close-authority owned set: space_key -> _Space (§4.1)。値の workspace_id 集合が
     # 「workspace.close を発行してよい」集合。自作成 + 自ラベル一致でのみ成長する。
     _spaces: dict[str, _Space] = field(default_factory=dict, init=False, repr=False)
@@ -556,6 +615,24 @@ class HerdrAdapter:
         if reason:
             raise HerdrError(CODE_ADAPTER_UNAVAILABLE, reason)
         self._client = _HerdrClient(self.socket_path, self.timeout)
+        # wire protocol 検査 (Issue #151 B)。**disk 副作用 (makedirs /
+        # org_instance / _bump_generation) と _startup_sweep より前**に行う。
+        # 非対応 herdr を掴んだ時に generation を進めてしまうと、次に対応版へ
+        # 戻した時の世代会計 (§5.2) が狂うため、副作用ゼロで fail-fast する。
+        #
+        # ただし **socket 不通では構築を失敗させない**: 既存契約では daemon 未起動 /
+        # 一時的な socket blip でも adapter は構築でき、liveness UNKNOWN や
+        # startup sweep skip として degrade する (構築を落とすと herdr が一瞬落ちた
+        # だけで broker serve 自体が起動不能になる)。よって
+        # - protocol **不一致** (サーバは応答した、番号が範囲外) = 恒久的 → 即 raise
+        # - **到達不能** (応答が無い) = 一過性かもしれない → 未確定のまま保留し、
+        #   実際に分岐が必要になる spawn 時に再 probe する (:meth:`_ensure_protocol`)
+        try:
+            self._protocol = self._probe_protocol()
+        except HerdrError as exc:
+            if exc.code == CODE_PROTOCOL_UNSUPPORTED:
+                raise
+            self._protocol = _PROTOCOL_UNDETERMINED
         # 世代識別の解決 (§5.2)。state_dir があれば永続 org_instance_id + boot ごとの
         # 単調 generation (write-ahead)。無ければ ephemeral (テスト / standalone)。
         # state_dir は Broker より先に adapter が構築されうる (cli.py: make_adapter →
@@ -580,6 +657,62 @@ class HerdrAdapter:
                 self._startup_sweep()
             except HerdrError:
                 pass
+
+    # ------------------------------------------------------ protocol (#151 B)
+    def _probe_protocol(self) -> int:
+        """``ping`` 1 往復で herdr の wire protocol を確定する (Issue #151 B)。
+
+        応答形状は 0.7.4 バイナリの ``herdr api schema`` で実測確定
+        (``success_response`` の ``result``)::
+
+            {"type": "pong", "version": "0.7.4", "protocol": 16,
+             "capabilities": {...}}
+
+        ``type`` / ``version`` / ``protocol`` は required。0.7.5 でも同形
+        (agent 系以外の schema は無変更)。
+
+        対応外 protocol は :data:`CODE_PROTOCOL_UNSUPPORTED` で **fail-fast** する。
+        これが Issue #151 の主症状 (protocol 不一致で agent.start が
+        ``invalid_request`` になり、サーバログにも出ないまま spawn が無診断で
+        こける) を、起動時の 1 行エラーに変える。
+
+        socket 不通は :meth:`_HerdrClient.request` が ``adapter_unavailable`` で
+        送出するのでそのまま透過する (daemon 停止と protocol 不一致は別診断)。
+        """
+        res = self._client.request("ping", {})
+        protocol = res.get("protocol")
+        if not isinstance(protocol, int) or isinstance(protocol, bool):
+            raise HerdrError(
+                CODE_PROTOCOL_UNSUPPORTED,
+                f"herdr ping: response has no usable 'protocol': {res!r}",
+            )
+        if protocol not in SUPPORTED_PROTOCOLS:
+            raise HerdrError(
+                CODE_PROTOCOL_UNSUPPORTED,
+                f"herdr server speaks protocol {protocol} "
+                f"(version {res.get('version')!r}), which this adapter does not "
+                f"support; supported protocols: {sorted(SUPPORTED_PROTOCOLS)}. "
+                "Pin herdr to a supported release or upgrade claude-org-runtime.",
+                raw=str(protocol),
+            )
+        return protocol
+
+    def _ensure_protocol(self) -> int:
+        """確定済み protocol を返す。未確定なら再 probe する (Issue #151 B)。
+
+        構築時の ping が socket 不通で流れた場合の遅延確定点。**agent 系 API の
+        分岐が必要になる直前 (spawn) にのみ**呼ぶ: ここで再び到達不能なら
+        ``adapter_unavailable`` が透過し、非対応 protocol なら
+        ``herdr_protocol_unsupported`` が出る。どちらも spawn の失敗として
+        C-1 経由で JSON-RPC error になり診断可能。
+        """
+        if self._protocol == _PROTOCOL_UNDETERMINED:
+            self._protocol = self._probe_protocol()
+        return self._protocol
+
+    def _uses_v075_agent_api(self) -> bool:
+        """agent.start が 0.7.5 形 (kind/pane_id 必須) かどうか。"""
+        return self._ensure_protocol() in PROTOCOL_AGENT_API_V075
 
     # -------------------------------------------------- back-compat accessors
     # 旧 single-workspace API (テスト / 後方互換)。control スペース (無ければ唯一の
@@ -857,6 +990,10 @@ class HerdrAdapter:
         self, agent: dict, pane_id: Any, space: _Space, split: str = "down"
     ) -> tuple[Any, Any]:
         """agent.start の実着地を検証し、space の workspace とずれていれば移送する (Fix-C)。
+
+        **legacy protocol (14/16) 経路専用**。v075 (17) は ``agent.start`` に
+        ``pane_id`` を渡して配置が決定的になるため、この補正自体が不要になる
+        (Issue #151、モジュール docstring の戦略 C 注記参照)。
 
         Herdr 0.7.1 は ``agent.start`` の ``workspace`` / ``tab`` を無視し focused
         workspace へ相乗り配置する (probe 6a)。本 helper は着地 workspace を応答から検証

@@ -28,11 +28,16 @@ from claude_org_runtime.terminal.base import (
 )
 from claude_org_runtime.terminal.herdr import (
     CODE_ADAPTER_UNAVAILABLE,
+    CODE_AGENT_PANE_BUSY,
     CODE_CWD_INVALID,
     CODE_INTERNAL,
     CODE_INVALID_PARAMS,
     CODE_NAME_IN_USE,
     CODE_PANE_NOT_FOUND,
+    CODE_PROTOCOL_UNSUPPORTED,
+    PROTOCOL_AGENT_API_LEGACY,
+    PROTOCOL_AGENT_API_V075,
+    SUPPORTED_PROTOCOLS,
     PANE_LIVE_ALIVE,
     PANE_LIVE_GONE,
     PANE_LIVE_REUSED,
@@ -70,11 +75,27 @@ class FakeHerdrServer:
       a server that drops the connection mid-roundtrip).
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, protocol: int = 16, version: str = "0.7.4") -> None:
         self.path = path
         self.handlers: dict[str, Handler] = {}
         self.requests: list[dict] = []
         self.mode = "normal"
+        # ``ping`` の pong は herdr 0.7.4 バイナリの ``herdr api schema`` で実測した
+        # 形 (success_response の result): type/version/protocol は required、
+        # capabilities は nullable。adapter は __post_init__ で必ず 1 往復するので
+        # (Issue #151 B) 既定ハンドラとして先に積む。0.7.5 経路を試すテストは
+        # ``server.protocol = 17`` を立ててから adapter を構築する。
+        self.protocol = protocol
+        self.version = version
+        self.on(
+            "ping",
+            lambda _params: {
+                "type": "pong",
+                "version": self.version,
+                "protocol": self.protocol,
+                "capabilities": {},
+            },
+        )
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(path)
         self._sock.listen(8)
@@ -148,8 +169,20 @@ class FakeHerdrServer:
         except OSError:
             pass
 
-    def methods_called(self) -> list[str]:
-        return [r.get("method") for r in self.requests]
+    def methods_called(self, include_ping: bool = False) -> list[str]:
+        """呼ばれた method 列。
+
+        既定で ``ping`` を除く: adapter 構築時の protocol 検査 (Issue #151 B) は
+        全テスト共通の配管であって個々の振る舞いの検証対象ではないため、既存の
+        シーケンス assert (``["workspace.create", "agent.start", ...]`` 等) を
+        protocol 検査の有無から独立に保つ。検査そのものを見るテストは
+        ``include_ping=True`` を使う。
+        """
+        return [
+            r.get("method")
+            for r in self.requests
+            if include_ping or r.get("method") != "ping"
+        ]
 
     def params_for(self, method: str) -> dict:
         for r in self.requests:
@@ -384,11 +417,14 @@ def test_spawn_cwd_preflight_rejects_before_any_socket_call(
 ) -> None:
     _wire_spawn(server)
     a = _adapter(server)
+    # Construction pings once for the protocol check (#151 B); the assertion
+    # below is about *spawn* touching the socket, so measure from here on.
+    before = len(server.requests)
     with pytest.raises(HerdrError) as exc:
         a.spawn(["claude"], cwd="/no/such/dir/xyz")
     assert exc.value.code == CODE_CWD_INVALID
     # layout must not be mutated: no request reached the server
-    assert server.requests == []
+    assert server.requests[before:] == []
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +665,9 @@ def test_pane_liveness_no_recorded_terminal_id_treats_present_as_alive(
 
 def test_list_panes_empty_before_spawn(server: FakeHerdrServer) -> None:
     a = _adapter(server)
+    before = len(server.requests)  # construction pings for protocol (#151 B)
     assert a.list_panes() == []
-    assert server.requests == []  # no workspace -> no socket call
+    assert server.requests[before:] == []  # no workspace -> no socket call
 
 
 def test_list_panes_merges_geometry_and_filters_workspace(
@@ -1083,6 +1120,99 @@ def test_close_workspace(server: FakeHerdrServer, tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# protocol negotiation (Issue #151 B)
+# ---------------------------------------------------------------------------
+
+def test_construction_pings_and_records_protocol(server: FakeHerdrServer) -> None:
+    a = _adapter(server)
+    assert server.methods_called(include_ping=True) == ["ping"]
+    assert a._protocol == 16
+    assert not a._uses_v075_agent_api()
+
+
+def test_protocol_17_selects_v075_agent_api(server: FakeHerdrServer) -> None:
+    server.protocol = 17
+    server.version = "0.7.5"
+    a = _adapter(server)
+    assert a._protocol == 17
+    assert a._uses_v075_agent_api()
+
+
+@pytest.mark.parametrize("protocol", sorted(SUPPORTED_PROTOCOLS))
+def test_every_supported_protocol_constructs(
+    server: FakeHerdrServer, protocol: int
+) -> None:
+    server.protocol = protocol
+    assert _adapter(server)._protocol == protocol
+
+
+@pytest.mark.parametrize("protocol", [13, 15, 18, 99])
+def test_unsupported_protocol_fails_fast(
+    server: FakeHerdrServer, protocol: int
+) -> None:
+    """非対応 protocol は起動時に **明示エラー**にする (#151 の無診断 wedge 対策)。
+
+    症状の元は、protocol 不一致で agent.start が herdr のパーサに弾かれ、
+    サーバログにすら残らないまま spawn がこけること。構築時に 1 往復して
+    落とせば「どの protocol を掴んでいるか」が 1 行で分かる。
+    """
+    server.protocol = protocol
+    server.version = "9.9.9"
+    with pytest.raises(HerdrError) as exc:
+        _adapter(server)
+    assert exc.value.code == CODE_PROTOCOL_UNSUPPORTED
+    # 診断可能であること: 実 protocol / version / 対応範囲が出る。
+    assert str(protocol) in str(exc.value)
+    assert "9.9.9" in str(exc.value)
+    for supported in SUPPORTED_PROTOCOLS:
+        assert str(supported) in str(exc.value)
+
+
+def test_unsupported_protocol_leaves_no_disk_side_effect(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    """fail-fast は **副作用ゼロ**であること (Codex Major 1)。
+
+    特に generation を進めてはならない: 非対応 herdr を一度掴んだだけで世代が
+    進むと、対応版へ戻した時の世代会計 (§5.2) が狂い、起動時 sweep が別世代を
+    孤児と誤認する。
+    """
+    server.protocol = 99
+    state_dir = tmp_path / "broker-state"
+    with pytest.raises(HerdrError) as exc:
+        HerdrAdapter(socket_path=server.path, timeout=2.0, state_dir=str(state_dir))
+    assert exc.value.code == CODE_PROTOCOL_UNSUPPORTED
+    assert not state_dir.exists()  # makedirs / generation write の前に落ちている
+
+
+def test_malformed_pong_is_protocol_unsupported(server: FakeHerdrServer) -> None:
+    server.on("ping", {"type": "pong", "version": "x"})  # protocol 欠落
+    with pytest.raises(HerdrError) as exc:
+        _adapter(server)
+    assert exc.value.code == CODE_PROTOCOL_UNSUPPORTED
+
+
+def test_unreachable_socket_does_not_block_construction(tmp_path) -> None:
+    """socket 不通では **構築を落とさない** (degrade 契約の維持)。
+
+    daemon 未起動 / 一時的な blip で adapter が構築不能になると、broker serve
+    自体が起動できなくなる。protocol は未確定のまま保留し、実際に分岐が要る
+    spawn 時に再 probe する。
+    """
+    a = HerdrAdapter(socket_path=str(tmp_path / "absent.sock"), timeout=0.5)
+    assert a._protocol == herdr_mod._PROTOCOL_UNDETERMINED
+    # 遅延確定点でも到達不能なら adapter_unavailable (protocol 不一致ではない)。
+    with pytest.raises(HerdrError) as exc:
+        a._ensure_protocol()
+    assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
+
+
+def test_protocol_families_are_disjoint_and_cover_supported() -> None:
+    assert PROTOCOL_AGENT_API_LEGACY.isdisjoint(PROTOCOL_AGENT_API_V075)
+    assert PROTOCOL_AGENT_API_LEGACY | PROTOCOL_AGENT_API_V075 == SUPPORTED_PROTOCOLS
+
+
+# ---------------------------------------------------------------------------
 # error-code normalization
 # ---------------------------------------------------------------------------
 
@@ -1094,6 +1224,13 @@ def test_close_workspace(server: FakeHerdrServer, tmp_path) -> None:
         ("invalid_request", CODE_INVALID_PARAMS),
         ("invalid_key", CODE_INVALID_PARAMS),
         ("name_taken", CODE_NAME_IN_USE),
+        # --- herdr 0.7.5 agent API の raw code (Issue #151 B) ---------------
+        # 恒久的な引数不正 (retry 不可)。
+        ("invalid_agent_name", CODE_INVALID_PARAMS),
+        ("unsupported_agent_kind", CODE_INVALID_PARAMS),
+        # 一過性 (pane が prompt に戻っていない)。retry 対象として識別できるよう
+        # 専用コードを持つ (internal にも invalid-params にも丸めない)。
+        ("agent_pane_busy", CODE_AGENT_PANE_BUSY),
     ],
 )
 def test_error_code_mapping(server: FakeHerdrServer, raw_code: str, expected: str) -> None:
