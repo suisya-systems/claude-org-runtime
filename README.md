@@ -78,6 +78,14 @@ that rejects headless flags. `org up` / `org down` are a thin launcher over
 this control plane (the `daemon.json` sidecar + admin RPC); see
 [`docs/cli.md`](docs/cli.md) for details.
 
+**herdr version requirement:** using **herdr 0.7.5 or newer** as the backend
+requires **claude-org-runtime 0.1.38 or newer**. herdr 0.7.5 (wire protocol 17)
+rewrote the `agent.start` API in a breaking way; earlier runtime releases only
+speak the protocol 14 / 16 shape and fail to spawn against it. Runtime 0.1.38
+keeps the legacy path, so herdr 0.7.1-0.7.4 (protocol 14 / 16) still work
+unchanged. A permanently unsupported protocol is rejected at startup with
+`herdr_protocol_unsupported` rather than failing silently.
+
 ## Reference role prompts
 
 The runtime ships English reference prompts for the three roles used in

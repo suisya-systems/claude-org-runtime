@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.38] - 2026-07-22
+
+### Compatibility
+
+- **Using herdr 0.7.5 or newer as the broker backend requires
+  claude-org-runtime 0.1.38 or newer.** herdr 0.7.5 (wire protocol 17)
+  rewrote the `agent.start` API in a breaking way; releases before 0.1.38
+  only speak the protocol 14 / 16 shape and fail to spawn against it.
+  Conversely 0.1.38 keeps the legacy path intact, so herdr 0.7.1-0.7.4
+  (protocol 14 / 16) continue to work unchanged. The `herdr` backend
+  remains opt-in and POSIX / WSL-only.
+
+### Fixed
+
+- `herdr` terminal backend: follow the herdr 0.7.5 `agent.start` API
+  (runtime Issue #151, PR #152). 0.7.5 replaced the params with
+  `{name, kind, pane_id, args, timeout_ms}` and stopped creating panes, so
+  the adapter now provisions an agent pane via `pane.split` (carrying
+  `cwd` / `env`), exports the venv `PATH` into it, and then starts the
+  agent against that `pane_id`. The agent kind is passed explicitly from
+  the broker rather than guessed from `argv[0]`, the agent pane is kept
+  separate from the root pane (and guarded against root cleanup), and the
+  transient `agent_pane_busy` race is retried with bounded backoff. The
+  pre-0.7.5 path is preserved verbatim and selected by protocol.
+- `herdr` terminal backend: probe the wire protocol at construction time
+  and fail fast with `herdr_protocol_unsupported` on a permanent mismatch,
+  before any on-disk side effects (generation bump / startup sweep) can
+  run. An unreachable socket or an unreadable `pong` is treated as
+  undetermined rather than unsupported, so a daemon blip no longer makes
+  `broker serve` unstartable; the probe is retried when a spawn actually
+  needs the answer. herdr 0.7.5 raw error codes are mapped instead of
+  being rounded to `internal`.
+- broker MCP surface: unexpected exceptions in `tools/call` are now
+  returned as JSON-RPC errors (`-32603`) instead of escaping `do_POST` and
+  leaving the handler thread to close the socket without a response —
+  previously the only client-visible symptom was "The socket connection
+  was closed unexpectedly" (runtime Issue #151). The diagnostic line
+  carries the tool name and exception type / message but never the
+  arguments; the traceback goes only to the daemon-local journal.
+- `herdr` v075 spawn: reclaim the provisioned pane when a spawn fails
+  after `pane.split`. Orphaned panes were invisible to the adapter but
+  real to herdr, so the workspace sweep misread them as foreign and the
+  workspace stayed permanently pending, which kept `org down` from
+  closing out.
+
 ## [0.1.37] - 2026-07-17
 
 ### Added
