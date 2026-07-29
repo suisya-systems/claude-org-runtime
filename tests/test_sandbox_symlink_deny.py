@@ -101,6 +101,30 @@ def test_absolute_symlink_in_chain_ignores_relative_path() -> None:
     assert generator._absolute_symlink_in_chain("relative/path") is None
 
 
+def test_absolute_symlink_in_chain_survives_parent_traversal(
+    escaping_home: Path,
+) -> None:
+    """``..`` after the link must not hide it.
+
+    ``normpath`` would collapse ``.aws/..`` textually and drop the link
+    component entirely, reporting a clean chain for a path the kernel
+    resolves *through* the absolute symlink.
+    """
+    hit = generator._absolute_symlink_in_chain(
+        str(escaping_home / ".aws" / ".." / "elsewhere")
+    )
+    assert hit == str(escaping_home / ".aws")
+
+
+def test_absolute_symlink_in_chain_tolerates_redundant_separators(
+    escaping_home: Path,
+) -> None:
+    hit = generator._absolute_symlink_in_chain(
+        f"{escaping_home}//.aws/./config"
+    )
+    assert hit == str(escaping_home / ".aws")
+
+
 # ---------------------------------------------------------------------------
 # permission rule parsing
 # ---------------------------------------------------------------------------

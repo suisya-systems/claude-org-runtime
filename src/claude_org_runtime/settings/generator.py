@@ -492,12 +492,19 @@ def _absolute_symlink_in_chain(
 
     Non-absolute inputs return ``None`` -- a project-relative deny path
     is not a concrete host path, so it never reaches bwrap as one.
+
+    The components are walked *unnormalized* on purpose. ``normpath``
+    collapses ``link/..`` textually and would erase the very component
+    we need to inspect, so ``/home/u/link/../x`` would be judged clean
+    even though the kernel traverses ``link`` while resolving it. Empty
+    segments and ``.`` are skipped; ``..`` is kept so the walk keeps
+    following the same chain the kernel does.
     """
     if not os.path.isabs(path):
         return None
     prefix = os.sep
-    for part in os.path.normpath(path).split(os.sep):
-        if not part:
+    for part in path.split(os.sep):
+        if not part or part == os.curdir:
             continue
         prefix = os.path.join(prefix, part)
         try:
