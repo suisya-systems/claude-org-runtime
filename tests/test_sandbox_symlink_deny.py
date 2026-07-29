@@ -911,6 +911,75 @@ def test_discover_merged_scopes_only_returns_existing_files(
     ]
 
 
+def test_discover_merged_scopes_adds_the_sibling_project_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`settings.json` and `settings.local.json` are separate scopes.
+
+    Claude Code unions both, so pointing --settings at one must not leave
+    the other unaudited.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "nowhere"))
+    monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
+    project = tmp_path / "proj" / ".claude"
+    project.mkdir(parents=True)
+    local = project / "settings.local.json"
+    local.write_text("{}", encoding="utf-8")
+    shared = project / "settings.json"
+    shared.write_text("{}", encoding="utf-8")
+
+    assert sandbox_doctor.discover_merged_scopes([local]) == [shared]
+    # ...and the other direction.
+    assert sandbox_doctor.discover_merged_scopes([shared]) == [local]
+
+
+def test_discover_merged_scopes_does_not_duplicate_the_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "nowhere"))
+    monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
+    project = tmp_path / ".claude"
+    project.mkdir()
+    only = project / "settings.json"
+    only.write_text("{}", encoding="utf-8")
+    assert sandbox_doctor.discover_merged_scopes([only]) == []
+
+
+def test_sibling_project_scope_breaks_the_gate(
+    escaping_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a dirty sibling must fail an otherwise clean run."""
+    monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
+    project = tmp_path / "proj" / ".claude"
+    project.mkdir(parents=True)
+    local = project / "settings.local.json"
+    local.write_text(
+        json.dumps(_settings_with_deny(["Read(~/.ssh/*)"])), encoding="utf-8"
+    )
+    (project / "settings.json").write_text(
+        json.dumps(
+            {"sandbox": {"enabled": True, "filesystem": {"denyRead": ["~/.aws"]}}}
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        settings=[local], json=True, verbose=False, probe_bwrap=False,
+        merge_scopes=True,
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = sandbox_doctor.run(args)
+    payload = json.loads(buf.getvalue())
+    assert rc == 1
+    failing = [
+        f
+        for f in payload["findings"]
+        if f["status"] == sandbox_doctor.STATUS_SYMLINK_ESCAPE
+    ]
+    assert len(failing) == 1
+    assert failing[0]["source_file"] == str(project / "settings.json")
+
+
 def test_cli_merges_extra_scopes_and_reports_the_source(
     escaping_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -921,7 +990,7 @@ def test_cli_merges_extra_scopes_and_reports_the_source(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        sandbox_doctor, "discover_merged_scopes", lambda: [extra]
+        sandbox_doctor, "discover_merged_scopes", lambda inputs=None: [extra]
     )
     args = SimpleNamespace(
         settings=[worker], json=True, verbose=False, probe_bwrap=False,
@@ -948,7 +1017,9 @@ def test_cli_no_merge_scopes_skips_discovery(
     monkeypatch.setattr(
         sandbox_doctor,
         "discover_merged_scopes",
-        lambda: (_ for _ in ()).throw(AssertionError("must not be called")),
+        lambda inputs=None: (_ for _ in ()).throw(
+            AssertionError("must not be called")
+        ),
     )
     args = SimpleNamespace(
         settings=[worker], json=False, verbose=False, probe_bwrap=False,
@@ -964,7 +1035,9 @@ def test_cli_reports_which_scope_is_malformed(
     worker = _write_settings(tmp_path, _settings_with_deny([]))
     bad = tmp_path / "bad-scope.json"
     bad.write_text("{not json", encoding="utf-8")
-    monkeypatch.setattr(sandbox_doctor, "discover_merged_scopes", lambda: [bad])
+    monkeypatch.setattr(
+        sandbox_doctor, "discover_merged_scopes", lambda inputs=None: [bad]
+    )
     args = SimpleNamespace(
         settings=[worker], json=False, verbose=False, probe_bwrap=False,
         merge_scopes=True,

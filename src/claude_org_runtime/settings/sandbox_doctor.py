@@ -75,6 +75,11 @@ MANAGED_SETTINGS_PATHS = (
     "/etc/claude-code/managed-settings.json",
     "/Library/Application Support/ClaudeCode/managed-settings.json",
 )
+# Project-level scopes live side by side: ``settings.json`` is the checked-in
+# one and ``settings.local.json`` the generated / personal one. Claude Code
+# unions both, so checking whichever was passed and ignoring its sibling
+# would leave half the project scope unaudited.
+PROJECT_SCOPE_FILENAMES = ("settings.json", "settings.local.json")
 
 
 @dataclass(frozen=True)
@@ -494,20 +499,42 @@ def load_source(path: Path) -> tuple[SettingsSource | None, str | None]:
     return SettingsSource(label=str(path), settings=settings), None
 
 
-def discover_merged_scopes() -> list[Path]:
+def discover_merged_scopes(inputs: list[Path] | None = None) -> list[Path]:
     """Settings scopes that merge into the effective deny set, if present.
+
+    Two families are discovered:
+
+    - **Sibling project scopes.** ``.claude/settings.json`` and
+      ``.claude/settings.local.json`` are separate scopes that Claude
+      Code unions, so pointing ``--settings`` at one must not leave the
+      other unchecked. They are derived from each input's directory
+      rather than from a fixed list, so the project scope is picked up
+      wherever the file happens to live.
+    - **Global scopes.** The user settings and any managed settings.
 
     Only files that exist are returned, so a machine without managed
     settings simply contributes fewer scopes rather than erroring.
+    Discovery never returns a path already present in ``inputs``.
     """
+    given = [Path(p) for p in (inputs or [])]
+    seen = {p.resolve() for p in given if p.exists()}
     found: list[Path] = []
-    user = Path(os.path.expanduser(USER_SETTINGS_PATH))
-    if user.is_file():
-        found.append(user)
+
+    def add(candidate: Path) -> None:
+        if not candidate.is_file():
+            return
+        resolved = candidate.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        found.append(candidate)
+
+    for path in given:
+        for name in PROJECT_SCOPE_FILENAMES:
+            add(path.parent / name)
+    add(Path(os.path.expanduser(USER_SETTINGS_PATH)))
     for candidate in MANAGED_SETTINGS_PATHS:
-        managed = Path(candidate)
-        if managed.is_file():
-            found.append(managed)
+        add(Path(candidate))
     return found
 
 
@@ -621,10 +648,7 @@ def run(args: argparse.Namespace) -> int:
 
     paths = [Path(p) for p in requested]
     if getattr(args, "merge_scopes", True):
-        resolved = {Path(p).resolve() for p in paths}
-        for extra in discover_merged_scopes():
-            if extra.resolve() not in resolved:
-                paths.append(extra)
+        paths.extend(discover_merged_scopes(paths))
 
     sources: list[SettingsSource] = []
     for path in paths:

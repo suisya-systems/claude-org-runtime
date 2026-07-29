@@ -49,8 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deny arrays merge across settings scopes.
 
   Because Claude Code unions the deny arrays across scopes, the check
-  merges the user (`~/.claude/settings.json`) and managed settings
-  alongside the given file by default, and each finding names the file
+  merges the sibling project scope (`.claude/settings.json` next to a
+  `settings.local.json`, or vice versa), the user
+  (`~/.claude/settings.json`) and managed settings alongside the given
+  file by default, and each finding names the file
   that contributed it. Auditing the rendered worker file alone would
   report a clean preflight while a symlinked path in another scope aborts
   the launch. `--settings` is repeatable and `--no-merge-scopes` restores
