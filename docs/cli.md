@@ -243,6 +243,19 @@ It does two independent checks:
    those paths bound and reports whether the sandbox comes up. This
    catches unbindable paths whose cause is *not* a symlink.
 
+The canary deliberately passes no `--proc` / `--dev`. Those mount fresh
+filesystems *over* the corresponding host trees, and a shadowed region
+contains no symlink for bwrap to trip over — it just creates plain
+directories and succeeds. Probing with them would blind the canary to any
+deny path under the shadowed prefix and make it contradict the static
+analysis.
+
+That shadowing is also the only case where the two checks can disagree: a
+deny path crossing an absolute symlink binds fine *while* some mount hides
+the link. The doctor still reports it as a failure, and says why — a deny
+path that works only because something happens to be mounted over it
+aborts the launch the moment that stops being true.
+
 Exit status is `0` when the deny paths are usable, `1` when either check
 fails, and `2` on a missing / malformed settings file — so it can gate a
 worker launch rather than being advisory. The shapes it reads are

@@ -201,8 +201,13 @@ def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
         detected = generator._absolute_symlink_in_chain(str(case)) is not None
         proc = subprocess.run(
             [
-                "bwrap", "--ro-bind", "/", "/", "--proc", "/proc",
-                "--dev", "/dev", "--ro-bind", "/dev/null", str(case), "true",
+                # No --proc / --dev: they shadow the corresponding host
+                # trees, and a shadowed region has no symlink to trip over.
+                # With them, this test's verdict would depend on where
+                # pytest happens to put tmp_path (it fails under
+                # TMPDIR=/dev/shm, which --dev hides).
+                "bwrap", "--ro-bind", "/", "/",
+                "--ro-bind", "/dev/null", str(case), "true",
             ],
             capture_output=True,
             text=True,
@@ -212,6 +217,71 @@ def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
             f"{case}: detector={detected} but bwrap rc={proc.returncode} "
             f"({proc.stderr.strip()})"
         )
+
+
+@pytest.mark.skipif(
+    shutil.which("bwrap") is None, reason="bubblewrap not installed"
+)
+def test_shadowing_mount_hides_the_symlink_failure(tmp_path: Path) -> None:
+    """A mount over the region makes the same deny path bind cleanly.
+
+    This is the one case where the static verdict and bwrap disagree, and
+    it is why the canary must not pass ``--proc`` / ``--dev``: those mount
+    fresh filesystems over the host trees, so no symlink exists there for
+    bwrap to trip over and it just creates plain directories. Pinning the
+    behavior here keeps the canary's mount choice from looking arbitrary.
+    """
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "config").write_text("", encoding="utf-8")
+    (tmp_path / "abs_link").symlink_to(external)
+    target = tmp_path / "abs_link" / "config"
+
+    def probe(extra: list[str]) -> int:
+        return subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", *extra,
+             "--ro-bind", "/dev/null", str(target), "true"],
+            capture_output=True, text=True, timeout=60,
+        ).returncode
+
+    # Visible link -> launch aborts. Shadowed by a tmpfs -> it does not.
+    assert probe([]) != 0
+    assert probe(["--tmpfs", str(tmp_path)]) == 0
+
+
+def test_canary_does_not_shadow_probed_paths() -> None:
+    """The canary's argv must not contain region-shadowing mounts."""
+    captured: list[list[str]] = []
+
+    def runner(cmd: list[str]) -> subprocess.CompletedProcess:
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    sandbox_doctor.run_bwrap_canary(
+        [sandbox_doctor.DenyTarget("permissions.deny", "Read(//etc/hosts)", "/etc/hosts")],
+        runner=runner,
+        bwrap_path="/usr/bin/bwrap",
+    )
+    assert captured, "canary did not invoke the runner"
+    assert "--dev" not in captured[0]
+    assert "--proc" not in captured[0]
+
+
+def test_report_explains_static_fail_with_canary_pass(
+    escaping_home: Path,
+) -> None:
+    def ok_runner(cmd: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    report = sandbox_doctor.diagnose(
+        _settings_with_deny(["Read(~/.aws/*)"]),
+        probe_bwrap=True,
+        runner=ok_runner,
+    )
+    assert report.canary_status == sandbox_doctor.CANARY_PASS
+    assert not report.ok, "a hidden-link pass must not be treated as healthy"
+    text = sandbox_doctor.format_report(report)
+    assert "only bindable while some mount hides the link" in text
 
 
 def test_canonicalize_permission_deny_handles_write_rules(

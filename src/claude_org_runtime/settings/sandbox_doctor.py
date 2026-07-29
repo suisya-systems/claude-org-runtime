@@ -327,7 +327,14 @@ def run_bwrap_canary(
     if resolved_bwrap is None:
         return CANARY_SKIPPED, "bwrap not found on PATH; live canary not run"
 
-    argv = [resolved_bwrap, "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]
+    # Deliberately no ``--proc`` / ``--dev``: those mount fresh filesystems
+    # that *shadow* the corresponding host trees, and a shadowed region has
+    # no symlink for bwrap to trip over -- it simply creates plain
+    # directories and succeeds. Probing with them would blind the canary to
+    # any deny path under the shadowed prefix and make it disagree with the
+    # static analysis. The probe only needs to create the mount points, and
+    # ``true`` needs neither /proc nor /dev.
+    argv = [resolved_bwrap, "--ro-bind", "/", "/"]
     with tempfile.TemporaryDirectory() as empty_dir:
         bound = 0
         for target in targets:
@@ -414,6 +421,15 @@ def format_report(report: DoctorReport, *, verbose: bool = False) -> str:
             "launch can be aborted here and the check passes. Any finding "
             "above is still latent: deny arrays merge across settings scopes, "
             "so it becomes live as soon as another scope enables the sandbox."
+        )
+    elif report.failures and report.canary_status == CANARY_PASS:
+        lines.append("")
+        lines.append(
+            "RESULT: bwrap started here, but the deny paths above cross an "
+            "absolute symlink and are only bindable while some mount hides "
+            "the link from the sandbox. That is not a property to depend on: "
+            "the same settings abort the launch as soon as the link is "
+            "visible. Treated as a failure; apply the suggested rewrites."
         )
     elif not report.ok:
         lines.append("")
