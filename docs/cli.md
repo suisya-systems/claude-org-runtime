@@ -245,7 +245,38 @@ It does two independent checks:
 
 Exit status is `0` when the deny paths are usable, `1` when either check
 fails, and `2` on a missing / malformed settings file — so it can gate a
-worker launch rather than being advisory.
+worker launch rather than being advisory. The shapes it reads are
+validated up front, because a `deny` given as a bare string is iterable
+and would otherwise be scanned character by character and reported clean.
+
+Settings that explicitly set `sandbox.enabled: false` pass the gate:
+no sandbox launches, so no launch can be aborted. Any finding is still
+printed and labelled latent, because the deny arrays merge across
+settings scopes and become live as soon as another scope enables the
+sandbox. An *absent* `sandbox` key is treated as unknown rather than
+off, since user or managed settings can enable it for a role that never
+mentions it.
+
+### On `failIfUnavailable` and `allowUnsandboxedCommands`
+
+`sandbox.failIfUnavailable` does **not** cover this failure. Per the
+[official docs](https://code.claude.com/docs/en/sandboxing) it governs a
+*missing dependency* such as bubblewrap not being installed, which blocks
+Claude Code from starting — not a per-command bwrap launch failure on a
+machine where bwrap is present and working.
+
+The knob that governs the silent fallback is
+`sandbox.allowUnsandboxedCommands: false` (shown as **Strict sandbox
+mode** in the `/sandbox` Overrides tab), which makes the
+`dangerouslyDisableSandbox` retry be ignored. This runtime does **not**
+set it, because the blast radius is fleet-wide: Claude Code's docs list
+`docker` as incompatible with the sandbox, and the `default` and
+`claude-org-self-edit` worker roles both allow `docker build` while the
+runtime ships no `excludedCommands`. Turning strict mode on without first
+adding those exclusions would make those workers fail outright rather
+than silently lose isolation. `sandbox doctor` is the non-breaking half
+of the answer: it makes the loss of isolation visible without changing
+what happens when a command cannot be sandboxed.
 
 ## `org up` / `org down`
 

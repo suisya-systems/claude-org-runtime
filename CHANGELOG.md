@@ -44,7 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that would fix each) plus a live `bwrap` canary that launches the
   sandbox with those paths bound. `--json`, `--verbose`, and
   `--no-probe-bwrap` are available; exit `0` usable / `1` broken / `2`
-  missing or malformed settings.
+  missing or malformed settings. Settings that explicitly disable the
+  sandbox pass the gate while still listing findings as latent, since
+  deny arrays merge across settings scopes.
+
+  `sandbox.failIfUnavailable` is deliberately left alone: per the official
+  docs it covers a missing dependency at startup, not a per-command bwrap
+  launch failure. The knob for the silent fallback is
+  `allowUnsandboxedCommands: false`, which this runtime also does not set
+  — `docker` is incompatible with the sandbox and two worker roles allow
+  `docker build` with no `excludedCommands` shipped, so forcing strict
+  mode would break those workers outright. That trade-off is an operator
+  decision; `sandbox doctor` makes the loss of isolation visible without
+  changing what happens when a command cannot be sandboxed.
 - `settings show --explain` now reports a `rewrites` list alongside
   `suppressions`, and the emitted `$comment` gains a
   `; symlink-canonicalized deny paths: [...]` clause. The contract-fixed
