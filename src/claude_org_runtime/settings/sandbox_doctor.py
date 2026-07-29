@@ -57,6 +57,7 @@ from .generator import (
 # Status values for a single deny target.
 STATUS_OK = "ok"
 STATUS_SYMLINK_ESCAPE = "symlink-escape"
+STATUS_UNSUPPORTED = "unsupported-entry"
 
 # Status values for the live bwrap canary.
 CANARY_PASS = "pass"
@@ -102,6 +103,7 @@ class DoctorReport:
     findings: list[Finding]
     canary_status: str
     canary_detail: str
+    sandbox_disabled: bool = False
 
     @property
     def failures(self) -> list[Finding]:
@@ -109,17 +111,63 @@ class DoctorReport:
 
     @property
     def ok(self) -> bool:
+        """Whether this settings file should be allowed to gate a launch.
+
+        A file that explicitly sets ``sandbox.enabled: false`` never
+        launches a sandbox of its own, so its deny paths cannot abort one
+        and the gate passes. The findings are still reported: the deny
+        arrays merge across settings scopes, so a symlinked path here
+        becomes live the moment any other scope enables the sandbox.
+        """
+        if self.sandbox_disabled:
+            return True
         return not self.failures and self.canary_status != CANARY_FAIL
 
     def to_jsonable(self) -> dict:
         return {
             "ok": self.ok,
+            "sandbox_disabled": self.sandbox_disabled,
             "findings": [f.to_jsonable() for f in self.findings],
             "canary": {
                 "status": self.canary_status,
                 "detail": self.canary_detail,
             },
         }
+
+
+def validate_settings(settings: Any) -> str | None:
+    """Return an error message when the settings shape cannot be checked.
+
+    Only the containers this module reads are validated, but they are
+    validated strictly: a ``deny`` given as a bare string is iterable, so
+    without this the scan would walk it character by character, find no
+    targets, and hand out a clean bill of health for a malformed file.
+    A preflight that gates a launch must not pass by accident.
+    """
+    if not isinstance(settings, dict):
+        return "settings root must be a JSON object"
+
+    permissions = settings.get("permissions")
+    if permissions is not None:
+        if not isinstance(permissions, dict):
+            return "permissions must be an object"
+        deny = permissions.get("deny")
+        if deny is not None and not isinstance(deny, list):
+            return "permissions.deny must be an array"
+
+    sandbox = settings.get("sandbox")
+    if sandbox is not None:
+        if not isinstance(sandbox, dict):
+            return "sandbox must be an object"
+        fs = sandbox.get("filesystem")
+        if fs is not None:
+            if not isinstance(fs, dict):
+                return "sandbox.filesystem must be an object"
+            for key in ("denyRead", "denyWrite"):
+                entries = fs.get(key)
+                if entries is not None and not isinstance(entries, list):
+                    return f"sandbox.filesystem.{key} must be an array"
+    return None
 
 
 def collect_deny_targets(settings: dict) -> list[DenyTarget]:
@@ -140,6 +188,11 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
     permissions = settings.get("permissions")
     if isinstance(permissions, dict):
         for rule in permissions.get("deny") or []:
+            if not isinstance(rule, str):
+                targets.append(
+                    DenyTarget(layer="permissions.deny", source=rule, path="")
+                )
+                continue
             parsed = _split_permission_rule(rule)
             if parsed is None:
                 continue
@@ -160,6 +213,17 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
             for key in ("denyRead", "denyWrite"):
                 for entry in fs.get(key) or []:
                     if not isinstance(entry, str):
+                        # The renderer emits kept entries as strings; a
+                        # structured dict surviving into a rendered file
+                        # means the entry was malformed, so surface it
+                        # rather than skipping to a clean result.
+                        targets.append(
+                            DenyTarget(
+                                layer=f"sandbox.filesystem.{key}",
+                                source=entry,
+                                path="",
+                            )
+                        )
                         continue
                     path = entry
                     if path.startswith("~/"):
@@ -181,6 +245,21 @@ def analyze_targets(targets: list[DenyTarget]) -> list[Finding]:
     """Statically classify each deny target as bwrap-safe or not."""
     findings: list[Finding] = []
     for target in targets:
+        if not target.path:
+            findings.append(
+                Finding(
+                    layer=target.layer,
+                    source=target.source,
+                    path="",
+                    status=STATUS_UNSUPPORTED,
+                    detail=(
+                        "entry is not a string, so its bwrap usability cannot "
+                        "be verified; a rendered settings file should contain "
+                        "only string deny entries"
+                    ),
+                )
+            )
+            continue
         literal = _literal_path_prefix(target.path)
         if literal is None:
             findings.append(
@@ -286,14 +365,29 @@ def diagnose(
     runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
 ) -> DoctorReport:
     """Run the full preflight against a parsed settings mapping."""
+    sandbox = settings.get("sandbox")
+    # Only an *explicit* disable downgrades the gate. An absent key is
+    # treated as unknown rather than off, because user or managed settings
+    # can enable the sandbox for a role that never mentions it.
+    sandbox_disabled = (
+        isinstance(sandbox, dict) and sandbox.get("enabled") is False
+    )
     targets = collect_deny_targets(settings)
     findings = analyze_targets(targets)
-    if probe_bwrap:
+    if sandbox_disabled:
+        status, detail = (
+            CANARY_SKIPPED,
+            "sandbox.enabled is false; no sandbox launch to probe",
+        )
+    elif probe_bwrap:
         status, detail = run_bwrap_canary(targets, runner=runner)
     else:
         status, detail = CANARY_SKIPPED, "live canary disabled (--no-probe-bwrap)"
     return DoctorReport(
-        findings=findings, canary_status=status, canary_detail=detail
+        findings=findings,
+        canary_status=status,
+        canary_detail=detail,
+        sandbox_disabled=sandbox_disabled,
     )
 
 
@@ -313,7 +407,15 @@ def format_report(report: DoctorReport, *, verbose: bool = False) -> str:
         if f.suggestion:
             lines.append(f"         suggested rewrite: {f.suggestion}")
     lines.append(f"bwrap canary: {report.canary_status} - {report.canary_detail}")
-    if not report.ok:
+    if report.sandbox_disabled:
+        lines.append("")
+        lines.append(
+            "RESULT: sandbox.enabled is false in these settings, so no sandbox "
+            "launch can be aborted here and the check passes. Any finding "
+            "above is still latent: deny arrays merge across settings scopes, "
+            "so it becomes live as soon as another scope enables the sandbox."
+        )
+    elif not report.ok:
         lines.append("")
         lines.append(
             "RESULT: the sandbox will NOT start with these settings. Claude "
@@ -373,8 +475,9 @@ def run(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         print(f"error: settings is not valid JSON: {exc}", file=sys.stderr)
         return 2
-    if not isinstance(settings, dict):
-        print("error: settings root must be a JSON object", file=sys.stderr)
+    invalid = validate_settings(settings)
+    if invalid is not None:
+        print(f"error: {invalid}", file=sys.stderr)
         return 2
 
     report = diagnose(settings, probe_bwrap=getattr(args, "probe_bwrap", True))

@@ -644,6 +644,90 @@ def test_doctor_cli_non_object_root(tmp_path: Path) -> None:
     assert sandbox_doctor.run(args) == 2
 
 
+# ---------------------------------------------------------------------------
+# gate robustness: disabled sandbox and malformed shapes
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_sandbox_passes_the_gate_but_still_reports(
+    escaping_home: Path,
+) -> None:
+    """A role that never launches a sandbox must not fail the gate.
+
+    The finding is still listed: deny arrays merge across settings
+    scopes, so the path goes live the moment another scope enables the
+    sandbox.
+    """
+    settings = {
+        "permissions": {"deny": ["Read(~/.aws/*)"]},
+        "sandbox": {"enabled": False, "filesystem": {"denyRead": []}},
+    }
+    report = sandbox_doctor.diagnose(settings, probe_bwrap=False)
+    assert report.sandbox_disabled is True
+    assert report.ok is True
+    assert len(report.failures) == 1
+    text = sandbox_doctor.format_report(report)
+    assert "latent" in text
+
+
+def test_absent_sandbox_key_still_gates(escaping_home: Path) -> None:
+    """Absent != disabled: user or managed settings can enable it."""
+    report = sandbox_doctor.diagnose(
+        {"permissions": {"deny": ["Read(~/.aws/*)"]}}, probe_bwrap=False
+    )
+    assert report.sandbox_disabled is False
+    assert report.ok is False
+
+
+@pytest.mark.parametrize(
+    "settings,expected",
+    [
+        ({"permissions": {"deny": "Read(~/.aws/*)"}}, "permissions.deny"),
+        ({"permissions": []}, "permissions"),
+        ({"sandbox": []}, "sandbox"),
+        ({"sandbox": {"filesystem": []}}, "sandbox.filesystem"),
+        (
+            {"sandbox": {"filesystem": {"denyRead": "x"}}},
+            "sandbox.filesystem.denyRead",
+        ),
+        ([], "settings root"),
+    ],
+)
+def test_validate_settings_rejects_bad_shapes(
+    settings: object, expected: str
+) -> None:
+    message = sandbox_doctor.validate_settings(settings)
+    assert message is not None and expected in message
+
+
+def test_validate_settings_accepts_good_shape() -> None:
+    assert sandbox_doctor.validate_settings(_settings_with_deny([])) is None
+
+
+def test_deny_as_bare_string_exits_2_not_0(
+    escaping_home: Path, tmp_path: Path
+) -> None:
+    """The character-iteration trap: a bare string must not read as clean."""
+    path = _write_settings(
+        tmp_path, {"permissions": {"deny": "Read(~/.aws/*)"}}
+    )
+    args = SimpleNamespace(
+        settings=path, json=False, verbose=False, probe_bwrap=False
+    )
+    assert sandbox_doctor.run(args) == 2
+
+
+def test_non_string_deny_entry_is_flagged_not_skipped(
+    escaping_home: Path,
+) -> None:
+    settings = _settings_with_deny(
+        [{"anchor": "home", "path": ".aws/**"}], sandbox_deny=[]
+    )
+    report = sandbox_doctor.diagnose(settings, probe_bwrap=False)
+    assert not report.ok
+    assert report.failures[0].status == sandbox_doctor.STATUS_UNSUPPORTED
+
+
 def test_unified_cli_wires_sandbox_doctor(
     escaping_home: Path, tmp_path: Path
 ) -> None:
