@@ -518,16 +518,24 @@ def _absolute_symlink_in_chain(
     ``max_links`` bounds symlink-loop resolution the way the kernel's
     ``ELOOP`` limit does; hitting it returns ``None`` so a pathological
     entry is passed through untouched instead of hanging.
+
+    The walk starts from the path's *anchor* rather than from ``os.sep``.
+    On Windows ``os.path.join('\\\\', 'C:')`` yields the drive-relative
+    ``'C:'``, which would silently rebase every subsequent component and
+    make the whole walk inspect paths that do not exist.
     """
     if not os.path.isabs(path):
         return None
-    remaining = [p for p in path.split(os.sep) if p and p != os.curdir]
-    resolved = os.sep
+    normalized = path.replace(os.altsep, os.sep) if os.altsep else path
+    drive, rest = os.path.splitdrive(normalized)
+    root = drive + os.sep
+    remaining = [p for p in rest.split(os.sep) if p and p != os.curdir]
+    resolved = root
     followed = 0
     while remaining:
         part = remaining.pop(0)
         if part == os.pardir:
-            resolved = os.path.dirname(resolved) or os.sep
+            resolved = os.path.dirname(resolved) or root
             continue
         candidate = os.path.join(resolved, part)
         try:
@@ -546,6 +554,7 @@ def _absolute_symlink_in_chain(
             return None
         # Relative link: resolution continues from the link's parent,
         # which ``resolved`` already is.
+        target = target.replace(os.altsep, os.sep) if os.altsep else target
         remaining = [
             p for p in target.split(os.sep) if p and p != os.curdir
         ] + remaining

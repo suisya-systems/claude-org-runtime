@@ -17,6 +17,7 @@ import io
 import json
 import shutil
 import subprocess
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,66 @@ from claude_org_runtime import cli as runtime_cli
 from claude_org_runtime.settings import generator, sandbox_doctor
 
 
+def _can_symlink() -> bool:
+    """Whether this host lets an unprivileged process create symlinks.
+
+    Probed rather than inferred from the platform: Windows allows it with
+    Developer Mode or elevation, so a blanket ``skipif(win32)`` would give
+    up coverage on hosts that can in fact run these tests.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.mkdir()
+        try:
+            (Path(tmp) / "link").symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+
+SYMLINKS_SUPPORTED = _can_symlink()
+requires_symlinks = pytest.mark.skipif(
+    not SYMLINKS_SUPPORTED,
+    reason="host cannot create symlinks (Windows without Developer Mode)",
+)
+def _bwrap_works() -> bool:
+    """Whether bwrap is present *and* able to start on this host.
+
+    Presence is not enough: Ubuntu 24.04 and many containers block the
+    unprivileged user namespaces bwrap needs, so the binary exists but
+    every launch fails. Gating on presence alone would turn that into a
+    wall of red assertions instead of an honest skip.
+    """
+    if shutil.which("bwrap") is None:
+        return False
+    try:
+        return (
+            subprocess.run(
+                ["bwrap", "--ro-bind", "/", "/", "true"],
+                capture_output=True,
+                timeout=60,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+requires_bwrap = pytest.mark.skipif(
+    not _bwrap_works(), reason="bubblewrap missing or cannot start on this host"
+)
+
+
+def _link_to_dir(link: Path, target: Path) -> None:
+    """Create a *directory* symlink.
+
+    ``target_is_directory`` is ignored on POSIX but decides between a file
+    and a directory link on Windows; without it, traversing ``link/child``
+    fails there.
+    """
+    link.symlink_to(target, target_is_directory=True)
+
+
 @pytest.fixture()
 def escaping_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A fake ``$HOME`` whose ``.aws`` is an *absolute* symlink elsewhere.
@@ -35,12 +96,14 @@ def escaping_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     symlink to a directory outside the home tree (there, ``/mnt/c/...``)
     and the credential files exist on the far side of the link.
     """
+    if not SYMLINKS_SUPPORTED:
+        pytest.skip("host cannot create symlinks")
     home = tmp_path / "home"
     home.mkdir()
     external = tmp_path / "external" / ".aws"
     external.mkdir(parents=True)
     (external / "config").write_text("not-a-real-credential\n", encoding="utf-8")
-    (home / ".aws").symlink_to(external)
+    _link_to_dir(home / ".aws", external)
 
     # A real (non-symlinked) credential dir, to prove we only rewrite the
     # entries that actually need it.
@@ -83,6 +146,7 @@ def test_absolute_symlink_in_chain_ignores_clean_path(
     )
 
 
+@requires_symlinks
 def test_absolute_symlink_in_chain_ignores_relative_symlink(
     tmp_path: Path,
 ) -> None:
@@ -94,7 +158,7 @@ def test_absolute_symlink_in_chain_ignores_relative_symlink(
     """
     (tmp_path / "target").mkdir()
     (tmp_path / "target" / "config").write_text("x", encoding="utf-8")
-    (tmp_path / "link").symlink_to(Path("target"))  # relative
+    _link_to_dir(tmp_path / "link", Path("target"))  # relative
     assert generator._absolute_symlink_in_chain(str(tmp_path / "link")) is None
 
 
@@ -126,6 +190,7 @@ def test_absolute_symlink_in_chain_tolerates_redundant_separators(
     assert hit == str(escaping_home / ".aws")
 
 
+@requires_symlinks
 def test_absolute_symlink_reached_through_relative_link(
     tmp_path: Path,
 ) -> None:
@@ -138,8 +203,8 @@ def test_absolute_symlink_reached_through_relative_link(
     """
     external = tmp_path / "external"
     external.mkdir()
-    (tmp_path / "abs_link").symlink_to(external)  # absolute
-    (tmp_path / "rel_link").symlink_to(Path("abs_link"))  # relative -> absolute
+    _link_to_dir(tmp_path / "abs_link", external)  # absolute
+    _link_to_dir(tmp_path / "rel_link", Path("abs_link"))  # relative -> absolute
 
     hit = generator._absolute_symlink_in_chain(
         str(tmp_path / "rel_link" / "config")
@@ -147,30 +212,65 @@ def test_absolute_symlink_reached_through_relative_link(
     assert hit == str(tmp_path / "abs_link")
 
 
+@requires_symlinks
 def test_purely_relative_chain_stays_clean(tmp_path: Path) -> None:
     """Control for the case above: relative-only chains are bwrap-safe."""
     external = tmp_path / "external"
     external.mkdir()
-    (tmp_path / "hop") .symlink_to(Path("external"))
-    (tmp_path / "rel_link").symlink_to(Path("hop"))
+    _link_to_dir(tmp_path / "hop", Path("external"))
+    _link_to_dir(tmp_path / "rel_link", Path("hop"))
     assert (
         generator._absolute_symlink_in_chain(str(tmp_path / "rel_link" / "c"))
         is None
     )
 
 
+@requires_symlinks
 def test_absolute_symlink_in_chain_bounds_symlink_loops(
     tmp_path: Path,
 ) -> None:
     """A relative symlink loop must terminate rather than spin."""
-    (tmp_path / "a").symlink_to(Path("b"))
-    (tmp_path / "b").symlink_to(Path("a"))
+    _link_to_dir(tmp_path / "a", Path("b"))
+    _link_to_dir(tmp_path / "b", Path("a"))
     assert generator._absolute_symlink_in_chain(str(tmp_path / "a")) is None
 
 
-@pytest.mark.skipif(
-    shutil.which("bwrap") is None, reason="bubblewrap not installed"
-)
+def test_absolute_symlink_in_chain_walks_windows_drive_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The walk must start at the drive anchor, not at ``os.sep``.
+
+    On Windows ``os.path.join('\\\\', 'C:')`` returns the drive-*relative*
+    ``'C:'``, so a walk seeded with ``os.sep`` rebases every component
+    onto a path that does not exist and reports every chain as clean.
+    Simulated with ``ntpath`` because the suite's own host is POSIX; this
+    is the case that took every Windows CI job down.
+    """
+    import ntpath
+
+    monkeypatch.setattr(generator.os, "path", ntpath)
+    monkeypatch.setattr(generator.os, "sep", "\\")
+    monkeypatch.setattr(generator.os, "altsep", "/")
+
+    link = r"C:\Users\me\.aws"
+    visited: list[str] = []
+
+    def islink(path: str) -> bool:
+        visited.append(path)
+        return path == link
+
+    hit = generator._absolute_symlink_in_chain(
+        r"C:\Users\me\.aws\config",
+        islink_fn=islink,
+        readlink_fn=lambda _: r"D:\external\.aws",
+    )
+    assert hit == link
+    # The drive-relative bug showed up as "C:Users..." (no separator).
+    assert r"C:\Users" in visited
+    assert not any(v.startswith("C:U") for v in visited)
+
+
+@requires_bwrap
 def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
     """Oracle test: the detector's verdict must match bubblewrap's.
 
@@ -186,9 +286,9 @@ def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     (plain / "config").write_text("", encoding="utf-8")
-    (tmp_path / "abs_link").symlink_to(external)
-    (tmp_path / "rel_link").symlink_to(Path("abs_link"))
-    (tmp_path / "rel_only").symlink_to(Path("external"))
+    _link_to_dir(tmp_path / "abs_link", external)
+    _link_to_dir(tmp_path / "rel_link", Path("abs_link"))
+    _link_to_dir(tmp_path / "rel_only", Path("external"))
 
     cases = [
         plain / "config",
@@ -219,9 +319,7 @@ def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.skipif(
-    shutil.which("bwrap") is None, reason="bubblewrap not installed"
-)
+@requires_bwrap
 def test_shadowing_mount_hides_the_symlink_failure(tmp_path: Path) -> None:
     """A mount over the region makes the same deny path bind cleanly.
 
@@ -234,7 +332,7 @@ def test_shadowing_mount_hides_the_symlink_failure(tmp_path: Path) -> None:
     external = tmp_path / "external"
     external.mkdir()
     (external / "config").write_text("", encoding="utf-8")
-    (tmp_path / "abs_link").symlink_to(external)
+    _link_to_dir(tmp_path / "abs_link", external)
     target = tmp_path / "abs_link" / "config"
 
     def probe(extra: list[str]) -> int:

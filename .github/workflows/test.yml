@@ -20,6 +20,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install bubblewrap (Linux)
+        # The sandbox deny-path tests assert against the real bwrap binary
+        # rather than a model of it. Without this they skip, and the check
+        # that matters most -- that our symlink verdict matches
+        # bubblewrap's -- would never run in CI.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 blocks the unprivileged user namespaces bwrap
+          # needs; without this the binary is present but cannot start.
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / true && echo "bwrap operational" || echo "bwrap present but cannot start; those tests will skip"
       - name: Install
         run: |
           python -m pip install --upgrade pip

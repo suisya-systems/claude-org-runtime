@@ -370,8 +370,12 @@ def run_bwrap_canary(
     actually come up on *this* machine with *these* settings?
     """
     resolved_bwrap = bwrap_path or shutil.which("bwrap")
-    if resolved_bwrap is None:
+    # An injected ``runner`` stands in for the real binary, so requiring
+    # bwrap on PATH would make the caller's substitution depend on the
+    # host having the tool it is substituting for.
+    if resolved_bwrap is None and runner is None:
         return CANARY_SKIPPED, "bwrap not found on PATH; live canary not run"
+    resolved_bwrap = resolved_bwrap or "bwrap"
 
     # Deliberately no ``--proc`` / ``--dev``: those mount fresh filesystems
     # that *shadow* the corresponding host trees, and a shadowed region has
