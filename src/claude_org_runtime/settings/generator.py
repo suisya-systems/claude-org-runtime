@@ -586,6 +586,14 @@ def _permission_rule_host_path(spec: str) -> str | None:
     and is left alone. Unanchored globs such as ``**/credentials*`` land
     here too, which matches the observed behavior: they never made bwrap
     fail because they are not expanded into host paths.
+
+    Only the anchor is substituted; the remainder keeps the rule's own
+    ``/`` separators rather than being normalized to the platform's. On
+    Windows that yields a mixed spelling (``C:\\Users\\u/.aws/*``), which
+    is deliberate: the value is a permission-rule path, whose grammar
+    separates with ``/``, and every OS accepts ``/`` for the filesystem
+    probing this feeds. Normalizing would rewrite the glob tail into a
+    spelling the rule grammar does not use.
     """
     if spec.startswith("~/"):
         return os.path.expanduser("~") + spec[1:]
@@ -719,7 +727,9 @@ def _canonicalize_sandbox_deny(
         probe = entry
         if probe.startswith("~/"):
             probe = os.path.expanduser("~") + probe[1:]
-        if not probe.startswith("/"):
+        # isabs, not startswith("/"): a Windows entry begins with a drive
+        # letter, which the prefix test would pass over uncanonicalized.
+        if not os.path.isabs(probe):
             out.append(entry)
             continue
         result = _canonicalize_escaping_path(

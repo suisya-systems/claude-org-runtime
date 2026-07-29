@@ -269,7 +269,11 @@ def collect_deny_targets(
                     path = entry
                     if path.startswith("~/"):
                         path = os.path.expanduser("~") + path[1:]
-                    if not path.startswith("/"):
+                    # isabs, not startswith("/"): on Windows an expanded
+                    # entry begins with a drive letter, so the prefix test
+                    # would drop every concrete Layer 3 target and leave
+                    # the report claiming there was nothing to check.
+                    if not os.path.isabs(path):
                         continue
                     targets.append(
                         DenyTarget(

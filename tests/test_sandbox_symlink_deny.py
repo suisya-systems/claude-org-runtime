@@ -449,9 +449,17 @@ def test_split_permission_rule(rule: object, expected: object) -> None:
 
 
 def test_permission_rule_host_path_anchored_forms(escaping_home: Path) -> None:
-    assert generator._permission_rule_host_path("~/.aws/*") == str(
-        escaping_home / ".aws"
-    ) + "/*"
+    """Only the anchor is substituted; the rest of the rule is verbatim.
+
+    The expectation is built by string concatenation rather than
+    ``escaping_home / ".aws"`` on purpose. Permission-rule paths are rule
+    syntax, which always separates with ``/``, so the tail is preserved
+    as authored; joining via ``Path`` would assert a backslash on Windows
+    and demand a normalization the rule grammar does not want.
+    """
+    assert generator._permission_rule_host_path("~/.aws/*") == (
+        f"{escaping_home}/.aws/*"
+    )
     assert generator._permission_rule_host_path("//mnt/c/x") == "/mnt/c/x"
 
 
@@ -721,7 +729,10 @@ def test_collect_deny_targets_expands_tilde_in_layer3(
 ) -> None:
     settings = _settings_with_deny([], ["~/.ssh"])
     targets = sandbox_doctor.collect_deny_targets(settings)
-    assert targets[0].path == str(escaping_home / ".ssh")
+    # Concatenated, not Path-joined: only the anchor is substituted, so
+    # the entry keeps its authored "/" (see
+    # test_permission_rule_host_path_anchored_forms).
+    assert targets[0].path == f"{escaping_home}/.ssh"
 
 
 def test_analyze_targets_flags_symlink_escape(
