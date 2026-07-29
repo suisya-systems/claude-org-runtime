@@ -1323,8 +1323,17 @@ def test_suppress_opt_out_still_canonicalizes_a_symlinked_entry() -> None:
     escaped = "/mnt/c/Users/u/work/wd"
 
     def fake_realpath(p: str) -> str:
-        if p == worker_dir or p.startswith(worker_dir + "/"):
-            return p.replace(worker_dir, escaped, 1)
+        # Separator-agnostic on purpose. The kept entry is built with
+        # os.path.join, so the tail arrives as "/secrets.env" on POSIX and
+        # "\secrets.env" on Windows; matching only the forward slash would
+        # make this fake silently never fire there, and the test would
+        # report "no rewrite happened" for a reason that has nothing to do
+        # with the code under test.
+        if p == worker_dir:
+            return escaped
+        for sep in ("/", os.sep):
+            if p.startswith(worker_dir + sep):
+                return escaped + p[len(worker_dir):]
         return p
 
     schema = {
