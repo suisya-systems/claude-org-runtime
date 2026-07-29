@@ -474,7 +474,15 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
 # when matching ``Read`` / ``Edit`` deny rules, so the realpath form still
 # blocks reads issued through the original symlinked path.
 
-_PERMISSION_PATH_TOOLS = ("Read", "Edit")
+# Layer 2 tools whose argument is a filesystem path. ``Read`` / ``Edit`` are
+# the pair Claude Code's sandbox docs name as contributing to the deny set;
+# ``Write`` is included because this repo's own schema and docs treat it as a
+# Layer 2 filesystem deny (``role_configs_schema.json`` ships
+# ``Write(*/workers/*/...)`` entries). Canonicalizing a rule that turns out
+# not to reach bwrap is harmless -- the realpath form denies the same files,
+# since path matching resolves symlinks -- whereas omitting one that does
+# reach it leaves the sandbox-launch failure in place.
+_PERMISSION_PATH_TOOLS = ("Read", "Edit", "Write")
 
 
 def _absolute_symlink_in_chain(
@@ -482,6 +490,7 @@ def _absolute_symlink_in_chain(
     *,
     islink_fn: Callable[[str], bool] = os.path.islink,
     readlink_fn: Callable[[str], str] = os.readlink,
+    max_links: int = 40,
 ) -> str | None:
     """Return the first component of ``path`` that is an *absolute* symlink.
 
@@ -493,27 +502,53 @@ def _absolute_symlink_in_chain(
     Non-absolute inputs return ``None`` -- a project-relative deny path
     is not a concrete host path, so it never reaches bwrap as one.
 
-    The components are walked *unnormalized* on purpose. ``normpath``
-    collapses ``link/..`` textually and would erase the very component
-    we need to inspect, so ``/home/u/link/../x`` would be judged clean
-    even though the kernel traverses ``link`` while resolving it. Empty
-    segments and ``.`` are skipped; ``..`` is kept so the walk keeps
-    following the same chain the kernel does.
+    The walk emulates kernel path resolution rather than inspecting the
+    literal components, because two textual shortcuts both produce false
+    negatives that were verified to still abort bwrap:
+
+    - ``normpath`` collapses ``link/..`` and would erase the very
+      component to inspect, so ``/home/u/link/../x`` would look clean.
+      Hence ``..`` is applied to the *resolved* prefix as we go.
+    - a **relative** link may point at an **absolute** one
+      (``rel -> abs`` where ``abs -> /mnt/c/...``). Checking only each
+      literal component's immediate target would clear ``rel`` and never
+      look at ``abs``. Hence relative targets are spliced into the
+      remaining components and the walk continues through them.
+
+    ``max_links`` bounds symlink-loop resolution the way the kernel's
+    ``ELOOP`` limit does; hitting it returns ``None`` so a pathological
+    entry is passed through untouched instead of hanging.
     """
     if not os.path.isabs(path):
         return None
-    prefix = os.sep
-    for part in path.split(os.sep):
-        if not part or part == os.curdir:
+    remaining = [p for p in path.split(os.sep) if p and p != os.curdir]
+    resolved = os.sep
+    followed = 0
+    while remaining:
+        part = remaining.pop(0)
+        if part == os.pardir:
+            resolved = os.path.dirname(resolved) or os.sep
             continue
-        prefix = os.path.join(prefix, part)
+        candidate = os.path.join(resolved, part)
         try:
-            if islink_fn(prefix) and os.path.isabs(readlink_fn(prefix)):
-                return prefix
+            if not islink_fn(candidate):
+                resolved = candidate
+                continue
+            target = readlink_fn(candidate)
         except OSError:
             # Unreadable / racing component: not something we can
             # canonicalize, so leave the operator's entry untouched.
             return None
+        if os.path.isabs(target):
+            return candidate
+        followed += 1
+        if followed > max_links:
+            return None
+        # Relative link: resolution continues from the link's parent,
+        # which ``resolved`` already is.
+        remaining = [
+            p for p in target.split(os.sep) if p and p != os.curdir
+        ] + remaining
     return None
 
 

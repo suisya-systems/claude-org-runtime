@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -123,6 +124,109 @@ def test_absolute_symlink_in_chain_tolerates_redundant_separators(
         f"{escaping_home}//.aws/./config"
     )
     assert hit == str(escaping_home / ".aws")
+
+
+def test_absolute_symlink_reached_through_relative_link(
+    tmp_path: Path,
+) -> None:
+    """A relative link pointing at an absolute one still breaks bwrap.
+
+    Verified directly against bubblewrap 0.6.1: binding through
+    ``rel -> abs -> /elsewhere`` aborts the launch, while a purely
+    relative chain succeeds. A per-component check of each *literal*
+    name would clear ``rel`` and never inspect ``abs``.
+    """
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "abs_link").symlink_to(external)  # absolute
+    (tmp_path / "rel_link").symlink_to(Path("abs_link"))  # relative -> absolute
+
+    hit = generator._absolute_symlink_in_chain(
+        str(tmp_path / "rel_link" / "config")
+    )
+    assert hit == str(tmp_path / "abs_link")
+
+
+def test_purely_relative_chain_stays_clean(tmp_path: Path) -> None:
+    """Control for the case above: relative-only chains are bwrap-safe."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "hop") .symlink_to(Path("external"))
+    (tmp_path / "rel_link").symlink_to(Path("hop"))
+    assert (
+        generator._absolute_symlink_in_chain(str(tmp_path / "rel_link" / "c"))
+        is None
+    )
+
+
+def test_absolute_symlink_in_chain_bounds_symlink_loops(
+    tmp_path: Path,
+) -> None:
+    """A relative symlink loop must terminate rather than spin."""
+    (tmp_path / "a").symlink_to(Path("b"))
+    (tmp_path / "b").symlink_to(Path("a"))
+    assert generator._absolute_symlink_in_chain(str(tmp_path / "a")) is None
+
+
+@pytest.mark.skipif(
+    shutil.which("bwrap") is None, reason="bubblewrap not installed"
+)
+def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
+    """Oracle test: the detector's verdict must match bubblewrap's.
+
+    The whole fix rests on one empirical claim -- that an absolute
+    symlink in the resolved chain is exactly what makes bwrap abort.
+    This pins that claim to the real binary instead of to our reading of
+    it, so a wrong refinement of the walk fails here rather than silently
+    disabling workers' sandboxes again.
+    """
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "config").write_text("", encoding="utf-8")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config").write_text("", encoding="utf-8")
+    (tmp_path / "abs_link").symlink_to(external)
+    (tmp_path / "rel_link").symlink_to(Path("abs_link"))
+    (tmp_path / "rel_only").symlink_to(Path("external"))
+
+    cases = [
+        plain / "config",
+        tmp_path / "abs_link" / "config",
+        tmp_path / "rel_link" / "config",
+        tmp_path / "rel_only" / "config",
+        tmp_path / "abs_link" / ".." / "external" / "config",
+    ]
+    for case in cases:
+        detected = generator._absolute_symlink_in_chain(str(case)) is not None
+        proc = subprocess.run(
+            [
+                "bwrap", "--ro-bind", "/", "/", "--proc", "/proc",
+                "--dev", "/dev", "--ro-bind", "/dev/null", str(case), "true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert detected == (proc.returncode != 0), (
+            f"{case}: detector={detected} but bwrap rc={proc.returncode} "
+            f"({proc.stderr.strip()})"
+        )
+
+
+def test_canonicalize_permission_deny_handles_write_rules(
+    escaping_home: Path, tmp_path: Path
+) -> None:
+    """``Write(...)`` is a Layer 2 path deny in this repo's schema."""
+    out, rewrites = generator._canonicalize_permission_deny(
+        ["Write(~/.aws/*)", "Write(*/workers/*/settings.local.json)"]
+    )
+    external = tmp_path / "external" / ".aws"
+    assert out == [
+        f"Write(//{str(external).lstrip('/')}/*)",
+        "Write(*/workers/*/settings.local.json)",
+    ]
+    assert len(rewrites) == 1
 
 
 # ---------------------------------------------------------------------------
