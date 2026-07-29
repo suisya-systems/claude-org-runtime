@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -80,6 +81,23 @@ requires_bwrap = pytest.mark.skipif(
 )
 
 
+def _set_fake_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    """Point ``~`` at ``home`` on every platform.
+
+    ``ntpath.expanduser`` never looks at ``HOME``: it reads
+    ``USERPROFILE``, falling back to ``HOMEDRIVE`` + ``HOMEPATH``. Setting
+    only ``HOME`` therefore redirects ``~`` on POSIX while leaving Windows
+    pointed at the real profile directory, which would quietly turn these
+    tests into assertions about the developer's own home.
+    """
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    drive, tail = os.path.splitdrive(str(home))
+    monkeypatch.setenv("HOMEDRIVE", drive)
+    monkeypatch.setenv("HOMEPATH", tail or str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+
 def _link_to_dir(link: Path, target: Path) -> None:
     """Create a *directory* symlink.
 
@@ -112,8 +130,7 @@ def escaping_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (home / ".ssh").mkdir()
     (home / ".ssh" / "known_hosts").write_text("", encoding="utf-8")
 
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _set_fake_home(monkeypatch, home)
     return home
 
 
@@ -1064,7 +1081,7 @@ def test_any_scope_enabling_the_sandbox_keeps_the_gate(
 def test_discover_merged_scopes_only_returns_existing_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _set_fake_home(monkeypatch, tmp_path)
     monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
     assert sandbox_doctor.discover_merged_scopes() == []
 
@@ -1084,7 +1101,7 @@ def test_discover_merged_scopes_adds_the_sibling_project_scope(
     Claude Code unions both, so pointing --settings at one must not leave
     the other unaudited.
     """
-    monkeypatch.setenv("HOME", str(tmp_path / "nowhere"))
+    _set_fake_home(monkeypatch, tmp_path / "nowhere")
     monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
     project = tmp_path / "proj" / ".claude"
     project.mkdir(parents=True)
@@ -1101,7 +1118,7 @@ def test_discover_merged_scopes_adds_the_sibling_project_scope(
 def test_discover_merged_scopes_does_not_duplicate_the_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path / "nowhere"))
+    _set_fake_home(monkeypatch, tmp_path / "nowhere")
     monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
     project = tmp_path / ".claude"
     project.mkdir()
