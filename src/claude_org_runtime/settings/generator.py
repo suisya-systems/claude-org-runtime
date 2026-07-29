@@ -681,14 +681,26 @@ def _canonicalize_sandbox_deny(
     sandbox read roots, but an entry can cross an absolute symlink and
     still land inside them (e.g. a symlinked worker_dir). Those are kept
     and would break bwrap just the same, so they are canonicalized here.
+
+    ``~/``-anchored raw strings are expanded before the check. Claude
+    Code resolves that prefix against the home directory when building
+    the deny set (per its documented sandbox path prefixes), so
+    ``~/.aws/**`` reaches bwrap as an escaping absolute path even though
+    the *authored* string does not start with ``/``.
     """
     out: list = []
     rewrites: list[SandboxPathRewrite] = []
     for entry in entries:
-        if not isinstance(entry, str) or not entry.startswith("/"):
+        if not isinstance(entry, str):
             out.append(entry)
             continue
-        result = _canonicalize_escaping_path(entry, realpath_fn=realpath_fn)
+        probe = entry
+        if probe.startswith("~/"):
+            probe = os.path.expanduser("~") + probe[1:]
+        if not probe.startswith("/"):
+            out.append(entry)
+            continue
+        result = _canonicalize_escaping_path(probe, realpath_fn=realpath_fn)
         if result is None:
             out.append(entry)
             continue
@@ -956,16 +968,48 @@ def _evaluate_sandbox_suppressions(
                     sandbox_read_roots=tuple(read_roots),
                 )
             )
-        canonical, rewrites = _canonicalize_sandbox_deny(
-            kept,
-            f"sandbox.filesystem.{layer_key}",
-            realpath_fn=realpath_fn,
-        )
-        metadata.rewrites.extend(rewrites)
-        new_fs[layer_key] = canonical
+        new_fs[layer_key] = kept
 
     new_sandbox = {**sandbox, "filesystem": new_fs}
     return new_sandbox, metadata
+
+
+def _canonicalize_sandbox_filesystem(
+    sandbox: Any,
+    *,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+) -> tuple[Any, list[SandboxPathRewrite]]:
+    """Canonicalize Layer 3 deny entries irrespective of ``enabled``.
+
+    Deliberately not gated on ``sandbox.enabled``: Claude Code unions the
+    deny arrays across settings scopes independently of which scope turns
+    the sandbox on, so entries rendered under a locally-disabled sandbox
+    still reach bwrap once any other scope enables it. This is the same
+    reasoning that keeps Layer 2 canonicalization ungated; running one
+    layer conditionally and the other unconditionally left an escaping
+    path in the rendered file.
+    """
+    if not isinstance(sandbox, dict):
+        return sandbox, []
+    fs = sandbox.get("filesystem")
+    if not isinstance(fs, dict):
+        return sandbox, []
+    rewrites: list[SandboxPathRewrite] = []
+    new_fs = dict(fs)
+    for layer_key in ("denyRead", "denyWrite"):
+        entries = fs.get(layer_key)
+        if not isinstance(entries, list):
+            continue
+        canonical, layer_rewrites = _canonicalize_sandbox_deny(
+            entries,
+            f"sandbox.filesystem.{layer_key}",
+            realpath_fn=realpath_fn,
+        )
+        rewrites.extend(layer_rewrites)
+        new_fs[layer_key] = canonical
+    if not rewrites:
+        return sandbox, []
+    return {**sandbox, "filesystem": new_fs}, rewrites
 
 
 def _format_entry_for_comment(entry: Any) -> str:
@@ -1278,10 +1322,18 @@ def render_role_with_metadata(
     else:
         metadata = SandboxMetadata(wsl_detected=wsl_detector())
 
-    # Layer 2 canonicalization runs whether or not *this role* declares a
-    # sandbox: Claude Code merges permissions.deny into the bwrap deny set
-    # of whatever sandbox is in effect, which may be enabled by user or
-    # managed settings rather than by the rendered role.
+    # Both layers are canonicalized whether or not *this role* enables a
+    # sandbox: Claude Code merges permissions.deny and the Layer 3 deny
+    # arrays into the bwrap deny set of whatever sandbox is in effect,
+    # which may be enabled by user or managed settings rather than by the
+    # rendered role.
+    canonical_sandbox, sandbox_rewrites = _canonicalize_sandbox_filesystem(
+        rendered.get("sandbox"), realpath_fn=realpath_fn
+    )
+    if sandbox_rewrites:
+        rendered["sandbox"] = canonical_sandbox
+        metadata.rewrites.extend(sandbox_rewrites)
+
     permissions = rendered.get("permissions")
     if isinstance(permissions, dict) and isinstance(permissions.get("deny"), list):
         canonical_deny, deny_rewrites = _canonicalize_permission_deny(

@@ -413,6 +413,59 @@ def test_canonicalize_sandbox_deny_rewrites_kept_entry(
     assert rewrites[0].layer == "sandbox.filesystem.denyRead"
 
 
+def test_canonicalize_sandbox_deny_expands_tilde_entries(
+    escaping_home: Path, tmp_path: Path
+) -> None:
+    """``~/`` Layer 3 raw strings reach bwrap expanded, so check them expanded.
+
+    The authored string does not start with ``/``, but Claude Code
+    resolves the prefix against the home directory when building the deny
+    set, so a tilde entry over a symlinked directory is just as fatal.
+    """
+    out, rewrites = generator._canonicalize_sandbox_deny(
+        ["~/.aws/**", "~/.ssh/**"], "sandbox.filesystem.denyRead"
+    )
+    external = tmp_path / "external" / ".aws"
+    assert out == [f"{external}/**", "~/.ssh/**"]
+    assert len(rewrites) == 1
+
+
+def _sandbox_role_schema(deny: list, *, enabled: bool) -> dict:
+    return {
+        "worker_roles": {
+            "demo": {
+                "sandbox": {
+                    "enabled": enabled,
+                    "filesystem": {"denyRead": deny, "denyWrite": []},
+                }
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_layer3_canonicalized_regardless_of_enabled(
+    escaping_home: Path, tmp_path: Path, enabled: bool
+) -> None:
+    """Deny arrays merge across scopes independently of who enables the sandbox.
+
+    An entry rendered under a locally-disabled sandbox still reaches
+    bwrap once another scope turns the sandbox on, so gating the rewrite
+    on the local flag would leave an escaping path in the file.
+    """
+    result = generator.render_role_with_metadata(
+        _sandbox_role_schema(["~/.aws/**"], enabled=enabled),
+        role="demo",
+        worker_dir=str(tmp_path / "wd"),
+        claude_org_path=str(tmp_path / "co"),
+    )
+    external = tmp_path / "external" / ".aws"
+    assert result.settings["sandbox"]["filesystem"]["denyRead"] == [
+        f"{external}/**"
+    ]
+    assert len(result.sandbox.rewrites) == 1
+
+
 def test_canonicalize_sandbox_deny_leaves_structured_entries(
     escaping_home: Path,
 ) -> None:
