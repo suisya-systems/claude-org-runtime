@@ -598,6 +598,7 @@ def _canonicalize_escaping_path(
     absolute_path: str,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
+    symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[str, str, str] | None:
     """Rewrite a deny path whose chain crosses an absolute symlink.
 
@@ -605,11 +606,19 @@ def _canonicalize_escaping_path(
     ``None`` when the path is already bwrap-safe. The glob tail is
     preserved verbatim: only the leading literal prefix (the part
     ``realpath`` can meaningfully resolve) is canonicalized.
+
+    ``symlink_probe_fn`` is the second half of the filesystem seam that
+    ``realpath_fn`` opens. Both must describe the *same* world: a caller
+    that injects a fake ``realpath_fn`` to simulate a symlinked layout
+    but leaves the probe reading the real filesystem gets a half-real
+    answer whose outcome depends on the host it runs on. Defaults to the
+    real probe, resolved at call time so it stays monkeypatchable.
     """
+    probe = symlink_probe_fn or _absolute_symlink_in_chain
     literal = _literal_path_prefix(absolute_path)
     if literal is None:
         return None
-    link = _absolute_symlink_in_chain(literal)
+    link = probe(literal)
     if link is None:
         return None
     resolved = realpath_fn(literal)
@@ -635,6 +644,7 @@ def _canonicalize_permission_deny(
     deny: list,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
+    symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[list, list[SandboxPathRewrite]]:
     """Canonicalize Layer 2 ``permissions.deny`` ``Read`` / ``Edit`` rules.
 
@@ -659,7 +669,9 @@ def _canonicalize_permission_deny(
         if target is None:
             out.append(rule)
             continue
-        result = _canonicalize_escaping_path(target, realpath_fn=realpath_fn)
+        result = _canonicalize_escaping_path(
+            target, realpath_fn=realpath_fn, symlink_probe_fn=symlink_probe_fn
+        )
         if result is None:
             out.append(rule)
             continue
@@ -683,6 +695,7 @@ def _canonicalize_sandbox_deny(
     layer: str,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
+    symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[list, list[SandboxPathRewrite]]:
     """Canonicalize *kept* Layer 3 deny entries.
 
@@ -709,7 +722,9 @@ def _canonicalize_sandbox_deny(
         if not probe.startswith("/"):
             out.append(entry)
             continue
-        result = _canonicalize_escaping_path(probe, realpath_fn=realpath_fn)
+        result = _canonicalize_escaping_path(
+            probe, realpath_fn=realpath_fn, symlink_probe_fn=symlink_probe_fn
+        )
         if result is None:
             out.append(entry)
             continue
@@ -987,6 +1002,7 @@ def _canonicalize_sandbox_filesystem(
     sandbox: Any,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
+    symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[Any, list[SandboxPathRewrite]]:
     """Canonicalize Layer 3 deny entries irrespective of ``enabled``.
 
@@ -1013,6 +1029,7 @@ def _canonicalize_sandbox_filesystem(
             entries,
             f"sandbox.filesystem.{layer_key}",
             realpath_fn=realpath_fn,
+            symlink_probe_fn=symlink_probe_fn,
         )
         rewrites.extend(layer_rewrites)
         new_fs[layer_key] = canonical
@@ -1246,6 +1263,7 @@ def render_role_with_metadata(
     pattern: str | None = None,
     realpath_fn: Callable[[str], str] = os.path.realpath,
     wsl_detector: Callable[[], bool] = _detect_wsl,
+    symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> RenderResult:
     """Render the per-role ``settings.local.json`` plus suppression metadata.
 
@@ -1337,7 +1355,9 @@ def render_role_with_metadata(
     # which may be enabled by user or managed settings rather than by the
     # rendered role.
     canonical_sandbox, sandbox_rewrites = _canonicalize_sandbox_filesystem(
-        rendered.get("sandbox"), realpath_fn=realpath_fn
+        rendered.get("sandbox"),
+        realpath_fn=realpath_fn,
+        symlink_probe_fn=symlink_probe_fn,
     )
     if sandbox_rewrites:
         rendered["sandbox"] = canonical_sandbox
@@ -1346,7 +1366,9 @@ def render_role_with_metadata(
     permissions = rendered.get("permissions")
     if isinstance(permissions, dict) and isinstance(permissions.get("deny"), list):
         canonical_deny, deny_rewrites = _canonicalize_permission_deny(
-            permissions["deny"], realpath_fn=realpath_fn
+            permissions["deny"],
+            realpath_fn=realpath_fn,
+            symlink_probe_fn=symlink_probe_fn,
         )
         if deny_rewrites:
             rendered["permissions"] = {**permissions, "deny": canonical_deny}
