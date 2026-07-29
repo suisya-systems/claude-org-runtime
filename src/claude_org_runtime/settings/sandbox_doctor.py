@@ -65,6 +65,26 @@ CANARY_FAIL = "fail"
 CANARY_SKIPPED = "skipped"
 
 
+# Settings scopes Claude Code merges besides the file under test. The deny
+# arrays are unioned across every scope, so a symlinked path in any one of
+# them aborts the launch no matter how clean the rendered worker file is.
+# Checking the worker file alone would hand out a clean bill of health for
+# a sandbox that cannot start.
+USER_SETTINGS_PATH = "~/.claude/settings.json"
+MANAGED_SETTINGS_PATHS = (
+    "/etc/claude-code/managed-settings.json",
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+)
+
+
+@dataclass(frozen=True)
+class SettingsSource:
+    """One settings file participating in the merge."""
+
+    label: str
+    settings: dict
+
+
 @dataclass(frozen=True)
 class DenyTarget:
     """One concrete host path the settings contribute to the deny set."""
@@ -72,6 +92,7 @@ class DenyTarget:
     layer: str  # "permissions.deny" | "sandbox.filesystem.denyRead" | ...
     source: Any  # the original rule / entry as authored
     path: str  # absolute host path (glob tail included)
+    source_file: str = ""  # which settings scope contributed it
 
 
 @dataclass(frozen=True)
@@ -84,6 +105,7 @@ class Finding:
     status: str
     detail: str
     suggestion: str | None = None
+    source_file: str = ""
 
     def to_jsonable(self) -> dict:
         return {
@@ -93,6 +115,7 @@ class Finding:
             "status": self.status,
             "detail": self.detail,
             "suggestion": self.suggestion,
+            "source_file": self.source_file,
         }
 
 
@@ -170,7 +193,9 @@ def validate_settings(settings: Any) -> str | None:
     return None
 
 
-def collect_deny_targets(settings: dict) -> list[DenyTarget]:
+def collect_deny_targets(
+    settings: dict, *, source_file: str = ""
+) -> list[DenyTarget]:
     """Collect every deny path ``settings`` contributes to the sandbox.
 
     Both layers are collected because Claude Code merges them: per
@@ -190,7 +215,12 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
         for rule in permissions.get("deny") or []:
             if not isinstance(rule, str):
                 targets.append(
-                    DenyTarget(layer="permissions.deny", source=rule, path="")
+                    DenyTarget(
+                        layer="permissions.deny",
+                        source=rule,
+                        path="",
+                        source_file=source_file,
+                    )
                 )
                 continue
             parsed = _split_permission_rule(rule)
@@ -203,7 +233,12 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
             if host_path is None:
                 continue
             targets.append(
-                DenyTarget(layer="permissions.deny", source=rule, path=host_path)
+                DenyTarget(
+                    layer="permissions.deny",
+                    source=rule,
+                    path=host_path,
+                    source_file=source_file,
+                )
             )
 
     sandbox = settings.get("sandbox")
@@ -222,6 +257,7 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
                                 layer=f"sandbox.filesystem.{key}",
                                 source=entry,
                                 path="",
+                                source_file=source_file,
                             )
                         )
                         continue
@@ -235,6 +271,7 @@ def collect_deny_targets(settings: dict) -> list[DenyTarget]:
                             layer=f"sandbox.filesystem.{key}",
                             source=entry,
                             path=path,
+                            source_file=source_file,
                         )
                     )
 
@@ -257,6 +294,7 @@ def analyze_targets(targets: list[DenyTarget]) -> list[Finding]:
                         "be verified; a rendered settings file should contain "
                         "only string deny entries"
                     ),
+                    source_file=target.source_file,
                 )
             )
             continue
@@ -269,6 +307,7 @@ def analyze_targets(targets: list[DenyTarget]) -> list[Finding]:
                     path=target.path,
                     status=STATUS_OK,
                     detail="no anchored literal prefix; not expanded to a host path",
+                    source_file=target.source_file,
                 )
             )
             continue
@@ -281,6 +320,7 @@ def analyze_targets(targets: list[DenyTarget]) -> list[Finding]:
                     path=target.path,
                     status=STATUS_OK,
                     detail="no absolute symlink in the path chain",
+                    source_file=target.source_file,
                 )
             )
             continue
@@ -298,6 +338,7 @@ def analyze_targets(targets: list[DenyTarget]) -> list[Finding]:
                     "the sandbox launch"
                 ),
                 suggestion=rewritten,
+                source_file=target.source_file,
             )
         )
     return findings
@@ -371,15 +412,50 @@ def diagnose(
     probe_bwrap: bool = True,
     runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
 ) -> DoctorReport:
-    """Run the full preflight against a parsed settings mapping."""
-    sandbox = settings.get("sandbox")
-    # Only an *explicit* disable downgrades the gate. An absent key is
-    # treated as unknown rather than off, because user or managed settings
-    # can enable the sandbox for a role that never mentions it.
-    sandbox_disabled = (
-        isinstance(sandbox, dict) and sandbox.get("enabled") is False
+    """Run the full preflight against a single parsed settings mapping."""
+    return diagnose_sources(
+        [SettingsSource(label="", settings=settings)],
+        probe_bwrap=probe_bwrap,
+        runner=runner,
     )
-    targets = collect_deny_targets(settings)
+
+
+def diagnose_sources(
+    sources: list[SettingsSource],
+    *,
+    probe_bwrap: bool = True,
+    runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+) -> DoctorReport:
+    """Run the preflight against the *merged* deny set of every scope.
+
+    Claude Code unions the deny arrays across settings scopes, so a
+    symlinked path contributed by ``~/.claude/settings.json`` or by
+    managed settings aborts the launch no matter how clean the rendered
+    worker file is. Checking one file in isolation would report a clean
+    preflight for a sandbox that cannot start -- exactly the silent
+    failure this command exists to catch.
+
+    ``sandbox.enabled`` is resolved conservatively: the gate is only
+    relaxed when no scope enables the sandbox and at least one explicitly
+    disables it. Any scope turning it on means a launch can be aborted.
+    """
+    enabled_anywhere = False
+    disabled_anywhere = False
+    for source in sources:
+        sandbox = source.settings.get("sandbox")
+        if not isinstance(sandbox, dict):
+            continue
+        if sandbox.get("enabled") is True:
+            enabled_anywhere = True
+        elif sandbox.get("enabled") is False:
+            disabled_anywhere = True
+    sandbox_disabled = disabled_anywhere and not enabled_anywhere
+
+    targets: list[DenyTarget] = []
+    for source in sources:
+        targets.extend(
+            collect_deny_targets(source.settings, source_file=source.label)
+        )
     findings = analyze_targets(targets)
     if sandbox_disabled:
         status, detail = (
@@ -398,6 +474,43 @@ def diagnose(
     )
 
 
+def load_source(path: Path) -> tuple[SettingsSource | None, str | None]:
+    """Load and shape-validate one settings file.
+
+    Returns ``(source, error)``; exactly one is non-``None``.
+    """
+    try:
+        with Path(path).open(encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except FileNotFoundError:
+        return None, f"settings not found: {path}"
+    except OSError as exc:
+        return None, f"could not read {path}: {exc}"
+    except json.JSONDecodeError as exc:
+        return None, f"{path} is not valid JSON: {exc}"
+    invalid = validate_settings(settings)
+    if invalid is not None:
+        return None, f"{path}: {invalid}"
+    return SettingsSource(label=str(path), settings=settings), None
+
+
+def discover_merged_scopes() -> list[Path]:
+    """Settings scopes that merge into the effective deny set, if present.
+
+    Only files that exist are returned, so a machine without managed
+    settings simply contributes fewer scopes rather than erroring.
+    """
+    found: list[Path] = []
+    user = Path(os.path.expanduser(USER_SETTINGS_PATH))
+    if user.is_file():
+        found.append(user)
+    for candidate in MANAGED_SETTINGS_PATHS:
+        managed = Path(candidate)
+        if managed.is_file():
+            found.append(managed)
+    return found
+
+
 def format_report(report: DoctorReport, *, verbose: bool = False) -> str:
     """Human-readable rendering of a :class:`DoctorReport`."""
     lines: list[str] = []
@@ -409,6 +522,8 @@ def format_report(report: DoctorReport, *, verbose: bool = False) -> str:
     for f in shown:
         marker = "ok " if f.status == STATUS_OK else "FAIL"
         lines.append(f"  [{marker}] {f.layer}: {f.source}")
+        if f.source_file:
+            lines.append(f"         from: {f.source_file}")
         lines.append(f"         path: {f.path}")
         lines.append(f"         {f.detail}")
         if f.suggestion:
@@ -456,8 +571,26 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--settings",
         type=Path,
+        action="append",
         required=True,
-        help="path to the settings.local.json to check",
+        dest="settings",
+        metavar="PATH",
+        help=(
+            "settings file to check; repeat to add more scopes. Their deny "
+            "sets are merged the way Claude Code merges them."
+        ),
+    )
+    parser.add_argument(
+        "--no-merge-scopes",
+        dest="merge_scopes",
+        action="store_false",
+        default=True,
+        help=(
+            "check only the files given with --settings. By default the "
+            "user settings (~/.claude/settings.json) and managed settings "
+            "are merged in too, because a deny path in any scope aborts "
+            "the sandbox launch."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -482,21 +615,29 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    try:
-        with Path(args.settings).open(encoding="utf-8") as fh:
-            settings = json.load(fh)
-    except FileNotFoundError:
-        print(f"error: settings not found: {args.settings}", file=sys.stderr)
-        return 2
-    except json.JSONDecodeError as exc:
-        print(f"error: settings is not valid JSON: {exc}", file=sys.stderr)
-        return 2
-    invalid = validate_settings(settings)
-    if invalid is not None:
-        print(f"error: {invalid}", file=sys.stderr)
-        return 2
+    requested = args.settings
+    if not isinstance(requested, list):
+        requested = [requested]
 
-    report = diagnose(settings, probe_bwrap=getattr(args, "probe_bwrap", True))
+    paths = [Path(p) for p in requested]
+    if getattr(args, "merge_scopes", True):
+        resolved = {Path(p).resolve() for p in paths}
+        for extra in discover_merged_scopes():
+            if extra.resolve() not in resolved:
+                paths.append(extra)
+
+    sources: list[SettingsSource] = []
+    for path in paths:
+        source, error = load_source(path)
+        if error is not None:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        assert source is not None
+        sources.append(source)
+
+    report = diagnose_sources(
+        sources, probe_bwrap=getattr(args, "probe_bwrap", True)
+    )
     if getattr(args, "json", False):
         sys.stdout.write(
             json.dumps(report.to_jsonable(), indent=2, ensure_ascii=False) + "\n"

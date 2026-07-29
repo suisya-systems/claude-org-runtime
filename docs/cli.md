@@ -228,10 +228,21 @@ claude-org-runtime sandbox doctor --settings path/to/settings.local.json
 
 | Flag | Description |
 |------|-------------|
-| `--settings PATH` | Settings file to check. Required. |
+| `--settings PATH` | Settings file to check. Required; repeat to add scopes. |
+| `--no-merge-scopes` | Check only the given files; skip user / managed settings. |
 | `--json` | Machine-readable report instead of the text one. |
 | `--verbose` | List every deny target, not just failing ones. |
 | `--no-probe-bwrap` | Static analysis only; skip the live bwrap canary. |
+
+By default the user settings (`~/.claude/settings.json`) and managed
+settings are merged in alongside the given file, because Claude Code
+unions the deny arrays across scopes: a symlinked path in *any* scope
+aborts the launch no matter how clean the rendered worker file is.
+Checking the worker file alone would report a clean preflight for a
+sandbox that cannot start. Each finding names the file that contributed
+it, so the fix lands in the right place. `sandbox.enabled` is resolved
+conservatively — the gate relaxes only when no scope enables the sandbox
+and at least one explicitly disables it.
 
 It does two independent checks:
 

@@ -652,7 +652,11 @@ def test_doctor_cli_exit_1_on_escape(
 ) -> None:
     path = _write_settings(tmp_path, _settings_with_deny(["Read(~/.aws/*)"]))
     args = SimpleNamespace(
-        settings=path, json=False, verbose=False, probe_bwrap=False
+        settings=[path],
+        json=False,
+        verbose=False,
+        probe_bwrap=False,
+        merge_scopes=False,
     )
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -664,7 +668,11 @@ def test_doctor_cli_exit_1_on_escape(
 def test_doctor_cli_exit_0_on_clean(escaping_home: Path, tmp_path: Path) -> None:
     path = _write_settings(tmp_path, _settings_with_deny(["Read(~/.ssh/*)"]))
     args = SimpleNamespace(
-        settings=path, json=False, verbose=False, probe_bwrap=False
+        settings=[path],
+        json=False,
+        verbose=False,
+        probe_bwrap=False,
+        merge_scopes=False,
     )
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -688,10 +696,11 @@ def test_doctor_cli_json_output(escaping_home: Path, tmp_path: Path) -> None:
 
 def test_doctor_cli_missing_file(tmp_path: Path) -> None:
     args = SimpleNamespace(
-        settings=tmp_path / "nope.json",
+        settings=[tmp_path / "nope.json"],
         json=False,
         verbose=False,
         probe_bwrap=False,
+        merge_scopes=False,
     )
     assert sandbox_doctor.run(args) == 2
 
@@ -700,7 +709,11 @@ def test_doctor_cli_invalid_json(tmp_path: Path) -> None:
     path = tmp_path / "bad.json"
     path.write_text("{not json", encoding="utf-8")
     args = SimpleNamespace(
-        settings=path, json=False, verbose=False, probe_bwrap=False
+        settings=[path],
+        json=False,
+        verbose=False,
+        probe_bwrap=False,
+        merge_scopes=False,
     )
     assert sandbox_doctor.run(args) == 2
 
@@ -709,7 +722,11 @@ def test_doctor_cli_non_object_root(tmp_path: Path) -> None:
     path = tmp_path / "list.json"
     path.write_text("[]", encoding="utf-8")
     args = SimpleNamespace(
-        settings=path, json=False, verbose=False, probe_bwrap=False
+        settings=[path],
+        json=False,
+        verbose=False,
+        probe_bwrap=False,
+        merge_scopes=False,
     )
     assert sandbox_doctor.run(args) == 2
 
@@ -782,7 +799,11 @@ def test_deny_as_bare_string_exits_2_not_0(
         tmp_path, {"permissions": {"deny": "Read(~/.aws/*)"}}
     )
     args = SimpleNamespace(
-        settings=path, json=False, verbose=False, probe_bwrap=False
+        settings=[path],
+        json=False,
+        verbose=False,
+        probe_bwrap=False,
+        merge_scopes=False,
     )
     assert sandbox_doctor.run(args) == 2
 
@@ -804,9 +825,148 @@ def test_unified_cli_wires_sandbox_doctor(
     path = _write_settings(tmp_path, _settings_with_deny(["Read(~/.aws/*)"]))
     parser = runtime_cli.build_parser()
     args = parser.parse_args(
-        ["sandbox", "doctor", "--settings", str(path), "--no-probe-bwrap"]
+        [
+            "sandbox", "doctor", "--settings", str(path),
+            "--no-probe-bwrap", "--no-merge-scopes",
+        ]
     )
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = args.func(args)
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# multi-scope merge
+# ---------------------------------------------------------------------------
+
+
+def test_merged_scopes_catch_a_clean_file_with_a_dirty_user_scope(
+    escaping_home: Path,
+) -> None:
+    """A clean worker file must not pass when another scope is broken.
+
+    Claude Code unions the deny arrays across scopes, so a symlinked path
+    in ``~/.claude/settings.json`` aborts the launch regardless of how
+    clean the rendered worker file is. Checking the worker file alone is
+    exactly the false-clean this command exists to prevent.
+    """
+    worker = sandbox_doctor.SettingsSource(
+        label="worker", settings=_settings_with_deny(["Read(~/.ssh/*)"])
+    )
+    user = sandbox_doctor.SettingsSource(
+        label="user", settings={"sandbox": {"filesystem": {"denyRead": ["~/.aws"]}}}
+    )
+
+    assert sandbox_doctor.diagnose_sources([worker], probe_bwrap=False).ok
+    merged = sandbox_doctor.diagnose_sources([worker, user], probe_bwrap=False)
+    assert not merged.ok
+    assert merged.failures[0].source_file == "user"
+
+
+def test_findings_name_the_contributing_file(escaping_home: Path) -> None:
+    report = sandbox_doctor.diagnose_sources(
+        [
+            sandbox_doctor.SettingsSource(
+                label="/etc/managed.json",
+                settings=_settings_with_deny(["Read(~/.aws/*)"]),
+            )
+        ],
+        probe_bwrap=False,
+    )
+    assert "/etc/managed.json" in sandbox_doctor.format_report(report)
+
+
+def test_any_scope_enabling_the_sandbox_keeps_the_gate(
+    escaping_home: Path,
+) -> None:
+    """Disabled locally + enabled by another scope still gates."""
+    local = sandbox_doctor.SettingsSource(
+        label="worker",
+        settings={
+            "permissions": {"deny": ["Read(~/.aws/*)"]},
+            "sandbox": {"enabled": False},
+        },
+    )
+    user = sandbox_doctor.SettingsSource(
+        label="user", settings={"sandbox": {"enabled": True}}
+    )
+    report = sandbox_doctor.diagnose_sources([local, user], probe_bwrap=False)
+    assert report.sandbox_disabled is False
+    assert not report.ok
+
+
+def test_discover_merged_scopes_only_returns_existing_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sandbox_doctor, "MANAGED_SETTINGS_PATHS", ())
+    assert sandbox_doctor.discover_merged_scopes() == []
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text("{}", encoding="utf-8")
+    assert sandbox_doctor.discover_merged_scopes() == [
+        claude_dir / "settings.json"
+    ]
+
+
+def test_cli_merges_extra_scopes_and_reports_the_source(
+    escaping_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _write_settings(tmp_path, _settings_with_deny(["Read(~/.ssh/*)"]))
+    extra = tmp_path / "user-settings.json"
+    extra.write_text(
+        json.dumps({"sandbox": {"enabled": True, "filesystem": {"denyRead": ["~/.aws"]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sandbox_doctor, "discover_merged_scopes", lambda: [extra]
+    )
+    args = SimpleNamespace(
+        settings=[worker], json=True, verbose=False, probe_bwrap=False,
+        merge_scopes=True,
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = sandbox_doctor.run(args)
+    payload = json.loads(buf.getvalue())
+    assert rc == 1
+    failing = [
+        f
+        for f in payload["findings"]
+        if f["status"] == sandbox_doctor.STATUS_SYMLINK_ESCAPE
+    ]
+    assert len(failing) == 1
+    assert failing[0]["source_file"] == str(extra)
+
+
+def test_cli_no_merge_scopes_skips_discovery(
+    escaping_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _write_settings(tmp_path, _settings_with_deny(["Read(~/.ssh/*)"]))
+    monkeypatch.setattr(
+        sandbox_doctor,
+        "discover_merged_scopes",
+        lambda: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+    args = SimpleNamespace(
+        settings=[worker], json=False, verbose=False, probe_bwrap=False,
+        merge_scopes=False,
+    )
+    with redirect_stdout(io.StringIO()):
+        assert sandbox_doctor.run(args) == 0
+
+
+def test_cli_reports_which_scope_is_malformed(
+    escaping_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _write_settings(tmp_path, _settings_with_deny([]))
+    bad = tmp_path / "bad-scope.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(sandbox_doctor, "discover_merged_scopes", lambda: [bad])
+    args = SimpleNamespace(
+        settings=[worker], json=False, verbose=False, probe_bwrap=False,
+        merge_scopes=True,
+    )
+    assert sandbox_doctor.run(args) == 2
