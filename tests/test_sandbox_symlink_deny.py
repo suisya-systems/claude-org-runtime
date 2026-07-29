@@ -50,6 +50,8 @@ requires_symlinks = pytest.mark.skipif(
     not SYMLINKS_SUPPORTED,
     reason="host cannot create symlinks (Windows without Developer Mode)",
 )
+
+
 def _bwrap_works() -> bool:
     """Whether bwrap is present *and* able to start on this host.
 
@@ -271,6 +273,7 @@ def test_absolute_symlink_in_chain_walks_windows_drive_paths(
 
 
 @requires_bwrap
+@requires_symlinks
 def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
     """Oracle test: the detector's verdict must match bubblewrap's.
 
@@ -320,6 +323,7 @@ def test_detector_agrees_with_real_bwrap(tmp_path: Path) -> None:
 
 
 @requires_bwrap
+@requires_symlinks
 def test_shadowing_mount_hides_the_symlink_failure(tmp_path: Path) -> None:
     """A mount over the region makes the same deny path bind cleanly.
 
@@ -347,7 +351,7 @@ def test_shadowing_mount_hides_the_symlink_failure(tmp_path: Path) -> None:
     assert probe(["--tmpfs", str(tmp_path)]) == 0
 
 
-def test_canary_does_not_shadow_probed_paths() -> None:
+def test_canary_does_not_shadow_probed_paths(tmp_path: Path) -> None:
     """The canary's argv must not contain region-shadowing mounts."""
     captured: list[list[str]] = []
 
@@ -355,10 +359,20 @@ def test_canary_does_not_shadow_probed_paths() -> None:
         captured.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
+    # A real path under tmp_path, not a POSIX system file: the canary
+    # skips targets that do not exist, so hardcoding /etc/hosts would
+    # make this assert nothing at all on Windows.
+    probed = tmp_path / "hosts"
+    probed.write_text("", encoding="utf-8")
+
     sandbox_doctor.run_bwrap_canary(
-        [sandbox_doctor.DenyTarget("permissions.deny", "Read(//etc/hosts)", "/etc/hosts")],
+        [
+            sandbox_doctor.DenyTarget(
+                "permissions.deny", f"Read(//{str(probed).lstrip('/')})", str(probed)
+            )
+        ],
         runner=runner,
-        bwrap_path="/usr/bin/bwrap",
+        bwrap_path="bwrap",
     )
     assert captured, "canary did not invoke the runner"
     assert "--dev" not in captured[0]
