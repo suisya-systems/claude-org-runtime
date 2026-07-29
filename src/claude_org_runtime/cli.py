@@ -4,6 +4,7 @@ Subcommands:
 
 - ``dispatcher delegate-plan ...`` -> :mod:`claude_org_runtime.dispatcher.runner`
 - ``settings generate ...`` -> :mod:`claude_org_runtime.settings.generator`
+- ``sandbox doctor ...`` -> :mod:`claude_org_runtime.settings.sandbox_doctor`
 - ``migrate ...`` -> :mod:`claude_org_runtime.migrate.v1_to_v2`
 - ``attention scan|watch ...`` -> :mod:`claude_org_runtime.attention.cli`
 - ``broker serve ...`` -> :mod:`claude_org_runtime.broker.cli`
@@ -26,10 +27,15 @@ from .broker import launcher as broker_launcher
 from .dispatcher import runner as dispatcher_runner
 from .migrate import v1_to_v2 as migrate_v1_to_v2
 from .settings import generator as settings_generator
+from .settings import sandbox_doctor
 
 
 def _run_settings_generate(args: argparse.Namespace) -> int:
     return settings_generator.run(args)
+
+
+def _run_sandbox_doctor(args: argparse.Namespace) -> int:
+    return sandbox_doctor.run(args)
 
 
 def _run_settings_show(args: argparse.Namespace) -> int:
@@ -85,6 +91,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     settings_generator.add_show_arguments(show_p)
     show_p.set_defaults(func=_run_settings_show)
+
+    # sandbox (preflight / canary over a rendered settings.local.json)
+    sandbox_p = sub.add_parser(
+        "sandbox",
+        help=(
+            "Sandbox preflight: check that deny paths are mountable by "
+            "bubblewrap so a failed sandbox launch cannot go unnoticed."
+        ),
+    )
+    sandbox_sub = sandbox_p.add_subparsers(dest="cmd", required=True)
+    doctor_p = sandbox_sub.add_parser(
+        "doctor",
+        help=(
+            "Report deny paths that bubblewrap cannot mount (absolute "
+            "symlinks in the path chain) and run a live bwrap canary."
+        ),
+    )
+    sandbox_doctor.add_arguments(doctor_p)
+    doctor_p.set_defaults(func=_run_sandbox_doctor)
 
     # attention
     attention_p = sub.add_parser(

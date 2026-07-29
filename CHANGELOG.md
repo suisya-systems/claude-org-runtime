@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `settings`: deny paths that cross an **absolute symlink** are now
+  rewritten to their realpath instead of being handed to bubblewrap
+  as-is. On WSL2, where `~/.aws` is commonly a symlink into `/mnt/c`,
+  such a path made bwrap abort at launch with
+  `bwrap: Can't create file at /home/<user>/.aws/config: No such file or
+  directory`. That failure is not fail-closed: Claude Code's escape hatch
+  then retries with `dangerouslyDisableSandbox`, so **every subsequent
+  Bash command ran unsandboxed with no standing signal** — a worker could
+  believe it was isolated for months while it was not.
+
+  The trigger was specifically the **Layer 2** mirror. Claude Code merges
+  `permissions.deny` `Read(...)` / `Edit(...)` rules into the same deny
+  set as `sandbox.filesystem.deny{Read,Write}`, so the `Read(~/.aws/*)`
+  mirror that existed as the *compensating control* for the already
+  suppressed Layer 3 entry is what re-injected the unbindable path. The
+  renderer now canonicalizes both layers. Rewriting rather than dropping
+  keeps the deny intact, and the Layer 2 tool-level block still applies
+  through the original symlinked path because Claude Code resolves
+  symlinks when matching `Read` / `Edit` rules.
+
+  Only absolute symlinks are rewritten: relative symlinks resolve
+  correctly inside bwrap's staging newroot, and unanchored globs such as
+  `Read(**/credentials*)` are never expanded into host paths. Both
+  boundaries were established empirically against bubblewrap 0.6.1 and a
+  live client, not inferred.
+
+### Added
+
+- `sandbox doctor`: preflight a rendered `settings.local.json` and exit
+  non-zero when the sandbox would not actually start, so the silent
+  fallback above becomes a checkable failure. Runs a static pass over
+  every deny path both layers contribute (reporting the realpath rewrite
+  that would fix each) plus a live `bwrap` canary that launches the
+  sandbox with those paths bound. `--json`, `--verbose`, and
+  `--no-probe-bwrap` are available; exit `0` usable / `1` broken / `2`
+  missing or malformed settings. Settings that explicitly disable the
+  sandbox pass the gate while still listing findings as latent, since
+  deny arrays merge across settings scopes.
+
+  Because Claude Code unions the deny arrays across scopes, the check
+  merges the sibling project scope (`.claude/settings.json` next to a
+  `settings.local.json`, or vice versa), the user
+  (`~/.claude/settings.json`) and managed settings alongside the given
+  file by default, and each finding names the file
+  that contributed it. Auditing the rendered worker file alone would
+  report a clean preflight while a symlinked path in another scope aborts
+  the launch. `--settings` is repeatable and `--no-merge-scopes` restores
+  single-file behavior.
+
+  `sandbox.failIfUnavailable` is deliberately left alone: per the official
+  docs it covers a missing dependency at startup, not a per-command bwrap
+  launch failure. The knob for the silent fallback is
+  `allowUnsandboxedCommands: false`, which this runtime also does not set
+  — `docker` is incompatible with the sandbox and two worker roles allow
+  `docker build` with no `excludedCommands` shipped, so forcing strict
+  mode would break those workers outright. That trade-off is an operator
+  decision; `sandbox doctor` makes the loss of isolation visible without
+  changing what happens when a command cannot be sandboxed.
+- `settings show --explain` now reports a `rewrites` list alongside
+  `suppressions`, and the emitted `$comment` gains a
+  `; symlink-canonicalized deny paths: [...]` clause. The contract-fixed
+  `platform=<linux|wsl>, layer-3 entries suppressed: [` prefix that the
+  ja-side launcher parses is unchanged.
+
 ## [0.1.38] - 2026-07-22
 
 ### Compatibility

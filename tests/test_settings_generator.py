@@ -15,6 +15,23 @@ from claude_org_runtime.settings import generator
 from claude_org_runtime import cli as runtime_cli
 
 
+@pytest.fixture(autouse=True)
+def _no_host_symlinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep these unit tests off the host filesystem.
+
+    They simulate layouts by injecting ``realpath_fn``. The deny-path
+    canonicalizer also probes for absolute symlinks, and left pointing at
+    the real filesystem that probe answers from whatever the CI runner
+    happens to look like -- which made a fixture using ``/home/u/...``
+    pass on Linux and fail on macOS. Pinning the probe to "no symlinks"
+    makes the simulated world complete; tests that want a symlink say so
+    by passing ``symlink_probe_fn`` themselves.
+    """
+    monkeypatch.setattr(
+        generator, "_absolute_symlink_in_chain", lambda *a, **k: None
+    )
+
+
 def test_bundled_schema_loads() -> None:
     schema = generator.load_schema()
     assert isinstance(schema, dict)
@@ -1288,6 +1305,61 @@ def test_suppress_on_symlink_escape_false_keeps_entry() -> None:
     # metadata that does not appear in the emitted list-of-strings.
     kept = result.settings["sandbox"]["filesystem"]["denyRead"][0]
     assert kept == os.path.join(worker_dir, "secrets.env")
+
+
+def test_suppress_opt_out_still_canonicalizes_a_symlinked_entry() -> None:
+    """Opting out of *suppression* does not opt out of canonicalization.
+
+    The two flags answer different questions: suppressOnSymlinkEscape
+    decides whether to drop the entry, while canonicalization decides
+    which spelling of the path is emitted. Keeping the operator's entry
+    but rewriting it to the realpath honors both -- the deny survives and
+    bwrap can actually bind it.
+
+    The symlink probe is injected so this asserts the simulated layout
+    rather than whatever the host filesystem looks like.
+    """
+    worker_dir = "/home/u/work/wd"
+    escaped = "/mnt/c/Users/u/work/wd"
+
+    def fake_realpath(p: str) -> str:
+        # Separator-agnostic on purpose. The kept entry is built with
+        # os.path.join, so the tail arrives as "/secrets.env" on POSIX and
+        # "\secrets.env" on Windows; matching only the forward slash would
+        # make this fake silently never fire there, and the test would
+        # report "no rewrite happened" for a reason that has nothing to do
+        # with the code under test.
+        if p == worker_dir:
+            return escaped
+        for sep in ("/", os.sep):
+            if p.startswith(worker_dir + sep):
+                return escaped + p[len(worker_dir):]
+        return p
+
+    schema = {
+        "worker_roles": {
+            "demo": _sandbox_role(
+                deny_read=[
+                    _structured("worker_dir", "secrets.env", suppress=False),
+                ],
+            ),
+        },
+    }
+    result = generator.render_role_with_metadata(
+        schema,
+        role="demo",
+        worker_dir=worker_dir,
+        claude_org_path="/home/u/co",
+        realpath_fn=fake_realpath,
+        wsl_detector=lambda: True,
+        symlink_probe_fn=lambda path: (
+            worker_dir if path.startswith(worker_dir) else None
+        ),
+    )
+    assert result.sandbox.suppressions == []
+    kept = result.settings["sandbox"]["filesystem"]["denyRead"][0]
+    assert kept == os.path.join(escaped, "secrets.env")
+    assert len(result.sandbox.rewrites) == 1
 
 
 def test_pattern_b_substitution_in_entry_path_and_additional_directories() -> None:

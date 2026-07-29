@@ -165,6 +165,147 @@ dropped from the rendered sandbox object — this handles WSL
 `permissions.deny Read(...) / Write(...)` (Layer 2) is **never**
 suppressed.
 
+### Symlink canonicalization of deny paths
+
+Suppressing a Layer 3 entry is not enough on its own, because Claude Code
+merges **both** layers into the single deny set it hands to bubblewrap
+([docs](https://code.claude.com/docs/en/sandboxing): "Paths from both
+`sandbox.filesystem` settings and permission rules are merged together
+into the final sandbox configuration"). A Layer 2 credential mirror kept
+as the compensating control for a suppressed Layer 3 entry — e.g.
+`Read(~/.aws/*)` — therefore re-injects the very path that was
+suppressed.
+
+That matters because bubblewrap materializes one mount point per deny
+path inside a staging newroot *before* the pivot. An **absolute** symlink
+anywhere in the chain resolves against a root where the target does not
+exist yet, so mount-point creation fails and bwrap aborts the whole
+launch:
+
+```
+bwrap: Can't create file at /home/<user>/.aws/config: No such file or directory
+```
+
+The launch failure is not fail-closed: Claude Code's escape hatch then
+retries the command with `dangerouslyDisableSandbox`, so every subsequent
+Bash command runs unsandboxed with no standing signal. On WSL2 this fires
+whenever a credential directory is a symlink into `/mnt/c`.
+
+So the renderer **rewrites** an escaping deny path to its realpath rather
+than dropping it, across both layers:
+
+| Rendered as | Becomes |
+|-------------|---------|
+| `Read(~/.aws/*)` (with `~/.aws -> /mnt/c/Users/u/.aws`) | `Read(//mnt/c/Users/u/.aws/*)` |
+| `sandbox.filesystem.denyRead: ["/home/u/.aws/config"]` | `["/mnt/c/Users/u/.aws/config"]` |
+
+Both guarantees survive: bwrap can bind the realpath form, and the Layer 2
+tool-level block still applies to reads issued through the original
+symlinked path, because Claude Code resolves symlinks when matching
+`Read` / `Edit` deny rules.
+
+Only *absolute* symlinks are rewritten. Relative symlinks resolve
+correctly inside bwrap's staging tree, and unanchored globs such as
+`Read(**/credentials*)` are never expanded into host paths, so neither
+needs canonicalization. Rewrites are reported in
+`settings show --explain` (`rewrites`) and appended to the emitted
+`$comment` as `; symlink-canonicalized deny paths: [...]` — the
+contract-fixed `platform=<linux|wsl>, layer-3 entries suppressed: [`
+prefix is left byte-identical.
+
+## `sandbox doctor`
+
+Preflight a rendered `settings.local.json` and fail loudly when the
+sandbox would not actually start. The generator canonicalizes what it
+renders, but a worker's *effective* deny set is the merge of several
+settings scopes (user `~/.claude/settings.json`, project, managed) and
+only some come from this runtime — any scope can contribute a path that
+takes the sandbox down.
+
+```sh
+claude-org-runtime sandbox doctor --settings path/to/settings.local.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--settings PATH` | Settings file to check. Required; repeat to add scopes. |
+| `--no-merge-scopes` | Check only the given files; skip user / managed settings. |
+| `--json` | Machine-readable report instead of the text one. |
+| `--verbose` | List every deny target, not just failing ones. |
+| `--no-probe-bwrap` | Static analysis only; skip the live bwrap canary. |
+
+By default the sibling project scope (`.claude/settings.json` next to a
+`settings.local.json`, or vice versa), the user settings
+(`~/.claude/settings.json`), and any managed settings are merged in
+alongside the given file, because Claude Code unions the deny arrays
+across scopes: a symlinked path in *any* scope aborts the launch no
+matter how clean the rendered worker file is. Sibling scopes are derived
+from each input's own directory rather than a fixed list, so the project
+scope is found wherever the file lives.
+Checking the worker file alone would report a clean preflight for a
+sandbox that cannot start. Each finding names the file that contributed
+it, so the fix lands in the right place. `sandbox.enabled` is resolved
+conservatively — the gate relaxes only when no scope enables the sandbox
+and at least one explicitly disables it.
+
+It does two independent checks:
+
+1. **Static analysis** — collects every deny path the settings contribute
+   (Layer 3 `deny{Read,Write}` plus Layer 2 `Read` / `Edit` rules) and
+   flags those crossing an absolute symlink, with the realpath rewrite
+   that would fix each.
+2. **Live canary** — when `bwrap` is on `PATH`, actually launches it with
+   those paths bound and reports whether the sandbox comes up. This
+   catches unbindable paths whose cause is *not* a symlink.
+
+The canary deliberately passes no `--proc` / `--dev`. Those mount fresh
+filesystems *over* the corresponding host trees, and a shadowed region
+contains no symlink for bwrap to trip over — it just creates plain
+directories and succeeds. Probing with them would blind the canary to any
+deny path under the shadowed prefix and make it contradict the static
+analysis.
+
+That shadowing is also the only case where the two checks can disagree: a
+deny path crossing an absolute symlink binds fine *while* some mount hides
+the link. The doctor still reports it as a failure, and says why — a deny
+path that works only because something happens to be mounted over it
+aborts the launch the moment that stops being true.
+
+Exit status is `0` when the deny paths are usable, `1` when either check
+fails, and `2` on a missing / malformed settings file — so it can gate a
+worker launch rather than being advisory. The shapes it reads are
+validated up front, because a `deny` given as a bare string is iterable
+and would otherwise be scanned character by character and reported clean.
+
+Settings that explicitly set `sandbox.enabled: false` pass the gate:
+no sandbox launches, so no launch can be aborted. Any finding is still
+printed and labelled latent, because the deny arrays merge across
+settings scopes and become live as soon as another scope enables the
+sandbox. An *absent* `sandbox` key is treated as unknown rather than
+off, since user or managed settings can enable it for a role that never
+mentions it.
+
+### On `failIfUnavailable` and `allowUnsandboxedCommands`
+
+`sandbox.failIfUnavailable` does **not** cover this failure. Per the
+[official docs](https://code.claude.com/docs/en/sandboxing) it governs a
+*missing dependency* such as bubblewrap not being installed, which blocks
+Claude Code from starting — not a per-command bwrap launch failure on a
+machine where bwrap is present and working.
+
+The knob that governs the silent fallback is
+`sandbox.allowUnsandboxedCommands: false` (shown as **Strict sandbox
+mode** in the `/sandbox` Overrides tab), which makes the
+`dangerouslyDisableSandbox` retry be ignored. This runtime does **not**
+set it, because the blast radius is fleet-wide: Claude Code's docs list
+`docker` as incompatible with the sandbox, and the `default` and
+`claude-org-self-edit` worker roles both allow `docker build` while the
+runtime ships no `excludedCommands`. Turning strict mode on without first
+adding those exclusions would make those workers fail outright rather
+than silently lose isolation. `sandbox doctor` is the non-breaking half
+of the answer: it makes the loss of isolation visible without changing
+what happens when a command cannot be sandboxed.
+
 ## `org up` / `org down`
 
 A thin session launcher over the broker control plane (the `daemon.json`
