@@ -165,6 +165,88 @@ dropped from the rendered sandbox object — this handles WSL
 `permissions.deny Read(...) / Write(...)` (Layer 2) is **never**
 suppressed.
 
+### Symlink canonicalization of deny paths
+
+Suppressing a Layer 3 entry is not enough on its own, because Claude Code
+merges **both** layers into the single deny set it hands to bubblewrap
+([docs](https://code.claude.com/docs/en/sandboxing): "Paths from both
+`sandbox.filesystem` settings and permission rules are merged together
+into the final sandbox configuration"). A Layer 2 credential mirror kept
+as the compensating control for a suppressed Layer 3 entry — e.g.
+`Read(~/.aws/*)` — therefore re-injects the very path that was
+suppressed.
+
+That matters because bubblewrap materializes one mount point per deny
+path inside a staging newroot *before* the pivot. An **absolute** symlink
+anywhere in the chain resolves against a root where the target does not
+exist yet, so mount-point creation fails and bwrap aborts the whole
+launch:
+
+```
+bwrap: Can't create file at /home/<user>/.aws/config: No such file or directory
+```
+
+The launch failure is not fail-closed: Claude Code's escape hatch then
+retries the command with `dangerouslyDisableSandbox`, so every subsequent
+Bash command runs unsandboxed with no standing signal. On WSL2 this fires
+whenever a credential directory is a symlink into `/mnt/c`.
+
+So the renderer **rewrites** an escaping deny path to its realpath rather
+than dropping it, across both layers:
+
+| Rendered as | Becomes |
+|-------------|---------|
+| `Read(~/.aws/*)` (with `~/.aws -> /mnt/c/Users/u/.aws`) | `Read(//mnt/c/Users/u/.aws/*)` |
+| `sandbox.filesystem.denyRead: ["/home/u/.aws/config"]` | `["/mnt/c/Users/u/.aws/config"]` |
+
+Both guarantees survive: bwrap can bind the realpath form, and the Layer 2
+tool-level block still applies to reads issued through the original
+symlinked path, because Claude Code resolves symlinks when matching
+`Read` / `Edit` deny rules.
+
+Only *absolute* symlinks are rewritten. Relative symlinks resolve
+correctly inside bwrap's staging tree, and unanchored globs such as
+`Read(**/credentials*)` are never expanded into host paths, so neither
+needs canonicalization. Rewrites are reported in
+`settings show --explain` (`rewrites`) and appended to the emitted
+`$comment` as `; symlink-canonicalized deny paths: [...]` — the
+contract-fixed `platform=<linux|wsl>, layer-3 entries suppressed: [`
+prefix is left byte-identical.
+
+## `sandbox doctor`
+
+Preflight a rendered `settings.local.json` and fail loudly when the
+sandbox would not actually start. The generator canonicalizes what it
+renders, but a worker's *effective* deny set is the merge of several
+settings scopes (user `~/.claude/settings.json`, project, managed) and
+only some come from this runtime — any scope can contribute a path that
+takes the sandbox down.
+
+```sh
+claude-org-runtime sandbox doctor --settings path/to/settings.local.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--settings PATH` | Settings file to check. Required. |
+| `--json` | Machine-readable report instead of the text one. |
+| `--verbose` | List every deny target, not just failing ones. |
+| `--no-probe-bwrap` | Static analysis only; skip the live bwrap canary. |
+
+It does two independent checks:
+
+1. **Static analysis** — collects every deny path the settings contribute
+   (Layer 3 `deny{Read,Write}` plus Layer 2 `Read` / `Edit` rules) and
+   flags those crossing an absolute symlink, with the realpath rewrite
+   that would fix each.
+2. **Live canary** — when `bwrap` is on `PATH`, actually launches it with
+   those paths bound and reports whether the sandbox comes up. This
+   catches unbindable paths whose cause is *not* a symlink.
+
+Exit status is `0` when the deny paths are usable, `1` when either check
+fails, and `2` on a missing / malformed settings file — so it can gate a
+worker launch rather than being advisory.
+
 ## `org up` / `org down`
 
 A thin session launcher over the broker control plane (the `daemon.json`
