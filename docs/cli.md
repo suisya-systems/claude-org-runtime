@@ -62,10 +62,19 @@ before the fix: a ceiling of `2` admitted three workers, every plan reporting
 `free_worker_slots: 2`.
 
 The ledger is the worker seed file the helper already writes on
-`ready_to_spawn`. A seed counts as a reservation only while it is younger than
-`WORKER_BIND_WINDOW_SECONDS` (45s) **and** its worker is absent from the
-census, so a worker that binds stops being double-counted and a spawn that
-never came up frees its slot on its own -- no cleanup step, no leaked slots.
+`ready_to_spawn`. A seed counts as a reservation only while all three hold:
+
+1. its worker is absent from the census (a worker that binds is never counted
+   twice),
+2. its `Status:` line is `planned` or unreadable -- a status a consumer's
+   monitoring loop rewrote (`running`, `pane_closed`, ...) is newer evidence
+   than the clock, and that rewrite is itself what refreshed the mtime, so
+   without this rule a worker that just finished would block its own
+   replacement for the whole window,
+3. it is younger than `WORKER_BIND_WINDOW_SECONDS` (45s) -- nothing ever
+   deletes these files, so a spawn that died before anything could rewrite it
+   frees its slot on the clock, with no cleanup step and no leaked slots.
+
 The mechanism applies to the overflow path only; the broker ceiling and the
 non-overflow renga path are unchanged.
 | `--state-dir PATH` | State directory root. Default: `.state`. |
@@ -111,7 +120,7 @@ error.
 | Code | Meaning |
 |------|---------|
 | `0` | `ready_to_spawn` -- plan emitted, side-effect files written (unless `--dry-run`). |
-| `1` | `input_invalid` -- task JSON / panes / peers / cwd validation failed, a `--tab` selector the peer census cannot address, or `--overflow-to-new-tab` without `--peers-json`. |
+| `1` | `input_invalid` -- task JSON / panes / peers / cwd validation failed, a malformed `--tab` selector, `--tab` without `--server-capability spawn_tab`, or `--overflow-to-new-tab` without `--peers-json`. A *well-formed* selector the peer census cannot resolve is **not** an error: the census only sees tabs holding at least one peer, so renga stays the authority and answers `tab_not_found` / `tab_ambiguous` itself. |
 | `2` | `split_capacity_exceeded` -- no balanced-split candidate, the broker `max_concurrent_workers` ceiling, or renga's tab limit; the `escalate` field tells Dispatcher to notify Secretary for human judgment. |
 
 The exit codes are exactly these three. The renga tab error codes

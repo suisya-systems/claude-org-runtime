@@ -1199,17 +1199,28 @@ def count_unbound_reservations(
     Reading it is not a new kind of impurity: ``build_plan`` already stats
     these exact paths for the duplicate-state-file guard.
 
-    Two rules keep the ledger honest:
+    Three rules keep the ledger honest:
 
     - **Excluded if already counted.** A worker that has since become a pane
       or a peer is in ``counted_names`` and must not be added twice.
+    - **Excluded if the seed says it is no longer pending.** The seed carries
+      a ``Status:`` line, and the runtime writes ``planned`` into it. A
+      consumer's monitoring loop rewrites these same files as the worker
+      progresses -- which also refreshes the mtime -- so a worker that just
+      finished would otherwise hold a slot for the whole window and block its
+      own replacement. An explicit status other than ``planned`` is direct
+      evidence the spawn is no longer pending, and it beats the mtime clock.
+      An unreadable or status-less seed falls back to the clock: guessing
+      "still pending" over-counts, which refuses a spawn, while guessing the
+      other way exceeds the only ceiling this mode has.
     - **Expired by mtime.** Nothing ever deletes a seed file, so counting
       them unconditionally would make every worker the org has ever planned
       consume a slot forever. A reservation is only credible while the bind
       it is waiting for is still plausible, hence
       :data:`WORKER_BIND_WINDOW_SECONDS`. That also makes the ledger
-      self-healing: a spawn that failed outright frees its slot once the
-      window passes, with no cleanup step and no operator action.
+      self-healing: a spawn that failed outright -- leaving a seed nothing
+      will ever rewrite -- frees its slot once the window passes, with no
+      cleanup step and no operator action.
 
     Returns the reserved worker names, sorted -- names rather than a count so
     the plan can show the operator WHICH workers are holding the slots.
@@ -1239,9 +1250,40 @@ def count_unbound_reservations(
         # treated as fresh. Erring toward counting the reservation is the
         # fail-safe direction: over-counting refuses a spawn, under-counting
         # exceeds the only ceiling this mode has.
-        if age <= WORKER_BIND_WINDOW_SECONDS:
-            reserved.append(name)
+        if age > WORKER_BIND_WINDOW_SECONDS:
+            continue
+        if _seed_status(seed) not in (None, "planned"):
+            # A rewritten status is newer evidence than the mtime -- and it is
+            # the rewrite itself that refreshed the mtime, so trusting the
+            # clock here would make a just-finished worker block its own
+            # replacement for the whole window.
+            continue
+        reserved.append(name)
     return tuple(sorted(reserved))
+
+
+def _seed_status(seed: Path) -> Optional[str]:
+    """Lowercased value of a worker seed's ``Status:`` line, or None.
+
+    None means "no usable answer" -- the file is unreadable, or carries no
+    ``Status:`` line at all (a consumer may template these files differently;
+    :func:`write_worker_seed` is the runtime's shape, not a contract every
+    writer signed). Callers treat None as "fall back to the mtime clock"
+    rather than as any particular status.
+
+    Only the first ``Status:`` line is read: the seed's Progress Log can
+    legitimately quote the word later in the body, and the header is the
+    field the writers agree on.
+    """
+    try:
+        body = seed.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("status:"):
+            return stripped.split(":", 1)[1].strip().lower() or None
+    return None
 
 
 def derive_tab_awareness(
@@ -1728,49 +1770,76 @@ def resolve_tab_placement(
     key = next(iter(selector))
     value = selector[key]
 
+    # The census is a LOWER BOUND on the real tab table, never an inventory:
+    # a tab whose panes are all non-peer (a bare shell) is invisible to
+    # list_peers, and TabAwareness.tabs says so in its own docstring. So the
+    # census may narrow a selector, and may warn about one -- it may never be
+    # the authority that REFUSES one, and it may never be the evidence that a
+    # display name is unique. renga is the authority; it does the exact match,
+    # it detects the ambiguity, and it owns tab_not_found / tab_ambiguous.
     if key == "name":
         matches = [t for t in census if t.name == value]
+        # A name selector is emitted UNRESOLVED, always. Canonicalising it to
+        # the one matching tab the census happens to see would be unsound in
+        # the exact case renga's tab_ambiguous rule exists to protect: with a
+        # visible tab and a peerless tab sharing a display name, the census
+        # sees one match, reports the name unique, and canonicalises to that
+        # tab's pane_id -- turning a request renga would have REFUSED as
+        # ambiguous into a silent spawn into whichever of the two the census
+        # could see. Passing the name through costs nothing (a name, unlike an
+        # index, does not shift when a tab closes) and puts the ambiguity
+        # check back where the evidence is.
         if not matches:
             seen = sorted(t.name for t in census if t.name)
-            return TabPlacement(
-                kind="existing",
-                error_code="tab_not_found",
-                error=(
-                    f"tab_not_found: no tab is named {value!r}; the peer "
-                    f"census sees {seen}. Note the census only sees tabs that "
-                    "contain at least one peer."
-                ),
-                reasons=tuple(reasons),
+            reasons.append(
+                f"no tab named {value!r} is in the peer census (which sees "
+                f"{seen}), but the census only sees tabs holding at least one "
+                "peer, so a peerless tab by that name may well exist. The "
+                "selector is emitted unresolved and renga decides -- it "
+                "answers tab_not_found if there really is none"
             )
-        if len(matches) > 1:
-            idxs = [t.index for t in matches]
-            return TabPlacement(
-                kind="existing",
-                error_code="tab_ambiguous",
-                error=(
-                    f"tab_ambiguous: display name {value!r} matches tabs "
-                    f"{idxs}; renga never first-matches. Re-target by pane_id "
-                    "(the stable anchor) -- e.g. --tab pane_id:"
-                    f"{matches[0].anchor_pane_id}."
-                ),
-                reasons=tuple(reasons),
+        elif len(matches) > 1:
+            reasons.append(
+                f"display name {value!r} matches {len(matches)} tabs in the "
+                f"peer census (indices {[t.index for t in matches]}); renga "
+                "never first-matches, so it will answer tab_ambiguous. "
+                "Re-target by pane_id (the stable anchor) -- e.g. "
+                f"--tab pane_id:{matches[0].anchor_pane_id}"
             )
-        target = matches[0]
-    elif key == "index":
+        else:
+            reasons.append(
+                f"the peer census sees exactly one tab named {value!r} "
+                f"(index {matches[0].index}), but it cannot prove that is the "
+                "ONLY one -- a peerless tab could share the name -- so the "
+                "name is emitted unresolved and renga performs the match"
+            )
+        return TabPlacement(
+            kind="existing", selector=dict(selector), reasons=tuple(reasons),
+        )
+    if key == "index":
         matches = [t for t in census if t.index == value]
         if not matches:
+            # Not a refusal, for the same reason as above: a peerless tab at
+            # this index is invisible here but perfectly real to renga. Pass
+            # the index through and let renga range-check it. This is the one
+            # selector that is genuinely shift-prone, so say so.
             idxs = sorted(t.index for t in census if t.index is not None)
+            reasons.append(
+                f"tab index {value} is not in the peer census (which sees "
+                f"{idxs}), but the census only sees tabs holding at least one "
+                "peer, so the index may still be valid. It is emitted "
+                "unresolved and renga range-checks it -- and an emitted index "
+                "is shift-prone, because renga renumbers tabs when one closes;"
+                " prefer --tab pane_id:N"
+            )
             return TabPlacement(
-                kind="existing",
-                error_code="tab_not_found",
-                error=(
-                    f"tab_not_found: tab index {value} is out of range; the "
-                    f"peer census sees indices {idxs}. Indices are display "
-                    "metadata and shift when a tab closes -- prefer "
-                    "--tab pane_id:N."
-                ),
+                kind="existing", selector=dict(selector),
                 reasons=tuple(reasons),
             )
+        # An index the census DOES resolve is safe to canonicalise: the value
+        # came from renga itself (PeerInfo.tab), so the census is not being
+        # asked to prove a negative here -- only to name the pane that anchors
+        # the tab renga already said this index is.
         target = matches[0]
     else:
         # pane_id: already the stable address renga documents, so there is

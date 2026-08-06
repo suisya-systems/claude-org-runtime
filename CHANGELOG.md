@@ -86,11 +86,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping cross-tab sends, so `caller_scope` never authorises cross-tab
   reasoning and `cross_tab_peers` never authorises a `tab` key.
 
-  Emitted selectors are canonicalised to `{"pane_id": N}` whenever the peer
-  census can resolve them, because renga documents the tab index as display
+  An **index** selector the peer census resolves is canonicalised to
+  `{"pane_id": N}`, because renga documents the tab index as display
   metadata that renumbers when a tab closes -- a plan carrying an index can
   address the wrong tab if anything closes between emission and the spawn
-  call. A tab spawn into an existing tab uses `target: "focused"`, which
+  call. A **name** never is, and neither is refused locally. The census is a
+  lower bound on the tab table, not an inventory: a tab whose panes are all
+  non-peer is invisible to `list_peers`. So "the census sees one tab with
+  this name" is not evidence the name is unique, and canonicalising on that
+  basis would bypass exactly the rule renga's `tab_ambiguous` exists to
+  enforce -- with a visible tab and a peerless tab sharing a display name,
+  the census sees one match and would silently spawn into whichever one it
+  could see, turning a request renga would have refused into a wrong-tab
+  placement. For the same reason a selector the census cannot resolve is
+  emitted rather than rejected: renga is the authority, it does the exact
+  match and the range check, and it owns `tab_not_found` / `tab_ambiguous`.
+  The census still annotates the plan with what it *can* see, including a
+  warning that renga is about to answer `tab_ambiguous`, so the operator is
+  not surprised. A tab spawn into an existing tab uses `target: "focused"`, which
   renga resolves *inside* the selected tab; that is also what structurally
   prevents `target_tab_mismatch`, since the runtime never pairs a
   caller-tab numeric target with a foreign-tab selector. A `tab: {new}`

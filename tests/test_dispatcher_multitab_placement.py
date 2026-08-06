@@ -426,9 +426,15 @@ def test_build_plan_tab_existing_uses_focused_vertical_and_warns(
     assert spawn["target"] != "dispatcher"
 
 
-def test_build_plan_canonicalizes_name_selector_to_pane_id(
+def test_build_plan_never_canonicalizes_a_name_selector(
     tmp_path: Path,
 ) -> None:
+    # A name is emitted UNRESOLVED even when the census sees exactly one
+    # match. The census is a lower bound on the tab table -- a tab whose panes
+    # are all non-peer is invisible to list_peers -- so "one match here" is
+    # not evidence the name is unique, and canonicalising on that basis would
+    # bypass the very rule renga's tab_ambiguous exists to enforce. The
+    # adversarial case is pinned in the sibling test below.
     plan = build_plan(
         _task(tmp_path),
         _ok_panes(),
@@ -439,21 +445,53 @@ def test_build_plan_canonicalizes_name_selector_to_pane_id(
         tab={"name": "build"},
     )
     assert plan.status == "ready_to_spawn"
-    selector = plan.spawn["tab"]
-    # renga documents the tab index as DISPLAY metadata that shifts when a tab
-    # closes, so an emitted plan must never carry one -- nor a display name
-    # that could have been resolved. The anchor is the smallest numeric peer
-    # id in the tab, so it does not depend on transcription order.
-    assert selector == {"pane_id": 11}
-    assert "name" not in selector
-    assert "index" not in selector
+    assert plan.spawn["tab"] == {"name": "build"}
     reasons = plan.layout["tab_placement"]["reasons"]
-    assert any("canonicalised" in r for r in reasons)
+    assert any("cannot prove" in r for r in reasons)
+    assert not any("canonicalised" in r for r in reasons)
 
 
-def test_build_plan_tab_name_zero_match_is_tab_not_found(
+def test_build_plan_name_selector_does_not_bypass_renga_tab_ambiguous(
     tmp_path: Path,
 ) -> None:
+    # The concrete hazard, and the reason a name is never canonicalised.
+    #
+    # Two tabs are named "build": tab 1 holds a peer, tab 3 is a bare shell
+    # and so is invisible to list_peers. Resolving against the census would
+    # see ONE match, declare the name unique, and emit {"pane_id": 11} --
+    # silently spawning into tab 1 a request renga would have REFUSED as
+    # tab_ambiguous. Emitting the name puts that decision back where the
+    # evidence is.
+    peers = [
+        _peer(3, name="dispatcher", role="dispatcher",
+              tab=0, tab_name="main", same_tab=True),
+        _peer(11, name="worker-a", role="worker",
+              tab=1, tab_name="build", same_tab=False),
+        # (the peerless tab 3, also named "build", cannot appear here at all)
+    ]
+    plan = build_plan(
+        _task(tmp_path),
+        _ok_panes(),
+        tmp_path / ".state",
+        transport="renga",
+        peers=peers,
+        server_capabilities=_ALL_CAPS,
+        tab={"name": "build"},
+    )
+    assert plan.spawn["tab"] == {"name": "build"}
+    assert plan.spawn["tab"] != {"pane_id": 11}, (
+        "canonicalising a name against an incomplete census can spawn into "
+        "the wrong tab when a peerless tab shares the display name"
+    )
+
+
+def test_build_plan_tab_name_zero_census_match_is_not_a_refusal(
+    tmp_path: Path,
+) -> None:
+    # "The census does not see it" is not "it does not exist": a peerless tab
+    # by that name is invisible here and perfectly real to renga. Refusing
+    # locally would make such a tab unaddressable by this CLI, so the selector
+    # is emitted and renga answers tab_not_found if there really is none.
     plan = build_plan(
         _task(tmp_path),
         _ok_panes(),
@@ -463,16 +501,23 @@ def test_build_plan_tab_name_zero_match_is_tab_not_found(
         server_capabilities=_ALL_CAPS,
         tab={"name": "nope"},
     )
-    assert plan.status == "input_invalid"
-    assert plan.spawn is None
-    assert plan.errors[0].startswith("tab_not_found:")
-    assert plan.state_writes == []
-    assert not (tmp_path / ".state").exists()
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["tab"] == {"name": "nope"}
+    assert not plan.errors
+    reasons = plan.layout["tab_placement"]["reasons"]
+    assert any("peerless tab" in r for r in reasons)
+    # The recovery table still ships, because the refusal now happens at spawn
+    # time and the seed/outbox files have already been written by then.
+    assert "tab_not_found" in plan.on_spawn_error
+    assert plan.on_spawn_error["tab_not_found"]["remove_state_writes"] is True
 
 
-def test_build_plan_tab_name_two_matches_is_tab_ambiguous(
+def test_build_plan_tab_name_duplicate_in_census_warns_not_refuses(
     tmp_path: Path,
 ) -> None:
+    # Two visible matches: renga will answer tab_ambiguous, and the plan says
+    # so in advance -- but it does not pre-empt renga, because a third
+    # peerless tab could exist and the census could not know.
     peers = [
         _peer(3, name="dispatcher", role="dispatcher",
               tab=0, tab_name="main", same_tab=True),
@@ -490,17 +535,21 @@ def test_build_plan_tab_name_two_matches_is_tab_ambiguous(
         server_capabilities=_ALL_CAPS,
         tab={"name": "build"},
     )
-    assert plan.status == "input_invalid"
-    assert plan.spawn is None
-    # renga never first-matches a duplicate display name, so neither may this.
-    assert plan.errors[0].startswith("tab_ambiguous:")
-    assert "pane_id" in plan.errors[0]
-    assert plan.state_writes == []
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["tab"] == {"name": "build"}
+    reasons = plan.layout["tab_placement"]["reasons"]
+    assert any("tab_ambiguous" in r and "pane_id" in r for r in reasons), (
+        "the operator must be told renga will refuse this and given the "
+        "stable alternative, even though the plan itself does not refuse"
+    )
+    assert "tab_ambiguous" in plan.on_spawn_error
 
 
-def test_build_plan_tab_index_out_of_range_is_tab_not_found(
+def test_build_plan_tab_index_outside_census_passes_through_shift_prone(
     tmp_path: Path,
 ) -> None:
+    # Same rule for an index -- renga range-checks it. An emitted index is the
+    # one genuinely shift-prone selector, so the reason must say so.
     plan = build_plan(
         _task(tmp_path),
         _ok_panes(),
@@ -510,11 +559,34 @@ def test_build_plan_tab_index_out_of_range_is_tab_not_found(
         server_capabilities=_ALL_CAPS,
         tab={"index": 9},
     )
-    assert plan.status == "input_invalid"
-    assert plan.spawn is None
-    assert plan.errors[0].startswith("tab_not_found:")
-    assert "pane_id" in plan.errors[0]     # points at the stable alternative
-    assert plan.state_writes == []
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["tab"] == {"index": 9}
+    reasons = plan.layout["tab_placement"]["reasons"]
+    assert any("shift-prone" in r and "pane_id" in r for r in reasons)
+
+
+def test_build_plan_canonicalizes_a_resolved_index_to_pane_id(
+    tmp_path: Path,
+) -> None:
+    # The one canonicalisation that survives, and why it is sound: the index
+    # came from renga itself (PeerInfo.tab), so the census is not being asked
+    # to prove a negative -- only to name the pane anchoring a tab renga
+    # already identified. Worth doing because an emitted index CAN address the
+    # wrong tab if one closes between emission and the spawn call.
+    plan = build_plan(
+        _task(tmp_path),
+        _ok_panes(),
+        tmp_path / ".state",
+        transport="renga",
+        peers=_two_tab_peers(),
+        server_capabilities=_ALL_CAPS,
+        tab={"index": 1},
+    )
+    assert plan.status == "ready_to_spawn"
+    assert plan.spawn["tab"] == {"pane_id": 11}
+    assert "index" not in plan.spawn["tab"]
+    reasons = plan.layout["tab_placement"]["reasons"]
+    assert any("canonicalised" in r for r in reasons)
 
 
 def test_build_plan_tab_selector_unresolvable_without_peers_passes_through_with_reason(
@@ -872,6 +944,47 @@ def test_overflow_reservations_expire_and_are_not_double_counted(
     assert count_unbound_reservations(
         tmp_path / ".state", ("worker-t1",),
     ) == ("worker-t2", "worker-t3")
+
+
+def test_reservations_release_on_a_rewritten_status_not_on_the_clock(
+    tmp_path: Path,
+) -> None:
+    # A consumer's monitoring loop rewrites these same seed files as the
+    # worker progresses, and the rewrite refreshes the mtime. On the clock
+    # alone a worker that JUST finished would keep holding a slot for the
+    # whole window and block its own replacement -- the opposite of what the
+    # ledger is for. An explicit status is newer evidence than the mtime.
+    peers = [_peer(3, name="secretary", role="secretary",
+                   tab=0, tab_name="main", same_tab=True)]
+    _overflow_once(tmp_path, "t1", peers, CapacityPolicy(max_concurrent_workers=2))
+    state = tmp_path / ".state"
+    seed = state / "workers" / "worker-t1.md"
+
+    # As written by the runtime: pending, and it holds its slot.
+    assert "Status: planned" in seed.read_text(encoding="utf-8")
+    assert count_unbound_reservations(state, ()) == ("worker-t1",)
+
+    # Rewritten by monitoring. mtime is FRESH (that is the trap), but the
+    # status says the spawn is no longer pending.
+    for status in ("running", "pane_closed", "done"):
+        seed.write_text(
+            f"# Worker: worker-t1\nStatus: {status}\n\n## Progress Log\n- x\n",
+            encoding="utf-8",
+        )
+        assert count_unbound_reservations(state, ()) == (), status
+
+    # A seed with no parseable status falls back to the clock, and the
+    # fallback direction is "still pending": over-counting refuses a spawn,
+    # under-counting exceeds the only ceiling this mode has.
+    seed.write_text("# Worker: worker-t1\nno header here\n", encoding="utf-8")
+    assert count_unbound_reservations(state, ()) == ("worker-t1",)
+
+    # ...and the clock still wins over a stale pending status, so a spawn that
+    # died before anything could rewrite it does not leak its slot forever.
+    seed.write_text("Status: planned\n", encoding="utf-8")
+    stale = time.time() - (WORKER_BIND_WINDOW_SECONDS + 60)
+    os.utime(seed, (stale, stale))
+    assert count_unbound_reservations(state, ()) == ()
 
 
 def test_count_unbound_reservations_tolerates_a_missing_state_dir(
