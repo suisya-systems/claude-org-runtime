@@ -66,6 +66,7 @@ import dataclasses
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
@@ -289,6 +290,19 @@ TRANSPORTS = ("renga", "broker")
 # secretary's serialized approval gate (design-review Major #3). ``unlimited``
 # is an explicit opt-in; ``0`` disables spawning entirely.
 DEFAULT_MAX_CONCURRENT_WORKERS = 8
+
+# How long a worker seed file counts as an outstanding capacity reservation
+# (runtime #158). See :func:`count_unbound_reservations` for why the ledger
+# exists at all; this is only the expiry.
+#
+# The value is the ``after_spawn`` peer-bind wait ("retry up to ~30s") plus
+# headroom, because that wait IS the window during which an overflowed worker
+# is invisible to both snapshots. Too short reopens the race it closes; too
+# long makes a failed spawn hold a slot longer than necessary. Reservations
+# are self-expiring rather than explicitly released because nothing in the
+# system reliably runs after a spawn fails -- a TTL needs no cleanup step and
+# cannot leak a slot permanently.
+WORKER_BIND_WINDOW_SECONDS = 45
 
 # Broker-path spawn coordinates. Under the broker transport the adapter does
 # not split a specific pane by geometry (it opens a fresh detached session), so
@@ -1156,6 +1170,78 @@ def _tab_anchor_pane_id(group: list[Peer]) -> Optional[int]:
     """Smallest numeric peer id in ``group``, or None on a tabless transport."""
     numeric = _tab_pane_ids(group)
     return numeric[0] if numeric else None
+
+
+def count_unbound_reservations(
+    state_dir: Path,
+    counted_names: Iterable[str],
+    now: Optional[float] = None,
+) -> tuple[str, ...]:
+    """Worker seeds written recently whose worker is in NEITHER snapshot.
+
+    Closes the one hole the pane/peer union cannot close on its own, and it
+    exists only because ``--overflow-to-new-tab`` opened it.
+
+    The union is what makes a *same-tab* spawn safe across the peer-bind
+    delay: the new pane shows up in the caller's ``list_panes`` immediately,
+    so it is counted from the moment it exists even though its peer bind is
+    still 10-30s away (this module's own ``after_spawn`` step waits up to
+    ~30s for that bind). An OVERFLOW spawn has no such cover. It lands in a
+    tab of its own, which renga#288 scoping keeps out of the caller's
+    ``list_panes`` forever, and it is not a peer yet -- so for the length of
+    that window it is invisible to both inputs, and back-to-back delegations
+    each re-observe the same census and each admit another worker. Measured
+    on the pre-fix build: a ceiling of 2 admitted three workers, every plan
+    reporting ``free_worker_slots: 2``.
+
+    The reservation ledger is the seed file the helper itself already writes
+    on ``ready_to_spawn`` (:func:`write_worker_seed`, ``Status: planned``).
+    Reading it is not a new kind of impurity: ``build_plan`` already stats
+    these exact paths for the duplicate-state-file guard.
+
+    Two rules keep the ledger honest:
+
+    - **Excluded if already counted.** A worker that has since become a pane
+      or a peer is in ``counted_names`` and must not be added twice.
+    - **Expired by mtime.** Nothing ever deletes a seed file, so counting
+      them unconditionally would make every worker the org has ever planned
+      consume a slot forever. A reservation is only credible while the bind
+      it is waiting for is still plausible, hence
+      :data:`WORKER_BIND_WINDOW_SECONDS`. That also makes the ledger
+      self-healing: a spawn that failed outright frees its slot once the
+      window passes, with no cleanup step and no operator action.
+
+    Returns the reserved worker names, sorted -- names rather than a count so
+    the plan can show the operator WHICH workers are holding the slots.
+    """
+    workers_dir = state_dir / "workers"
+    if not workers_dir.is_dir():
+        return ()
+    already = set(counted_names)
+    # Injected by the caller in tests; ``None`` means "ask the clock". Kept a
+    # parameter rather than a module-level seam so the planner stays a pure
+    # function of its arguments for any caller that wants determinism.
+    if now is None:
+        now = time.time()
+    reserved: list[str] = []
+    for seed in workers_dir.glob("*.md"):
+        name = seed.stem
+        if name in already:
+            continue
+        try:
+            age = now - seed.stat().st_mtime
+        except OSError:
+            # A seed that vanished mid-scan cannot be holding a slot. Skip it
+            # rather than fail the plan: capacity accounting must not be the
+            # thing that breaks a delegation.
+            continue
+        # A negative age (clock skew, or a file stamped in the future) is
+        # treated as fresh. Erring toward counting the reservation is the
+        # fail-safe direction: over-counting refuses a spawn, under-counting
+        # exceeds the only ceiling this mode has.
+        if age <= WORKER_BIND_WINDOW_SECONDS:
+            reserved.append(name)
+    return tuple(sorted(reserved))
 
 
 def derive_tab_awareness(
@@ -2615,6 +2701,16 @@ def build_plan(
                     )
                     plan.layout = _layout_report(panes, awareness, placement)
                     return plan
+                # The census alone still cannot see an overflow spawn during
+                # its peer-bind window -- it is in another tab (so never in
+                # ``panes`` again) and not yet a peer -- so the ceiling is
+                # counted against the census PLUS the outstanding reservation
+                # ledger. See count_unbound_reservations for the measured
+                # failure this closes.
+                reserved = count_unbound_reservations(
+                    state_dir, population.names,
+                )
+                committed = population.total + len(reserved)
                 policy = capacity_policy or CapacityPolicy.default()
                 if policy.is_unlimited:
                     max_repr: Any = "unlimited"
@@ -2623,12 +2719,20 @@ def build_plan(
                 else:
                     max_workers = policy.max_concurrent_workers
                     max_repr = max_workers
-                    free_slots = max(0, max_workers - population.total)
-                    exceeded = population.total >= max_workers
+                    free_slots = max(0, max_workers - committed)
+                    exceeded = committed >= max_workers
                 plan.capacity = {
                     "transport": "renga",
                     "max_concurrent_workers": max_repr,
+                    # ``active_workers`` stays the OBSERVED census so the key
+                    # keeps meaning the same thing it does on the broker path.
+                    # The reservations are reported beside it rather than
+                    # folded into it, because a consumer that shows a human
+                    # "N workers running" must not count panes that may never
+                    # come up.
                     "active_workers": population.total,
+                    "reserved_workers": len(reserved),
+                    "reserved_worker_names": list(reserved),
                     "free_worker_slots": 0 if exceeded else free_slots,
                 }
                 if exceeded:
@@ -2643,10 +2747,24 @@ def build_plan(
                             "(--overflow-to-new-tab), "
                             f"max_concurrent_workers={max_repr}, "
                             f"active_workers={population.total}, "
-                            "free_worker_slots=0. Overflow removes the rect "
+                            f"reserved_workers={len(reserved)}"
+                            + (
+                                f" ({', '.join(reserved)}), " if reserved
+                                else ", "
+                            )
+                            + "free_worker_slots=0. Overflow removes the rect "
                             "ceiling and mints one tab per delegation, so the "
-                            "explicit fleet ceiling is what bounds it. Raise "
-                            "it via --max-concurrent-workers (N|unlimited), "
+                            "explicit fleet ceiling is what bounds it. "
+                            + (
+                                "A reserved worker is one this helper already "
+                                "planned but that has not become a pane or a "
+                                "peer yet; those slots free themselves "
+                                f"{WORKER_BIND_WINDOW_SECONDS}s after the "
+                                "seed was written if the spawn never came up. "
+                                if reserved else ""
+                            )
+                            + "Raise the ceiling via "
+                            "--max-concurrent-workers (N|unlimited), "
                             "or wait for an active worker to finish -- human "
                             "judgment required."
                         ),

@@ -107,6 +107,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produce N tabs. The explicit fleet ceiling is the only bound left, which
   is why that one mode consults it. Outside overflow the renga path still
   ignores the policy entirely.
+
+  That ceiling counts outstanding **reservations** as well as the observed
+  census, because the pane/peer union cannot cover an overflow spawn. A
+  same-tab spawn is safe across the peer-bind delay -- its pane appears in
+  the caller's `list_panes` immediately -- but an overflowed one lands in a
+  tab of its own, which caller-tab scoping keeps out of `list_panes`
+  permanently, and it is not a peer for another 10-30s. For that window it
+  is invisible to both inputs, so back-to-back delegations each re-observe
+  the same census and each admit another worker: measured, a ceiling of 2
+  admitted three workers with every plan reporting `free_worker_slots: 2`.
+  The ledger is the worker seed file the helper already writes, credited
+  only while it is younger than the 45s bind window and its worker is still
+  absent from the census -- so a worker that binds is never counted twice
+  and a spawn that never came up frees its slot with no cleanup step.
+  `plan.capacity` reports `reserved_workers` / `reserved_worker_names`
+  beside the unchanged `active_workers`, and the escalation names the
+  workers holding the slots (otherwise "0 active, 0 free" reads as a bug).
 - `dispatcher delegate-plan`: three additive plan fields -- `population`
   (auditable worker census with provenance and a per-tab breakdown),
   `layout` (renga layout diagnostics), and `on_spawn_error` (a recovery

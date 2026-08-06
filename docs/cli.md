@@ -45,7 +45,29 @@ python -m claude_org_runtime.dispatcher.runner delegate-plan \
 | `--tab SELECTOR` | Place the worker in a specific renga tab: `pane_id:N` (stable anchor, preferred), `index:N` (0-based, shifts when a tab closes), `name:LABEL` (exact match), `new`, or `new:LABEL`. Requires `--server-capability spawn_tab`. Ignored under `--transport broker`. |
 | `--overflow-to-new-tab` | Under `--transport renga`, when no balanced-split candidate is left, plan a spawn into a fresh background tab instead of escalating. Requires `--server-capability spawn_tab` **and** `--peers-json`: overflow removes the rect ceiling and the fleet ceiling that replaces it is counted from the peer census, which cannot see workers this flag placed in other tabs unless the census is supplied. Each overflow mints a new tab; it never reuses one. Ignored under `--transport broker`. |
 | `--transport {renga,broker}` | Capacity backend: `renga` uses the rect-based balanced split; `broker` uses the explicit `--max-concurrent-workers` ceiling. Default: resolved from `ORG_TRANSPORT`, else the descriptor default (`broker`). |
-| `--max-concurrent-workers N\|unlimited` | Worker ceiling: a non-negative int (`0` disables spawning) or `unlimited` (explicit opt-in). Default when omitted: `8`. Ignored under `--transport renga` **unless** `--overflow-to-new-tab` is set -- that mode removes the rect ceiling, so the fleet ceiling becomes the only bound. |
+| `--max-concurrent-workers N\|unlimited` | Worker ceiling: a non-negative int (`0` disables spawning) or `unlimited` (explicit opt-in). Default when omitted: `8`. Ignored under `--transport renga` **unless** `--overflow-to-new-tab` is set -- that mode removes the rect ceiling, so the fleet ceiling becomes the only bound. In that mode the ceiling counts the observed census **plus outstanding reservations** (see below). |
+
+#### Overflow reservations
+
+In `--overflow-to-new-tab` mode the fleet ceiling is counted against
+`active_workers + reserved_workers`, and `plan.capacity` reports both.
+
+A *reservation* is a worker this helper already planned that has not shown up
+in either snapshot yet. It exists because the pane/peer union cannot cover an
+overflow spawn: the new pane lands in a tab of its own, which renga's
+caller-tab scoping keeps out of `list_panes` permanently, and its peer bind is
+still 10-30s away -- so for the length of that window the worker is invisible
+to both inputs and back-to-back delegations each admit another one. Measured
+before the fix: a ceiling of `2` admitted three workers, every plan reporting
+`free_worker_slots: 2`.
+
+The ledger is the worker seed file the helper already writes on
+`ready_to_spawn`. A seed counts as a reservation only while it is younger than
+`WORKER_BIND_WINDOW_SECONDS` (45s) **and** its worker is absent from the
+census, so a worker that binds stops being double-counted and a spawn that
+never came up frees its slot on its own -- no cleanup step, no leaked slots.
+The mechanism applies to the overflow path only; the broker ceiling and the
+non-overflow renga path are unchanged.
 | `--state-dir PATH` | State directory root. Default: `.state`. |
 | `--template-repo PATH` | Repo root that hosts `.claude/skills/org-delegate/references/instruction-template.md`. Default: try the runtime package's ancestors first, then walk up from CWD. |
 | `--locale-json PATH` | Override the English defaults for non-English consumers (e.g. claude-org-ja). The JSON file maps to `LocaleConfig` fields: `constraints_default`, `report_target_default`, `claude_md_filename_default`, `instruction_template`. |

@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +50,7 @@ from claude_org_runtime.dispatcher.runner import (
     MIN_PANE_WIDTH,
     RENGA_MAX_TABS,
     TAB_SPAWN_ERROR_CODES,
+    WORKER_BIND_WINDOW_SECONDS,
     CapacityPolicy,
     Pane,
     Peer,
@@ -56,10 +59,13 @@ from claude_org_runtime.dispatcher.runner import (
     build_plan,
     build_parser,
     choose_split,
+    count_unbound_reservations,
     derive_tab_awareness,
     main,
     parse_tab_selector,
     validate_tab_selector,
+    write_instruction,
+    write_worker_seed,
 )
 
 # The renga rect escalation exactly as it read before #158, byte for byte
@@ -728,10 +734,15 @@ def test_build_plan_overflow_applies_fleet_ceiling(tmp_path: Path) -> None:
     # The fleet reason must stay distinguishable from the rect reason: ja
     # branches on the wording.
     assert "MIN_PANE" not in msg
+    # No seed files exist under this tmp_path, so the reservation ledger is
+    # empty and the ceiling is decided by the census alone. The two reserved_*
+    # keys are still present: their ABSENCE would mean the ledger was skipped.
     assert plan.capacity == {
         "transport": "renga",
         "max_concurrent_workers": 3,
         "active_workers": 3,
+        "reserved_workers": 0,
+        "reserved_worker_names": [],
         "free_worker_slots": 0,
     }
 
@@ -753,6 +764,153 @@ def test_build_plan_overflow_applies_fleet_ceiling(tmp_path: Path) -> None:
     assert off.capacity is None
     assert "max_concurrent_workers" not in off.escalate["message"]
     assert "MIN_PANE" in off.escalate["message"]
+
+
+def _overflow_once(
+    tmp_path: Path, task_id: str, peers: list[Peer], policy: CapacityPolicy,
+) -> Any:
+    """One overflow delegation, including the state writes the CLI performs.
+
+    ``cmd_delegate_plan`` writes the seed and instruction files on
+    ``ready_to_spawn``; the reservation ledger is those seed files, so a test
+    that skipped the writes would not be simulating consecutive delegations
+    at all.
+    """
+    state = tmp_path / ".state"
+    task = {"task_id": task_id, "worker_dir": str(tmp_path), "instruction": "x"}
+    plan = build_plan(
+        task, _unsplittable_panes(), state,
+        transport="renga",
+        capacity_policy=policy,
+        peers=peers,
+        server_capabilities=_ALL_CAPS,
+        overflow_to_new_tab=True,
+    )
+    if plan.status == "ready_to_spawn":
+        write_worker_seed(state, task, plan.task_id, plan.spawn or {})
+        write_instruction(state, task, plan.task_id)
+    return plan
+
+
+def test_build_plan_overflow_ceiling_counts_unbound_reservations(
+    tmp_path: Path,
+) -> None:
+    # The hole the pane/peer union cannot close, and the reason the ledger
+    # exists. A same-tab spawn is covered by the union because its pane shows
+    # up in the caller's list_panes at once. An OVERFLOW spawn lands in a tab
+    # of its own -- kept out of list_panes forever by renga#288 scoping -- and
+    # is not a peer for another 10-30s, so during that window it is invisible
+    # to BOTH inputs. Before the ledger, three consecutive delegations against
+    # a ceiling of 2 all returned ready_to_spawn, each reporting
+    # "free_worker_slots: 2".
+    peers = [_peer(3, name="secretary", role="secretary",
+                   tab=0, tab_name="main", same_tab=True)]
+    policy = CapacityPolicy(max_concurrent_workers=2)
+
+    first = _overflow_once(tmp_path, "t1", peers, policy)
+    assert first.status == "ready_to_spawn"
+    assert first.capacity["reserved_workers"] == 0
+
+    second = _overflow_once(tmp_path, "t2", peers, policy)
+    assert second.status == "ready_to_spawn"
+    # t1 is now a reservation: still not a pane (other tab), still not a peer.
+    assert second.capacity["reserved_workers"] == 1
+    assert second.capacity["reserved_worker_names"] == ["worker-t1"]
+    assert second.capacity["free_worker_slots"] == 1
+
+    third = _overflow_once(tmp_path, "t3", peers, policy)
+    assert third.status == "split_capacity_exceeded"
+    assert third.spawn is None
+    assert third.capacity["active_workers"] == 0
+    assert third.capacity["reserved_workers"] == 2
+    assert third.capacity["free_worker_slots"] == 0
+    msg = third.escalate["message"]
+    # The operator is told WHICH workers hold the slots, and that the hold is
+    # self-releasing -- otherwise "0 active, 0 free" reads as a bug.
+    assert "reserved_workers=2" in msg
+    assert "worker-t1" in msg and "worker-t2" in msg
+    assert f"{WORKER_BIND_WINDOW_SECONDS}s" in msg
+    msg.encode("cp932")
+
+
+def test_overflow_reservations_expire_and_are_not_double_counted(
+    tmp_path: Path,
+) -> None:
+    # Two properties that together stop the ledger from becoming a leak.
+    peers = [_peer(3, name="secretary", role="secretary",
+                   tab=0, tab_name="main", same_tab=True)]
+    policy = CapacityPolicy(max_concurrent_workers=2)
+    _overflow_once(tmp_path, "t1", peers, policy)
+    _overflow_once(tmp_path, "t2", peers, policy)
+    seeds = sorted((tmp_path / ".state" / "workers").glob("*.md"))
+    assert len(seeds) == 2
+
+    # 1. EXPIRY. Nothing ever deletes a seed file, so without a TTL every
+    #    worker the org has ever planned would hold a slot forever. Age them
+    #    past the bind window: a spawn that never came up must free its slot
+    #    with no cleanup step and no operator action.
+    stale = time.time() - (WORKER_BIND_WINDOW_SECONDS + 60)
+    for seed in seeds:
+        os.utime(seed, (stale, stale))
+    assert count_unbound_reservations(tmp_path / ".state", ()) == ()
+    revived = _overflow_once(tmp_path, "t3", peers, policy)
+    assert revived.status == "ready_to_spawn"
+
+    # 2. NO DOUBLE COUNT. Once the worker does bind, it is in the census --
+    #    and a reservation that is also a peer would consume its slot twice,
+    #    halving the effective ceiling. (t3's own seed is fresh from the
+    #    revived delegation above, so all three are live reservations now.)
+    for seed in seeds:
+        os.utime(seed, None)  # fresh again
+    assert count_unbound_reservations(tmp_path / ".state", ()) == (
+        "worker-t1", "worker-t2", "worker-t3",
+    )
+    assert count_unbound_reservations(
+        tmp_path / ".state", ("worker-t1", "worker-t2", "worker-t3"),
+    ) == ()
+    # Partial binding frees exactly the bound slots, not all of them.
+    assert count_unbound_reservations(
+        tmp_path / ".state", ("worker-t1",),
+    ) == ("worker-t2", "worker-t3")
+
+
+def test_count_unbound_reservations_tolerates_a_missing_state_dir(
+    tmp_path: Path,
+) -> None:
+    # The very first delegation of a session runs before .state/workers
+    # exists. Capacity accounting must not be the thing that breaks it.
+    assert count_unbound_reservations(tmp_path / "nope", ()) == ()
+
+
+def test_overflow_reservations_ignored_outside_overflow_mode(
+    tmp_path: Path,
+) -> None:
+    # The ledger is scoped to the one mode that needs it. A fresh seed file
+    # must not perturb the broker ceiling or the non-overflow renga path,
+    # whose numbers pre-date #158.
+    state = tmp_path / ".state"
+    (state / "workers").mkdir(parents=True)
+    (state / "workers" / "worker-ghost.md").write_text("x", encoding="utf-8")
+
+    broker = build_plan(
+        _task(tmp_path, "b1"), _unsplittable_panes(), state,
+        transport="broker",
+        capacity_policy=CapacityPolicy(max_concurrent_workers=1),
+    )
+    assert broker.status == "ready_to_spawn"
+    assert "reserved_workers" not in (broker.capacity or {})
+
+    renga_off = build_plan(
+        _task(tmp_path, "r1"), _unsplittable_panes(), state,
+        transport="renga",
+        capacity_policy=CapacityPolicy(max_concurrent_workers=1),
+        peers=[_peer(3, name="secretary", role="secretary",
+                     tab=0, tab_name="main", same_tab=True)],
+        server_capabilities=_ALL_CAPS,
+        overflow_to_new_tab=False,
+    )
+    assert renga_off.status == "split_capacity_exceeded"
+    assert renga_off.capacity is None
 
 
 def _full_tab_table_peers() -> list[Peer]:
