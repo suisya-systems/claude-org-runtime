@@ -36,12 +36,27 @@ replaced by an explicit ``--max-concurrent-workers`` policy and the spawn
 addresses a stable adapter-resolvable target. The ``split_capacity_exceeded``
 status is kept for both backends; only the escalation reason differs.
 
+renga 2.0 (runtime Issue #158) scopes ``list_panes`` to the CALLER's tab, so
+the pane snapshot stopped being a census of the org. The population source is
+therefore split off into an optional ``--peers-json`` (``list_peers``, which
+spans every tab), while ``--panes-json`` stays the geometry source that the
+balanced split ranks. Optional ``--tab`` / ``--overflow-to-new-tab`` place a
+worker in another tab; both fail closed unless the caller asserts
+``--server-capability spawn_tab``. Every one of those inputs is optional and
+omitting them reproduces the pre-#158 numbers and plan shape exactly.
+
 Exit codes:
   0 -- plan emitted OK (status = ``ready_to_spawn``)
   1 -- input validation failed (status = ``input_invalid``)
   2 -- capacity exhausted and escalation is required
        (status = ``split_capacity_exceeded``): renga = no rect balanced-split
        candidate; broker = max_concurrent_workers reached
+
+These three are the only process exit codes. The renga tab error codes
+(``tab_not_found`` / ``tab_ambiguous`` / ``tab_limit_reached`` /
+``target_tab_mismatch``) are PLAN-level: they lead the relevant ``errors[]``
+or escalation string and key ``plan.on_spawn_error``, but never become an
+exit status -- consumers branch on 0/1/2 and would misread a fourth value.
 """
 
 from __future__ import annotations
@@ -51,9 +66,10 @@ import dataclasses
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence, Union
 
 # Re-export for documentation / downstream importers (Step B + C symbols).
 from claude_org_runtime import prompts as _prompts  # noqa: F401
@@ -98,6 +114,107 @@ SECRETARY_MIN_HEIGHT = 30
 # dispatcher is a compact relay/control pane, so this floor sits below the
 # secretary's content-pane floor.
 DISPATCHER_MIN_WIDTH = 80
+
+# ---------------------------------------------------------------------------
+# renga layout mirrors -- REPORTING ONLY, NEVER ARITHMETIC (runtime #158)
+# ---------------------------------------------------------------------------
+#
+# These mirror renga's own layout constants so escalation copy can *name* the
+# panels that are eating the frame. They must NEVER be subtracted from a
+# ``Pane`` rect, and no capacity comparison may take one as an operand.
+#
+# Why: renga carves the org sidebar, the file tree and a swapped preview off
+# the frame BEFORE the pane layout runs -- ``layout_geometry::compute`` does
+# ``pane_w = width - org_w - tree_w - preview_w`` and advances the pane area's
+# origin past each panel (renga src/app/layout_geometry.rs:143-176). That
+# ``layout.panes`` Rect is the only thing ever handed to
+# ``LayoutNode::calculate_rects``, whose output becomes ``last_pane_rects``,
+# which ``pane_infos_for_workspace`` copies verbatim onto the wire
+# (app_core.rs:387-427 -> ipc_handlers.rs:193-214). So every rect this module
+# receives is FRAME-ABSOLUTE and already net of the sidebar: ``x`` includes the
+# offset and ``width`` is the post-carve remainder. Subtracting a sidebar width
+# here would be a straight double subtraction, and worse it would DESYNC this
+# module's prediction from renga's own split guard (layout_ops.rs:244-263,
+# ``rect.width / 2 < min_pane_width``), which judges the very same rects --
+# manufacturing split_capacity_exceeded on layouts renga would happily split.
+# The measured alternative is :func:`pane_area_bbox`; see its docstring.
+ORG_SIDEBAR_DEFAULT_WIDTH = 26      # renga DEFAULT_ORG_SIDEBAR_WIDTH
+ORG_SIDEBAR_COMPACT_WIDTH = 16      # renga ORG_SIDEBAR_COMPACT_WIDTH
+DEFAULT_FILE_TREE_WIDTH = 20        # renga AppCore::file_tree_width default
+RENGA_MAX_PANES = 16                # renga layout_ops MAX_PANES (per tab)
+RENGA_MAX_TABS = 16                 # renga layout_ops MAX_TABS (per window)
+
+# renga protocol capability tokens (renga src/ipc/mod.rs:77/89/103).
+#
+# Deliberately three distinct tokens, and this module honours the distinction:
+# a #288-era server advertises ``caller_scope`` while STILL silently dropping
+# cross-tab sends, so ``caller_scope`` can never authorise cross-tab reasoning
+# and ``cross_tab_peers`` can never authorise a ``tab`` spawn key.
+#
+# NOTE (renga src/mcp_peer/mod.rs): the MCP surface does not expose the
+# server's capability list to a tool caller -- ``send_request_requiring``
+# gates internally and only surfaces an ``[server_too_old] ...`` error. So
+# these are an ASSERTION the caller passes in (``--server-capability``), not a
+# value this module can read. That is exactly why nothing is ever inferred
+# from them and why omission fails closed.
+CAP_CALLER_SCOPE = "caller_scope"
+CAP_CROSS_TAB_PEERS = "cross_tab_peers"
+CAP_SPAWN_TAB = "spawn_tab"
+
+# Spawn coordinates for a spawn directed into an EXISTING non-caller tab.
+#
+# Structurally identical to the broker pair but for a different reason, so
+# they are named separately rather than aliased: peers carry no geometry at
+# all (renga PeerInfo has no rect, and PeerList deliberately skips the rect
+# refresh), so there is no cross-tab rect to rank and ``choose_split`` cannot
+# participate. ``"focused"`` is resolved by renga INSIDE the selected tab,
+# which is also what structurally prevents ``target_tab_mismatch``: this
+# module never pairs a caller-tab numeric target with a foreign-tab selector.
+# ``direction`` is required by renga's schema for an existing-tab selector.
+_TAB_SPAWN_TARGET = "focused"
+_TAB_SPAWN_DIRECTION = "vertical"
+
+# The externally-tagged renga TabSelector keys (exactly one per selector) and
+# the error codes a tab-directed spawn can come back with. ``split_refused``
+# is included in the recovery table because renga returns it for "terminal too
+# small to lay out a new background tab" -- deliberately distinct from
+# ``tab_limit_reached`` (MAX_TABS) and from MAX_PANES-within-a-tab refusal.
+#
+# ``pane_not_found`` is in the table because this module CHOOSES to address
+# existing tabs by their anchor pane id: ``resolve_tab_placement``
+# canonicalises ``name:`` / ``index:`` down to ``{"pane_id": N}`` so the plan
+# survives a tab close between emission and the spawn call. renga resolves
+# that selector with ``workspace_index_of_pane(..).ok_or_else(|| CodedError::
+# new(err_code::PANE_NOT_FOUND, "tab anchor pane {id} not found in any
+# workspace"))`` (renga src/app/layout_ops.rs:828-835) -- so when the ANCHOR
+# itself dies (a worker finishing is the common case) the code that comes back
+# is ``pane_not_found``, not ``tab_not_found``. Leaving it out would leave the
+# dispatcher with no recovery entry -- and no ``remove_state_writes`` -- for
+# the most likely failure mode of the strategy this module picked.
+TAB_SELECTOR_KEYS = ("name", "index", "pane_id", "new")
+TAB_SPAWN_ERROR_CODES = (
+    "tab_not_found",
+    "tab_ambiguous",
+    "tab_limit_reached",
+    "target_tab_mismatch",
+    "pane_not_found",
+    "server_too_old",
+    "split_refused",
+)
+
+# The subset of TAB_SPAWN_ERROR_CODES that a *pre-flight* (plan-time) check
+# can raise against the caller's own inputs, before any state file is written.
+# These become ``status="input_invalid"`` (exit 1) rather than an escalation:
+# the operator asked for a tab that the peer census says cannot be addressed,
+# which is a bad argument, not exhausted capacity. ``tab_limit_reached`` is
+# deliberately NOT here -- a full tab table is capacity, so it escalates
+# (exit 2) like every other capacity refusal.
+_TAB_PREFLIGHT_INPUT_CODES = (
+    "server_too_old",
+    "tab_not_found",
+    "tab_ambiguous",
+    "target_tab_mismatch",
+)
 
 # Role priority for balanced-split target selection. Higher wins.
 # Mirrors claude-org-ja's pane-layout.md sort regime: priority is the
@@ -174,6 +291,19 @@ TRANSPORTS = ("renga", "broker")
 # is an explicit opt-in; ``0`` disables spawning entirely.
 DEFAULT_MAX_CONCURRENT_WORKERS = 8
 
+# How long a worker seed file counts as an outstanding capacity reservation
+# (runtime #158). See :func:`count_unbound_reservations` for why the ledger
+# exists at all; this is only the expiry.
+#
+# The value is the ``after_spawn`` peer-bind wait ("retry up to ~30s") plus
+# headroom, because that wait IS the window during which an overflowed worker
+# is invisible to both snapshots. Too short reopens the race it closes; too
+# long makes a failed spawn hold a slot longer than necessary. Reservations
+# are self-expiring rather than explicitly released because nothing in the
+# system reliably runs after a spawn fails -- a TTL needs no cleanup step and
+# cannot leak a slot permanently.
+WORKER_BIND_WINDOW_SECONDS = 45
+
 # Broker-path spawn coordinates. Under the broker transport the adapter does
 # not split a specific pane by geometry (it opens a fresh detached session), so
 # choose_split() is bypassed and the spawn addresses a stable, adapter-
@@ -247,7 +377,7 @@ def parse_capacity_policy(raw: str) -> CapacityPolicy:
 
 
 def count_active_workers(
-    panes: list["Pane"],
+    panes: "Sequence[Union[Pane, Peer]]",
     live_worker_names: Optional[set[str]] = None,
 ) -> int:
     """Count panes acting as live workers for the broker capacity check.
@@ -260,6 +390,15 @@ def count_active_workers(
     Minor #5). The reconciliation set is a caller input rather than a registry
     lookup inside ``build_plan`` so the planner stays a pure function of its
     arguments.
+
+    runtime #158 widened the *annotation* only: :class:`Peer` duck-types on
+    ``.role`` / ``.name``, which is everything this function reads, so a peer
+    snapshot can be counted with the identical body. The parameter is
+    deliberately still named ``panes`` -- renaming it to something
+    population-flavoured would silently break any keyword caller
+    (``count_active_workers(panes=...)``), and a keyword break is not an
+    annotation-only change. This stays the legacy *scalar* entry point;
+    :func:`count_worker_population` is the auditable union that #158 needs.
     """
     workers = [p for p in panes if p.role == "worker"]
     if live_worker_names is None:
@@ -608,6 +747,1314 @@ def choose_split(panes: list[Pane]) -> Optional[SplitChoice]:
 
 
 # ----------------------------------------------------------------------------
+# Multi-tab population / geometry / placement (runtime #158, renga 2.0)
+# ----------------------------------------------------------------------------
+#
+# renga 2.0 (renga#287-#291) turned one window into many tabs and scoped
+# ``list_panes`` to the CALLER's tab, which broke the one assumption every
+# capacity number in this module rested on: "the pane snapshot is the whole
+# org". A dispatcher in tab 0 counting worker panes now misses every worker in
+# tabs 1..N and happily spawns past the ceiling.
+#
+# The fix splits the two jobs the ``panes`` argument used to do:
+#
+#   * ``panes`` stays the GEOMETRY source. It is the only input carrying rects,
+#     it is caller-tab-scoped, and it is what ``choose_split`` ranks. Unchanged.
+#   * ``peers`` becomes the POPULATION / IDENTITY source. renga's ``list_peers``
+#     spans every tab on 2.0 and is already caller-tab-only on 1.4, so counting
+#     worker peers yields the org-wide number on 2.0 and the caller-tab number
+#     on 1.4 -- correct on both WITHOUT knowing which one is on the wire. That
+#     is why the count needs no capability token (see :func:`derive_tab_awareness`
+#     for the three things that DO need one).
+#
+# Everything below is additive. ``choose_split`` / ``_split_options`` / ``Pane``
+# / ``SplitChoice`` are deliberately untouched, and the sidebar constants above
+# appear in exactly one place in this section -- inside
+# :func:`explain_left_panels` -- so no arithmetic can ever double-subtract them.
+
+
+@dataclass
+class Peer:
+    """One entry of a renga ``list_peers`` (or broker ``list_peers``) snapshot.
+
+    Deliberately NOT a :class:`Pane`: renga's ``PeerInfo`` carries no rect and
+    no ``focused`` flag (renga src/ipc/mod.rs:523-560 -- ``PeerList``
+    deliberately skips the rect refresh that ``List`` performs), so a peer
+    forced into ``Pane`` would need fabricated zero geometry -- which collides
+    with the broker's *meaningful* ``w=h=0`` logical-pane sentinel that
+    :func:`_parse_panes` / :func:`_has_logical_pane_geometry` depend on.
+    Keeping the types separate makes the geometry-vs-population split
+    structural rather than conventional: there is no rect on a ``Peer`` to
+    accidentally feed into :func:`choose_split`.
+    """
+
+    id: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+    kind: Optional[str] = None
+    receive_mode: Optional[str] = None
+    cwd: Optional[str] = None
+    summary: Optional[str] = None
+    tab: Optional[int] = None
+    tab_name: Optional[str] = None
+    same_tab: Optional[bool] = None
+    # True iff the SOURCE DICT carried at least one of tab / tab_name /
+    # same_tab. Captured before defaults are applied, because *presence* (not
+    # value) is the old-vs-new server discriminator: renga 2.0 sets all three
+    # unconditionally -- ``tab: Some(ws_idx), tab_name: Some(..), same_tab:
+    # Some(ws_idx == caller_ws)`` (renga src/app/ipc_handlers.rs:253-255) -- so
+    # even a SINGLE-TAB 2.0 server emits them, while renga 1.4 declares all
+    # three ``skip_serializing_if = "Option::is_none"`` and never had the
+    # fields at all. A value-based probe ("does anyone report same_tab?") is
+    # ambiguous between "1.4" and "2.0 with one tab"; presence is not.
+    has_tab_metadata: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Peer":
+        """Parse one peer dict, rejecting malformed tab metadata.
+
+        ``id`` is required and kept as ``str(...)`` VERBATIM -- deliberately
+        not run through :func:`_parse_pane_id`. That function justifies its id
+        collisions with "a single delegate-plan call only ever sees panes from
+        one transport", which does not cover ids that legitimately span tabs,
+        and the broker's peer ids are agent handles (``"worker-foo"``,
+        ``"manual-test"``) that are not numeric at all. The int was only ever
+        a :func:`choose_split` tie-breaker, and a peer can never be a split
+        candidate (it has no rect), so nothing needs the reduction.
+
+        Absence and malformation are different: a missing ``tab`` is renga 1.4
+        (fine, see ``has_tab_metadata``), but ``"tab": "2"`` / ``-1`` / ``True``
+        is a broken transcription and must not be silently coerced into a tab
+        index that then addresses the wrong tab.
+        """
+        if d["id"] is None:
+            # ``str(None)`` would mint the literal handle ``"None"``: a null id
+            # is not an id, and two null-id peers would collapse onto the same
+            # synthetic anchor. ``_parse_peers``' contract is "every entry that
+            # HAS an id parses", so this belongs with the other field errors.
+            raise ValueError("peer id must not be null")
+        tab = d.get("tab")
+        if tab is not None and (
+            isinstance(tab, bool) or not isinstance(tab, int) or tab < 0
+        ):
+            raise ValueError(
+                f"peer tab must be a non-negative int (or absent), got {tab!r}"
+            )
+        same_tab = d.get("same_tab")
+        if same_tab is not None and not isinstance(same_tab, bool):
+            raise ValueError(
+                f"peer same_tab must be a bool (or absent), got {same_tab!r}"
+            )
+        tab_name = d.get("tab_name")
+        if tab_name is not None and not isinstance(tab_name, str):
+            raise ValueError(
+                f"peer tab_name must be a string (or absent), got {tab_name!r}"
+            )
+        return cls(
+            id=str(d["id"]),
+            name=d.get("name"),
+            role=d.get("role"),
+            kind=d.get("kind"),
+            receive_mode=d.get("receive_mode"),
+            cwd=d.get("cwd"),
+            summary=d.get("summary"),
+            tab=tab,
+            tab_name=tab_name,
+            same_tab=same_tab,
+            has_tab_metadata=(
+                "tab" in d or "tab_name" in d or "same_tab" in d
+            ),
+        )
+
+
+def _peer_numeric_id(peer: Peer) -> Optional[int]:
+    """Return ``peer.id`` as an int, or ``None`` when it is not numeric.
+
+    renga peer ids are numeric pane ids; broker peer ids are agent handles.
+    Used only to pick a tab's ``anchor_pane_id``, so a non-numeric handle is a
+    normal answer ("this transport has no addressable anchor"), not an error.
+    """
+    try:
+        return _parse_pane_id(peer.id)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class TabCensus:
+    """Peer-derived census of one observed tab.
+
+    ``anchor_pane_id`` is the numeric id of a peer known to live in this tab.
+    It is the STABLE address: renga documents the tab index as display
+    metadata that shifts when tabs close and is never an address (renga
+    src/mcp_peer/mod.rs:531). Canonicalising a name/index selector down to
+    ``{"pane_id": anchor_pane_id}`` is what keeps an emitted plan valid across
+    a tab close between plan emission and the spawn call. The smallest numeric
+    peer id in the tab is used so the anchor does not depend on the order the
+    caller happened to transcribe ``list_peers`` in.
+
+    ``pane_ids`` is EVERY numeric peer id the census places in this tab, and it
+    exists because ``anchor_pane_id`` must not do double duty. The anchor is an
+    ordering-stability device (``min()``); membership is a different question,
+    and the ``target_tab_mismatch`` guard asks the membership one -- "does the
+    caller's own ``list_panes`` also claim this pane?". Keying that guard on
+    the anchor would make it fire only when the operator happened to name the
+    smallest id in the tab and sail past the identical contradiction on every
+    other id.
+    """
+
+    index: Optional[int]
+    name: Optional[str]
+    peers: int
+    workers: int
+    is_caller: bool
+    anchor_pane_id: Optional[int]
+    pane_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TabAwareness:
+    """What this module knows about tabs, and on whose authority.
+
+    ``tabs`` is a LOWER BOUND on the real tab count: a tab whose panes are all
+    non-peer (a bare shell) is invisible to ``list_peers``, so this can never
+    be a hard MAX_TABS gate -- renga stays authoritative and answers
+    ``tab_limit_reached`` itself. The pre-flight check here only avoids
+    obviously-doomed spawns; it never claims to be exhaustive.
+    """
+
+    cross_tab: bool                     # peers demonstrably span tabs
+    spawn_tab: bool                     # a `tab` key may be emitted
+    capabilities_known: bool            # caller asserted a token list
+    caller_tab: Optional[int]
+    caller_tab_name: Optional[str]
+    tabs: tuple[TabCensus, ...]
+
+    @classmethod
+    def none(cls) -> "TabAwareness":
+        """Nothing is known: no peers supplied and no capability asserted."""
+        return cls(
+            cross_tab=False,
+            spawn_tab=False,
+            capabilities_known=False,
+            caller_tab=None,
+            caller_tab_name=None,
+            tabs=(),
+        )
+
+
+@dataclass(frozen=True)
+class WorkerPopulation:
+    """Auditable worker count with its provenance.
+
+    ``total`` is the UNION of worker panes and worker peers deduped on
+    ``name``. Union, not replacement, because a freshly spawned worker exists
+    as a pane for the ~10-30s before its peer bind registers -- this module's
+    own ``after_spawn`` step says "wait for {worker} to appear as a peer
+    (retry up to ~30s)" -- so a second delegate-plan inside that window would
+    undercount and over-spawn if peers simply replaced panes.
+
+    Dedup is on ``name`` because it is the ONLY key present on both surfaces
+    of every transport: renga's list_panes / list_peers agree on the numeric
+    id AND the name, but the broker's list_peers emits ``id = agent_id``
+    (``worker-foo``) while its list_panes emits ``id = adapter handle``
+    (``%3``), so a pane-id dedup would double-count every broker worker
+    (broker/surface.py:775 vs broker/server.py:508).
+
+    ``anonymous`` workers (``role="worker"`` with no name) cannot be deduped
+    at all and are simply added on top: dropping them would undercount, and
+    merging them would collapse two real workers into one.
+    """
+
+    total: int
+    source: str                 # "panes" | "panes+peers"
+    scope: str                  # "caller_tab" | "all_tabs"
+    panes_only: int
+    peers_only: int
+    both: int
+    anonymous: int              # role=worker with no name; cannot be deduped
+    names: tuple[str, ...]      # sorted; excludes anonymous
+    tab_metadata: bool
+
+
+@dataclass(frozen=True)
+class PaneArea:
+    """The caller tab's pane area, MEASURED from the snapshot.
+
+    Exact, not predicted: ``calculate_rects`` / ``split_rect`` tile
+    ``layout.panes`` with no gaps and no overlap (renga
+    src/app/layout_tree.rs:222-242), so the bounding box of the pane rects IS
+    the pane area renga computed after carving off every left panel.
+
+    ``left_panels_columns`` (== ``x``) is the sidebar folded into the capacity
+    model as an OBSERVED quantity. It is automatically right in every sidebar
+    mode (default 26 / compact 16 / off / replace) because widening or hiding
+    the sidebar simply changes the rects in the next snapshot, and it needs no
+    terminal width -- which the runtime never receives. What it is NOT is
+    decomposable: ``min(x) = org_w + tree_w + (preview_w if swapped)`` is one
+    equation in three unknowns, so any attribution is a hypothesis and
+    :func:`explain_left_panels` phrases it as one.
+    """
+
+    x: int
+    y: int
+    width: int
+    height: int
+    pane_count: int
+
+    @property
+    def left_panels_columns(self) -> int:
+        """Columns consumed by renga's left panels, measured (== ``x``)."""
+        return self.x
+
+    def fits_new_pane(self) -> bool:
+        """Would a *whole* pane of this size clear the MIN_PANE_* floors?
+
+        No ``// 2`` anywhere, deliberately: a ``tab:{new}`` pane is the new
+        tab's ONLY pane, not a split child (renga workspace_state.rs:128
+        creates the workspace single-pane). Halving here would refuse an
+        overflow that renga would have laid out fine.
+        """
+        return self.width >= MIN_PANE_WIDTH and self.height >= MIN_PANE_HEIGHT
+
+    def to_dict(self) -> dict[str, int]:
+        """Geometry only -- ``pane_count`` is deliberately NOT serialized.
+
+        It is not the same number as the plan's ``panes_in_tab``, which is
+        ``len(panes)``: this bbox counts only entries with positive geometry,
+        so the broker's ``w=h=0`` logical-pane sentinel is in one and not the
+        other. Emitting both under near-identical names would invite a
+        consumer to treat them as interchangeable.
+        """
+        return {
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+        }
+
+
+@dataclass(frozen=True)
+class TabPlacement:
+    """Resolved tab placement for one spawn.
+
+    ``kind == "caller"`` means no ``tab`` key is emitted at all, which is the
+    only shape that existed before #158 -- and therefore the shape every
+    pre-#158 caller must keep getting.
+    """
+
+    kind: str                           # "caller" | "existing" | "new"
+    # Wire TabSelector; None for "caller".
+    selector: Optional[dict[str, Any]] = None
+    error_code: Optional[str] = None    # one of TAB_SPAWN_ERROR_CODES
+    error: Optional[str] = None         # "<code>: <human message>"
+    reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def caller(cls) -> "TabPlacement":
+        """The pre-#158 placement: spawn into the caller's own tab."""
+        return cls(kind="caller")
+
+
+def _dedup_name(value: Any) -> Optional[str]:
+    """Return ``value`` when it can serve as a dedup key, else ``None``.
+
+    Neither ``Pane.from_dict`` nor :meth:`Peer.from_dict` type-checks ``name``
+    -- ``d.get("name")`` takes whatever the transcription put there -- so a
+    snapshot carrying ``"name": ["dispatcher"]`` reaches here with an
+    UNHASHABLE name. Before #158 nothing hashed a name on the renga path
+    (``len(workers)`` and ``p.name == worker_name`` both tolerate any type), so
+    building a set here without this guard would turn a tolerated-if-odd input
+    into a bare ``TypeError`` traceback -- exactly what ``_parse_panes``'
+    comment promises not to do, and a regression for every existing caller.
+
+    A non-string (or empty) name simply cannot be a dedup key, so it is
+    reported as anonymous: that is the branch this module already documents for
+    "cannot be deduped", and it errs toward over-counting, which is the
+    fail-safe direction for a capacity ceiling.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def count_worker_population(
+    panes: list[Pane],
+    peers: Optional[list[Peer]] = None,
+    live_worker_names: Optional[set[str]] = None,
+) -> WorkerPopulation:
+    """Count live workers across panes AND peers, with provenance.
+
+    ``peers is None`` (every pre-#158 caller) reproduces
+    :func:`count_active_workers` exactly -- same number, no dedup, no tab
+    scope -- so the fallback path is numerically identical to today.
+
+    ``peers`` supplied unions the two snapshots on ``name`` (see
+    :class:`WorkerPopulation` for why ``name`` and not the pane id). The
+    result is tab-AGNOSTIC on purpose: ``same_tab`` never changes the count,
+    which is what makes the same code correct against renga 1.4 (peers are
+    already caller-tab-only there) and renga 2.0 (peers span tabs) without a
+    capability token and without a paired consumer-side release.
+    """
+    pane_workers = [p for p in panes if p.role == "worker"]
+    if live_worker_names is not None:
+        # ``_dedup_name`` rather than ``p.name`` for the same reason the sets
+        # below use it: a set lookup hashes its operand, and #158 made this
+        # function run on the renga path too (build_plan calls it
+        # unconditionally), where an unvalidated name never used to be hashed.
+        pane_workers = [
+            p for p in pane_workers if _dedup_name(p.name) in live_worker_names
+        ]
+
+    if peers is None:
+        pane_names = {
+            n for n in (_dedup_name(p.name) for p in pane_workers)
+            if n is not None
+        }
+        return WorkerPopulation(
+            # len(), not len(pane_names): identical to count_active_workers,
+            # which has never deduped. Changing the number on the fallback
+            # path would be a silent capacity change for every caller that
+            # passes nothing new.
+            total=len(pane_workers),
+            source="panes",
+            scope="caller_tab",
+            panes_only=len(pane_workers),
+            peers_only=0,
+            both=0,
+            anonymous=sum(
+                1 for p in pane_workers if _dedup_name(p.name) is None
+            ),
+            names=tuple(sorted(pane_names)),
+            tab_metadata=False,
+        )
+
+    peer_workers = [q for q in peers if q.role == "worker"]
+    if live_worker_names is not None:
+        peer_workers = [
+            q for q in peer_workers if _dedup_name(q.name) in live_worker_names
+        ]
+
+    pane_names = {
+        n for n in (_dedup_name(p.name) for p in pane_workers) if n is not None
+    }
+    peer_names = {
+        n for n in (_dedup_name(q.name) for q in peer_workers) if n is not None
+    }
+    both = pane_names & peer_names
+    anonymous = (
+        sum(1 for p in pane_workers if _dedup_name(p.name) is None)
+        + sum(1 for q in peer_workers if _dedup_name(q.name) is None)
+    )
+    names = pane_names | peer_names
+    has_tab_metadata = any(q.has_tab_metadata for q in peers)
+    return WorkerPopulation(
+        total=len(names) + anonymous,
+        source="panes+peers",
+        scope="all_tabs" if has_tab_metadata else "caller_tab",
+        panes_only=len(pane_names - peer_names),
+        peers_only=len(peer_names - pane_names),
+        both=len(both),
+        anonymous=anonymous,
+        names=tuple(sorted(names)),
+        tab_metadata=has_tab_metadata,
+    )
+
+
+def _tab_pane_ids(group: list[Peer]) -> tuple[int, ...]:
+    """Every numeric peer id in ``group``, sorted. Empty on a tabless handle."""
+    return tuple(sorted(
+        n for n in (_peer_numeric_id(q) for q in group) if n is not None
+    ))
+
+
+def _tab_anchor_pane_id(group: list[Peer]) -> Optional[int]:
+    """Smallest numeric peer id in ``group``, or None on a tabless transport."""
+    numeric = _tab_pane_ids(group)
+    return numeric[0] if numeric else None
+
+
+def count_unbound_reservations(
+    state_dir: Path,
+    counted_names: Iterable[str],
+    now: Optional[float] = None,
+) -> tuple[str, ...]:
+    """Worker seeds written recently whose worker is in NEITHER snapshot.
+
+    Closes the one hole the pane/peer union cannot close on its own, and it
+    exists only because ``--overflow-to-new-tab`` opened it.
+
+    The union is what makes a *same-tab* spawn safe across the peer-bind
+    delay: the new pane shows up in the caller's ``list_panes`` immediately,
+    so it is counted from the moment it exists even though its peer bind is
+    still 10-30s away (this module's own ``after_spawn`` step waits up to
+    ~30s for that bind). An OVERFLOW spawn has no such cover. It lands in a
+    tab of its own, which renga#288 scoping keeps out of the caller's
+    ``list_panes`` forever, and it is not a peer yet -- so for the length of
+    that window it is invisible to both inputs, and back-to-back delegations
+    each re-observe the same census and each admit another worker. Measured
+    on the pre-fix build: a ceiling of 2 admitted three workers, every plan
+    reporting ``free_worker_slots: 2``.
+
+    The reservation ledger is the seed file the helper itself already writes
+    on ``ready_to_spawn`` (:func:`write_worker_seed`, ``Status: planned``).
+    Reading it is not a new kind of impurity: ``build_plan`` already stats
+    these exact paths for the duplicate-state-file guard.
+
+    Three rules keep the ledger honest:
+
+    - **Excluded if already counted.** A worker that has since become a pane
+      or a peer is in ``counted_names`` and must not be added twice.
+    - **Excluded if the seed says it is no longer pending.** The seed carries
+      a ``Status:`` line, and the runtime writes ``planned`` into it. A
+      consumer's monitoring loop rewrites these same files as the worker
+      progresses -- which also refreshes the mtime -- so a worker that just
+      finished would otherwise hold a slot for the whole window and block its
+      own replacement. An explicit status other than ``planned`` is direct
+      evidence the spawn is no longer pending, and it beats the mtime clock.
+      An unreadable or status-less seed falls back to the clock: guessing
+      "still pending" over-counts, which refuses a spawn, while guessing the
+      other way exceeds the only ceiling this mode has.
+    - **Expired by mtime.** Nothing ever deletes a seed file, so counting
+      them unconditionally would make every worker the org has ever planned
+      consume a slot forever. A reservation is only credible while the bind
+      it is waiting for is still plausible, hence
+      :data:`WORKER_BIND_WINDOW_SECONDS`. That also makes the ledger
+      self-healing: a spawn that failed outright -- leaving a seed nothing
+      will ever rewrite -- frees its slot once the window passes, with no
+      cleanup step and no operator action.
+
+    Returns the reserved worker names, sorted -- names rather than a count so
+    the plan can show the operator WHICH workers are holding the slots.
+    """
+    workers_dir = state_dir / "workers"
+    if not workers_dir.is_dir():
+        return ()
+    already = set(counted_names)
+    # Injected by the caller in tests; ``None`` means "ask the clock". Kept a
+    # parameter rather than a module-level seam so the planner stays a pure
+    # function of its arguments for any caller that wants determinism.
+    if now is None:
+        now = time.time()
+    reserved: list[str] = []
+    for seed in workers_dir.glob("*.md"):
+        name = seed.stem
+        if name in already:
+            continue
+        try:
+            age = now - seed.stat().st_mtime
+        except OSError:
+            # A seed that vanished mid-scan cannot be holding a slot. Skip it
+            # rather than fail the plan: capacity accounting must not be the
+            # thing that breaks a delegation.
+            continue
+        # A negative age (clock skew, or a file stamped in the future) is
+        # treated as fresh. Erring toward counting the reservation is the
+        # fail-safe direction: over-counting refuses a spawn, under-counting
+        # exceeds the only ceiling this mode has.
+        if age > WORKER_BIND_WINDOW_SECONDS:
+            continue
+        if _seed_status(seed) not in (None, "planned"):
+            # A rewritten status is newer evidence than the mtime -- and it is
+            # the rewrite itself that refreshed the mtime, so trusting the
+            # clock here would make a just-finished worker block its own
+            # replacement for the whole window.
+            continue
+        reserved.append(name)
+    return tuple(sorted(reserved))
+
+
+def _seed_status(seed: Path) -> Optional[str]:
+    """Lowercased value of a worker seed's ``Status:`` line, or None.
+
+    None means "no usable answer" -- the file is unreadable, or carries no
+    ``Status:`` line at all (a consumer may template these files differently;
+    :func:`write_worker_seed` is the runtime's shape, not a contract every
+    writer signed). Callers treat None as "fall back to the mtime clock"
+    rather than as any particular status.
+
+    Only the first ``Status:`` line is read: the seed's Progress Log can
+    legitimately quote the word later in the body, and the header is the
+    field the writers agree on.
+    """
+    try:
+        body = seed.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("status:"):
+            return stripped.split(":", 1)[1].strip().lower() or None
+    return None
+
+
+def derive_tab_awareness(
+    peers: Optional[list[Peer]],
+    server_capabilities: Optional[frozenset[str]] = None,
+) -> TabAwareness:
+    """Derive what may be *claimed* about tabs, and on whose authority.
+
+    Three independent signals, each gating exactly one thing, and nothing is
+    inferred from a data shape to guess a server version:
+
+    * ``spawn_tab`` -- an explicit assertion, NEVER inferred. It is true iff
+      the caller passed a capability set containing ``spawn_tab``. Omission
+      fails closed, which is why an existing caller (who passes
+      ``server_capabilities=None``) can never have a ``tab`` key emitted into
+      its plan and therefore can never be sent a request a renga 1.4 server
+      would refuse with ``[server_too_old]``.
+    * ``cross_tab`` -- the peer snapshot carries tab structure (field
+      presence, see :attr:`Peer.has_tab_metadata`) AND nothing contradicts
+      it. When the caller asserted a capability list, the deliberately
+      distinct ``cross_tab_peers`` token must be in it: a renga#288-era
+      server advertises ``caller_scope`` while STILL silently dropping
+      cross-tab sends (renga src/ipc/mod.rs:77/89/103), so ``caller_scope``
+      alone must never authorise cross-tab reasoning.
+    * ``capabilities_known`` -- whether an assertion was made at all. Purely
+      a label for the plan JSON, so a reader can tell "no tokens asserted"
+      apart from "tokens asserted and this one was absent".
+
+    Note that the worker COUNT is deliberately absent from that list: see
+    :func:`count_worker_population`.
+    """
+    caps_known = server_capabilities is not None
+    spawn_tab = caps_known and CAP_SPAWN_TAB in (server_capabilities or ())
+    if peers is None:
+        if not caps_known:
+            return TabAwareness.none()
+        # No census, but the caller did assert capabilities -- an operator can
+        # legitimately drive `--tab new` / `--overflow-to-new-tab` with no
+        # `--peers-json` at all, so the assertion must survive the empty
+        # census (the selector then passes through unresolved, with a reason).
+        return TabAwareness(
+            cross_tab=False,
+            spawn_tab=spawn_tab,
+            capabilities_known=True,
+            caller_tab=None,
+            caller_tab_name=None,
+            tabs=(),
+        )
+
+    has_tab_metadata = any(q.has_tab_metadata for q in peers)
+    if caps_known:
+        cross_tab = has_tab_metadata and CAP_CROSS_TAB_PEERS in (
+            server_capabilities or ()
+        )
+    else:
+        cross_tab = has_tab_metadata
+
+    # The caller's own tab is read off the peer that says ``same_tab is True``
+    # rather than off list order: renga sets the flag per peer, and the caller
+    # is not guaranteed to be first (or present) in the transcription.
+    caller = next((q for q in peers if q.same_tab is True), None)
+
+    # Grouping key, and why it is not simply ``q.tab``:
+    #
+    # renga's MCP ``list_peers`` is TEXT, and the dispatcher transcribes it.
+    # That renderer annotates the CALLER's own rows as a bare ``[your tab]``
+    # -- no index, no label -- and only foreign rows as ``[tab N "label"]``
+    # (renga src/mcp_peer/mod.rs:904-910, ``match (p.same_tab, p.tab)`` with
+    # ``(Some(true), _) => " [your tab]"``). So a FAITHFUL transcription of a
+    # renga 2.0 org yields caller peers carrying ``same_tab: true`` and no
+    # ``tab`` key at all. Skipping those (the obvious ``if q.tab is None:
+    # continue``) silently drops the caller's entire tab: ``by_tab`` would omit
+    # it while ``scope`` claims "all_tabs", no census row would ever be
+    # ``caller``, and ``tabs_seen`` would be off by one -- which also puts the
+    # tab_limit_reached pre-flight permanently out of reach, because 15 foreign
+    # tabs plus the caller's own is 16 real tabs but only 15 counted ones.
+    #
+    # So ``same_tab is True`` is a grouping key in its own right. When some
+    # caller row DOES carry an index (a structured transcription, or a future
+    # renderer), the index-less rows join that same group rather than forming a
+    # second one; otherwise the caller's tab is censused with ``index=None``,
+    # which is honest -- the wire genuinely did not say which index it is, and
+    # ``TabCensus.index`` has always been Optional for exactly this reason.
+    caller_index = next(
+        (q.tab for q in peers if q.same_tab is True and q.tab is not None),
+        None,
+    )
+    by_index: dict[Optional[int], list[Peer]] = {}
+    for q in peers:
+        if q.tab is not None:
+            key: Optional[int] = q.tab
+        elif q.same_tab is True:
+            key = caller_index
+        else:
+            # No tab metadata at all (renga 1.4 / the tabless broker), or a
+            # foreign peer whose index the transcription lost: there is nothing
+            # to census it under, and inventing a tab would be a guess.
+            continue
+        by_index.setdefault(key, []).append(q)
+
+    tabs = tuple(
+        TabCensus(
+            index=idx,
+            name=next((q.tab_name for q in group if q.tab_name), None),
+            peers=len(group),
+            workers=sum(1 for q in group if q.role == "worker"),
+            is_caller=any(q.same_tab is True for q in group),
+            anchor_pane_id=_tab_anchor_pane_id(group),
+            pane_ids=_tab_pane_ids(group),
+        )
+        # ``sorted`` cannot compare None with int, and the index-less caller
+        # entry is the caller's own tab, so it deliberately leads the census.
+        for idx, group in sorted(
+            by_index.items(),
+            key=lambda kv: (kv[0] is not None, kv[0] or 0),
+        )
+    )
+
+    return TabAwareness(
+        cross_tab=cross_tab,
+        spawn_tab=spawn_tab,
+        capabilities_known=caps_known,
+        caller_tab=caller.tab if caller is not None else None,
+        caller_tab_name=caller.tab_name if caller is not None else None,
+        tabs=tabs,
+    )
+
+
+def pane_area_bbox(panes: list[Pane]) -> Optional[PaneArea]:
+    """Measure the caller tab's pane area as the bounding box of its rects.
+
+    This is the sidebar folded into the capacity model WITHOUT any
+    subtraction: renga tiles ``layout.panes`` with no gaps and no overlap, so
+    ``(min x, min y, max(x+w) - min x, max(y+h) - min y)`` reconstructs the
+    post-carve pane area exactly. Prediction is not an option anyway -- the
+    runtime never receives a frame width, and the left-panel total is one
+    equation in three unknowns (see :class:`PaneArea`).
+
+    Only panes with ``width > 0 and height > 0`` are bounded: the broker's
+    ``w=h=0`` logical-pane sentinel is a real entry in ``panes`` (kept for
+    duplicate-name detection) and would otherwise drag the origin to 0,0 and
+    report a pane area that includes columns nothing is drawn in.
+    """
+    real = [p for p in panes if p.width > 0 and p.height > 0]
+    if not real:
+        return None
+    x = min(p.x for p in real)
+    y = min(p.y for p in real)
+    return PaneArea(
+        x=x,
+        y=y,
+        width=max(p.x + p.width for p in real) - x,
+        height=max(p.y + p.height for p in real) - y,
+        pane_count=len(real),
+    )
+
+
+def new_tab_pane_estimate(panes: list[Pane]) -> Optional[dict[str, Any]]:
+    """Advisory estimate of the lone pane a ``tab:{new}`` would create.
+
+    A fresh renga workspace is created single-pane with the file tree visible
+    and no preview, so its pane area equals the caller tab's own measured
+    bbox whenever the caller's tab is in that same default state. That is a
+    hypothesis about the caller's UI state, not a fact, which is why the
+    result is flagged ``advisory``.
+
+    ``advisory`` describes the NUMBER's provenance, not the caller's freedom
+    to ignore it. ``build_plan`` does gate on ``fits``, but only for the
+    IMPLICIT overflow (``--overflow-to-new-tab``), never for an explicit
+    ``--tab new`` -- an operator who named the tab is left to renga. That
+    asymmetry is the whole reason the flag is not a hard precondition here:
+    refusing an implicit fallback costs the caller the pre-#158 escalation it
+    would have got anyway, while refusing an explicit request would override
+    an instruction on the strength of a hypothesis. Note the estimate can err
+    in BOTH directions -- renga's own background-tab refusal is
+    ``terminal_too_small_for_layout()`` on the whole terminal, not a test on
+    the pane area (renga src/app/app_core.rs:363, :625-628), so renga may
+    well accept a spawn this estimate calls unfit; and a caller tab with a
+    preview swapped in measures narrower than the fresh tab actually would
+    (renga src/app/workspace_state.rs:118-130). See the gate's own comment in
+    ``build_plan`` for the full reasoning.
+    """
+    area = pane_area_bbox(panes)
+    if area is None:
+        return None
+    return {
+        "width": area.width,
+        "height": area.height,
+        "fits": area.fits_new_pane(),
+        "advisory": True,
+    }
+
+
+def explain_left_panels(columns: int) -> str:
+    """Human-readable, ASCII-only account of the measured left-panel columns.
+
+    The ONLY place the ``ORG_SIDEBAR_*`` / ``DEFAULT_FILE_TREE_WIDTH``
+    constants are ever read. They are interpolated into prose here and are
+    never an operand in a comparison, which is what makes a future
+    double-subtraction structurally impossible rather than merely discouraged.
+
+    The attribution is phrased as a candidate on purpose: ``columns`` is a
+    measured total and ``org_w + tree_w + maybe preview_w`` is one equation in
+    three unknowns, so naming a single decomposition would be a guess dressed
+    as a fact at 3am.
+
+    ``columns == 0`` gets its own sentence. This text is appended to the
+    pre-#158 rect escalation, which claude-org-ja forwards to the secretary
+    VERBATIM and which a pane at ``x=0`` reaches today with none of the new
+    flags. Offering a "26 + 20" attribution for a measured total of zero is
+    self-contradicting, and telling a human to reclaim columns that do not
+    exist -- via a toggle that is already off -- sends them chasing nothing.
+    """
+    if columns <= 0:
+        return (
+            "The pane area starts at column 0, so renga's left panels are "
+            "consuming nothing: the org sidebar and the file tree are already "
+            "hidden. There are no columns left to reclaim here."
+        )
+    return (
+        f"{columns} columns left of the pane area are consumed by renga's "
+        "left panels; that total is not decomposable from a list_panes "
+        "snapshot, but a candidate attribution is an org sidebar "
+        f"({ORG_SIDEBAR_DEFAULT_WIDTH} default / "
+        f"{ORG_SIDEBAR_COMPACT_WIDTH} compact) plus a file tree "
+        f"(~{DEFAULT_FILE_TREE_WIDTH}). Reclaim them with Ctrl+B or "
+        "[ui] org_sidebar = \"off\" and re-run."
+    )
+
+
+def parse_tab_selector(raw: str) -> dict[str, Any]:
+    """Parse a ``--tab`` value into renga's externally-tagged TabSelector.
+
+    Accepted forms (exactly the renga variants, no aliases)::
+
+        pane_id:N   -> {"pane_id": N}    stable anchor, preferred
+        index:N     -> {"index": N}      0-based, shifts when a tab closes
+        name:LABEL  -> {"name": LABEL}    exact match, never first-match
+        new         -> {"new": {}}
+        new:LABEL   -> {"new": {"name": LABEL}}
+
+    Raises :class:`ValueError` on anything else. There is no "bare N" form:
+    an unprefixed integer is ambiguous between an index and a pane id, and
+    guessing wrong addresses a different tab than the operator meant.
+
+    **A LABEL is taken verbatim, surrounding whitespace included.** renga
+    stores tab labels as given and matches display names exactly -- it trims
+    only to test emptiness (``Some(s) if !s.trim().is_empty()``,
+    src/mcp_peer/mod.rs:1170) -- so a label is opaque data this parser has no
+    licence to normalise. Trimming it would silently address a DIFFERENT tab
+    than the operator asked for, or create one under a name they did not
+    choose. Only the selector's own syntax (the key, and a numeric value) is
+    whitespace-insensitive, because that part is this parser's grammar rather
+    than the operator's data.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(f"--tab must be a string, got {type(raw).__name__}")
+    if not raw.strip():
+        raise ValueError(
+            "--tab is empty; expected pane_id:N, index:N, name:LABEL, new, "
+            "or new:LABEL"
+        )
+    # Partition the ORIGINAL string, not a stripped copy: everything after the
+    # first colon may be a label and must survive byte for byte. The key is
+    # stripped on its own so shell-quoting slack around the selector still
+    # works, and so does a trailing-space "new".
+    raw_key, sep, value = raw.partition(":")
+    key = raw_key.strip()
+    if not sep:
+        if key == "new":
+            return {"new": {}}
+        raise ValueError(
+            f"--tab {raw!r} has no selector prefix; expected pane_id:N, "
+            "index:N, name:LABEL, new, or new:LABEL"
+        )
+    if key == "new":
+        # Emptiness is judged on the trimmed label (renga's own rule) while
+        # the label itself is kept untrimmed.
+        if not value.strip():
+            raise ValueError("--tab new:LABEL requires a non-empty LABEL")
+        return {"new": {"name": value}}
+    if key == "name":
+        if not value.strip():
+            raise ValueError("--tab name:LABEL requires a non-empty LABEL")
+        return {"name": value}
+    if key in ("index", "pane_id"):
+        value = value.strip()
+        if not value.isdigit():
+            # ``isdigit`` rejects "-1" and "abc" in one test. A negative index
+            # is not "out of range" (which is a tab_not_found at plan time),
+            # it is a malformed argument.
+            raise ValueError(
+                f"--tab {key}:{value!r} must be a non-negative integer"
+            )
+        return {key: int(value)}
+    raise ValueError(
+        f"--tab {raw!r} has unknown selector {key!r}; expected one of "
+        f"{list(TAB_SELECTOR_KEYS)}"
+    )
+
+
+def validate_tab_selector(selector: Any) -> Optional[str]:
+    """Return an error string for a malformed TabSelector, else ``None``.
+
+    renga's TabSelector is externally tagged, so EXACTLY one key is legal --
+    a two-key object is not "the first one wins", it is a schema violation.
+    This also guards the direct-API caller who builds the dict by hand rather
+    than going through :func:`parse_tab_selector` -- which claude-org-ja does,
+    so "the CLI happens to strip it" is not protection.
+
+    Emptiness is tested after ``strip()`` because renga tests it that way:
+    ``Some(s) if !s.trim().is_empty()`` for ``tab.name`` and
+    ``v.as_str().map(str::trim)`` for ``tab.new.name`` (renga
+    src/mcp_peer/mod.rs:1173-1178, :1205-1215). A whitespace-only label would
+    otherwise pass here, get a seed file and an instruction file written for
+    it, and then be rejected by renga with a JSON-RPC -32602 -- the retry
+    lockout ``on_spawn_error`` exists to prevent. The VALUE is not stripped,
+    matching renga, which stores tab labels verbatim and matches them exactly.
+    """
+    if not isinstance(selector, dict):
+        return (
+            f"tab selector must be an object, got {type(selector).__name__}"
+        )
+    keys = [k for k in selector]
+    if len(keys) != 1:
+        return (
+            f"tab selector must carry exactly one of {list(TAB_SELECTOR_KEYS)}, "
+            f"got {sorted(keys)}"
+        )
+    key = keys[0]
+    if key not in TAB_SELECTOR_KEYS:
+        return (
+            f"unknown tab selector key {key!r}; expected one of "
+            f"{list(TAB_SELECTOR_KEYS)}"
+        )
+    value = selector[key]
+    if key == "name":
+        if not isinstance(value, str) or not value.strip():
+            return f"tab selector name must be a non-empty string, got {value!r}"
+        return None
+    if key in ("index", "pane_id"):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            # bool is an int subclass; ``{"index": True}`` must not become
+            # tab 1.
+            return (
+                f"tab selector {key} must be a non-negative int, got {value!r}"
+            )
+        return None
+    # key == "new": renga's NewTab payload carries an optional display name
+    # and nothing else.
+    if not isinstance(value, dict):
+        return f"tab selector new must be an object, got {value!r}"
+    extra = sorted(set(value) - {"name"})
+    if extra:
+        return f"tab selector new accepts only 'name', got extra keys {extra}"
+    if "name" in value and (
+        not isinstance(value["name"], str) or not value["name"].strip()
+    ):
+        return (
+            "tab selector new.name must be a non-empty string, got "
+            f"{value['name']!r}"
+        )
+    return None
+
+
+def _new_tab_placement(
+    new_body: dict[str, Any],
+    awareness: TabAwareness,
+    worker_name: str,
+    reasons: list[str],
+) -> TabPlacement:
+    """Build a ``tab:{new}`` placement, refusing at the observed MAX_TABS."""
+    tabs_seen = len(awareness.tabs)
+    if tabs_seen >= RENGA_MAX_TABS:
+        return TabPlacement(
+            kind="new",
+            selector=None,
+            error_code="tab_limit_reached",
+            error=(
+                f"tab_limit_reached: the peer census already sees {tabs_seen} "
+                f"tabs and renga's MAX_TABS is {RENGA_MAX_TABS}, so a fresh "
+                "background tab cannot be created. Close a tab or wait for a "
+                "worker to finish."
+            ),
+            reasons=tuple(reasons),
+        )
+    # An operator-supplied label wins; otherwise the tab is named after the
+    # worker. ``worker-{task_id}`` is unique by construction (a duplicate
+    # task_id was already rejected upstream) and matches renga's
+    # [A-Za-z0-9_-]+ because validate_task_id enforces it, so the operator
+    # gets a greppable label instead of a bare index.
+    label = new_body.get("name") or worker_name
+    return TabPlacement(
+        kind="new",
+        selector={"new": {"name": label}},
+        reasons=tuple(reasons),
+    )
+
+
+def resolve_tab_placement(
+    selector: Optional[dict[str, Any]],
+    awareness: TabAwareness,
+    *,
+    overflow: bool,
+    worker_name: str,
+    caller_pane_ids: frozenset[int] = frozenset(),
+) -> TabPlacement:
+    """Resolve where this worker's pane should be created.
+
+    ``caller_pane_ids`` is the set of pane ids in the caller's own
+    ``list_panes`` snapshot. It is used for one thing only: the
+    ``target_tab_mismatch`` snapshot-contradiction guard below.
+
+    Precedence, and why:
+
+    1. Nothing requested -> ``caller``. This is the pre-#158 shape and MUST be
+       what every existing caller keeps getting.
+    2. Requested but ``spawn_tab`` was not asserted -> fail closed. An
+       explicit ``--tab`` is a hard input error (the operator asked for
+       something that cannot be emitted); ``--overflow-to-new-tab`` merely
+       degrades back to the pre-#158 escalation, because it is a *fallback*
+       the operator armed, not a demand.
+    3. An explicit selector always beats overflow. Overflow is what happens
+       when the caller tab is full, never a preference.
+    """
+    reasons: list[str] = []
+
+    if selector is None and not overflow:
+        return TabPlacement.caller()
+
+    if not awareness.spawn_tab:
+        if selector is not None:
+            return TabPlacement(
+                kind="caller",
+                error_code="server_too_old",
+                error=(
+                    "server_too_old: --tab was requested but the caller did "
+                    "not assert --server-capability spawn_tab. The renga MCP "
+                    "surface does not report its capability list, so this is "
+                    "an operator assertion and omission fails closed -- "
+                    "emitting a tab key against a server that predates it "
+                    "would be refused outright. Re-run with "
+                    "--server-capability spawn_tab, or drop --tab."
+                ),
+                reasons=tuple(reasons),
+            )
+        reasons.append(
+            "--overflow-to-new-tab was ignored: --server-capability spawn_tab "
+            "was not asserted, so no tab key may be emitted; falling back to "
+            "the pre-#158 capacity escalation"
+        )
+        return TabPlacement(kind="caller", reasons=tuple(reasons))
+
+    if selector is None:
+        # Overflow: armed, permitted, and only ever *used* when the caller
+        # tab yields no balanced-split candidate (build_plan demotes this
+        # back to ``caller`` when choose_split finds a target).
+        reasons.append(
+            "--overflow-to-new-tab is armed and --server-capability spawn_tab "
+            "was asserted, so a saturated caller tab overflows into a fresh "
+            "background tab instead of escalating"
+        )
+        return _new_tab_placement({}, awareness, worker_name, reasons)
+
+    shape_err = validate_tab_selector(selector)
+    if shape_err is not None:
+        # Reported under tab_not_found because that is the renga code a
+        # caller recovers from the same way (re-read list_peers, re-target);
+        # the message leads with the concrete shape defect.
+        return TabPlacement(
+            kind="caller",
+            error_code="tab_not_found",
+            error=f"tab_not_found: malformed tab selector -- {shape_err}",
+            reasons=tuple(reasons),
+        )
+
+    if overflow:
+        reasons.append(
+            "an explicit --tab selector was supplied, so "
+            "--overflow-to-new-tab was ignored (overflow is a fallback, not a "
+            "preference)"
+        )
+
+    if "new" in selector:
+        return _new_tab_placement(
+            selector["new"], awareness, worker_name, reasons,
+        )
+
+    census = awareness.tabs
+    if not census:
+        reasons.append(
+            "no peer census was available (--peers-json omitted, or the "
+            "server predates renga 2.0 and sends no tab metadata), so the "
+            "selector is emitted unresolved; an index selector is "
+            "index-shift-prone because renga renumbers tabs when one closes"
+        )
+        return TabPlacement(
+            kind="existing", selector=dict(selector), reasons=tuple(reasons),
+        )
+
+    key = next(iter(selector))
+    value = selector[key]
+
+    # The census is a LOWER BOUND on the real tab table, never an inventory:
+    # a tab whose panes are all non-peer (a bare shell) is invisible to
+    # list_peers, and TabAwareness.tabs says so in its own docstring. So the
+    # census may narrow a selector, and may warn about one -- it may never be
+    # the authority that REFUSES one, and it may never be the evidence that a
+    # display name is unique. renga is the authority; it does the exact match,
+    # it detects the ambiguity, and it owns tab_not_found / tab_ambiguous.
+    if key == "name":
+        matches = [t for t in census if t.name == value]
+        # A name selector is emitted UNRESOLVED, always. Canonicalising it to
+        # the one matching tab the census happens to see would be unsound in
+        # the exact case renga's tab_ambiguous rule exists to protect: with a
+        # visible tab and a peerless tab sharing a display name, the census
+        # sees one match, reports the name unique, and canonicalises to that
+        # tab's pane_id -- turning a request renga would have REFUSED as
+        # ambiguous into a silent spawn into whichever of the two the census
+        # could see. Passing the name through costs nothing (a name, unlike an
+        # index, does not shift when a tab closes) and puts the ambiguity
+        # check back where the evidence is.
+        if not matches:
+            seen = sorted(t.name for t in census if t.name)
+            reasons.append(
+                f"no tab named {value!r} is in the peer census (which sees "
+                f"{seen}), but the census only sees tabs holding at least one "
+                "peer, so a peerless tab by that name may well exist. The "
+                "selector is emitted unresolved and renga decides -- it "
+                "answers tab_not_found if there really is none"
+            )
+        elif len(matches) > 1:
+            reasons.append(
+                f"display name {value!r} matches {len(matches)} tabs in the "
+                f"peer census (indices {[t.index for t in matches]}); renga "
+                "never first-matches, so it will answer tab_ambiguous. "
+                "Re-target by pane_id (the stable anchor) -- e.g. "
+                f"--tab pane_id:{matches[0].anchor_pane_id}"
+            )
+        else:
+            reasons.append(
+                f"the peer census sees exactly one tab named {value!r} "
+                f"(index {matches[0].index}), but it cannot prove that is the "
+                "ONLY one -- a peerless tab could share the name -- so the "
+                "name is emitted unresolved and renga performs the match"
+            )
+        return TabPlacement(
+            kind="existing", selector=dict(selector), reasons=tuple(reasons),
+        )
+    if key == "index":
+        matches = [t for t in census if t.index == value]
+        if not matches:
+            # Not a refusal, for the same reason as above: a peerless tab at
+            # this index is invisible here but perfectly real to renga. Pass
+            # the index through and let renga range-check it. This is the one
+            # selector that is genuinely shift-prone, so say so.
+            idxs = sorted(t.index for t in census if t.index is not None)
+            reasons.append(
+                f"tab index {value} is not in the peer census (which sees "
+                f"{idxs}), but the census only sees tabs holding at least one "
+                "peer, so the index may still be valid. It is emitted "
+                "unresolved and renga range-checks it -- and an emitted index "
+                "is shift-prone, because renga renumbers tabs when one closes;"
+                " prefer --tab pane_id:N"
+            )
+            return TabPlacement(
+                kind="existing", selector=dict(selector),
+                reasons=tuple(reasons),
+            )
+        # An index the census DOES resolve is safe to canonicalise: the value
+        # came from renga itself (PeerInfo.tab), so the census is not being
+        # asked to prove a negative here -- only to name the pane that anchors
+        # the tab renga already said this index is.
+        target = matches[0]
+    else:
+        # pane_id: already the stable address renga documents, so there is
+        # nothing to canonicalise -- only the contradiction guard applies.
+        #
+        # Membership is asked of ``pane_ids``, NOT of ``anchor_pane_id``: the
+        # anchor is ``min()`` of the tab's peer ids, an ordering-stability
+        # device with nothing to say about whether the two snapshots disagree.
+        # Keying the guard on it would refuse ``pane_id:11`` and wave through
+        # the structurally identical ``pane_id:17`` purely because 11 < 17.
+        target = next(
+            (t for t in census if value in t.pane_ids), None,
+        )
+        if target is not None and not target.is_caller and (
+            value in caller_pane_ids
+        ):
+            return _target_tab_mismatch(value, target, reasons)
+        return TabPlacement(
+            kind="existing", selector=dict(selector), reasons=tuple(reasons),
+        )
+
+    anchor = target.anchor_pane_id
+    if anchor is None:
+        reasons.append(
+            "the selected tab has no numeric peer id to canonicalise against "
+            "(a tabless / handle-addressed transport), so the operator's "
+            "selector is emitted unchanged"
+        )
+        return TabPlacement(
+            kind="existing", selector=dict(selector), reasons=tuple(reasons),
+        )
+    # The name/index branch asks the guard about the ANCHOR rather than about
+    # every id in the tab, and that asymmetry with the pane_id branch above is
+    # deliberate: here the anchor is the id this plan is about to EMIT, so the
+    # coherence question is whether that specific id is contradicted. There the
+    # operator named an id and the question was membership.
+    if not target.is_caller and anchor in caller_pane_ids:
+        return _target_tab_mismatch(anchor, target, reasons)
+    reasons.append(
+        f"canonicalised {key}:{value!r} to the stable anchor "
+        f"pane_id:{anchor}; renga documents the tab index as display metadata "
+        "that shifts when tabs close, so an emitted plan must not carry one"
+    )
+    return TabPlacement(
+        kind="existing", selector={"pane_id": anchor}, reasons=tuple(reasons),
+    )
+
+
+def _target_tab_mismatch(
+    pane_id: int, target: TabCensus, reasons: list[str],
+) -> TabPlacement:
+    """Refuse a spawn whose two input snapshots disagree about a pane's tab.
+
+    renga answers ``target_tab_mismatch`` when a request pairs an existing-tab
+    selector with a numeric target owned by a *different* tab (renga
+    src/mcp_peer/mod.rs:573-590). For runtime-emitted plans that is
+    STRUCTURALLY prevented -- a non-caller placement always emits
+    ``target="focused"``, which renga resolves inside the selected tab -- so
+    the only way to reach it is a contradiction between the two snapshots the
+    caller supplied: ``--panes-json`` (caller-tab-scoped after renga#288)
+    lists this pane id, while ``--peers-json`` places it in a tab that is not
+    the caller's. One of the two is stale. Refusing here costs a re-read;
+    proceeding would address the wrong tab.
+    """
+    return TabPlacement(
+        kind="existing",
+        error_code="target_tab_mismatch",
+        error=(
+            f"target_tab_mismatch: pane id {pane_id} appears in the caller "
+            "tab's list_panes snapshot, but the peer census places it in tab "
+            f"{target.index} ({target.name!r}). The two snapshots disagree, "
+            "so one of them is stale. Re-capture list_panes and list_peers "
+            "together, then re-run delegate-plan."
+        ),
+        reasons=tuple(reasons),
+    )
+
+
+def tab_spawn_error_actions(
+    state_writes: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Recovery table the dispatcher consults when a tab-directed spawn fails.
+
+    Emitted only when the plan actually carries a ``spawn["tab"]`` key, so a
+    pre-#158 plan is byte-unchanged.
+
+    ``remove_state_writes`` names a concrete lockout rather than being
+    advice: ``cmd_delegate_plan`` writes the worker seed and the instruction
+    file as soon as the status is ``ready_to_spawn``, and :func:`build_plan`
+    hard-fails when either already exists. A tab spawn that fails after those
+    writes would therefore block its own retry until someone deletes them by
+    hand. The files to remove are exactly ``plan.state_writes``, which is why
+    the list is passed in rather than reconstructed.
+
+    The flag is True whenever this table is emitted at all: :func:`build_plan`
+    populates ``plan.state_writes`` unconditionally and knows nothing about
+    ``--dry-run`` (that flag is honoured in :func:`cmd_delegate_plan`, one
+    layer up). So a dry-run plan carries a populated ``state_writes`` and a
+    True flag for files that were never created -- deletion must therefore be
+    best-effort on the consumer side (``missing_ok``), not an assertion that
+    the paths exist. ``state_writes`` stays a parameter because it names WHICH
+    paths, and because a future caller that emits the table before the writes
+    are decided must not silently inherit a hard-coded True.
+    """
+    remove = bool(state_writes)
+    return {
+        "tab_not_found": {
+            "meaning": (
+                "the selected tab did not resolve; the tab table shifted "
+                "since the snapshot"
+            ),
+            "action": "refresh_snapshot_and_replan",
+            "remove_state_writes": remove,
+            "next": (
+                "re-run list_peers, then re-run delegate-plan; prefer "
+                "--tab pane_id:N (ids never shift)"
+            ),
+        },
+        "tab_ambiguous": {
+            "meaning": (
+                "more than one tab carries that display name; renga never "
+                "first-matches"
+            ),
+            "action": "refresh_snapshot_and_replan",
+            "remove_state_writes": remove,
+            "next": "re-run with --tab pane_id:N taken from list_peers",
+        },
+        "tab_limit_reached": {
+            "meaning": (
+                f"renga MAX_TABS ({RENGA_MAX_TABS}) is exhausted; this is NOT "
+                "split_refused (that is MAX_PANES within one tab)"
+            ),
+            "action": "escalate",
+            "remove_state_writes": remove,
+            "next": (
+                "send_message to secretary: close a tab or wait for a worker "
+                "to finish -- human judgment required"
+            ),
+        },
+        "target_tab_mismatch": {
+            "meaning": (
+                "the numeric target is owned by another tab; unreachable for "
+                "runtime-emitted plans, which always use target=focused"
+            ),
+            "action": "refresh_snapshot_and_replan",
+            "remove_state_writes": remove,
+            "next": (
+                "re-run list_panes + list_peers and re-run delegate-plan; if "
+                "it recurs, report a runtime/ja contract bug"
+            ),
+        },
+        "pane_not_found": {
+            # The most likely failure of the anchor-pane strategy this module
+            # picked: name/index selectors are canonicalised to the tab's
+            # smallest peer id, and that peer is often a worker that can finish
+            # (and close) between plan emission and the spawn call. renga
+            # answers PANE_NOT_FOUND, not TAB_NOT_FOUND, for a dead anchor
+            # (renga src/app/layout_ops.rs:828-835).
+            "meaning": (
+                "the tab anchor pane in spawn.tab.pane_id no longer exists; "
+                "the peer that anchored the selected tab closed since the "
+                "snapshot. The tab itself may still be open"
+            ),
+            "action": "refresh_snapshot_and_replan",
+            "remove_state_writes": remove,
+            "next": (
+                "re-run list_peers to pick a live anchor in the same tab, "
+                "then re-run delegate-plan with --tab pane_id:N"
+            ),
+        },
+        "server_too_old": {
+            "meaning": (
+                "this renga server does not advertise spawn_tab; the asserted "
+                "capability set is stale"
+            ),
+            "action": "replan_without_tab",
+            "remove_state_writes": remove,
+            "next": (
+                "re-run delegate-plan without --tab / --overflow-to-new-tab "
+                "and without --server-capability spawn_tab"
+            ),
+        },
+        "split_refused": {
+            "meaning": (
+                "terminal too small to lay out a new background tab; this is "
+                "terminal size, not tab count"
+            ),
+            "action": "escalate",
+            "remove_state_writes": remove,
+            "next": (
+                "send_message to secretary: enlarge the terminal, or reclaim "
+                "columns per plan.layout.reclaim_hint"
+            ),
+        },
+    }
+
+
+# ----------------------------------------------------------------------------
 # Instruction template auto-expansion
 # ----------------------------------------------------------------------------
 
@@ -785,6 +2232,221 @@ class ActionPlan:
     # is the runtime's first-class free-capacity report; ja's work-discovery
     # ``--free-panes`` reads it as "free worker slots" (paired ja follow-up).
     capacity: Optional[dict[str, Any]] = None
+    # --- runtime #158 (renga 2.0 multi-tab), all additive -------------------
+    #
+    # All three are ``None`` on every path that exists today, with one
+    # documented exception: on the renga ``split_capacity_exceeded`` path
+    # ``layout`` becomes a diagnostics object, because that escalation is
+    # exactly where a human needs to know how many columns the left panels
+    # are eating. ``status``, the 0/1/2 exit codes, ``spawn``, ``after_spawn``,
+    # ``state_writes`` and ``capacity`` are unchanged everywhere.
+    #
+    # ``population``  -- auditable worker census; set iff ``peers`` was passed.
+    # ``layout``      -- renga-only measured pane area + tab diagnostics.
+    # ``on_spawn_error`` -- recovery table; set iff ``spawn["tab"]`` was
+    #                    emitted, so it can only appear on a #158 plan.
+    population: Optional[dict[str, Any]] = None
+    layout: Optional[dict[str, Any]] = None
+    on_spawn_error: Optional[dict[str, dict[str, Any]]] = None
+
+
+def _population_report(
+    population: WorkerPopulation, awareness: TabAwareness,
+) -> dict[str, Any]:
+    """Render :class:`WorkerPopulation` + :class:`TabAwareness` for the plan.
+
+    Every tuple is converted to a list: the plan is emitted through
+    ``json.dumps(dataclasses.asdict(plan))`` and a tuple would round-trip as a
+    list anyway, so leaking one only makes the in-process dict differ from the
+    serialized one.
+
+    ``by_tab`` counts are PEER-derived only. ``panes_only`` workers live in
+    the caller's tab and are not represented there, so the per-tab worker
+    counts deliberately need not sum to ``active_workers``.
+    """
+    by_tab = None
+    if population.tab_metadata:
+        by_tab = [
+            {
+                "tab": t.index,
+                "tab_name": t.name,
+                "caller": t.is_caller,
+                "peers": t.peers,
+                "workers": t.workers,
+                "anchor_pane_id": t.anchor_pane_id,
+            }
+            for t in awareness.tabs
+        ]
+    return {
+        "source": population.source,
+        "scope": population.scope,
+        "active_workers": population.total,
+        "panes_only": population.panes_only,
+        "peers_only": population.peers_only,
+        "both": population.both,
+        "anonymous": population.anonymous,
+        "names": list(population.names),
+        "tab_metadata": population.tab_metadata,
+        "capabilities_known": awareness.capabilities_known,
+        "cross_tab_peers": awareness.cross_tab,
+        "spawn_tab": awareness.spawn_tab,
+        "by_tab": by_tab,
+    }
+
+
+def _tab_placement_report(
+    placement: TabPlacement,
+) -> Optional[dict[str, Any]]:
+    """Render a :class:`TabPlacement`, or ``None`` when there is nothing to say.
+
+    A bare ``caller`` placement with no reasons is the pre-#158 shape, so it
+    reports ``null`` rather than an object full of defaults. A ``caller``
+    placement that DOES carry reasons is not silent: that is how a degraded
+    ``--overflow-to-new-tab`` (armed, but no ``spawn_tab`` token) records why
+    it fell back.
+    """
+    if (
+        placement.kind == "caller"
+        and not placement.reasons
+        and placement.error_code is None
+    ):
+        return None
+    report: dict[str, Any] = {
+        "kind": placement.kind,
+        "selector": (
+            dict(placement.selector) if placement.selector is not None else None
+        ),
+        "reasons": list(placement.reasons),
+    }
+    if placement.error_code is not None:
+        report["error_code"] = placement.error_code
+        report["error"] = placement.error
+    return report
+
+
+def _layout_report(
+    panes: list[Pane], awareness: TabAwareness, placement: TabPlacement,
+) -> dict[str, Any]:
+    """Measured layout diagnostics for the renga path.
+
+    Everything here is observed or a named constant -- no rect is adjusted, no
+    sidebar width is subtracted. ``tabs_seen`` is ``None`` rather than ``0``
+    when there is no tab metadata, because "no census" and "one tab" are
+    different facts and only the census-bearing one is a lower bound worth
+    printing.
+    """
+    area = pane_area_bbox(panes)
+    return {
+        "transport": "renga",
+        "pane_area": area.to_dict() if area is not None else None,
+        "left_panels_columns": (
+            area.left_panels_columns if area is not None else None
+        ),
+        "reclaim_hint": (
+            explain_left_panels(area.left_panels_columns)
+            if area is not None else None
+        ),
+        "panes_in_tab": len(panes),
+        "max_panes": RENGA_MAX_PANES,
+        "tabs_seen": len(awareness.tabs) or None,
+        "tabs_seen_is_lower_bound": True,
+        "max_tabs": RENGA_MAX_TABS,
+        "new_tab_estimate": new_tab_pane_estimate(panes),
+        "tab_placement": _tab_placement_report(placement),
+    }
+
+
+def _overflow_note(overflow_requested: bool, awareness: TabAwareness) -> str:
+    """One ASCII sentence telling the operator how to reach the overflow path."""
+    if overflow_requested and not awareness.spawn_tab:
+        return (
+            "--overflow-to-new-tab was armed but ignored: "
+            "--server-capability spawn_tab was not asserted, so no tab key "
+            "may be emitted. Re-run with both to place this worker in a fresh "
+            "background tab instead."
+        )
+    return (
+        "Re-run with --overflow-to-new-tab (needs --server-capability "
+        "spawn_tab) to place this worker in a fresh background tab instead."
+    )
+
+
+def _renga_rect_escalation_message(
+    task_id: str, layout: dict[str, Any], overflow_note: str,
+) -> str:
+    """The pre-#158 rect escalation, byte-for-byte, plus measured diagnostics.
+
+    The first sentence is preserved EXACTLY and stays a prefix of the result:
+    claude-org-ja forwards this text to the secretary verbatim, and consumers
+    (plus this repo's own tests) key on ``"MIN_PANE" in message`` and on
+    ``"max_concurrent_workers" not in message`` to tell the rect reason apart
+    from the fleet-ceiling reason. Rewriting it would be the riskier change,
+    so the diagnostics are APPENDED rather than merged in -- and the appended
+    text must never mention ``max_concurrent_workers`` for the same reason.
+    """
+    base = (
+        f"SPLIT_CAPACITY_EXCEEDED: no balanced-split target found for "
+        f"task {task_id!r}. The rect-based balanced split's MIN_PANE / "
+        "adjacency constraints produced 0 candidates. Likely terminal "
+        "size shortage or unexpected layout -- human judgment required."
+    )
+    parts: list[str] = []
+    area = layout.get("pane_area")
+    if area is not None:
+        parts.append(
+            f"The pane area is {area['width']}x{area['height']} at "
+            f"x={area['x']},y={area['y']} ({layout['panes_in_tab']} panes, "
+            f"cap {layout['max_panes']})."
+        )
+    hint = layout.get("reclaim_hint")
+    if hint:
+        parts.append(hint)
+    estimate = layout.get("new_tab_estimate")
+    if estimate is not None:
+        parts.append(
+            f"A fresh tab would give this worker about {estimate['width']}x"
+            f"{estimate['height']} (advisory)."
+        )
+    if layout.get("tabs_seen") is not None:
+        parts.append(
+            f"Tabs seen: {layout['tabs_seen']} of {layout['max_tabs']} "
+            "(lower bound)."
+        )
+    # ``overflow_note`` is unconditional and both of its branches return a
+    # sentence, so ``parts`` is never empty and the diagnostics paragraph is
+    # never optional. There is deliberately no ``if not parts: return base``
+    # guard here -- it would be dead code that reads as if the pre-#158 message
+    # could still be emitted unchanged, which since #158 it cannot.
+    parts.append(overflow_note)
+    return base + " " + " ".join(parts)
+
+
+def _tab_limit_escalation(
+    plan: "ActionPlan",
+    task_id: str,
+    panes: list[Pane],
+    awareness: TabAwareness,
+    placement: TabPlacement,
+) -> "ActionPlan":
+    """Mark ``plan`` as refused because renga's tab table is full.
+
+    Shared by the two sites that can reach it -- an explicit ``--tab new``
+    (refused in the pre-flight) and an armed ``--overflow-to-new-tab`` (refused
+    only after ``choose_split`` has been asked, so a usable in-tab split still
+    wins). One builder so the two can never drift into two different messages
+    for the same renga condition.
+    """
+    plan.status = "split_capacity_exceeded"
+    plan.layout = _layout_report(panes, awareness, placement)
+    plan.escalate = {
+        "tool": "send_message",
+        "to_id": "secretary",
+        "message": (
+            f"SPLIT_CAPACITY_EXCEEDED: {placement.error} No worker was "
+            f"planned for task {task_id!r}; human judgment required."
+        ),
+    }
+    return plan
 
 
 def build_plan(
@@ -797,6 +2459,10 @@ def build_plan(
     transport: str = "renga",
     capacity_policy: Optional[CapacityPolicy] = None,
     live_worker_names: Optional[set[str]] = None,
+    peers: Optional[list[Peer]] = None,
+    server_capabilities: Optional[frozenset[str]] = None,
+    tab: Optional[dict[str, Any]] = None,
+    overflow_to_new_tab: bool = False,
 ) -> ActionPlan:
     """Compute a worker delegation action plan.
 
@@ -815,6 +2481,25 @@ def build_plan(
       addresses a stable adapter-resolvable target. ``live_worker_names``, when
       given, reconciles the active-worker count against registry liveness (see
       :func:`count_active_workers`).
+
+    runtime #158 adds four keyword-only inputs, appended AFTER the existing
+    keyword-only block so nothing shifts for a positional caller (ja's
+    documented ``build_plan(task, panes, state_dir, locale=ja)`` is untouched):
+
+    - ``peers``: a ``list_peers`` snapshot. This is the org-wide worker
+      population under renga 2.0, where ``list_panes`` only sees the caller's
+      tab. Omitted -> the population is derived from ``panes`` alone and every
+      number is numerically identical to today.
+    - ``server_capabilities``: the renga protocol tokens the CALLER asserts
+      the server advertises. The MCP surface cannot be probed for them, so
+      this is an assertion; omitting it makes every tab feature fail closed.
+    - ``tab``: an externally-tagged renga TabSelector (see
+      :func:`parse_tab_selector`). Requires ``spawn_tab``.
+    - ``overflow_to_new_tab``: when the caller tab has no balanced-split
+      candidate left, place the worker in a fresh background tab instead of
+      escalating. Requires ``spawn_tab``. This is the ONLY mode in which the
+      renga path consults ``capacity_policy``, because it is the only mode in
+      which the rect ceiling no longer bounds the fleet.
     """
     task_id = task.get("task_id", "")
     plan = ActionPlan(status="ready_to_spawn", task_id=task_id)
@@ -870,11 +2555,36 @@ def build_plan(
         return plan
 
     worker_name = f"worker-{task_id}"
-    if any(p.name == worker_name for p in panes):
+    # Duplicate-name guard, WIDENED by #158 -- a UNION, never a replacement.
+    #
+    # A pane with no peer bind must still block (a worker is a pane for the
+    # ~10-30s before its peer registers), and a peer with no pane in THIS tab
+    # must now block too, because under renga 2.0 the colliding worker can
+    # live in a tab ``list_panes`` cannot see. The pane / same-tab branch keeps
+    # today's message byte-for-byte: consumers forward it verbatim and this
+    # repo pins it.
+    peer_name_hits = [q for q in (peers or []) if q.name == worker_name]
+    # ``same_tab is not False`` deliberately absorbs both "renga says this peer
+    # is in my tab" and "this server sends no tab metadata at all" (renga 1.4 /
+    # the tabless broker), because in both cases "in the tab" is the honest
+    # description and the classic wording is correct.
+    same_tab_peer_hit = any(q.same_tab is not False for q in peer_name_hits)
+    if any(p.name == worker_name for p in panes) or same_tab_peer_hit:
         plan.status = "input_invalid"
         plan.errors.append(
             f"pane named {worker_name!r} already exists in the tab; "
             "close it first or pick a different task_id"
+        )
+        return plan
+    if peer_name_hits:
+        # Every remaining hit is a peer renga placed in another tab.
+        other = peer_name_hits[0]
+        plan.status = "input_invalid"
+        plan.errors.append(
+            f"pane named {worker_name!r} already exists in tab {other.tab} "
+            f"({other.tab_name!r}); worker-<task_id> is the org-wide identity "
+            "behind the seed file, the outbox file and name-addressed "
+            "send_message, so close it first or pick a different task_id"
         )
         return plan
 
@@ -889,12 +2599,77 @@ def build_plan(
             )
             return plan
 
+    # --- runtime #158: population census and tab pre-flight ----------------
+    #
+    # Placed AFTER the identity guards (so a duplicate task_id still fails
+    # with its own message) and BEFORE the transport branch (so a tab refusal
+    # happens while ``state_writes`` is still empty and nothing has to be
+    # rolled back).
+    awareness = derive_tab_awareness(peers, server_capabilities)
+    population = count_worker_population(panes, peers, live_worker_names)
+    if peers is not None:
+        plan.population = _population_report(population, awareness)
+
+    if transport == "broker":
+        # The broker has no tab concept at any layer, so a tab flag is inert
+        # rather than wrong. Warn and continue, following the
+        # --max-concurrent-workers precedent: a flag with no effect must not
+        # fail the run.
+        if tab is not None or overflow_to_new_tab:
+            plan.warnings.append(
+                "--tab / --overflow-to-new-tab are renga-only; the broker has "
+                "no tab concept. Ignored."
+            )
+        placement = TabPlacement.caller()
+    else:
+        if tab is not None and overflow_to_new_tab:
+            plan.warnings.append(
+                "both --tab and --overflow-to-new-tab were given; the "
+                "explicit --tab selector wins (overflow is a fallback, not a "
+                "preference)"
+            )
+        placement = resolve_tab_placement(
+            tab,
+            awareness,
+            overflow=overflow_to_new_tab,
+            worker_name=worker_name,
+            caller_pane_ids=frozenset(p.id for p in panes),
+        )
+        if placement.error_code in _TAB_PREFLIGHT_INPUT_CODES:
+            # A bad argument, not exhausted capacity: exit 1, and no state
+            # file has been written yet, so the operator can simply re-run.
+            plan.status = "input_invalid"
+            plan.errors.append(placement.error or placement.error_code)
+            plan.layout = _layout_report(panes, awareness, placement)
+            return plan
+        if placement.error_code == "tab_limit_reached" and tab is not None:
+            # A full tab table IS capacity, so it escalates (exit 2) like
+            # every other capacity refusal. The message leads with renga's own
+            # code token so the plan is greppable by the same string renga
+            # would have returned, and deliberately shares no wording with the
+            # rect reason.
+            #
+            # ``tab is not None`` scopes this to an EXPLICIT --tab new. For an
+            # ARMED --overflow-to-new-tab the refusal is deferred past
+            # choose_split, because overflow is documented (and tested) as a
+            # fallback, never a preference: refusing here would let merely
+            # arming the flag turn a perfectly usable in-tab split into exit 2
+            # the moment the census sees MAX_TABS -- and an org that keeps the
+            # flag on as a standing setting is driven toward exactly that
+            # state by overflow itself. The demotion that implements "fallback,
+            # not preference" lives downstream, so this must not pre-empt it.
+            return _tab_limit_escalation(
+                plan, task_id, panes, awareness, placement,
+            )
+
     if transport == "broker":
         # Broker path: bypass the rect ceiling and choose_split entirely.
         # Capacity is the explicit max_concurrent_workers policy; the spawn
         # target/direction are stable adapter-resolvable constants.
         policy = capacity_policy or CapacityPolicy.default()
-        active = count_active_workers(panes, live_worker_names)
+        # #158: the union of worker panes and worker peers. With ``peers=None``
+        # this is exactly ``count_active_workers(panes, live_worker_names)``.
+        active = population.total
         if policy.is_unlimited:
             free_slots: Any = "unlimited"
             max_repr: Any = "unlimited"
@@ -939,36 +2714,223 @@ def build_plan(
         }
     else:
         choice = choose_split(panes)
-        if choice is None:
-            plan.status = "split_capacity_exceeded"
-            plan.escalate = {
-                "tool": "send_message",
-                "to_id": "secretary",
-                "message": (
-                    f"SPLIT_CAPACITY_EXCEEDED: no balanced-split target found for "
-                    f"task {task_id!r}. The rect-based balanced split's MIN_PANE / "
-                    "adjacency constraints produced 0 candidates. Likely terminal "
-                    "size shortage or unexpected layout -- human judgment required."
-                ),
-            }
-            return plan
-        target_name = choice.target_name
-        direction = choice.direction
+
+        # Overflow is a FALLBACK, never a preference: if the caller's tab
+        # still has a balanced-split candidate the worker goes there and no
+        # tab key is emitted at all. Only an explicit --tab (which the
+        # operator typed on purpose) overrides a usable in-tab split.
+        if tab is None and placement.kind == "new" and choice is not None:
+            placement = TabPlacement.caller()
+
+        if placement.kind == "caller":
+            if choice is None:
+                plan.status = "split_capacity_exceeded"
+                plan.layout = _layout_report(panes, awareness, placement)
+                plan.escalate = {
+                    "tool": "send_message",
+                    "to_id": "secretary",
+                    "message": _renga_rect_escalation_message(
+                        task_id,
+                        plan.layout,
+                        _overflow_note(overflow_to_new_tab, awareness),
+                    ),
+                }
+                return plan
+            target_name = choice.target_name
+            direction = choice.direction
+        elif placement.kind == "new":
+            if placement.error_code == "tab_limit_reached":
+                # Deferred from the pre-flight (see the ``tab is not None``
+                # guard there). We are here only because choose_split ALSO
+                # found nothing, so the caller's tab genuinely cannot host the
+                # worker and the full tab table is genuinely the binding
+                # constraint. Now it escalates.
+                return _tab_limit_escalation(
+                    plan, task_id, panes, awareness, placement,
+                )
+            if tab is None:
+                # Overflow mode -- and ONLY overflow mode -- reinstates a fleet
+                # ceiling on the renga path. Under renga the only worker
+                # ceiling has ever been "choose_split found nothing", and
+                # overflow deletes exactly that. Worse, it does not self-limit:
+                # list_panes is caller-tab-scoped after renga#288, so the next
+                # delegate-plan re-observes the same saturated caller tab, gets
+                # None again, and mints ANOTHER tab -- N delegations produce N
+                # tabs and never reuse the one just created. capacity_policy is
+                # the only bound left. Outside overflow the renga path still
+                # ignores capacity_policy entirely.
+                #
+                # ...which is precisely why the census is REQUIRED here. Every
+                # worker overflow places lives in a tab of its own, so none of
+                # them is ever in the caller's ``list_panes`` again. With
+                # ``peers is None`` the count falls back to the caller tab
+                # alone, reads 0 forever, and the one remaining bound never
+                # binds: twelve consecutive delegations each report
+                # "free_worker_slots: 8" and each mint another tab. Refusing
+                # costs one flag; not refusing voids the invariant that tabs
+                # minted by overflow <= max_concurrent_workers, and feeds
+                # ja's --free-panes consumer a plan.capacity that is wrong.
+                # This is an input error (exit 1), not exhausted capacity: the
+                # fix is to pass --peers-json, and nothing has been written.
+                if peers is None:
+                    plan.status = "input_invalid"
+                    plan.errors.append(
+                        "--overflow-to-new-tab requires --peers-json: overflow "
+                        "removes the rect ceiling, and the fleet ceiling that "
+                        "replaces it is counted from the peer census. Workers "
+                        "placed by a previous overflow live in their own tabs "
+                        "and never appear in --panes-json again, so without "
+                        "the census the ceiling reads 0 forever and mints one "
+                        "tab per delegation without bound. Re-run with "
+                        "--peers-json, or drop --overflow-to-new-tab to keep "
+                        "the pre-#158 rect ceiling."
+                    )
+                    plan.layout = _layout_report(panes, awareness, placement)
+                    return plan
+                # The census alone still cannot see an overflow spawn during
+                # its peer-bind window -- it is in another tab (so never in
+                # ``panes`` again) and not yet a peer -- so the ceiling is
+                # counted against the census PLUS the outstanding reservation
+                # ledger. See count_unbound_reservations for the measured
+                # failure this closes.
+                reserved = count_unbound_reservations(
+                    state_dir, population.names,
+                )
+                committed = population.total + len(reserved)
+                policy = capacity_policy or CapacityPolicy.default()
+                if policy.is_unlimited:
+                    max_repr: Any = "unlimited"
+                    free_slots: Any = "unlimited"
+                    exceeded = False
+                else:
+                    max_workers = policy.max_concurrent_workers
+                    max_repr = max_workers
+                    free_slots = max(0, max_workers - committed)
+                    exceeded = committed >= max_workers
+                plan.capacity = {
+                    "transport": "renga",
+                    "max_concurrent_workers": max_repr,
+                    # ``active_workers`` stays the OBSERVED census so the key
+                    # keeps meaning the same thing it does on the broker path.
+                    # The reservations are reported beside it rather than
+                    # folded into it, because a consumer that shows a human
+                    # "N workers running" must not count panes that may never
+                    # come up.
+                    "active_workers": population.total,
+                    "reserved_workers": len(reserved),
+                    "reserved_worker_names": list(reserved),
+                    "free_worker_slots": 0 if exceeded else free_slots,
+                }
+                if exceeded:
+                    plan.status = "split_capacity_exceeded"
+                    plan.layout = _layout_report(panes, awareness, placement)
+                    plan.escalate = {
+                        "tool": "send_message",
+                        "to_id": "secretary",
+                        "message": (
+                            "SPLIT_CAPACITY_EXCEEDED: worker capacity reached "
+                            f"for task {task_id!r}. transport=renga "
+                            "(--overflow-to-new-tab), "
+                            f"max_concurrent_workers={max_repr}, "
+                            f"active_workers={population.total}, "
+                            f"reserved_workers={len(reserved)}"
+                            + (
+                                f" ({', '.join(reserved)}), " if reserved
+                                else ", "
+                            )
+                            + "free_worker_slots=0. Overflow removes the rect "
+                            "ceiling and mints one tab per delegation, so the "
+                            "explicit fleet ceiling is what bounds it. "
+                            + (
+                                "A reserved worker is one this helper already "
+                                "planned but that has not become a pane or a "
+                                "peer yet; those slots free themselves "
+                                f"{WORKER_BIND_WINDOW_SECONDS}s after the "
+                                "seed was written if the spawn never came up. "
+                                if reserved else ""
+                            )
+                            + "Raise the ceiling via "
+                            "--max-concurrent-workers (N|unlimited), "
+                            "or wait for an active worker to finish -- human "
+                            "judgment required."
+                        ),
+                    }
+                    return plan
+
+                # The fresh tab's lone pane is estimated from the caller tab's
+                # measured pane area, and the estimate refuses the IMPLICIT
+                # overflow when a whole pane could not clear this module's own
+                # MIN_PANE_* floors. An explicit --tab new is left to renga:
+                # the operator asked for that tab by name.
+                #
+                # The message deliberately does NOT claim renga would refuse.
+                # renga's background-tab refusal is
+                # ``terminal_too_small_for_layout()`` -- ``last_term_size.cols
+                # < 20 || rows < 5`` on the WHOLE terminal (renga
+                # src/app/app_core.rs:363, :625-628) -- not a test on the pane
+                # area, so renga might well accept this spawn. What the floors
+                # say is that the pane the runtime would be planning is below
+                # the size this module treats as usable. And the estimate can
+                # be pessimistic in the other direction too: a fresh workspace
+                # is always built with ``file_tree_visible: true`` and a blank
+                # ``Preview`` (renga src/app/workspace_state.rs:118-130), so a
+                # caller tab with a preview swapped in measures narrower than
+                # the new tab actually would.
+                estimate = new_tab_pane_estimate(panes)
+                if estimate is not None and not estimate["fits"]:
+                    plan.status = "split_capacity_exceeded"
+                    plan.layout = _layout_report(panes, awareness, placement)
+                    hint = plan.layout.get("reclaim_hint") or ""
+                    plan.escalate = {
+                        "tool": "send_message",
+                        "to_id": "secretary",
+                        "message": (
+                            "SPLIT_CAPACITY_EXCEEDED: split_refused: "
+                            "--overflow-to-new-tab cannot help task "
+                            f"{task_id!r}. A fresh tab would give this worker "
+                            f"about {estimate['width']}x{estimate['height']} "
+                            "(advisory, measured from this tab), which is "
+                            f"below the {MIN_PANE_WIDTH}x{MIN_PANE_HEIGHT} "
+                            "floor this runtime treats as a usable pane, so "
+                            "overflowing would just move the problem into a "
+                            "new tab. " + hint
+                        ),
+                    }
+                    return plan
+            # A tab:{new} spawn carries neither target nor direction (see the
+            # spawn assembly below); both stay unbound here on purpose.
+            target_name = None
+            direction = None
+        else:  # placement.kind == "existing"
+            plan.warnings.append(
+                "tab-directed spawn: renga peers carry no geometry (PeerInfo "
+                "has no rect and PeerList skips the rect refresh), so no "
+                "balanced split can be ranked inside the target tab. The "
+                f"spawn uses target={_TAB_SPAWN_TARGET!r} / "
+                f"direction={_TAB_SPAWN_DIRECTION!r}, which renga resolves "
+                "inside the selected tab."
+            )
+            target_name = _TAB_SPAWN_TARGET
+            direction = _TAB_SPAWN_DIRECTION
 
     permission_mode = task.get("permission_mode", "auto")
     model = task.get("model") or DEFAULT_WORKER_MODEL
     extra_args = task.get("args") or []
 
-    spawn: dict[str, Any] = {
-        "tool": "spawn_claude_pane",
-        "target": target_name,
-        "direction": direction,
-        "name": worker_name,
-        "role": "worker",
-        "cwd": cwd,
-        "permission_mode": permission_mode,
-        "model": model,
-    }
+    spawn: dict[str, Any] = {"tool": "spawn_claude_pane"}
+    if placement.kind != "new":
+        spawn["target"] = target_name
+        spawn["direction"] = direction
+    # else: ABSENT KEYS, not None. renga forbids target/direction at the
+    # schema level for a tab:{new} selector and rejects the whole request when
+    # either is present, and a JSON ``null`` is present.
+    spawn["name"] = worker_name
+    spawn["role"] = "worker"
+    spawn["cwd"] = cwd
+    spawn["permission_mode"] = permission_mode
+    spawn["model"] = model
+    if placement.selector is not None:
+        spawn["tab"] = dict(placement.selector)
     if extra_args:
         spawn["args"] = list(extra_args)
     plan.spawn = spawn
@@ -1009,6 +2971,15 @@ def build_plan(
         str(state_dir / "workers" / f"{worker_name}.md"),
         str(state_dir / "dispatcher" / "outbox" / f"{task_id}-instruction.md"),
     ]
+
+    # The recovery table is emitted only when a tab key actually went out, so
+    # a plan that predates #158 in shape also predates it in size.
+    if "tab" in spawn:
+        plan.on_spawn_error = tab_spawn_error_actions(plan.state_writes)
+    # Layout diagnostics accompany any renga plan where a tab feature was
+    # requested (the escalation paths set it themselves before returning).
+    if transport == "renga" and (tab is not None or overflow_to_new_tab):
+        plan.layout = _layout_report(panes, awareness, placement)
 
     return plan
 
@@ -1124,6 +3095,60 @@ def _parse_panes(panes_data: Any) -> list[Pane]:
     return panes
 
 
+def _parse_peers(peers_data: Any) -> list[Peer]:
+    """Parse a ``list_peers`` snapshot, mirroring :func:`_parse_panes`.
+
+    Accepts a bare list or ``{"peers": [...]}``, and fails the whole snapshot
+    on a malformed entry with the same ``SystemExit`` (exit 1) shape.
+
+    There is deliberately NO logical-peer skip here. ``_parse_panes`` skips a
+    non-addressable logical pane because such an entry can never be a
+    balanced-split target; peers are never split targets in the first place
+    (they carry no geometry), and a non-numeric id is the NORMAL shape on the
+    broker, whose peer ids are agent handles. So every entry that has an
+    ``id`` parses, and anything that does not is a real input error.
+    """
+    if isinstance(peers_data, dict) and "peers" in peers_data:
+        peers_list = peers_data["peers"]
+    else:
+        peers_list = peers_data
+    if not isinstance(peers_list, list):
+        raise SystemExit("peers JSON must be a list or {peers: [...]} object")
+    peers: list[Peer] = []
+    for i, d in enumerate(peers_list):
+        try:
+            peers.append(Peer.from_dict(d))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise SystemExit(f"peers[{i}] is invalid: {exc}") from None
+    return peers
+
+
+def _parse_server_capabilities(
+    values: Optional[list[str]],
+) -> Optional[frozenset[str]]:
+    """Normalise repeated ``--server-capability`` tokens into an assertion set.
+
+    ``None`` (the flag omitted) is meaningfully different from an empty set:
+    it means "the caller made no claim", which is what every pre-#158 caller
+    does. Both fail closed for tab features, but only the former reports
+    ``capabilities_known: false`` in the plan.
+
+    Unknown tokens are kept rather than rejected. Nothing is ever inferred
+    from a token this module does not recognise, so an unknown one is inert --
+    whereas hard-failing on it would turn a future renga capability into an
+    outage for a runtime that simply has not learned the name yet. A typo
+    therefore fails closed, which is the documented default for every tab
+    feature, and surfaces as a ``server_too_old:`` error that names the exact
+    flag value to pass.
+    """
+    if values is None:
+        return None
+    tokens = [v.strip() for v in values]
+    if any(not t for t in tokens):
+        raise SystemExit("--server-capability token must not be empty")
+    return frozenset(tokens)
+
+
 def _load_locale(path: Optional[str]) -> Optional[LocaleConfig]:
     if not path:
         return None
@@ -1197,6 +3222,29 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
     panes_raw = _load_json(args.panes_json, stdin=False)
     panes = _parse_panes(panes_raw)
 
+    # #158: the peer snapshot is the org-wide population source. Omitted ->
+    # peers stays None and every number matches the pre-#158 behaviour.
+    #
+    # Presence-checked, not truthiness-checked, and for the same reason --tab
+    # is: a wrapper that builds the invocation as `--peers-json "$PEERS"` with
+    # an unset variable yields the empty string, which is a supplied-but-broken
+    # argument, not an omission. Under truthiness that silently reverts to the
+    # caller-tab-only count #158 exists to fix, with `population: null` as the
+    # only (easily missed) signal. An explicit refusal is the fail-closed
+    # answer every other JSON input in this command already gives.
+    if args.peers_json is not None and not args.peers_json.strip():
+        print(
+            "--peers-json was given an empty path; pass a real list_peers "
+            "snapshot or omit the flag entirely",
+            file=sys.stderr,
+        )
+        return 1
+    peers = (
+        _parse_peers(_load_json(args.peers_json, stdin=False))
+        if args.peers_json is not None else None
+    )
+    server_capabilities = _parse_server_capabilities(args.server_capability)
+
     state_dir = Path(args.state_dir).resolve()
     template_repo = (
         Path(args.template_repo).resolve() if args.template_repo else None
@@ -1214,11 +3262,41 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    # --tab is renga-only: build_plan warns and forces the caller placement
+    # under the broker, which has no tab concept at any layer. So the selector
+    # is parsed only where it can have an effect, for the same reason
+    # --max-concurrent-workers is parsed only where IT can (see below) -- a
+    # flag documented as "ignored under transport X" must not be able to fail
+    # the run under transport X. This is also why the parse sits after the
+    # transport resolution rather than with the other argument decoding above.
+    try:
+        tab = (
+            parse_tab_selector(args.tab)
+            if transport == "renga" and args.tab is not None else None
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     # --max-concurrent-workers is a broker-only ceiling; under renga the rect
     # path ignores it, so don't parse/reject it there (keeps the flag's "ignored
     # under --transport renga" contract honest -- a value that has no effect
     # must not fail the run). It is still validated on the broker path.
-    if transport == "broker" and args.max_concurrent_workers is not None:
+    #
+    # #158 adds one renga case: --overflow-to-new-tab removes the rect ceiling,
+    # so the fleet ceiling becomes live and the value stops being inert -- and
+    # a value that DOES have an effect must be validated.
+    #
+    # ...but only when overflow is actually reachable. An explicit --tab beats
+    # overflow (overflow is a fallback, never a preference), so with both
+    # supplied the fleet ceiling is never consulted and the value is inert
+    # again. Validating it there would fail a run over a number nothing reads.
+    ceiling_applies = transport == "broker" or (
+        transport == "renga"
+        and args.overflow_to_new_tab
+        and tab is None
+    )
+    if ceiling_applies and args.max_concurrent_workers is not None:
         try:
             capacity_policy: Optional[CapacityPolicy] = parse_capacity_policy(
                 args.max_concurrent_workers
@@ -1233,7 +3311,22 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         task, panes, state_dir,
         template_repo=template_repo, locale=locale,
         transport=transport, capacity_policy=capacity_policy,
+        peers=peers, server_capabilities=server_capabilities,
+        tab=tab, overflow_to_new_tab=args.overflow_to_new_tab,
     )
+
+    # Not parsing --tab under the broker (above) means build_plan never sees it
+    # and so cannot emit its own "renga-only, ignored" warning for it. Say it
+    # here instead: not-failing-the-run is the contract, silently swallowing an
+    # explicit operator instruction is not. Emitted whatever the selector's
+    # shape, because under the broker its shape was never inspected.
+    if transport == "broker" and args.tab is not None:
+        plan.warnings.append(
+            f"--tab {args.tab!r} was ignored: tab placement is renga-only and "
+            "the broker has no tab concept at any layer (its panes are "
+            "independent detached sessions). The selector was not even parsed, "
+            "so a malformed one would not have been reported either."
+        )
 
     if plan.status == "ready_to_spawn" and not args.dry_run:
         write_worker_seed(state_dir, task, plan.task_id, plan.spawn or {})
@@ -1284,6 +3377,42 @@ def add_subparsers(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -
               "(a list of pane dicts, or {panes: [...]})"),
     )
     dp.add_argument(
+        "--peers-json", default=None,
+        help=("path to a JSON file with renga `list_peers` output (a list of "
+              "peer dicts, or {peers: [...]}). Peers span every renga tab, so "
+              "this is the org-wide worker population; --panes-json only sees "
+              "the caller's tab. When omitted the population is derived from "
+              "--panes-json alone, which is the renga 1.4 / broker behaviour"),
+    )
+    dp.add_argument(
+        "--server-capability", action="append", default=None, metavar="TOKEN",
+        help=("renga protocol capability the server advertises (caller_scope, "
+              "cross_tab_peers, spawn_tab). Repeat once per token. Asserted by "
+              "the caller, not probed. When omitted every tab feature fails "
+              "closed"),
+    )
+    dp.add_argument(
+        "--tab", default=None, metavar="SELECTOR",
+        help=("place the worker in a specific renga tab: 'pane_id:N' (stable "
+              "anchor, preferred), 'index:N' (0-based, shifts when tabs "
+              "close), 'name:LABEL' (exact match; 0 -> tab_not_found, 2+ -> "
+              "tab_ambiguous), 'new' or 'new:LABEL' (fresh background tab). "
+              "Requires --server-capability spawn_tab. Ignored under "
+              "--transport broker"),
+    )
+    dp.add_argument(
+        "--overflow-to-new-tab", action="store_true",
+        help=("under --transport renga, when no balanced-split candidate is "
+              "left, plan a spawn into a fresh background tab instead of "
+              "escalating. Requires --server-capability spawn_tab AND "
+              "--peers-json. In this mode --max-concurrent-workers also gates "
+              "the renga path, because the rect ceiling no longer bounds the "
+              "fleet -- and that fleet ceiling is counted from the peer "
+              "census, which is why --peers-json is required rather than "
+              "optional here. Each overflow mints a new tab; it never reuses "
+              "one. Ignored under --transport broker"),
+    )
+    dp.add_argument(
         "--state-dir", default=".state",
         help="state directory root (default: .state)",
     )
@@ -1320,7 +3449,9 @@ def add_subparsers(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -
         help=(
             "broker-transport worker ceiling: a non-negative int (0 disables "
             "spawning) or 'unlimited' (explicit opt-in). Ignored under "
-            f"--transport renga. Default when omitted: {DEFAULT_MAX_CONCURRENT_WORKERS}"
+            "--transport renga unless --overflow-to-new-tab is set (that mode "
+            "removes the rect ceiling, so the fleet ceiling applies). Default "
+            f"when omitted: {DEFAULT_MAX_CONCURRENT_WORKERS}"
         ),
     )
     dp.add_argument(

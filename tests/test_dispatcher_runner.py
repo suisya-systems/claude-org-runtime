@@ -1297,6 +1297,11 @@ def test_action_plan_dataclass_default() -> None:
     assert plan.after_spawn == []
     assert plan.warnings == []
     assert plan.capacity is None
+    # runtime #158 added three additive fields. They default to None so a
+    # plan built the pre-#158 way carries no new payload at all.
+    assert plan.population is None
+    assert plan.layout is None
+    assert plan.on_spawn_error is None
 
 
 # ---------------------------------------------------------------------------

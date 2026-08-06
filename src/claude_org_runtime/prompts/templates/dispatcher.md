@@ -101,7 +101,9 @@ py -3 tools/dispatcher_runner.py delegate-plan \
 > - **renga** (`--transport renga` / `ORG_TRANSPORT=renga`): pass the snapshot
 >   from `mcp__renga-peers__list_panes` and spawn against
 >   `mcp__renga-peers__spawn_claude_pane`. Capacity is the rect-based balanced
->   split; `--max-concurrent-workers` is ignored; `capacity` is absent.
+>   split; `--max-concurrent-workers` is ignored and `capacity` is absent —
+>   unless `--overflow-to-new-tab` is in play (see below), which is the one
+>   mode where the rect ceiling no longer bounds the fleet.
 >
 > The `mcp__renga-peers__*` tool names elsewhere in this prompt describe the
 > renga flow; under the broker default read them as the `mcp__org-broker__*`
@@ -127,7 +129,70 @@ deliberate special cases.
 
 The panes JSON is the `structuredContent.panes` payload from the active
 transport's `list_panes` (`mcp__org-broker__list_panes` by default;
-`mcp__renga-peers__list_panes` under renga), passed through verbatim.
+`mcp__renga-peers__list_panes` under renga), passed through verbatim. Under
+renga the MCP tool answers with **text only** — no `structuredContent` — so
+you transcribe the `id / name / role / focused / x / y / width / height`
+columns into the JSON yourself.
+
+### Multi-tab capacity under renga 2.0 (`--peers-json`)
+
+renga 2.0 scopes `list_panes` to **your own tab**. A worker running in
+another tab is therefore invisible to the pane snapshot, and a capacity
+number computed from panes alone under-counts the fleet and over-spawns.
+
+So under renga, capture `mcp__renga-peers__list_peers` **alongside**
+`list_panes` every time and pass it as `--peers-json`:
+
+```bash
+claude-org-runtime dispatcher delegate-plan \
+  --task-json .state/dispatcher/inbox/{task_id}.json \
+  --panes-json {list_panes transcription} \
+  --peers-json {list_peers transcription}
+```
+
+Panes stay the **geometry** source (they are the only thing carrying rects,
+and the balanced split ranks them); peers become the **population** source
+(they span every tab). The helper unions the two on pane `name`, so a worker
+that has already spawned but has not finished binding as a peer is still
+counted exactly once.
+
+`list_peers` also answers as text. Transcribe each row as
+`{"id": ..., "name": ..., "role": ..., "cwd": ..., "summary": ...}` and then,
+**critically**, carry the tab annotation across verbatim:
+
+- a row annotated `[your tab]` → add `"same_tab": true`. renga prints **no**
+  index and **no** label on those rows, so leave `"tab"` / `"tab_name"` out
+  unless the row really shows them. The helper censuses your own tab from
+  `same_tab` alone;
+- a row annotated `[tab N "label"]` → add `"tab": N`, `"tab_name": "label"`,
+  `"same_tab": false`;
+- a row with **no** tab annotation → **omit all three keys entirely**. Do not
+  invent `"same_tab": true`, and do not write `null`.
+
+That last rule is load-bearing. The helper distinguishes an old renga (which
+never sends tab fields) from a new renga that happens to have one tab open by
+**key presence**, not by value — a fabricated or nulled key makes a
+multi-tab server look single-tab, or the reverse. Omission is always the
+honest transcription of an absent annotation.
+
+Two optional renga-only flags build on the peer snapshot. Both require you to
+assert what the server supports, because the MCP surface does not report its
+own capabilities — pass `--server-capability spawn_tab` (repeatable) only
+when the renga server actually advertises it. With the assertion missing,
+both flags fail closed and the helper behaves exactly as it does today:
+
+- `--tab pane_id:N | index:N | name:LABEL | new | new:LABEL` — place this
+  worker in a specific tab. Prefer `pane_id:N`: renga treats the tab index as
+  display metadata that shifts whenever a tab closes.
+- `--overflow-to-new-tab` — when the current tab has no balanced-split
+  candidate left, plan a spawn into a **fresh background tab** instead of
+  escalating. This turns a would-be exit 2 into an exit 0, so it is opt-in.
+  In this mode `--max-concurrent-workers` also applies under renga: overflow
+  removes the rect ceiling, and each overflow mints a new tab rather than
+  reusing one. **`--peers-json` is required here**, not optional: every worker
+  overflow places lives in a tab of its own and never shows up in your
+  `list_panes` again, so without the census the fleet ceiling counts zero
+  forever and mints an unbounded number of tabs. Omitting it is exit 1.
 
 ### Reading the helper's output
 
@@ -142,15 +207,66 @@ The helper returns one of three results, distinguishable by exit code:
   `message_file` named in the action. Do not second-guess `spawn.target` /
   `spawn.direction`: under broker they are stable fixed values the adapter
   resolves, not a geometry choice.
+
+  Pass `spawn` through **verbatim, key for key** — including `spawn.tab` when
+  it is present, and including the case where `target` and `direction` are
+  **absent**. Copying the keys the helper emitted is the whole rule; you never
+  need to inspect anything else to send the request correctly. The three
+  shapes, for reading a plan rather than for branching on one:
+
+  | shape | `spawn.tab` | `spawn.target` / `spawn.direction` |
+  |--------|-------------|------------------------------------|
+  | in your own tab (every plan that used no tab flag) | absent | present, as always |
+  | an existing tab | `{"pane_id": N}` | `"focused"` / `"vertical"` — renga resolves them *inside* the selected tab |
+  | a fresh tab | `{"new": {"name": ...}}` | **absent — do not add them back** |
+
+  renga rejects a `tab: {new: ...}` request outright if `target` or
+  `direction` is present, and a JSON `null` counts as present. Send exactly
+  the keys the helper emitted.
+
+  (`plan.layout.tab_placement` records which of the three it was and why, but
+  `plan.layout` itself is `null` on every plan that used no tab flag — which
+  is the common case — so read it for diagnostics, never as a required step.)
 - **exit 2 / `status: "split_capacity_exceeded"`** — Send the `escalate`
   field to the secretary verbatim. Under broker the reason is the
   `max_concurrent_workers` ceiling (the message reports `active_workers` /
   `free_worker_slots=0`), **not** a rect/MIN_PANE shortage — forward the
   helper's message rather than the prose Step 3-1c wording. Cancel only this
   single dispatch; the monitoring loop continues.
+
+  Under renga the escalation message already carries
+  `plan.layout.reclaim_hint` — the **measured** column count that renga's
+  left panels (org sidebar + file tree) are consuming, and the exact remedy
+  (`Ctrl+B`, or `[ui] org_sidebar = "off"`). Forward it verbatim; do not
+  paraphrase the numbers and do not compute your own. They come from the
+  pane rects, which are already net of the sidebar.
 - **exit 1 / `status: "input_invalid"`** — Forward the `errors[]` to the
   secretary so the Lead can decide (missing cwd, duplicate `task_id`,
-  pane-name collisions, etc.).
+  pane-name collisions, an unaddressable `--tab` selector, etc.). Nothing was
+  written, so a corrected re-run is safe.
+
+### When a tab-directed spawn fails
+
+If the plan carried `spawn.tab`, it also carries `plan.on_spawn_error` — a
+table keyed by the renga error code in the `[<code>] <msg>` result text. Look
+your code up there instead of guessing:
+
+- `action: "refresh_snapshot_and_replan"` — re-capture `list_panes` +
+  `list_peers` and re-run the helper, following the entry's `next` hint
+  (usually: re-target by `pane_id`, which never shifts).
+- `action: "replan_without_tab"` — the asserted capability set was stale;
+  re-run without `--tab` / `--overflow-to-new-tab`.
+- `action: "escalate"` — send to the secretary; human judgment is required.
+
+**Honour `remove_state_writes` before you re-plan.** When it is `true`,
+delete every path in `plan.state_writes` first — **delete-if-exists, not
+delete-and-assert**. On a normal run the helper wrote the worker seed and the
+instruction file already (that happens on `ready_to_spawn`, i.e. before the
+spawn call), and it refuses any task whose state files already exist, so a
+failed tab spawn will block its own retry until those files are gone. Under
+`--dry-run` the same plan still lists `state_writes` and still reports
+`remove_state_writes: true` even though nothing was created — the flag names
+the paths to clear, not a guarantee that they are there.
 
 In `ready_to_spawn` the helper writes two files for you:
 
