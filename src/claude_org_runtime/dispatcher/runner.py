@@ -3158,13 +3158,6 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         if args.peers_json is not None else None
     )
     server_capabilities = _parse_server_capabilities(args.server_capability)
-    try:
-        tab = (
-            parse_tab_selector(args.tab) if args.tab is not None else None
-        )
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
 
     state_dir = Path(args.state_dir).resolve()
     template_repo = (
@@ -3183,6 +3176,22 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    # --tab is renga-only: build_plan warns and forces the caller placement
+    # under the broker, which has no tab concept at any layer. So the selector
+    # is parsed only where it can have an effect, for the same reason
+    # --max-concurrent-workers is parsed only where IT can (see below) -- a
+    # flag documented as "ignored under transport X" must not be able to fail
+    # the run under transport X. This is also why the parse sits after the
+    # transport resolution rather than with the other argument decoding above.
+    try:
+        tab = (
+            parse_tab_selector(args.tab)
+            if transport == "renga" and args.tab is not None else None
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     # --max-concurrent-workers is a broker-only ceiling; under renga the rect
     # path ignores it, so don't parse/reject it there (keeps the flag's "ignored
     # under --transport renga" contract honest -- a value that has no effect
@@ -3191,8 +3200,15 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
     # #158 adds one renga case: --overflow-to-new-tab removes the rect ceiling,
     # so the fleet ceiling becomes live and the value stops being inert -- and
     # a value that DOES have an effect must be validated.
+    #
+    # ...but only when overflow is actually reachable. An explicit --tab beats
+    # overflow (overflow is a fallback, never a preference), so with both
+    # supplied the fleet ceiling is never consulted and the value is inert
+    # again. Validating it there would fail a run over a number nothing reads.
     ceiling_applies = transport == "broker" or (
-        transport == "renga" and args.overflow_to_new_tab
+        transport == "renga"
+        and args.overflow_to_new_tab
+        and tab is None
     )
     if ceiling_applies and args.max_concurrent_workers is not None:
         try:
@@ -3212,6 +3228,19 @@ def cmd_delegate_plan(args: argparse.Namespace) -> int:
         peers=peers, server_capabilities=server_capabilities,
         tab=tab, overflow_to_new_tab=args.overflow_to_new_tab,
     )
+
+    # Not parsing --tab under the broker (above) means build_plan never sees it
+    # and so cannot emit its own "renga-only, ignored" warning for it. Say it
+    # here instead: not-failing-the-run is the contract, silently swallowing an
+    # explicit operator instruction is not. Emitted whatever the selector's
+    # shape, because under the broker its shape was never inspected.
+    if transport == "broker" and args.tab is not None:
+        plan.warnings.append(
+            f"--tab {args.tab!r} was ignored: tab placement is renga-only and "
+            "the broker has no tab concept at any layer (its panes are "
+            "independent detached sessions). The selector was not even parsed, "
+            "so a malformed one would not have been reported either."
+        )
 
     if plan.status == "ready_to_spawn" and not args.dry_run:
         write_worker_seed(state_dir, task, plan.task_id, plan.spawn or {})

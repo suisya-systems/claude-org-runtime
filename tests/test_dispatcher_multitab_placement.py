@@ -913,6 +913,68 @@ def test_overflow_reservations_ignored_outside_overflow_mode(
     assert renga_off.capacity is None
 
 
+def test_cli_inert_flags_do_not_fail_the_run_but_are_never_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # This module's pre-#158 neighbour establishes the rule: a flag documented
+    # as "ignored under transport X" must not be able to FAIL the run under
+    # transport X (see the --max-concurrent-workers comment in
+    # cmd_delegate_plan). The #158 flags follow it -- and pair it with the
+    # other half, that an ignored instruction still has to be reported.
+    argv = _write_cli_inputs(tmp_path, _renga_panes())
+
+    # (a) --tab under the broker: not parsed at all, so even a malformed
+    #     selector cannot abort the run -- but the plan says it was dropped.
+    rc = main(argv + [
+        "--transport", "broker", "--tab", "bogus:1", "--dry-run",
+    ])
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["status"] == "ready_to_spawn"
+    assert plan["spawn"].get("tab") is None
+    assert any("--tab" in w and "renga-only" in w for w in plan["warnings"]), (
+        "an ignored --tab must still be reported; not-failing is the contract, "
+        "silently swallowing an explicit operator instruction is not"
+    )
+
+    # (b) An explicit --tab beats overflow, so the fleet ceiling is never
+    #     consulted and --max-concurrent-workers is inert again.
+    rc = main(argv + [
+        "--transport", "renga",
+        "--server-capability", CAP_SPAWN_TAB,
+        "--tab", "pane_id:7",
+        "--overflow-to-new-tab",
+        "--max-concurrent-workers", "not-a-number",
+        "--dry-run",
+    ])
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["status"] == "ready_to_spawn"
+    assert plan["spawn"]["tab"] == {"pane_id": 7}
+    assert any("overflow is a fallback" in w for w in plan["warnings"])
+
+    # The controls, which are the load-bearing half: where each value DOES
+    # have an effect, a malformed one must still abort with exit 1.
+    assert main(argv + [
+        "--transport", "renga",
+        "--server-capability", CAP_SPAWN_TAB,
+        "--overflow-to-new-tab",
+        "--max-concurrent-workers", "not-a-number",
+        "--dry-run",
+    ]) == 1
+    assert main(argv + [
+        "--transport", "renga",
+        "--server-capability", CAP_SPAWN_TAB,
+        "--tab", "bogus:1",
+        "--dry-run",
+    ]) == 1
+    assert main(argv + [
+        "--transport", "broker",
+        "--max-concurrent-workers", "not-a-number",
+        "--dry-run",
+    ]) == 1
+
+
 def _full_tab_table_peers() -> list[Peer]:
     """A peer census that already sees renga's MAX_TABS tabs."""
     return [
