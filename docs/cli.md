@@ -39,7 +39,13 @@ python -m claude_org_runtime.dispatcher.runner delegate-plan \
 |------|-------------|
 | `--task-json PATH` | Path to a task JSON file (object with `task_id`, `worker_dir`, `instruction` or `instruction_vars`, etc.). Mutually exclusive with `--task-stdin`. |
 | `--task-stdin` | Read the task JSON from stdin. |
-| `--panes-json PATH` | Path to a JSON file containing renga `list_panes` output (a list of pane dicts, or `{panes: [...]}`). |
+| `--panes-json PATH` | Path to a JSON file containing renga `list_panes` output (a list of pane dicts, or `{panes: [...]}`). Under renga 2.0 this is **caller-tab-scoped** and is the geometry source only. |
+| `--peers-json PATH` | Path to a JSON file containing `list_peers` output (a list of peer dicts, or `{peers: [...]}`). Peers span every renga tab, so this is the org-wide worker population; `--panes-json` only sees the caller's tab. Omitted -> the population is derived from `--panes-json` alone, which is the renga 1.4 / broker behaviour. |
+| `--server-capability TOKEN` | renga protocol capability the server advertises (`caller_scope`, `cross_tab_peers`, `spawn_tab`). Repeatable. Asserted by the caller, never probed -- the renga MCP surface does not report its own capability list. Omitted -> every tab feature fails closed. |
+| `--tab SELECTOR` | Place the worker in a specific renga tab: `pane_id:N` (stable anchor, preferred), `index:N` (0-based, shifts when a tab closes), `name:LABEL` (exact match), `new`, or `new:LABEL`. Requires `--server-capability spawn_tab`. Ignored under `--transport broker`. |
+| `--overflow-to-new-tab` | Under `--transport renga`, when no balanced-split candidate is left, plan a spawn into a fresh background tab instead of escalating. Requires `--server-capability spawn_tab` **and** `--peers-json`: overflow removes the rect ceiling and the fleet ceiling that replaces it is counted from the peer census, which cannot see workers this flag placed in other tabs unless the census is supplied. Each overflow mints a new tab; it never reuses one. Ignored under `--transport broker`. |
+| `--transport {renga,broker}` | Capacity backend: `renga` uses the rect-based balanced split; `broker` uses the explicit `--max-concurrent-workers` ceiling. Default: resolved from `ORG_TRANSPORT`, else the descriptor default (`broker`). |
+| `--max-concurrent-workers N\|unlimited` | Worker ceiling: a non-negative int (`0` disables spawning) or `unlimited` (explicit opt-in). Default when omitted: `8`. Ignored under `--transport renga` **unless** `--overflow-to-new-tab` is set -- that mode removes the rect ceiling, so the fleet ceiling becomes the only bound. |
 | `--state-dir PATH` | State directory root. Default: `.state`. |
 | `--template-repo PATH` | Repo root that hosts `.claude/skills/org-delegate/references/instruction-template.md`. Default: try the runtime package's ancestors first, then walk up from CWD. |
 | `--locale-json PATH` | Override the English defaults for non-English consumers (e.g. claude-org-ja). The JSON file maps to `LocaleConfig` fields: `constraints_default`, `report_target_default`, `claude_md_filename_default`, `instruction_template`. |
@@ -83,8 +89,44 @@ error.
 | Code | Meaning |
 |------|---------|
 | `0` | `ready_to_spawn` -- plan emitted, side-effect files written (unless `--dry-run`). |
-| `1` | `input_invalid` -- task JSON / panes / cwd validation failed. |
-| `2` | `split_capacity_exceeded` -- no balanced-split candidate; `escalate` field tells Dispatcher to notify Secretary for human judgment. |
+| `1` | `input_invalid` -- task JSON / panes / peers / cwd validation failed, a `--tab` selector the peer census cannot address, or `--overflow-to-new-tab` without `--peers-json`. |
+| `2` | `split_capacity_exceeded` -- no balanced-split candidate, the broker `max_concurrent_workers` ceiling, or renga's tab limit; the `escalate` field tells Dispatcher to notify Secretary for human judgment. |
+
+The exit codes are exactly these three. The renga tab error codes
+(`tab_not_found`, `tab_ambiguous`, `tab_limit_reached`,
+`target_tab_mismatch`, `pane_not_found`) are **plan-level**, never process
+exit codes: they appear as the leading token of an `errors[]` entry / the
+`escalate` message, and as the keys of `plan.on_spawn_error`.
+`--overflow-to-new-tab` can turn a would-be exit `2` into an exit `0` by
+planning the worker into a fresh background tab, which is why it is opt-in
+rather than the default.
+
+Note for upgrading consumers: the renga `split_capacity_exceeded` escalation
+**message string** grew a measured diagnostics paragraph, on a path that
+needs none of the flags above. The pre-#158 sentence is preserved byte for
+byte as a literal prefix, so `MIN_PANE` / `max_concurrent_workers` matching
+still discriminates the two capacity reasons -- but anything that renders the
+message into a fixed-width surface, or matches it in full, should be
+re-checked.
+
+### Plan fields added for multi-tab capacity
+
+Three additive fields carry the renga 2.0 facts. All three are `null` on
+every invocation that passes none of the flags above, with one exception:
+`layout` is populated on the renga `split_capacity_exceeded` path, because
+that escalation is precisely where an operator needs the measurement.
+
+| Field | Set when | Contents |
+|-------|----------|----------|
+| `population` | `--peers-json` was given | Worker census with provenance: `active_workers` (union of worker panes and worker peers, deduped on `name`), `source`, `scope`, `panes_only` / `peers_only` / `both` / `anonymous`, `names`, and a per-tab `by_tab` breakdown. |
+| `layout` | renga, and either the status is `split_capacity_exceeded` or a tab flag was used | The **measured** pane area (`pane_area`, `left_panels_columns`, `reclaim_hint`), `panes_in_tab` / `max_panes`, `tabs_seen` (a lower bound) / `max_tabs`, the advisory `new_tab_estimate`, and the resolved `tab_placement`. |
+| `on_spawn_error` | the plan emitted `spawn.tab` | Recovery table keyed by renga error code, each with `meaning` / `action` / `remove_state_writes` / `next`. When `remove_state_writes` is true, delete `plan.state_writes` before re-planning -- otherwise the pre-existing state files block the retry. |
+
+The sidebar is **measured**, never subtracted. renga carves the org sidebar
+and file tree off the frame *before* laying out panes, so every rect in
+`list_panes` is already net of them; `left_panels_columns` is recovered as
+the pane area's own `x` offset. Nothing in the split arithmetic takes a
+sidebar width as an operand.
 
 ## `settings generate`
 

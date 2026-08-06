@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `dispatcher delegate-plan`: the concurrent-worker count no longer
+  under-reports the fleet under renga 2.0, where it silently over-spawned
+  (Issue #158). renga 2.0 scopes `list_panes` to the **caller's own tab**,
+  so a dispatcher in tab 0 counting worker panes simply cannot see the
+  workers running in tabs 1..N. Every capacity number derived from that
+  snapshot was therefore a per-tab number being used as an org-wide one:
+  a ceiling of 8 would admit a 9th, 10th and 11th worker as long as the
+  extras lived in other tabs.
+
+  The fix separates the two jobs the pane snapshot was doing. `--panes-json`
+  stays the **geometry** source -- it is the only input carrying rects, and
+  the balanced split still ranks exactly those rects -- while a new
+  `--peers-json` (`list_peers`) becomes the **population** source, because
+  peers span every tab. The count is the union of worker panes and worker
+  peers, deduped on pane `name`.
+
+  Union rather than replacement, and `name` rather than the pane id, are
+  both load-bearing. A freshly spawned worker exists as a pane for the
+  10-30s before its peer bind registers -- the helper's own `after_spawn`
+  step waits up to ~30s for exactly that -- so a second `delegate-plan`
+  inside that window would under-count and over-spawn again if peers simply
+  replaced panes. And `name` is the only key present on both surfaces of
+  every transport: the broker's `list_peers` reports `id = agent_id`
+  (`worker-foo`) while its `list_panes` reports `id = adapter handle`
+  (`%3`), so a pane-id dedup would double-count every broker worker instead.
+
+  No capability negotiation is involved, deliberately. renga 1.4's
+  `list_peers` is already caller-tab-only and renga 2.0's spans tabs, so
+  counting worker peers yields the correct number on both without knowing
+  which server is on the wire -- which is what lets the correctness fix land
+  here without waiting for a paired consumer release. Omitting
+  `--peers-json` reproduces the previous numbers exactly.
+
 - `settings`: deny paths that cross an **absolute symlink** are now
   rewritten to their realpath instead of being handed to bubblewrap
   as-is. On WSL2, where `~/.aws` is commonly a symlink into `/mnt/c`,
@@ -37,6 +70,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dispatcher delegate-plan`: tab-directed spawning under renga 2.0, via
+  `--tab SELECTOR` (`pane_id:N` / `index:N` / `name:LABEL` / `new` /
+  `new:LABEL`) and `--overflow-to-new-tab`, both gated on an explicit
+  `--server-capability spawn_tab` assertion (Issue #158).
+
+  The gate is an assertion rather than a probe because renga's MCP surface
+  does not expose the server's capability list at all -- it enforces
+  capabilities internally and only ever surfaces an `[server_too_old] ...`
+  error string. Omission therefore fails closed: a caller that passes
+  nothing new can never have a `tab` key emitted into its plan, and so can
+  never be handed a request an older renga would refuse. The three renga
+  tokens stay distinct for the same reason renga made them distinct -- a
+  renga#288-era server advertises `caller_scope` while still silently
+  dropping cross-tab sends, so `caller_scope` never authorises cross-tab
+  reasoning and `cross_tab_peers` never authorises a `tab` key.
+
+  Emitted selectors are canonicalised to `{"pane_id": N}` whenever the peer
+  census can resolve them, because renga documents the tab index as display
+  metadata that renumbers when a tab closes -- a plan carrying an index can
+  address the wrong tab if anything closes between emission and the spawn
+  call. A tab spawn into an existing tab uses `target: "focused"`, which
+  renga resolves *inside* the selected tab; that is also what structurally
+  prevents `target_tab_mismatch`, since the runtime never pairs a
+  caller-tab numeric target with a foreign-tab selector. A `tab: {new}`
+  spawn omits `target` and `direction` as **absent keys** rather than
+  nulls, because renga forbids them at the schema level for that variant
+  and a JSON `null` counts as present.
+
+  `--overflow-to-new-tab` is opt-in, and it re-enables
+  `--max-concurrent-workers` on the renga path. Under renga the only worker
+  ceiling has ever been "the balanced split found no candidate", and
+  overflow deletes exactly that. It also does not self-limit: because
+  `list_panes` is caller-tab-scoped, the next `delegate-plan` re-observes
+  the same saturated tab and would mint yet another tab, so N delegations
+  produce N tabs. The explicit fleet ceiling is the only bound left, which
+  is why that one mode consults it. Outside overflow the renga path still
+  ignores the policy entirely.
+- `dispatcher delegate-plan`: three additive plan fields -- `population`
+  (auditable worker census with provenance and a per-tab breakdown),
+  `layout` (renga layout diagnostics), and `on_spawn_error` (a recovery
+  table keyed by renga error code). All three are `null` on every
+  invocation that predates Issue #158, with one deliberate exception:
+  `layout` is populated on the renga `split_capacity_exceeded` path,
+  because that escalation is exactly where an operator needs the numbers.
+
+  `layout` folds the org sidebar into the capacity story by **measuring**
+  it, never by subtracting it. renga carves the sidebar, the file tree and
+  a swapped preview off the frame *before* the pane layout runs, and the
+  rects it puts on the wire are the post-carve remainder -- so subtracting
+  a sidebar width here would be a straight double subtraction, and would
+  desync this module's prediction from renga's own split guard, which
+  judges the very same rects. It would manufacture `split_capacity_exceeded`
+  on layouts renga would happily split. Instead the pane area is recovered
+  exactly as the bounding box of the pane rects (renga tiles them with no
+  gaps and no overlap), and the reclaimable column count is that box's own
+  `x` offset. That number is automatically right in every sidebar mode --
+  default, compact, off -- with no terminal width, which the runtime never
+  receives. The accompanying `reclaim_hint` names the likely decomposition
+  (sidebar 26/16 plus file tree ~20) and explicitly labels it a candidate
+  attribution, because `min(x)` is one equation in three unknowns.
+
+  `on_spawn_error` exists because a tab spawn can fail *after* the helper
+  has already written the worker seed and instruction files, and the helper
+  refuses any task whose state files exist -- so a failed tab spawn would
+  otherwise block its own retry. Each entry says what the code means, what
+  to do, and carries `remove_state_writes` naming that concrete lockout.
+  `pane_not_found` is in the table alongside the tab codes because the
+  runtime deliberately addresses existing tabs by their anchor pane id: when
+  that anchor closes (a worker finishing is the common case) renga answers
+  `pane_not_found`, not `tab_not_found`, and without an entry the dispatcher
+  would have no recovery -- and no `remove_state_writes` -- for the most
+  likely failure of the strategy the runtime chose.
+
+  Exit codes stay `0` / `1` / `2`. The tab error codes are plan-level
+  only: they appear as the leading token of an error / escalation message
+  and as `on_spawn_error` keys, never as a process exit status.
+
+### Changed
+
+- `dispatcher delegate-plan`: the renga `split_capacity_exceeded`
+  **escalation message text** now carries an appended diagnostics paragraph,
+  on a path that needs none of the new flags. This is the one user-visible
+  behaviour delta for a caller that passes nothing new, and it matters
+  because claude-org-ja forwards that string to the secretary verbatim: in
+  this repo's own fixture it grows from 239 to 766 characters. The original
+  sentence is preserved **byte for byte as a literal prefix** -- so
+  `"MIN_PANE" in message` and `"max_concurrent_workers" not in message`
+  still discriminate the rect reason from the fleet reason -- and everything
+  appended is measured (pane area, left-panel columns, the advisory new-tab
+  estimate, tabs seen) plus a one-sentence pointer at
+  `--overflow-to-new-tab`. `plan.layout` carries the same facts structurally
+  for consumers that would rather parse than read. Re-review any consumer
+  that pattern-matches on the full escalation string or renders it into a
+  fixed-width surface.
 - `sandbox doctor`: preflight a rendered `settings.local.json` and exit
   non-zero when the sandbox would not actually start, so the silent
   fallback above becomes a checkable failure. Runs a static pass over
