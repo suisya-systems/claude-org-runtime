@@ -659,7 +659,9 @@ def test_count_worker_population_dedupes_on_name_not_pane_id() -> None:
     assert count_worker_population(renga_panes, renga_peers).total == 1
 
 
-def test_count_worker_population_is_not_gated_on_cross_tab_capability() -> None:
+def test_count_worker_population_is_not_gated_on_cross_tab_capability(
+    tmp_path: Path,
+) -> None:
     # The count needs no discriminator and no capability token: renga 1.4
     # list_peers is already caller-tab-only and renga 2.0 spans tabs, so
     # counting every worker peer is correct on both without knowing which one
@@ -681,10 +683,15 @@ def test_count_worker_population_is_not_gated_on_cross_tab_capability() -> None:
     # And end to end: no token asserted anywhere, yet the broker ceiling still
     # sees all three tabs.
     assert derive_tab_awareness(peers, None).spawn_tab is False
+    # worker_dir must be a REAL directory (build_plan calls validate_cwd on it)
+    # and state_dir must be somewhere this process can stat. Both come from
+    # tmp_path rather than a POSIX literal like "/tmp": that literal passes on
+    # Linux and turns this into a cwd_invalid / input_invalid on Windows, which
+    # is exactly how it broke CI (windows-latest, all three Python versions).
     plan = build_plan(
-        {"task_id": "demo", "worker_dir": "/tmp"},
+        _task(tmp_path),
         [],
-        Path("/nonexistent-state"),
+        tmp_path / ".state",
         transport="broker",
         capacity_policy=CapacityPolicy(max_concurrent_workers=3),
         peers=peers,
