@@ -1528,32 +1528,49 @@ def parse_tab_selector(raw: str) -> dict[str, Any]:
     Raises :class:`ValueError` on anything else. There is no "bare N" form:
     an unprefixed integer is ambiguous between an index and a pane id, and
     guessing wrong addresses a different tab than the operator meant.
+
+    **A LABEL is taken verbatim, surrounding whitespace included.** renga
+    stores tab labels as given and matches display names exactly -- it trims
+    only to test emptiness (``Some(s) if !s.trim().is_empty()``,
+    src/mcp_peer/mod.rs:1170) -- so a label is opaque data this parser has no
+    licence to normalise. Trimming it would silently address a DIFFERENT tab
+    than the operator asked for, or create one under a name they did not
+    choose. Only the selector's own syntax (the key, and a numeric value) is
+    whitespace-insensitive, because that part is this parser's grammar rather
+    than the operator's data.
     """
     if not isinstance(raw, str):
         raise ValueError(f"--tab must be a string, got {type(raw).__name__}")
-    s = raw.strip()
-    if not s:
+    if not raw.strip():
         raise ValueError(
             "--tab is empty; expected pane_id:N, index:N, name:LABEL, new, "
             "or new:LABEL"
         )
-    if s == "new":
-        return {"new": {}}
-    key, sep, value = s.partition(":")
+    # Partition the ORIGINAL string, not a stripped copy: everything after the
+    # first colon may be a label and must survive byte for byte. The key is
+    # stripped on its own so shell-quoting slack around the selector still
+    # works, and so does a trailing-space "new".
+    raw_key, sep, value = raw.partition(":")
+    key = raw_key.strip()
     if not sep:
+        if key == "new":
+            return {"new": {}}
         raise ValueError(
             f"--tab {raw!r} has no selector prefix; expected pane_id:N, "
             "index:N, name:LABEL, new, or new:LABEL"
         )
     if key == "new":
-        if not value:
+        # Emptiness is judged on the trimmed label (renga's own rule) while
+        # the label itself is kept untrimmed.
+        if not value.strip():
             raise ValueError("--tab new:LABEL requires a non-empty LABEL")
         return {"new": {"name": value}}
     if key == "name":
-        if not value:
+        if not value.strip():
             raise ValueError("--tab name:LABEL requires a non-empty LABEL")
         return {"name": value}
     if key in ("index", "pane_id"):
+        value = value.strip()
         if not value.isdigit():
             # ``isdigit`` rejects "-1" and "abc" in one test. A negative index
             # is not "out of range" (which is a tab_not_found at plan time),

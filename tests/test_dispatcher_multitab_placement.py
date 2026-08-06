@@ -246,6 +246,47 @@ def test_parse_tab_selector_forms(raw: str, expected: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # A LABEL is operator data, not this parser's grammar. renga stores
+        # labels verbatim and matches display names exactly -- it trims only
+        # to test emptiness (src/mcp_peer/mod.rs:1170) -- so normalising one
+        # would silently address a DIFFERENT tab than was asked for, or mint
+        # one under a name nobody chose.
+        ("name:build ", {"name": "build "}),
+        ("name: build", {"name": " build"}),
+        ("name: my build ", {"name": " my build "}),
+        ("new:my tab ", {"new": {"name": "my tab "}}),
+        # ...while the selector's OWN syntax stays whitespace-insensitive,
+        # so shell-quoting slack around it still works.
+        (" pane_id: 7 ", {"pane_id": 7}),
+        ("  index:2  ", {"index": 2}),
+        ("  new  ", {"new": {}}),
+    ],
+)
+def test_parse_tab_selector_keeps_labels_verbatim(
+    raw: str, expected: dict[str, Any],
+) -> None:
+    got = parse_tab_selector(raw)
+    assert got == expected
+    assert validate_tab_selector(got) is None
+
+
+def test_parse_tab_selector_label_trimming_was_asymmetric() -> None:
+    # The shape of the original defect, pinned so it cannot come back: the
+    # whole selector was stripped BEFORE being split on the colon, so a
+    # trailing space was eaten while a leading one survived -- the same label
+    # normalised two different ways depending on which side the space was on.
+    lead = parse_tab_selector("name: build")["name"]
+    trail = parse_tab_selector("name:build ")["name"]
+    assert lead == " build" and trail == "build "
+    assert lead.strip() == trail.strip() == "build"
+    assert lead != trail.strip() and trail != lead.strip(), (
+        "neither side may be normalised; renga matches display names exactly"
+    )
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "",
