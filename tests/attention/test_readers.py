@@ -202,43 +202,93 @@ def test_read_broker_duplicates_skips_corrupt_and_undateable_rows(
     assert [r["ts"] for r in out] == [990.0]
 
 
-def test_read_broker_duplicates_tail_only_drops_partial_first_line(
+def test_read_broker_duplicates_scan_follows_window_not_a_byte_cap(
     tmp_path: Path,
 ) -> None:
-    """Only the journal tail is parsed; the cut first line is discarded."""
-    records = [_dup(float(900 + i), instances=(f"a{i}", f"b{i}"))
-               for i in range(20)]
-    path = _write_journal(tmp_path / "broker", records)
-    size = path.stat().st_size
-    line_len = size // 20
+    """A busy journal must not push a still-live incident out of view.
+
+    The detection is re-emitted only once per lease window, so whatever
+    the daemon journals in between (claims, deliveries, nudges) sits
+    between the signal and the tail. A fixed-size tail would drop the
+    signal while it is still inside the freshness window; the backward
+    walk keeps reading until it passes the window.
+    """
+    records: list[dict] = [_dup(950.0, instances=("live-a", "live-b"))]
+    records += [
+        {"ts": 950.0 + i * 0.01, "event": "claimed", "owner": "sec",
+         "ids": ["row-" + "x" * 40]}
+        for i in range(200)
+    ]
+    _write_journal(tmp_path / "broker", records)
     out = read_broker_duplicates(
         tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
-        # Cut mid-line: 3.5 lines' worth of tail -> 3 usable rows.
-        tail_bytes=int(line_len * 3.5),
+        chunk_bytes=256,   # far smaller than the trailing traffic
     )
-    assert [r["instances"] for r in out] == [
-        ["a17", "b17"], ["a18", "b18"], ["a19", "b19"],
+    assert [r["instances"] for r in out] == [["live-a", "live-b"]]
+
+
+def test_read_broker_duplicates_stops_walking_past_the_window(
+    tmp_path: Path, capsys,
+) -> None:
+    """The walk ends at the first line older than the window.
+
+    Asserted through the scan cap: reading the whole file would exceed
+    ``max_scan_bytes`` and warn, so a silent run proves the walk stopped
+    at the window boundary instead.
+    """
+    records: list[dict] = [
+        {"ts": 100.0 + i, "event": "claimed", "owner": "sec"}
+        for i in range(100)
     ]
+    records.append(_dup(995.0))
+    _write_journal(tmp_path / "broker", records)
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+        chunk_bytes=128, max_scan_bytes=1024,
+    )
+    assert [r["ts"] for r in out] == [995.0]
+    assert capsys.readouterr().err == ""
 
 
-def test_read_broker_duplicates_survives_multibyte_tail_cut(
+def test_read_broker_duplicates_reports_a_capped_scan(
+    tmp_path: Path, capsys,
+) -> None:
+    """Hitting the safety cap is said out loud, not silently truncated."""
+    records: list[dict] = [
+        {"event": "claimed", "owner": "sec", "note": "no ts at all"}
+        for _ in range(100)
+    ]
+    records.append(_dup(995.0))
+    _write_journal(tmp_path / "broker", records)
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+        chunk_bytes=128, max_scan_bytes=512,
+    )
+    # Partial degradation: what was reached is still reported.
+    assert [r["ts"] for r in out] == [995.0]
+    err = capsys.readouterr().err
+    assert "freshness window" in err
+
+
+def test_read_broker_duplicates_survives_multibyte_chunk_cut(
     tmp_path: Path,
 ) -> None:
-    """A tail boundary inside a UTF-8 codepoint must not kill the read."""
+    """A chunk boundary inside a UTF-8 codepoint must not kill the read."""
     _write_journal(tmp_path / "broker", [
+        {"ts": 100.0, "event": "claimed", "owner": "old"},
         _dup(990.0, owner="ワーカー日本語", instances=("x", "y")),
         _dup(995.0, owner="sec"),
     ])
     data = (tmp_path / "broker" / "queue.jsonl").read_bytes()
-    # Start one byte into the 3-byte codepoint opening the first line's
-    # owner value, so the tail begins mid-character.
-    cut = data.index("ワーカー日本語".encode("utf-8")) + 1
-    tail = len(data) - cut
+    # Size the chunk so the first read boundary lands one byte into the
+    # 3-byte codepoint opening the middle line's owner value.
+    chunk = len(data) - (data.index("ワーカー日本語".encode("utf-8")) + 1)
     out = read_broker_duplicates(
         tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
-        tail_bytes=tail,
+        chunk_bytes=chunk,
     )
-    assert [r["owner"] for r in out] == ["sec"]
+    # The damaged line is dropped; the next chunk brings back the rest.
+    assert [r["owner"] for r in out] == ["ワーカー日本語", "sec"]
 
 
 def test_read_broker_duplicates_unreadable_journal_warns(

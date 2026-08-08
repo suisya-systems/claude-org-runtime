@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the failure mode the signal was added to make visible.
 
   The watcher reads only the **tail** of `.state/broker/queue.jsonl` (the
-  journal is append-only and never rotated) and only lines newer than
-  `duplicate_sidecar_window_sec` (default 300s). That window is what makes
+  journal is append-only and never rotated), walking backwards until it
+  passes `duplicate_sidecar_window_sec` (default 300s) so the bytes read
+  follow the configured window rather than a fixed cap -- a busy daemon
+  cannot push a still-live incident out of view. That window is what makes
   the alert mean "this is happening now": the store re-emits per instance
   pair once per lease window for as long as both sidecars keep polling, so
   a live incident keeps re-firing while a resolved one falls silent by
