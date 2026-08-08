@@ -158,42 +158,40 @@ strongest case for switching, and it is why the decision below is a genuine trad
 The reason it does not carry the decision is §6.2: the failure direction argument is about the *push* path,
 but the same silent loss is reachable through the *pull* path, which broadcast leaves untouched. Buying a
 better failure direction on one of two paths, at the cost of a delivery-core rewrite, does not eliminate the
-failure class - it narrows it. §6.1 and §6.3 add further costs, but §6.2 is what makes the trade unattractive.
+failure class - it narrows it. §6.3 adds migration cost on top, but §6.2 is what makes the trade
+unattractive. Note that §6.1 does **not** contribute: the argument that broadcast harms the protected owner
+was examined and withdrawn.
 
 ---
 
 ## 6. Why we are not switching
 
-### 6.1 Broadcast turns a persisted credential into a standing read capability
+### 6.1 An argument that did not survive review
 
-Today, for the secretary (the only owner with an observer lease), a fork's *sidecar* is rejected `unobserved`
-(`store.py:412-418`); it sets `_stood_down` and its push loop returns before entering the claim loop
-(`channel_sidecar.py:191-198`, `:254-258`). It never claims, never emits, never confirms.
+This section originally argued that broadcast regresses the one owner protected today (the secretary), and
+that argument was weighted heavily while reaching the decision. Review dismantled it in three stages. It is
+recorded here, rather than deleted, so that it is not raised again.
 
-Two corrections to how this argument was first drafted, both of which narrow it:
+**The protection is narrower than claimed.** The observer lease rejects a fork's *sidecar*, which sets
+`_stood_down` and never enters the claim loop (`store.py:412-418`, `channel_sidecar.py:191-198`, `:254-258`).
+It does nothing about a fork's *pull*. Per §4.4, `drain()` authenticates nothing beyond the replayed
+`AgentBind`, so a forked session's `check_messages` still consumes the secretary's rows. The secretary is
+correct only against the push path, not in general.
 
-- It holds **only** for sidecar activity. The lease does not protect the secretary from a fork's *pull*: per
-  §4.4, `drain()` authenticates nothing beyond the replayed `AgentBind`, so a forked session's
-  `check_messages` still consumes the secretary's rows and marks them `DELIVERED`. The secretary is not
-  "correct today" in general - it is correct only against the push path.
-- Broadcast does **not** cost the watched session its copy. With the per-row-per-instance state that §6.3
-  identifies as mandatory, a fork's ack completes only that fork's own delivery and does not retire the
-  incumbent's. Retiring a row on any single ack is a defect of the proposal *as drafted* (§6.3), not a
-  property of broadcast as a model, and charging broadcast for it would be comparing against a known-broken
-  variant.
+**The harm attributed to broadcast was a drafting defect, not a property of the model.** With the
+per-row-per-instance state §6.3 identifies as mandatory, a fork's ack completes only that fork's delivery and
+the watched session still receives its copy. Retiring a row on any single ack is the defect noted in §6.3;
+charging broadcast for it compares against a known-broken variant.
 
-What survives is a **confidentiality** cost rather than an availability one. The delivery credential is stored
-literally in the mcp-config (`tokens.py:161-178`, which deliberately avoids `${VAR}` indirection), and for the
-secretary that config is persisted to `<state-dir>/secretary-mcp.json` at mode 0600 (`launcher.py:195-217`,
-`:558`). Today a holder of that file gets **nothing** on the push path: register returns `unobserved`, the
-generation is untouched, and no claim is ever issued. Under broadcast the same holder receives a **full copy
-of every message** sent to the operator's own report channel, because broadcast's premise is that any
-registered instance is entitled to a copy.
+**The fallback confidentiality form also fails.** The secretary's mcp-config is persisted to
+`<state-dir>/secretary-mcp.json` at mode 0600 (`launcher.py:195-217`, `:558`), and the delivery credential
+sits in it literally. But that same file carries the **full agent token** (`server.py:296`,
+`tokens.py:192-205`), and the full token already grants destructive read of the entire queue via
+`check_messages`. Broadcast would add another route to data the file holder can already read; it would not
+create a new capability.
 
-So broadcast would not silence the watched session, but it would convert a persisted, replayable credential
-from an inert artifact into a standing read capability on the most sensitive queue in the system. That cost is
-real and lands on the owner the operator actually watches - though it is narrower than "broadcast regresses
-the protected owner", which is how this point was originally put here.
+Net position: **broadcast costs the protected owner nothing that keeping does not already cost it.** The case
+for keeping rests on §6.2 and §6.3, not on this.
 
 ### 6.2 Switching does not close #162
 
@@ -334,8 +332,9 @@ section - without it, the same discussion recurs from scratch.
 2. **The host is shown to coalesce or drop duplicate `notifications/claude/channel` frames.** The entire
    operator-safety case for broadcast rests on the duplicate being *visible*. If the host silently collapses
    duplicates, broadcast loses its main advantage and this decision becomes unambiguous.
-3. **The observer lease is extended to all spawned panes** and proves stable in practice. That would make the
-   protected-minority argument in §6.1 apply to everyone, materially changing the trade.
+3. **The live-incumbent guard (§8 item 1) lands and proves insufficient**, or the observer lease is extended
+   to all spawned panes and proves unstable. Either would mean the §4.1 default-silence path is not closable
+   in-model as cheaply as §6.4 assumes, which is the premise the decision rests on.
 4. **A ruling that DELEGATE-class traffic on this queue requires at-most-once execution.** Unconditional
    broadcast would then be wrong for a subset of rows, pointing at per-row delivery policy set at enqueue
    rather than a global model.
@@ -367,9 +366,9 @@ judge, which explicitly noted that no option closes the pull door - and the migr
 specification was demonstrably not converged (§6.3).
 
 A third argument, that broadcast regresses the one protected owner, was raised by the adversarial reviewer and
-initially carried more weight here than it deserved. Review narrowed it: with per-instance acks the watched
-session still receives its copy, so the cost is confidentiality rather than lost delivery (§6.1). It counts
-against switching but is not load-bearing, and the original phrasing overstated it.
+carried substantial weight in the original draft of this note. It did **not** survive review and has been
+withdrawn in full (§6.1). Readers weighing this decision should note that one of the three reasons originally
+given for it turned out to be wrong; the decision stands on the remaining two.
 
 A **hybrid** ("keep claim, degrade a contested owner to fan-out") was evaluated and rejected. Its safety is
 contingent on a wall-clock contention window that collapses under the sidecar's own 5-second HTTP timeout, and
