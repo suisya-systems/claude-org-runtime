@@ -45,7 +45,7 @@ from ..terminal import (
     venv_pane_env,
     venv_pane_prep,
 )
-from . import sidecar, surface
+from . import sidecar, store, surface
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
@@ -133,6 +133,9 @@ class Broker(TokenMixin, StoreMixin):
         # stand-down は子プロセス内の Event で外から見えないため、daemon 側に残して
         # delivery_dump で晒す (「黙っている pane」を journal を読まずに発見できる)。
         self._delivery_standdowns: dict[str, dict[str, dict]] = {}
+        # stale lease を理由に register を拒否した時の pane liveness probe のレート制限
+        # (Issue #169)。adapter I/O を 1Hz の再試行で叩き続けない。
+        self._stale_lease_probe_at: float = 0.0
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -687,6 +690,64 @@ class Broker(TokenMixin, StoreMixin):
             # クロスセッション誤配送になる (Codex review Major / 切戻し §5.5(5))。
             self.discard_agent_rows(agent_id)
         return agent_id, meta is not None
+
+    def register_delivery_instance(
+        self, token: str, instance_id: str, *,
+        observer: str | None = None, bg_hosted: bool = False,
+    ) -> dict:
+        """store の register に **pane liveness による lease 解放** を足す (Issue #169)。
+
+        sticky lease (:class:`~claude_org_runtime.broker.store.ObserverLease`) は TTL では
+        外れず、``reset_delivery_state`` (pane の close/reap) を主要な解除経路にしている。
+        ところが reap は **opportunistic** で、``resolve_target`` / ``_reserve_name`` を
+        通る入口 (spawn / close / send_keys 等) からしか走らない。``/claim-owner`` は
+        store にしか届かないので、pane が **broker の外で死ぬ** (crash / 端末ごと閉じる)
+        と、誰も registry 入口を叩かない限り reap されず、再試行し続ける正統な sidecar が
+        ``observer_pending`` を受け続ける = 恒久的に push が来ない (Codex review P1)。
+
+        そこで「stale な lease を理由に拒否した」時だけ opportunistic reap を 1 回走らせ、
+        pane が実際に消えていれば ``_cleanup_pane`` -> ``reset_delivery_state`` が lease を
+        落とし、同じ register を通す。**TTL に戻したのではない**: 判定材料は adapter が
+        答える pane の生死 (broker が観測できる外部事実) であって経過時間ではない。停止中
+        (Ctrl+Z / suspend) の pane は adapter snapshot に残るので fence は維持される。
+
+        reap は adapter I/O なので、1Hz の再試行で叩き続けないよう ``lease_seconds``
+        窓でレート制限する (probe しなかった回は従来どおり拒否のまま返る)。
+        """
+        res = super().register_delivery_instance(
+            token, instance_id, observer=observer, bg_hosted=bg_hosted)
+        if res.get("error") != store.REFUSE_OBSERVER_PENDING:
+            return res
+        owner = res.get("owner")
+        if owner is None or not self._probe_dead_pane_for_stale_lease(owner):
+            return res
+        # reap が lease を落としたかもしれないので 1 回だけ再評価する。
+        return super().register_delivery_instance(
+            token, instance_id, observer=observer, bg_hosted=bg_hosted)
+
+    def _probe_dead_pane_for_stale_lease(self, owner: str) -> bool:
+        """stale lease の owner について opportunistic reap を走らせたら True。
+
+        **stale の時だけ** 走らせる (armed = まだ誰も観測していない / active = 現職が
+        heartbeat 中。どちらも pane の生死を問う理由がない)。adapter I/O を伴うので
+        ``lease_seconds`` 窓でレート制限し、失敗は握り潰す (診断のための best-effort で、
+        ここで例外を出すと register 応答そのものを壊す)。
+        """
+        if self.adapter is None:
+            return False
+        now = time.time()
+        with self._lock:
+            _lease, state = self._observer_state_locked(owner, now)
+            if state != store.OBSERVER_STALE:
+                return False
+            if now - self._stale_lease_probe_at < self.lease_seconds:
+                return False
+            self._stale_lease_probe_at = now
+        try:
+            self._reap_stale_managed_panes()
+        except Exception:  # noqa: BLE001 - best-effort な liveness probe
+            return False
+        return True
 
     def _reap_stale_managed_panes(self, panes: list[dict] | None = None) -> None:
         """adapter snapshot に無い broker 管理 pane (自己終了) を掃除する。

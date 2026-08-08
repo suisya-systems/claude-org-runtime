@@ -91,6 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adopt path when #166 lands. An incumbent that comes back and resumes polling
   simply moves its lease back to `active`.
 
+  Because `reset_delivery_state` (pane close/reap) is now a load-bearing release
+  path rather than a tidy-up, it can no longer rely on being reached
+  opportunistically. The reaper only runs from registry entry points such as
+  spawn, close or send_keys, and `/claim-owner` reaches none of them, so a pane
+  that died outside the broker's view would have kept its lease fenced for as long
+  as no unrelated call happened to run. A registration refused on account of a
+  *stale* lease now triggers one rate-limited liveness probe, so a dead pane is
+  reaped promptly and its lease does not outlive it. This is not the TTL door
+  returning: the evidence is the adapter's answer about whether the pane exists,
+  not elapsed time, and a merely suspended pane still holds its lease.
+
   Leases asserted on the spawn path carry an **activation deadline** (10 minutes by
   default, `observer_arming_seconds`), because the secret's journey to the child
   crosses backend-specific machinery - tmux `-e`, a wezterm argv rewrite, a herdr

@@ -1370,6 +1370,54 @@ def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path):
     assert b.register_delivery_instance(dc, "manual", observer=None)["ok"] is True
 
 
+def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, fake_adapter):
+    """sticky lease の主要な解除経路 (pane の close/reap) は **opportunistic** で、
+    ``resolve_target`` / ``_reserve_name`` を通る入口からしか走らない。``/claim-owner``
+    は store にしか届かないので、pane が broker の外で死ぬ (crash / 端末ごと閉じる) と
+    誰も reap を叩かず、再試行し続ける正統な sidecar が恒久的に push を受け取れない。
+
+    そこで stale lease を理由に拒否した時だけ liveness probe (opportunistic reap) を
+    走らせる。**TTL に戻したのではない**: 材料は adapter が答える pane の生死。
+
+    reap 後にこの cred が受け取るのは ``unauthorized`` (``ok`` ではない) が正しい:
+    reap は lease を落とすと同時に delivery cred を revoke し未配達行を purge する
+    = broker はその agent を「葬った」。死んだ pane の設定を replay した session へ
+    配送を再開させるのは、その purge が防いでいる cross-session 誤配送そのものになる。
+    ここで直るのは「stale lease が pane より長生きして bookkeeping が残り続ける」方で、
+    同 agent_id の **新しい spawn** は綺麗な状態から始められる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter, lease_seconds=0.0,
+               observer_lease_seconds=0.1)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "w" and bd.scope == "delivery"][0]
+    b.register_delivery_instance(dc, "orig", observer=secret)
+    time.sleep(0.15)                                  # heartbeat 途絶 -> stale
+    # pane が **生きている** 間は stale でも fence を維持する (Ctrl+Z / suspend 相当)。
+    assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
+            == "observer_pending")
+    assert "w" in b._observer_leases
+    # pane が broker の外で消えた (crash)。close_pane は呼ばれていない。
+    fake_adapter.kill_pane(out["id"])
+    # 次の再試行が liveness probe を走らせ、reap が pane の bookkeeping を掃除する。
+    # stale lease は pane より長生きしない。
+    assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
+            == "unauthorized")
+    assert "w" not in b._observer_leases
+    assert str(out["id"]) not in b._pane_meta
+    # 同 agent_id の新しい spawn は綺麗な状態から始まり、自分の lease を張れる。
+    fake_adapter.add_pane(active=True)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    fresh = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    assert fresh != secret
+    assert b._observer_leases["w"].secret == fresh
+
+
 def test_spawn_lease_expires_if_it_is_never_activated(tmp_path, fake_adapter):
     """acceptance (#165 の安全弁): 秘密が子へ届かない環境で恒久無音にならない。
 
