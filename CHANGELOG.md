@@ -38,6 +38,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids. `--broker-state-dir` overrides the default `<state-dir>/broker`
   location for a daemon started with a non-default `--state-dir`.
 
+### Fixed
+
+- Channel delivery: the observer lease now covers the `spawn_claude` path, and a
+  sidecar's stand-down is no longer an unrecoverable latch (Issues #165 + #169).
+  These ship together on purpose - see below.
+
+  Before this change the observer lease, the only signal a forked session cannot
+  replay, was asserted for exactly one owner (`org up`'s secretary).
+  `spawn_claude` handed out a delivery credential and wired a channel sidecar but
+  never asserted a lease, so every dispatcher and worker pane fell through to
+  last-register-wins. A forked or resumed session's registration therefore
+  **deterministically fenced the original**, which then polled forever and emitted
+  nothing while messages were delivered into a session nobody was watching. The
+  journal read `claimed` + `delivered`; the operator saw silence. That was the
+  default for every spawned pane, not a rare race
+  (`docs/channel-delivery-model-decision.md` §4.1).
+
+  `spawn_claude` now asserts the lease and hands the secret to the child through
+  the **pane process environment**, never through `--mcp-config`: the mcp-config is
+  precisely what a fork replays verbatim, which is the whole reason the secret has
+  to travel out of band. Owners with no asserted lease are untouched and keep
+  last-register-wins, so callers without an env handoff do not lose push.
+
+  Extending the lease to every owner also multiplies the number of sessions that
+  can be refused at registration, and the sidecar's `_stood_down` latch had no
+  clear path - a legitimate hand-started session would have been muted permanently.
+  Registration refusals are therefore now split by **what the daemon can actually
+  know**, namely whether the caller presented a secret at all:
+
+  - presented a secret that does not match the active lease -> the caller once held
+    one and was rotated out, so it is superseded. Still `unobserved`, still latches.
+    Retrying cannot make a superseded instance legitimate, which is the reason the
+    latch exists.
+  - presented no secret -> a fork replay and an operator's hand-started session are
+    indistinguishable here, and guessing between them is the job of the explicit
+    adopt path (#166), not of this code. New non-latching `observer_pending`: the
+    push loop retries at poll cadence instead of going silent for good.
+
+  A refused registration does not bump the generation and does not move in-flight
+  rows, so retrying cannot ping-pong the generation with the live session.
+
+  For that retry to be safe rather than merely delayed, an activated lease is now
+  **sticky**: a lapsed TTL marks the lease `stale` and keeps fencing instead of
+  falling back to last-register-wins. A stopped heartbeat is not evidence of death
+  - Ctrl+Z on the pane sends SIGTSTP to the whole process group, and a laptop
+  suspend, a slow MCP restart or an NTP clock step all produce the same gap - while
+  the incumbent registers exactly once per lifetime and a fork retries every
+  second. A TTL-expiry door is therefore a door only a fork can walk through. What
+  opens it instead is an external act: the pane closing or being reaped (a death
+  the broker actually observed), a respawn rotating the lease, or the explicit
+  adopt path when #166 lands. An incumbent that comes back and resumes polling
+  simply moves its lease back to `active`.
+
+  Because `reset_delivery_state` (pane close/reap) is now a load-bearing release
+  path rather than a tidy-up, it can no longer rely on being reached
+  opportunistically. The reaper only runs from registry entry points such as
+  spawn, close or send_keys, and `/claim-owner` reaches none of them, so a pane
+  that died outside the broker's view would have kept its lease fenced for as long
+  as no unrelated call happened to run. A registration refused on account of a
+  *stale* lease now triggers one rate-limited liveness probe, so a dead pane is
+  reaped promptly and its lease does not outlive it. This is not the TTL door
+  returning: the evidence is the adapter's answer about whether the pane exists,
+  not elapsed time, and a merely suspended pane still holds its lease.
+
+  Leases asserted on the spawn path carry an **activation deadline** (10 minutes by
+  default, `observer_arming_seconds`), because the secret's journey to the child
+  crosses backend-specific machinery - tmux `-e`, a wezterm argv rewrite, a herdr
+  `pane.split` and shell inheritance - and the last leg, whether Claude Code passes
+  its environment to a stdio MCP server, is outside this repository. Where that
+  handoff fails, the pane's own sidecar cannot present the secret, and an
+  never-expiring armed lease would mute that owner permanently. If no observed
+  registration ever arrives, the lease is dropped, `observer_arming_expired` is
+  journalled, and the owner returns to today's behaviour - safe precisely because
+  "nobody ever presented the secret" is the definition of "there is no incumbent to
+  protect". The launcher/secretary path keeps its unbounded arming window, since a
+  human may sit on the stage-1 folder-trust prompt. Relatedly, only a registration
+  bearing the secret can activate an armed lease; a poll no longer can, which also
+  closes the gap noted in the decision note's §7 item 5.
+
+  Stood-down state is also observable from outside the sidecar process now:
+  `delivery_dump` reports, per owner and per instance, which sidecar is not
+  claiming, why, since when, and whether that state is permanent. Sidecars fenced
+  at poll time (`stale_sidecar`) are included - they are the common case, and
+  recording only registration refusals would have missed them.
+
+  The observer secret is redacted from tool-call error messages and from the
+  journal. Adapters put their whole argument vector into failure messages, which
+  reach both the calling agent and `queue.jsonl` (a file that, unlike
+  `admin.token`, is not 0600).
+
 ## [0.1.39] - 2026-08-06
 
 ### Fixed

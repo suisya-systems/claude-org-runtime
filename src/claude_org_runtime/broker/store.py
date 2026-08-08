@@ -40,6 +40,7 @@ per-agent mode boolean ではなく **行レベル claim 所有権** が担保�
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 import time
@@ -59,6 +60,54 @@ DELIVERED = "DELIVERED"
 PUSH = "PUSH"
 PULL = "PULL"
 
+# ------------------------------------------- delivery register refusal codes
+# :meth:`StoreMixin.register_delivery_instance` が generation bump を拒否するときの
+# コード。**latch するか否か**が意味の中心で、sidecar 側の挙動を決める (Issue #169):
+#
+# - ``REFUSE_BG_HOSTED`` / ``REFUSE_SUPERSEDED``: **latching**。状態は当該プロセスの
+#   生涯にわたり覆らないので、sidecar は claim loop を畳んで沈黙する。
+# - ``REFUSE_OBSERVER_PENDING``: **non-latching**。「まだ正統ではない」だけで、
+#   daemon 側の状態 (現職 lease の失効 / 将来の明示 adopt) が変われば覆りうる。
+#   sidecar は poll cadence で register を再試行する。
+#
+# 拒否は generation を bump しないので、再試行が現職と generation を ping-pong する
+# ことはない (再試行が通るのは現職が heartbeat を止めて lease が失効した時だけ)。
+#
+# ``REFUSE_SUPERSEDED`` が既存の ``"unobserved"`` 文字列を保持しているのは意図的:
+# 旧 sidecar はこの 1 語だけを latch 対象として知っており、latch させたい側に
+# 割り当てておけば version skew でも安全側に落ちる (未知コードは旧 sidecar から見て
+# 「不明な失敗」= 再試行、これは新コード側に与えたい挙動と一致する)。
+REFUSE_BG_HOSTED = "suppressed_bg_hosted"
+REFUSE_SUPERSEDED = "unobserved"
+REFUSE_OBSERVER_PENDING = "observer_pending"
+# poll 側の fence (register は通ったが、その後で世代交代された sidecar)。register の
+# 拒否ではないが **観測上は同じ「claim していない sidecar」** なので stand-down 面に
+# 載せる。sidecar はこれで latch せず、静かに poll し続ける (再 register は generation
+# war になるためしない)。
+REFUSE_STALE_SIDECAR = "stale_sidecar"
+
+# ---------------------------------------------------- observer lease の状態
+# :meth:`StoreMixin._observer_state_locked` が返す状態 (:class:`ObserverLease` 参照)。
+# **fence するのは NONE / ARMING_EXPIRED 以外のすべて**。
+OBSERVER_NONE = "none"                      # lease 無し = 従来の last-register-wins
+OBSERVER_ARMED = "armed"                    # assert 済・未 activate (TTL では失効しない)
+OBSERVER_ACTIVE = "active"                  # activate 済・heartbeat 継続中
+OBSERVER_STALE = "stale"                    # activate 済・heartbeat 途絶 (fence は維持)
+OBSERVER_ARMING_EXPIRED = "arming_expired"  # 一度も activate されないまま期限切れ
+# stand-down 記録の owner あたり上限 (instance ごとに 1 枠持つため上限を置く)。
+_STANDDOWN_MAX_PER_OWNER = 8
+# sidecar に恒久 stand-down を指示するコード (channel_sidecar._LATCHING_REFUSALS と
+# 対応する。両者の一致は tests/broker/test_channel_sidecar.py が固定する)。
+LATCHING_REFUSALS = (REFUSE_BG_HOSTED, REFUSE_SUPERSEDED)
+
+# ``ORG_BROKER_CHANNEL_OBSERVER`` への代入形を捉える (``-e K=V`` / ``env K=V`` /
+# JSON ``"K": "V"``)。adapter が起動失敗時に引数列を例外文へ載せる回り込みを
+# :meth:`StoreMixin.scrub_secrets` で伏せるため。値の文字集合は
+# ``secrets.token_urlsafe`` の ``[A-Za-z0-9_-]``。
+_OBSERVER_ASSIGN_RE = re.compile(
+    r'(ORG_BROKER_CHANNEL_OBSERVER["\']?\s*[=:]\s*)(["\']?)[A-Za-z0-9_\-]+'
+)
+
 
 @dataclass
 class ObserverLease:
@@ -72,20 +121,55 @@ class ObserverLease:
     継承しないため lease を提示できず、:meth:`register_delivery_instance` が generation
     bump を拒否する (fork による observed session の takeover を断つ)。
 
-    ``expires_at`` は 2 相のライフサイクルを持つ:
-    - **armed** (``None``): assert 直後〜初回 observed register まで。**失効しない**。
-      secretary の起動が遅い (段1 folder-trust プロンプト放置等で TTL 超) 場合でも lease が
-      消えず、初回 register まで fork/replay 保護を保つ (register 前に wall-clock で失効
-      させると保護が黙って外れる — Codex review P2)。
-    - **activated** (``float``): 初回 observed register が ``now + observer_lease_seconds``
-      を打ち、以後 observed sidecar の register/poll heartbeat が renew する。poll が止まった
-      (session 死亡) 後に TTL 経過で失効し、dead session の stale lease が将来の観測束縛や
-      recovery register を塞がないようにする。
+    **脅威モデル (過大評価しないこと)**: この lease が防ぐのは **意図しない verbatim
+    replay** (fork / resume が persisted mcp-config を再生して original を fence する)
+    だけである。同一 uid の敵対プロセスに対する防御ではない:
+
+    - ``--mcp-config`` は inline JSON で argv に載るため、full token と delivery cred は
+      元々 ``ps`` から読める (docs/channel-delivery-model-decision.md §4.4)。
+    - Issue #165 で spawn 経路にも lease を張った結果、tmux backend では秘密が
+      ``new-session -e`` で **session 環境**に入る = 同一 uid のプロセスが
+      ``tmux -L claude-org-broker show-environment`` で他 pane の秘密を読める。
+
+    つまり cred と秘密の両方を読める同一 uid のプロセスは、正しい秘密を提示して lease に
+    一致し、last-register-wins をそのまま勝てる。これは #165 が作った穴ではなく (cred 側は
+    以前から読めた)、lease が塞ぐ範囲の上限である。
+
+    ``expires_at`` は 3 状態のライフサイクルを持つ (:meth:`StoreMixin._observer_state_locked`):
+
+    - **armed** (``None``): assert 直後〜初回 observed register まで。**TTL では失効しない**。
+      起動が遅い (段1 folder-trust プロンプト放置等で TTL 超) 場合でも lease が消えず、
+      初回 register まで fork/replay 保護を保つ (register 前に wall-clock で失効させると
+      保護が黙って外れる — Codex review P2)。
+    - **active** (未来の ``float``): 初回 observed register が ``now + observer_lease_seconds``
+      を打ち、以後 observed sidecar の poll heartbeat が renew する。
+    - **stale** (過去の ``float``): heartbeat が TTL 分途切れた。**last-register-wins には
+      戻さない** (Issue #169)。以前はここで秘密無し register が通ったが、heartbeat の停止は
+      死亡を意味しない — pane の Ctrl+Z (SIGTSTP はプロセスグループ全体)、ラップトップ
+      suspend、MCP サーバー再起動の長期化、NTP の wall-clock ステップでも起きる。しかも
+      現職は **生涯 1 回しか register しない** (generation war 防止) ので、一度この扉が
+      開くとそこに居るのは 1 秒ごとに叩き続ける fork だけで、現職は取り返せない。よって
+      stale でも fence を維持し、扉は **外部の行為** (pane の close/reap = broker が実際に
+      観測した死、再 spawn の re-assert、将来の adopt #166) だけが開ける。現職が戻って
+      poll を再開すれば lease は再び active に戻る。
+
+    ``arming_until`` は **armed 相にだけ効く期限** (Issue #165)。spawn 経路は秘密を adapter
+    の env 経路で子へ渡すが、その到達は backend ごとに実装が違い (tmux は ``-e``、wezterm は
+    argv 書き換え、herdr protocol 17 は ``pane.split`` 経由のシェル継承)、リポジトリ外の
+    挙動に依存する。届かない環境では **その pane 自身の sidecar が秘密を提示できない** ため、
+    無期限 armed だと組織全体の push が恒久的に無音になる。一度も observed register が来ない
+    まま期限を過ぎた lease は落として今日の last-register-wins に戻す: 誰も秘密を提示できて
+    いない = **守るべき現職が存在しない**ので、ここで戻しても fence を奪われる被害者はいない。
+    ``None`` は無期限 armed (launcher / secretary 経路。段1 は人間の承認待ちが入る)。
+
+    **脅威モデル**: 上の docstring 冒頭を参照。
     """
 
     secret: str
-    # None = armed (未 activate、失効しない)。float = activated 後の失効時刻。
+    # None = armed (未 activate)。float = activate 後の失効時刻 (過去なら stale)。
     expires_at: float | None
+    # armed 相の活性化期限 (None = 無期限)。spawn 経路だけが設定する。
+    arming_until: float | None = None
 
 
 @dataclass
@@ -131,6 +215,11 @@ class StoreMixin:
     _duplicate_emit_at: dict[tuple[str, str, str], float]  # (owner, iA, iB) -> last emit ts
     # observed-session binding (Issue #129 問題 A)。owner -> 現在の observer lease。
     _observer_leases: dict[str, ObserverLease]
+    # stand-down 観測面 (Issue #169)。owner -> instance -> 記録
+    # ({instance, reason, latched, since, last, count, journalled_at})。sidecar 側の
+    # _stood_down は子プロセス内の Event で外から見えないため、daemon 側に「誰が・
+    # なぜ・いつから claim していないか」を残して delivery_dump で観測可能にする。
+    _delivery_standdowns: dict[str, dict[str, dict]]
     state_dir: Path
     lease_seconds: float
     observer_lease_seconds: float
@@ -161,25 +250,33 @@ class StoreMixin:
         """
         return self._delivery_generations.get(owner, 0)
 
-    def _observer_active_locked(self, owner: str, now: float) -> ObserverLease | None:
-        """owner の未失効 observer lease を返す (無ければ None)。**_lock 保持中に呼ぶ**。
+    def _observer_state_locked(
+        self, owner: str, now: float
+    ) -> tuple[ObserverLease | None, str]:
+        """owner の observer lease と **その状態** を返す。**_lock 保持中に呼ぶ**。
 
-        observed-session binding (Issue #129 問題 A): lease が active な owner は
-        「human launcher が observed live session を assert 済」= その lease 秘密を提示
-        できる sidecar だけが generation を bump できる。lease 不在 / 失効時は None を
-        返し、:meth:`register_delivery_instance` は従来の last-register-wins に委ねる
-        (子 pane 等 launcher が束縛していない owner の push 配信を回帰させない安全側)。
+        状態は :data:`OBSERVER_NONE` / :data:`OBSERVER_ARMED` /
+        :data:`OBSERVER_ACTIVE` / :data:`OBSERVER_STALE` /
+        :data:`OBSERVER_ARMING_EXPIRED` のいずれか (:class:`ObserverLease` 参照)。
+
+        **fence するのは NONE と ARMING_EXPIRED 以外のすべて** (Issue #169): 以前は
+        「失効した lease = 無い lease」として last-register-wins に戻していたが、
+        heartbeat の停止は死亡ではないので、その扉は fork にしか使えなかった。
         """
         lease = self._observer_leases.get(owner)
         if lease is None:
-            return None
-        # armed (expires_at is None) は失効しない (初回 register までの arming window)。
-        # activated 後のみ wall-clock で失効させる (dead session の cleanup)。
-        if lease.expires_at is not None and lease.expires_at <= now:
-            return None
-        return lease
+            return None, OBSERVER_NONE
+        if lease.expires_at is None:
+            if lease.arming_until is not None and lease.arming_until <= now:
+                # 一度も observed register が来ないまま活性化期限を過ぎた。誰も秘密を
+                # 提示できていない = 守るべき現職がいないので、今日の挙動へ戻す。
+                return lease, OBSERVER_ARMING_EXPIRED
+            return lease, OBSERVER_ARMED
+        if lease.expires_at <= now:
+            return lease, OBSERVER_STALE
+        return lease, OBSERVER_ACTIVE
 
-    def assert_observer(self, owner: str) -> str:
+    def assert_observer(self, owner: str, arming_seconds: float | None = None) -> str:
         """owner の observer lease を assert / rotate し、その秘密を返す (Issue #129 問題 A)。
 
         human-facing launcher (``org up`` / admin-minted secretary) が observed live
@@ -191,14 +288,130 @@ class StoreMixin:
         呼ぶたびに秘密を rotate する: 新しい launcher 起動が旧 observed session を
         supersede し、旧 session の秘密は以後 unobserved になる。expires_at は
         observed sidecar の register / poll heartbeat が renew する。
+
+        ``arming_seconds`` (Issue #165) は **armed 相にだけ効く活性化期限**。
+        ``None`` (既定) は無期限 armed で、人間の承認待ちが入りうる launcher /
+        secretary 経路が使う。spawn 経路は有限値を渡す: 秘密が子へ届かない backend /
+        ホストに当たった時、無期限 armed だと **その owner の push が恒久的に無音** に
+        なるため、一度も observed register が来なければ今日の last-register-wins へ
+        戻す (:class:`ObserverLease` 参照)。
         """
         secret = secrets.token_urlsafe(32)
         with self._lock:
             # armed で置く (expires_at=None): 初回 observed register が TTL 計時を開始する
             # まで失効させない (slow startup で保護が黙って外れるのを防ぐ — Codex P2)。
-            self._observer_leases[owner] = ObserverLease(secret=secret, expires_at=None)
-        self._journal("observer_lease_asserted", owner=owner)
+            self._observer_leases[owner] = ObserverLease(
+                secret=secret, expires_at=None,
+                arming_until=None if arming_seconds is None
+                else time.time() + arming_seconds,
+            )
+        self._journal("observer_lease_asserted", owner=owner,
+                      arming_seconds=arming_seconds)
         return secret
+
+    def clear_observer(self, owner: str, secret: str) -> bool:
+        """自分が張った observer lease を落とす (Issue #165)。落ちれば True。
+
+        :meth:`assert_observer` の対 (spawn 経路の失敗巻き戻し)。lease を張った直後に
+        pane spawn が失敗すると、誰も秘密を提示できない **armed lease** (失効しない)
+        だけが owner に残る。次の spawn は rotate するので実害は小さいが、その間に
+        同 agent_id へ mint された channel token の sidecar が
+        ``observer_pending`` で claim できなくなるため、発行元が巻き戻す。
+
+        **compare-and-delete** にするのが要: 巻き戻しは失敗経路で走り、そこでは既に
+        name 予約と token が解放されている。その隙に同名の別 caller が新しい lease を
+        張れるので、無条件 pop だと **他人が今張った lease を消してしまう** (その
+        session は mute されないが fork 保護だけが黙って外れる)。自分が受け取った秘密と
+        一致する時だけ落とす。
+        """
+        with self._lock:
+            lease = self._observer_leases.get(owner)
+            if lease is None or lease.secret != secret:
+                return False
+            del self._observer_leases[owner]
+        self._journal("observer_lease_cleared", owner=owner)
+        return True
+
+    def scrub_secrets(self, text: str) -> str:
+        """診断文字列から live な observer 秘密を伏せる (Issue #165)。
+
+        spawn 経路は秘密を adapter の ``env`` に載せるが、adapter は起動失敗時に
+        **引数列をそのまま例外文に載せる** (tmux は ``-e KEY=VALUE``、wezterm は
+        argv 前置の ``env KEY=VALUE``)。その文字列は tools/call のエラーとして
+        呼び元エージェントへ返り、traceback ごと ``queue.jsonl`` にも書かれる
+        (queue.jsonl は admin.token と違い 0600 ではない)。``_tool_error_message``
+        が「引数は載せない」と宣言している scrub-policy を、例外文経由の回り込みに
+        対しても効かせる。
+
+        2 段で伏せる。**live 値の一致だけでは足りない**のが要点で、spawn の失敗経路は
+        例外が診断層へ届く前に :meth:`clear_observer` で lease を落とすため、その時点で
+        秘密は「live ではない」= 値一致では捕まらない。
+
+        1. ``ORG_BROKER_CHANNEL_OBSERVER`` への代入形 (``-e K=V`` / ``env K=V`` /
+           JSON の ``"K": "V"``) を、値の生死に依らず伏せる。
+        2. 加えて live な lease 秘密の一致も伏せる (前置の無い剥き出しの値まで届く)。
+
+        秘密「らしき」語を推測する汎用パターンは置かない (誤爆で診断が読めなくなる方が
+        高くつく)。他の秘匿値 (full token / delivery cred) が ``--mcp-config`` 経由で
+        同じ例外文に載る問題は **本 PR 以前からの既知の露出** で、ここでは触らない。
+        """
+        text = _OBSERVER_ASSIGN_RE.sub(r"\1\2[REDACTED_OBSERVER_SECRET]", text)
+        with self._lock:
+            secrets_now = [l.secret for l in self._observer_leases.values()]
+        for secret in secrets_now:
+            if secret and secret in text:
+                text = text.replace(secret, "[REDACTED_OBSERVER_SECRET]")
+        return text
+
+    def _note_standdown_locked(
+        self, owner: str, instance_id: str, reason: str, now: float,
+    ) -> tuple[dict, bool]:
+        """register 拒否を owner 単位で記録する (Issue #169 の観測面)。
+
+        **_lock 保持中に呼ぶ** (I/O はしない)。sidecar 側の stand-down は子プロセス内の
+        :class:`threading.Event` で外から見えないため、「どの instance が・なぜ・
+        いつから claim していないか」を daemon 側に残し :meth:`delivery_dump` で
+        晒す。返り値は ``(記録, journal すべきか)``。
+
+        記録は **(owner, instance) 単位**で持つ。owner に 1 枠だけだと、複数の instance
+        が交互に再試行した瞬間に互いを上書きし、``since`` が毎秒 now に戻って「1 時間
+        黙っている pane」が「0 秒前から」に見える。さらに latch した正統 instance の
+        記録が、粘っている fork の記録に消される (一番見たい 1 行が消える)。
+
+        journal は **状態が変わった時だけ** 出す。non-latching な拒否 (
+        ``observer_pending``) や fence された poll は毎秒繰り返されるので、毎回 journal
+        すると queue.jsonl が毎秒太る。同一 ``(instance, reason)`` の反復は ``count`` /
+        ``last`` を進めるだけにし、遷移にも duplicate 検知と同じ lease window の cooldown
+        を owner 単位で掛ける。継続状態の観測は delivery_dump が担う。
+        """
+        per_owner = self._delivery_standdowns.setdefault(owner, {})
+        prev = per_owner.get(instance_id)
+        if prev is not None and prev["reason"] == reason:
+            prev["last"] = now
+            prev["count"] += 1
+            return prev, False
+        # owner 単位の journal cooldown (instance が交互に来ても発散させない)。
+        last_journal = max((r["journalled_at"] for r in per_owner.values()),
+                           default=0.0)
+        emit = now - last_journal > self.lease_seconds
+        rec = {
+            "instance": instance_id,
+            "reason": reason,
+            "latched": reason in LATCHING_REFUSALS,
+            # 同じ instance が reason を遷移しても「いつから黙っているか」は保つ。
+            "since": prev["since"] if prev is not None else now,
+            "last": now,
+            "count": (prev["count"] + 1) if prev is not None else 1,
+            "journalled_at": now if emit else last_journal,
+        }
+        per_owner[instance_id] = rec
+        # 無制限成長を防ぐ。捨てるのは **latch していない古い記録から** (latch した
+        # 記録 = そのプロセスが二度と claim しないという、一番残す価値のある事実)。
+        while len(per_owner) > _STANDDOWN_MAX_PER_OWNER:
+            victim = min(per_owner,
+                         key=lambda i: (per_owner[i]["latched"], per_owner[i]["last"]))
+            del per_owner[victim]
+        return rec, emit
 
     def _note_poll_locked(
         self, owner: str, instance_id: str, now: float
@@ -392,11 +605,37 @@ class StoreMixin:
         observer lease がある (human launcher が :meth:`assert_observer` 済) 場合、
         ``observer`` 秘密が一致する sidecar だけが generation を bump できる。秘密を
         提示できない register (= mcp-config を replay しただけの fork/resume で process
-        env の秘密を持たない sidecar) は generation を bump せず ``unobserved`` を返し
-        stand-down させる (observed live session の takeover を断つ)。lease 不在 / 失効の
-        owner は従来の last-register-wins に委ねる (子 pane 等の push 配信を回帰させない)。
+        env の秘密を持たない sidecar) は generation を bump せず拒否する (observed live
+        session の takeover を断つ)。lease 不在 / 失効の owner は従来の
+        last-register-wins に委ねる (子 pane 等の push 配信を回帰させない)。
+
+        **Issue #169 — 拒否の 2 分割 (latch するもの / しないもの)**: 上の拒否を
+        「二度と claim するな」と「まだ正統でないだけ」に分ける。判定は *daemon が
+        実際に知りうること* だけに基づく — すなわち **caller が秘密を提示したか**:
+
+        - 秘密を提示したが現 lease と不一致 -> かつてこの owner の秘密を持っていた
+          session が :meth:`assert_observer` の rotate で supersede された。再試行で
+          覆る状態ではないので ``unobserved`` (:data:`LATCHING_REFUSALS`) を返し
+          sidecar を恒久 stand-down させる。「fence された旧 session が粘って claim を
+          取り戻す」のを防ぐという latch 本来の目的はここに残る。
+        - 秘密を未提示 -> fork replay か、adopt を経ていない正統な手動起動かを daemon
+          は **区別できない**。区別を表現する機構は明示 adopt 経路 (#166) の担当なので
+          ここで推測はしない。代わりに latch もせず ``observer_pending`` を返し、
+          sidecar に poll cadence での再試行を許す。拒否は generation を bump せず
+          in-flight 行も動かさないため、再試行が現職と generation を ping-pong する
+          ことはない (Issue #129 の fence はそのまま効いている)。
+
+        **再試行が通る条件は「時間が経ったこと」ではない**: lease は stale (TTL 切れ)
+        でも fence し続ける (:class:`ObserverLease`)。扉を開けるのは **外部の行為**
+        だけ — pane の close/reap (:meth:`reset_delivery_state`。broker が実際に観測した
+        死)、再 spawn / 再 mint による :meth:`assert_observer` の rotate、armed のまま
+        期限切れになった lease の失効 (誰も秘密を提示できていない = 守るべき現職が
+        いない)、そして将来の明示 adopt (#166)。heartbeat の停止を死亡の証拠として
+        扱わないのが要点で、それは Ctrl+Z / suspend / MCP 再起動 / NTP ステップでも
+        起きるうえ、現職は生涯 1 回しか register しないため、一度開いた扉に居るのは
+        1 秒ごとに叩いている fork だけになる。
         """
-        journal: tuple[str, dict] | None = None
+        journal: list[tuple[str, dict]] = []
         with self._lock:
             owner = self._delivery_owner_locked(token)
             if owner is None:
@@ -404,18 +643,56 @@ class StoreMixin:
             now = time.time()
             if bg_hosted:
                 # Phase 1: 明示 bg-hosted marker -> register/claim 抑止 (generation 不変)。
-                journal = ("delivery_suppressed_bg_hosted",
-                           {"owner": owner, "instance": instance_id})
-                result: dict = {"ok": False, "error": "suppressed_bg_hosted",
+                rec, emit = self._note_standdown_locked(
+                    owner, instance_id, REFUSE_BG_HOSTED, now)
+                if emit:
+                    journal.append(("delivery_suppressed_bg_hosted",
+                                    {"owner": owner, "instance": instance_id}))
+                result: dict = {"ok": False, "error": REFUSE_BG_HOSTED,
                                 "owner": owner}
             else:
-                lease = self._observer_active_locked(owner, now)
+                lease, state = self._observer_state_locked(owner, now)
+                if state == OBSERVER_ARMING_EXPIRED:
+                    # 一度も observed register が来ないまま活性化期限を過ぎた lease は
+                    # 落として今日の last-register-wins に戻す (Issue #165)。秘密が子へ
+                    # 届かない backend / ホストで組織全体が恒久無音になるのを防ぐ安全弁。
+                    # ここで戻しても fence を奪われる現職は存在しない (誰も秘密を提示
+                    # できていないことが、この状態の定義そのもの)。**保護が外れる瞬間
+                    # なので必ず journal に残す** (黙って外れるのが一番悪い)。
+                    del self._observer_leases[owner]
+                    lease = None
+                    journal.append(("observer_arming_expired",
+                                    {"owner": owner, "instance": instance_id}))
                 if lease is not None and observer != lease.secret:
                     # Phase 2: observer lease が active だが秘密不一致 (未提示含む)。
-                    # unobserved sidecar (fork replay 等) -> generation を bump しない。
-                    journal = ("delivery_register_unobserved",
-                               {"owner": owner, "instance": instance_id})
-                    result = {"ok": False, "error": "unobserved", "owner": owner}
+                    # generation は bump しない。**latch させるか否かをここで分ける**
+                    # (Issue #169):
+                    if observer:
+                        # 秘密を提示したのに現 lease と一致しない = この caller は
+                        # かつて秘密を持っていた = rotate で supersede された session。
+                        # 再試行では絶対に覆らないので latch させる (fenced な旧
+                        # session が claim を取り戻そうと粘れない、という latch 本来の
+                        # 目的はここに残る)。
+                        code = REFUSE_SUPERSEDED
+                        event = "delivery_register_superseded"
+                    else:
+                        # 秘密を一切提示していない。これが fork replay なのか、adopt を
+                        # 経ていない正統なセッションなのかは **daemon には区別できない**
+                        # (区別を表現する機構は明示 adopt 経路 = #166)。区別できないもの
+                        # を推測しない代わりに latch もしない: lease がある限り拒否し
+                        # 続け、**外部の行為** (pane の close/reap、再 spawn の re-assert、
+                        # 将来の adopt) が lease を落とした時に初めて通る。拒否は
+                        # generation を bump しないので、再試行が現職と generation を
+                        # ping-pong することはない。
+                        code = REFUSE_OBSERVER_PENDING
+                        event = "delivery_register_unobserved"
+                    rec, emit = self._note_standdown_locked(
+                        owner, instance_id, code, now)
+                    if emit:
+                        journal.append(
+                            (event, {"owner": owner, "instance": instance_id,
+                                     "state": state, "latched": rec["latched"]}))
+                    result = {"ok": False, "error": code, "owner": owner}
                 else:
                     gen = self._generation_of(owner) + 1
                     self._delivery_generations[owner] = gen
@@ -426,18 +703,29 @@ class StoreMixin:
                                 and row.claim_generation != gen):
                             row.state = UNDELIVERED
                             row.owner = None
+                    # register が通った instance の記録だけ落とす (Issue #169)。
+                    # **owner ごと消さない**のが要点: 他 instance の記録は「この owner
+                    # には黙っている sidecar が別にいる」という、まさに今から効く事実
+                    # (二重 sidecar のシグナル)。takeover の瞬間に観測面を白紙に戻すと、
+                    # 「なぜ静かなのか」を一番知りたい時に何も残らない。
+                    per_owner = self._delivery_standdowns.get(owner)
+                    if per_owner is not None:
+                        per_owner.pop(instance_id, None)
+                        if not per_owner:
+                            del self._delivery_standdowns[owner]
                     observed = lease is not None
                     if observed:
                         # observed sidecar の register で lease を activate (armed->TTL 計時
                         # 開始) / renew する。以後 poll heartbeat が renew し続ける。
                         lease.expires_at = now + self.observer_lease_seconds
-                    journal = ("delivery_generation_registered",
-                               {"owner": owner, "generation": gen,
-                                "instance": instance_id, "observed": observed})
+                    journal.append(("delivery_generation_registered",
+                                    {"owner": owner, "generation": gen,
+                                     "instance": instance_id,
+                                     "observed": observed}))
                     result = {"ok": True, "owner": owner, "generation": gen,
                               "instance_id": instance_id}
-        if journal is not None:
-            self._journal(journal[0], **journal[1])
+        for event_name, fields in journal:
+            self._journal(event_name, **fields)
         return result
 
     # ----------------------------------------------------------- poll-claims
@@ -476,14 +764,34 @@ class StoreMixin:
                 # 現世代番号を replay されると破れる。現 instance_id は応答に載せず daemon
                 # だけが持つ (register 済の唯一の claimer 識別子) ので、これを一致条件に
                 # 加えることで daemon 側で真に単一 claimer を強制する (Codex review P2)。
+                #
+                # ここも stand-down 面に載せる (Issue #169): **黙っている sidecar の
+                # 多数派はこちら** — register には成功したが後から世代交代された
+                # instance で、以後は claim せず poll だけ続ける。register 拒否だけを
+                # 記録すると、一番よく起きる mute が観測面から丸ごと抜ける。
+                _rec, emit_sd = self._note_standdown_locked(
+                    owner, instance_id, REFUSE_STALE_SIDECAR, now)
+                if emit_sd:
+                    dup_journal.append((
+                        "delivery_poll_fenced",
+                        {"owner": owner, "instance": instance_id,
+                         "generation": cur_gen},
+                    ))
                 result: dict = {"error": "stale_sidecar", "rows": [],
                                 "generation": cur_gen}
             else:
                 # 現世代 instance の poll は observed session が live な heartbeat。
-                # observer lease があれば renew する (Issue #129: session 継続中は束縛を
-                # 維持し、poll が止まった dead session のみ TTL 経過で失効させる)。
-                lease = self._observer_active_locked(owner, now)
-                if lease is not None:
+                # **既に activate 済の lease だけ** renew する (Issue #129 / #169)。
+                # stale (TTL 切れ) も renew 対象に含む: 止まっていた現職が戻ってきた
+                # ケースで、sticky により扉は開いていないのだから素直に active へ戻す。
+                #
+                # armed は **renew しない**: activate は「秘密を提示した register」の
+                # 専権にする。poll で activate できてしまうと、秘密を一度も提示して
+                # いない instance が lease を活性化でき (docs §7 項目5)、arming 期限
+                # (誰も提示できていないなら今日の挙動へ戻す、という Issue #165 の安全弁)
+                # が黙って無効化される。
+                lease, _state = self._observer_state_locked(owner, now)
+                if lease is not None and lease.expires_at is not None:
                     lease.expires_at = now + self.observer_lease_seconds
                 mode = self._mode_of(owner)
                 epoch = self._epoch_of(owner)
@@ -664,9 +972,14 @@ class StoreMixin:
             self._delivery_instances.pop(owner, None)
             self._delivery_poll_seen.pop(owner, None)
             # observed-session binding も落とす (Issue #129): 残ると同名 respawn 後に
-            # 旧 observer lease を継承し、新 session の sidecar が unobserved 扱いで
-            # claim できなくなる (誤束縛)。
+            # 旧 observer lease を継承し、新 session の sidecar が claim できなくなる
+            # (誤束縛)。**これが sticky lease の主要な解除経路** でもある (Issue #169):
+            # pane の close/reap は broker が実際に観測した死なので、TTL の代わりに
+            # これが「外部が正統と言った」に相当する。
             self._observer_leases.pop(owner, None)
+            # stand-down 記録も落とす (Issue #169): 旧 session の「黙っている」記録が
+            # 同名 respawn 後の観測面に残ると、新 pane が muted だと誤読される。
+            self._delivery_standdowns.pop(owner, None)
             for k in [k for k in self._duplicate_emit_at if k[0] == owner]:
                 del self._duplicate_emit_at[k]
             for row in self._rows.values():
@@ -683,6 +996,7 @@ class StoreMixin:
         """
         with self._lock:
             reaped = self._reap_locked()
+            now = time.time()
             by_state: dict[str, int] = {}
             for row in self._rows.values():
                 by_state[row.state] = by_state.get(row.state, 0) + 1
@@ -694,10 +1008,25 @@ class StoreMixin:
                 # 現世代と active instance を出す (二重 sidecar / stale fence の切り分け)。
                 "generations": dict(self._delivery_generations),
                 "instances": dict(self._delivery_instances),
-                # observed-session binding 診断 (Issue #129): owner ごとの observer lease
-                # 失効時刻 (active な束縛の有無と残 TTL の切り分け)。秘密自体は晒さない。
-                "observers": {o: l.expires_at
-                              for o, l in self._observer_leases.items()},
+                # observed-session binding 診断 (Issue #129 / #169): owner ごとの lease
+                # 状態。**bare な失効時刻ではなく state を出す** のが要点で、stale は
+                # 「fence が外れた」ではなく「fence したまま heartbeat が途絶えている」
+                # を意味するようになった (Issue #169 の sticky lease)。両者が同じ float
+                # に見えると、fence 済 owner を unfenced と誤読する。秘密自体は晒さない。
+                "observers": {
+                    o: {"state": self._observer_state_locked(o, now)[1],
+                        "expires_at": l.expires_at,
+                        "arming_until": l.arming_until}
+                    for o, l in self._observer_leases.items()
+                },
+                # stand-down 観測面 (Issue #169): claim していない sidecar は子プロセス
+                # 内で沈黙するだけで外から見えないため、「どの owner の どの instance が
+                # ・なぜ・いつから claim していないか」を owner -> instance -> 記録 で
+                # 出す。``latched`` True は当該プロセスが二度と claim しないこと、False
+                # は再試行中 (現職 lease の失効 / pane の消滅 / adopt で覆る) を意味する。
+                # 同一 owner に 2 件以上並ぶこと自体が二重 sidecar のシグナルになる。
+                "standdowns": {o: {i: dict(r) for i, r in per.items()}
+                               for o, per in self._delivery_standdowns.items()},
                 "rows": [
                     {"id": r.id, "to_id": r.to_id, "state": r.state,
                      "owner": r.owner, "reclaim": r.reclaim_count}

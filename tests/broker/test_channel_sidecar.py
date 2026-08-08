@@ -9,6 +9,8 @@ queue row -> claude/channel payload 変換) を固定する。
 
 from __future__ import annotations
 
+import pytest
+
 from claude_org_runtime.broker import channel_sidecar as cs
 
 
@@ -97,6 +99,7 @@ def test_channel_payload_tolerates_missing_entry_fields():
 def _reset_sidecar_state():
     cs._stood_down.clear()
     cs._started.clear()
+    cs._deferred_count = 0
     with cs._gen_lock:
         cs._generation = None
 
@@ -121,8 +124,9 @@ def test_register_owner_includes_observer_and_bg_signals(monkeypatch):
 
 
 def test_register_owner_stands_down_on_unobserved(monkeypatch):
-    """daemon の unobserved (fork replay で observer 秘密を持たない) は stand-down させ、
-    None を返す (claim しない = message を破壊しない)。"""
+    """daemon の ``unobserved`` (= 秘密を提示したが現 lease と不一致 = supersede された)
+    は stand-down させ None を返す (claim しない = message を破壊しない)。Issue #169 で
+    これは **latch する側** に確定した拒否コード。"""
     monkeypatch.setattr(cs, "_daemon_post",
                         lambda path, payload: {"ok": False, "error": "unobserved"})
     _reset_sidecar_state()
@@ -164,6 +168,116 @@ def test_register_with_retries_no_retry_on_stand_down(monkeypatch):
         assert len(calls) == 1
     finally:
         _reset_sidecar_state()
+
+
+# ================================================== Issue #169 recoverable stand-down
+def test_register_owner_does_not_latch_on_observer_pending(monkeypatch):
+    """``observer_pending`` は latch **しない**: 「まだ正統でない」だけで、現職 lease の
+    失効や adopt で覆りうる。ここで恒久的に黙ると、正統なセッションが二度と push を
+    受け取れなくなる (#169 が塞ぐ失敗)。"""
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: {"ok": False,
+                                               "error": "observer_pending"})
+    _reset_sidecar_state()
+    try:
+        assert cs._register_owner() is None
+        assert not cs._stood_down.is_set()      # latch しない
+        assert cs._current_generation() is None
+    finally:
+        _reset_sidecar_state()
+
+
+def test_unknown_refusal_code_does_not_latch(monkeypatch):
+    """未知の拒否コードは **非 latch 側に倒す**: 誤って latch すると恒久的な沈黙になり、
+    誤って再試行しても daemon が拒否し続けるだけ (generation は bump されない)。"""
+    monkeypatch.setattr(cs, "_daemon_post",
+                        lambda path, payload: {"ok": False, "error": "brand_new_code"})
+    _reset_sidecar_state()
+    try:
+        # 未知コードは RuntimeError 経由で呼び元のリトライ判断に落ちる (latch しない)。
+        assert cs._register_with_retries() is False
+        assert not cs._stood_down.is_set()
+    finally:
+        _reset_sidecar_state()
+
+
+def test_push_loop_retries_after_observer_pending_and_then_registers(monkeypatch):
+    """acceptance (#169): 再起動なしで回復する。push loop は generation を持たない間
+    poll cadence で register を再試行し、daemon 側の状態が変われば claim を開始する。"""
+    class _Stop(BaseException):
+        """push loop の except Exception を貫いてループを止める (テスト用)。"""
+
+    calls: list[str] = []
+    emitted: list[tuple[str, dict]] = []
+
+    def fake_post(path: str, payload: dict) -> dict:
+        calls.append(path)
+        if path == "/claim-owner":
+            # 最初の 2 回は「まだ正統でない」、3 回目に通す。
+            if len([c for c in calls if c == "/claim-owner"]) <= 2:
+                return {"ok": False, "error": "observer_pending"}
+            return {"ok": True, "generation": 7}
+        if path == "/poll-claims":
+            return {"rows": [{"id": "r1", "epoch": 0,
+                              "entry": {"message": "hello", "from_id": "d",
+                                        "from_name": "d", "sent_at": 1.0}}]}
+        if path == "/confirm-delivered":
+            raise _Stop()          # 1 行配達できたら止める
+        return {}
+
+    monkeypatch.setattr(cs, "_daemon_post", fake_post)
+    monkeypatch.setattr(cs, "_emit_channel",
+                        lambda content, meta: emitted.append((content, meta)))
+    monkeypatch.setattr(cs.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(cs, "POLL_INTERVAL", 0.0)
+    _reset_sidecar_state()
+    cs._started.set()
+    try:
+        with pytest.raises(_Stop):
+            cs._push_loop()
+        # 3 回目の register で通り、その後 claim->emit まで到達している。
+        assert len([c for c in calls if c == "/claim-owner"]) == 3
+        assert cs._current_generation() == 7
+        assert [c for c, _m in emitted] == ["hello"]
+        assert not cs._stood_down.is_set()
+    finally:
+        _reset_sidecar_state()
+
+
+def test_push_loop_does_not_start_claiming_when_latched(monkeypatch):
+    """latch する拒否 (supersede) を受けたら claim loop に入らない — 「粘れば勝てる」に
+    しないための境界。"""
+    calls: list[str] = []
+
+    def fake_post(path: str, payload: dict) -> dict:
+        calls.append(path)
+        return {"ok": False, "error": "unobserved"}
+
+    monkeypatch.setattr(cs, "_daemon_post", fake_post)
+    monkeypatch.setattr(cs.time, "sleep", lambda _s: None)
+    _reset_sidecar_state()
+    cs._started.set()
+    try:
+        cs._push_loop()                       # latch して return する (無限ループしない)
+        assert cs._stood_down.is_set()
+        assert calls == ["/claim-owner"]      # poll は 1 度も打たない
+    finally:
+        _reset_sidecar_state()
+
+
+def test_refusal_tables_agree_with_the_daemon(monkeypatch):
+    """sidecar の拒否コード表が daemon 側 (store.py) の定数と一致していることを固定する。
+
+    両者は別プロセスで別々に版が上がりうるので表は二重管理になる。せめて **同一版の
+    中では** ずれていないことを保証する (ずれると latch すべき拒否を再試行し続ける、
+    あるいはその逆になる)。
+    """
+    from claude_org_runtime.broker import store
+
+    assert set(cs._LATCHING_REFUSALS) == set(store.LATCHING_REFUSALS)
+    assert store.REFUSE_OBSERVER_PENDING in cs._RETRYABLE_REFUSALS
+    # 同じコードが両方の表に載っていない。
+    assert not set(cs._LATCHING_REFUSALS) & set(cs._RETRYABLE_REFUSALS)
 
 
 def test_initialized_stands_down_without_registering(monkeypatch):

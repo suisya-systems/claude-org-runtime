@@ -50,11 +50,14 @@ LOG_PATH = os.environ.get("ORG_BROKER_CHANNEL_LOG", "")
 # テスト専用 fault injection: "skip-confirm" = emit はするが confirm しない
 # (emit と confirm の間で sidecar が死亡したケースの再現。lease reaping の回復を検証する)
 FAULT = os.environ.get("ORG_BROKER_CHANNEL_FAULT", "")
-# observed-session binding (Issue #129 問題 A): human launcher (org up) が **子プロセス
+# observed-session binding (Issue #129 問題 A): session を起こした側が **子プロセス
 # env** に注入する非 replay 秘密。register 時に提示すると observed generation として
 # claim できる。fork/resume は mcp-config を verbatim replay しても process env の本秘密は
-# 継承しない (空になる) ため、daemon が generation bump を拒否して stand-down させる。
+# 継承しない (空になる) ため、daemon が generation bump を拒否する。
 # mcp-config の DAEMON_URL/CRED/OWNER と違い、これは env だけに存在し config には載らない。
+# 注入元は human launcher (org up = secretary) と、**broker の spawn_claude 経路**
+# (Issue #165: dispatcher / worker の全 pane。以前はここが lease を張っておらず、全 owner
+# が last-register-wins に落ちて fork の register が original を決定的に fence していた)。
 OBSERVER_SECRET = os.environ.get("ORG_BROKER_CHANNEL_OBSERVER", "")
 # 明示 bg-hosted marker (Issue #129 問題 B / Phase 1): background-hosted host が明示的に
 # セットした時だけ register/claim を抑止する。**heuristic 判定 (isatty / process tree 等)
@@ -79,11 +82,35 @@ _REGISTER_RETRY_DELAY = 0.5
 
 _stdout_lock = threading.Lock()
 _started = threading.Event()
-# stand-down (Issue #129): register が ``suppressed_bg_hosted`` (Phase 1) / ``unobserved``
-# (Phase 2) を返したらセットする。この sidecar は claim loop を起動せず沈黙する
-# (何も claim/emit/confirm しない = background-hosted host や fork replay が message を
-# claim->silent-drop で破壊するのを断つ)。stdin は読み続け MCP transport は生かす。
+# stand-down (Issue #129): register が **latch する拒否コード** を返したらセットする。
+# この sidecar は claim loop を起動せず沈黙する (何も claim/emit/confirm しない =
+# background-hosted host や supersede された session が message を claim->silent-drop
+# で破壊するのを断つ)。stdin は読み続け MCP transport は生かす。
+# **これは解除されない** (Issue #169): latch するのは「二度と正統になりえない」と
+# daemon が断定できた拒否だけに絞る。
 _stood_down = threading.Event()
+
+# 拒否コードの 2 分割 (Issue #169)。daemon 側の store.py (LATCHING_REFUSALS /
+# REFUSE_* 定数) と対応する。sidecar は daemon より古い / 新しいことがありうるので
+# 自前の表を持ち、**未知のコードは非 latch (再試行) 側に倒す** — 誤って latch すると
+# 恒久的な沈黙になり、誤って再試行しても generation は bump されない (daemon が
+# 拒否し続ける) ため、非 latch 側が安全側。
+#
+# - ``suppressed_bg_hosted``: 明示 bg-hosted marker。marker は自プロセス env の事実で
+#   生涯変わらないので、再試行しても結果は変わらない -> latch。
+# - ``unobserved``: observer 秘密を提示したのに現 lease と一致しなかった = この
+#   session は rotate で supersede された。粘っても claim は戻らない -> latch。
+_LATCHING_REFUSALS = ("suppressed_bg_hosted", "unobserved")
+# - ``observer_pending``: 秘密を持たないまま lease が active な owner へ register した。
+#   fork replay かもしれないし、adopt を経ていない正統な session かもしれず、daemon は
+#   区別できない。よって latch せず poll cadence で再試行する。現職が生きている限り
+#   拒否され続け (generation は bump されない)、現職が heartbeat を止めて lease が
+#   失効した時だけ通る。
+_RETRYABLE_REFUSALS = ("observer_pending",)
+# 再試行中の拒否は毎 poll 発生するので、ログは状態が変わった時と一定間隔でだけ出す
+# (mcp-logs を毎秒 1 行で埋めない)。
+_DEFERRED_LOG_EVERY = 60
+_deferred_count = 0
 
 # MCP protocolVersion negotiation (blind mirror を避ける)
 _SUPPORTED_PROTO = frozenset((
@@ -177,10 +204,14 @@ def _register_owner() -> int | None:
 
     register には Issue #129 の 2 信号を任意で載せる: ``observer`` (非 replay 秘密、
     Phase 2 observed-session binding) と ``bg_hosted`` (明示 bg-hosted marker、Phase 1)。
-    daemon が register/claim を抑止した場合 (``suppressed_bg_hosted`` / ``unobserved``)
-    は :data:`_stood_down` をセットして ``None`` を返す (再試行せず claim もしない)。
+
+    daemon が register を拒否した場合の扱いは **コードで 2 分割** される (Issue #169)。
+    :data:`_LATCHING_REFUSALS` は :data:`_stood_down` をセットして恒久的に沈黙する。
+    :data:`_RETRYABLE_REFUSALS` は latch せず ``None`` を返すだけで、呼び元の push loop
+    が poll cadence で再試行する (「まだ正統でない」は後で覆りうる状態なので、
+    ここで恒久的に黙ると正統なセッションが二度と push を受け取れなくなる)。
     """
-    global _generation
+    global _generation, _deferred_count
     payload: dict = {"instance_id": INSTANCE_ID}
     if OBSERVER_SECRET:
         payload["observer"] = OBSERVER_SECRET
@@ -188,17 +219,27 @@ def _register_owner() -> int | None:
         payload["bg_hosted"] = True
     res = _daemon_post("/claim-owner", payload)
     err = res.get("error")
-    if err in ("suppressed_bg_hosted", "unobserved"):
-        # Phase 1 (bg-hosted) / Phase 2 (fork replay で observer 秘密を持たない unobserved
-        # sidecar)。この instance は claim しない = 沈黙 (message を破壊しない)。再試行も
-        # しない (状態は transient ではないため retry で覆らない)。
+    if err in _LATCHING_REFUSALS:
+        # bg-hosted marker、または supersede された session。この instance は claim
+        # しない = 沈黙 (message を破壊しない)。再試行もしない (状態は transient では
+        # ないため retry で覆らない)。
         _stood_down.set()
         _log(f"delivery not claimed: {err} "
-             f"(standing down; not entering claim loop)")
+             f"(standing down for good; not entering claim loop)")
+        return None
+    if err in _RETRYABLE_REFUSALS:
+        # まだ正統ではないだけ (observer lease を持つ現職が生きている)。latch せず
+        # 再試行する。拒否は generation を bump しないので、この再試行が現職を fence
+        # したり generation war を起こしたりすることはない。
+        _deferred_count += 1
+        if _deferred_count == 1 or _deferred_count % _DEFERRED_LOG_EVERY == 0:
+            _log(f"delivery not claimed yet: {err} (attempt {_deferred_count}; "
+                 f"retrying every {POLL_INTERVAL}s, not standing down)")
         return None
     gen = res.get("generation")
     if not res.get("ok") or gen is None:
         raise RuntimeError(f"claim-owner rejected: {res}")
+    _deferred_count = 0
     with _gen_lock:
         _generation = int(gen)
     _log(f"registered owner={OWNER} instance={INSTANCE_ID} generation={_generation}")
@@ -226,13 +267,17 @@ def _register_with_retries() -> bool:
             if attempt < _REGISTER_RETRIES:
                 time.sleep(_REGISTER_RETRY_DELAY)
             continue
-        # daemon が register/claim を抑止した (Issue #129 stand-down)。transient では
+        # daemon が latch する拒否を返した (Issue #129 stand-down)。transient では
         # ないので再試行しない。呼び元は claim loop を起動しない。
         if _stood_down.is_set():
             return False
         if gen is not None:
             return True
-        # gen None かつ非 stand-down は想定外。失敗として扱い再試行しない。
+        # gen None かつ非 stand-down = 再試行可能な拒否 (``observer_pending``、Issue
+        # #169) か想定外応答。**ここでは即 False を返す** — この短いリトライ予算
+        # (_REGISTER_RETRIES x _REGISTER_RETRY_DELAY) は daemon 未起動という transient
+        # 障害のためのもので、「現職が生きている」状態を 0.5s 間隔で叩き直す用途では
+        # ない。push loop 側が poll cadence で再試行する。
         return False
     return False
 
@@ -252,8 +297,10 @@ def _push_loop() -> None:
     """
     _started.wait()   # client の initialized を待ってから配送開始
     if _stood_down.is_set():
-        # Issue #129: register で抑止された (bg-hosted / unobserved fork)。claim loop を
-        # 起動せず沈黙する (message を claim->破壊しない)。stdin loop は生きたまま。
+        # Issue #129: register が latch する拒否を返した (bg-hosted / supersede された
+        # session)。claim loop を起動せず沈黙する (message を claim->破壊しない)。stdin
+        # loop は生きたまま。非 latch の拒否 (observer_pending) はここを通らず、下の
+        # ループが poll cadence で register を再試行する (Issue #169)。
         _log("standing down (delivery suppressed at register); claim loop not started")
         return
     _log(f"push loop start: daemon={DAEMON_URL} owner={OWNER} "
@@ -265,8 +312,10 @@ def _push_loop() -> None:
         try:
             gen = _current_generation()
             if gen is None:
-                # 起動時 register が transient に失敗した場合のみここで再試行する
-                # (まだ一度も成功していない間だけ = generation war を起こさない)。
+                # 起動時 register が transient に失敗した場合、または daemon がまだ
+                # 正統と認めていない場合 (observer_pending、Issue #169) にここで
+                # 再試行する。**まだ一度も成功していない間だけ**なので generation war
+                # は起こさない (成功後は二度と register しない)。
                 if not _register_with_retries():
                     if _stood_down.is_set():
                         _log("standing down after register; exiting claim loop")
@@ -352,8 +401,9 @@ def _handle(msg: dict) -> dict | None:
         elif _register_with_retries():
             _log("client initialized -> registered -> push loop armed")
         else:
-            _log("client initialized -> register deferred (daemon unreachable); "
-                 "push loop will retry")
+            # daemon 未起動 (transient) か、まだ正統でない (observer_pending、Issue
+            # #169)。どちらも push loop が poll cadence で再試行する。
+            _log("client initialized -> register deferred; push loop will retry")
         _started.set()        # client ready -> push loop 開始
         return None           # 通知には応答しない
 

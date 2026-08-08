@@ -29,6 +29,7 @@ import secrets
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -44,7 +45,7 @@ from ..terminal import (
     venv_pane_env,
     venv_pane_prep,
 )
-from . import sidecar, surface
+from . import sidecar, store, surface
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
@@ -64,6 +65,7 @@ class Broker(TokenMixin, StoreMixin):
         admin_token: str | None = None,
         lease_seconds: float = 30.0,
         observer_lease_seconds: float = 90.0,
+        observer_arming_seconds: float = 600.0,
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
@@ -86,9 +88,20 @@ class Broker(TokenMixin, StoreMixin):
         # の trade-off)。reclaim_warn_threshold 超で reclaim された行は印字する。
         self.lease_seconds = lease_seconds
         # observed-session binding (Issue #129 問題 A): observer lease の TTL。observed
-        # sidecar の register/poll heartbeat (~POLL_INTERVAL 毎) が renew するため、
-        # session 継続中は失効せず、poll が止まった dead session のみ TTL 経過で解放する。
+        # sidecar の poll heartbeat (~POLL_INTERVAL 毎) が renew する。TTL 切れは
+        # **fence の解除ではなく** 「heartbeat が途絶えている」印にすぎない (Issue #169
+        # の sticky lease。heartbeat 停止は死亡の証拠にならないため)。
         self.observer_lease_seconds = observer_lease_seconds
+        # spawn 経路が張る lease の **活性化期限** (Issue #165)。一度も observed
+        # register が来ないまま超過したら lease を落として今日の last-register-wins に
+        # 戻す (秘密が子へ届かない backend / ホストでの恒久無音を防ぐ安全弁)。
+        #
+        # 桁の根拠 (値そのものより桁が本質): 下は「正常な起動」より十分大きく — pane の
+        # 起動 + MCP handshake は通常 1 桁秒で、段2/3 の folder-trust は呼び出し元
+        # エージェントが send_keys で承認するため分オーダーに収まる。上は「人間が
+        # 組織全体の沈黙に気付くまで」より十分小さく。TTL (90s) の数倍以上離して、
+        # 遅い起動が期限に触れないようにもする。10 分はこの間の広い谷にある。
+        self.observer_arming_seconds = observer_arming_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
@@ -116,6 +129,13 @@ class Broker(TokenMixin, StoreMixin):
         # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
         # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。
         self._observer_leases: dict[str, ObserverLease] = {}
+        # stand-down 観測面 (Issue #169)。owner -> 最後の register 拒否記録。sidecar 側の
+        # stand-down は子プロセス内の Event で外から見えないため、daemon 側に残して
+        # delivery_dump で晒す (「黙っている pane」を journal を読まずに発見できる)。
+        self._delivery_standdowns: dict[str, dict[str, dict]] = {}
+        # stale lease を理由に register を拒否した時の pane liveness probe のレート制限
+        # (Issue #169)。adapter I/O を 1Hz の再試行で叩き続けない。
+        self._stale_lease_probe_at: float = 0.0
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -671,6 +691,64 @@ class Broker(TokenMixin, StoreMixin):
             self.discard_agent_rows(agent_id)
         return agent_id, meta is not None
 
+    def register_delivery_instance(
+        self, token: str, instance_id: str, *,
+        observer: str | None = None, bg_hosted: bool = False,
+    ) -> dict:
+        """store の register に **pane liveness による lease 解放** を足す (Issue #169)。
+
+        sticky lease (:class:`~claude_org_runtime.broker.store.ObserverLease`) は TTL では
+        外れず、``reset_delivery_state`` (pane の close/reap) を主要な解除経路にしている。
+        ところが reap は **opportunistic** で、``resolve_target`` / ``_reserve_name`` を
+        通る入口 (spawn / close / send_keys 等) からしか走らない。``/claim-owner`` は
+        store にしか届かないので、pane が **broker の外で死ぬ** (crash / 端末ごと閉じる)
+        と、誰も registry 入口を叩かない限り reap されず、再試行し続ける正統な sidecar が
+        ``observer_pending`` を受け続ける = 恒久的に push が来ない (Codex review P1)。
+
+        そこで「stale な lease を理由に拒否した」時だけ opportunistic reap を 1 回走らせ、
+        pane が実際に消えていれば ``_cleanup_pane`` -> ``reset_delivery_state`` が lease を
+        落とし、同じ register を通す。**TTL に戻したのではない**: 判定材料は adapter が
+        答える pane の生死 (broker が観測できる外部事実) であって経過時間ではない。停止中
+        (Ctrl+Z / suspend) の pane は adapter snapshot に残るので fence は維持される。
+
+        reap は adapter I/O なので、1Hz の再試行で叩き続けないよう ``lease_seconds``
+        窓でレート制限する (probe しなかった回は従来どおり拒否のまま返る)。
+        """
+        res = super().register_delivery_instance(
+            token, instance_id, observer=observer, bg_hosted=bg_hosted)
+        if res.get("error") != store.REFUSE_OBSERVER_PENDING:
+            return res
+        owner = res.get("owner")
+        if owner is None or not self._probe_dead_pane_for_stale_lease(owner):
+            return res
+        # reap が lease を落としたかもしれないので 1 回だけ再評価する。
+        return super().register_delivery_instance(
+            token, instance_id, observer=observer, bg_hosted=bg_hosted)
+
+    def _probe_dead_pane_for_stale_lease(self, owner: str) -> bool:
+        """stale lease の owner について opportunistic reap を走らせたら True。
+
+        **stale の時だけ** 走らせる (armed = まだ誰も観測していない / active = 現職が
+        heartbeat 中。どちらも pane の生死を問う理由がない)。adapter I/O を伴うので
+        ``lease_seconds`` 窓でレート制限し、失敗は握り潰す (診断のための best-effort で、
+        ここで例外を出すと register 応答そのものを壊す)。
+        """
+        if self.adapter is None:
+            return False
+        now = time.time()
+        with self._lock:
+            _lease, state = self._observer_state_locked(owner, now)
+            if state != store.OBSERVER_STALE:
+                return False
+            if now - self._stale_lease_probe_at < self.lease_seconds:
+                return False
+            self._stale_lease_probe_at = now
+        try:
+            self._reap_stale_managed_panes()
+        except Exception:  # noqa: BLE001 - best-effort な liveness probe
+            return False
+        return True
+
     def _reap_stale_managed_panes(self, panes: list[dict] | None = None) -> None:
         """adapter snapshot に無い broker 管理 pane (自己終了) を掃除する。
 
@@ -1175,6 +1253,7 @@ class Broker(TokenMixin, StoreMixin):
         self, argv: list[str], cwd: str | None,
         role: str | None, project: str | None,
         kind: str | None = None,
+        env_extra: dict[str, str] | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1208,8 +1287,16 @@ class Broker(TokenMixin, StoreMixin):
         (``"claude"`` / ``"codex"`` / generic は None)。``supports_agent_kind`` な
         backend にのみ渡す。**argv[0] からの推測はしない** (venv wrapper 経路では
         argv[0] がシェルに、generic spawn では任意コマンドになり破綻するため)。
+
+        ``env_extra`` (Issue #165) は呼び元が pane プロセス env へ追加する変数。
+        observer lease の非 replay 秘密 (``ORG_BROKER_CHANNEL_OBSERVER``) の運搬に使う。
+        **mcp-config ではなく process env** で運ぶのが要点で、fork/resume は mcp-config
+        を verbatim replay しても process env は継承しないため秘密を replay できない。
+        **先に** 敷いてから broker 所有のキー (state dir / venv) を載せるので、呼び元が
+        それらを上書きすることはない。
         """
-        env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
+        env = {**(env_extra or {}),
+               "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
         if getattr(self.adapter, "venv_path_via_pane_env", False):
             env.update(venv_pane_env(cwd, self.root_cwd))
         else:
@@ -1253,6 +1340,9 @@ class Broker(TokenMixin, StoreMixin):
             return _err(err)
         token: str | None = None  # generic spawn では None のまま
         delivery_cred: str | None = None  # channel sidecar 用 (§9.4)。失敗時 revoke
+        # observer lease を張った (owner, secret)。失敗時に **自分が張った lease だけ**
+        # を clear するため秘密も持つ (compare-and-delete)。
+        leased: tuple[str, str] | None = None
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("claude")
@@ -1283,12 +1373,37 @@ class Broker(TokenMixin, StoreMixin):
             mcp_config["mcpServers"]["org-broker-channel"] = (
                 self.channel_server_config(delivery_cred, agent_id)
             )
+            # observed-session binding を **子 pane にも** 張る (Issue #165)。ここまでは
+            # spawn 経路が delivery cred と channel sidecar を配りながら lease を張らず、
+            # dispatcher と全 worker が last-register-wins に落ちていた。その状態では
+            # fork/resume の register が決定的に original を fence し、message は誰も
+            # 見ていない session へ配達されて沈黙する (§4.1: これは稀な race ではなく
+            # 既定挙動)。lease は armed で置かれ、この pane の sidecar が初回 register で
+            # 秘密を提示した時に activate する。
+            #
+            # **活性化期限つき**なのが launcher / secretary 経路との違い: spawn は秘密を
+            # adapter の env 経路で渡すが、その到達は backend 実装依存 (tmux は -e、
+            # wezterm は argv 書き換え、herdr 17 は pane.split 経由のシェル継承) で、
+            # リポジトリ外の挙動に依存する。届かない環境では pane 自身の sidecar が秘密を
+            # 提示できないため、無期限 armed だと **その owner の push が恒久的に無音**
+            # になる。期限内に一度も observed register が無ければ lease を落として今日の
+            # last-register-wins へ戻す (誰も秘密を提示できていない = 守るべき現職が
+            # いない、ので戻して失う保護は無い)。
+            observer_secret = self.assert_observer(
+                agent_id, arming_seconds=self.observer_arming_seconds)
+            leased = (agent_id, observer_secret)
             argv = surface.build_claude_argv(
                 mcp_config_json=json.dumps(mcp_config),
                 model=model, permission_mode=permission_mode, extra_args=extra,
                 channel_server="org-broker-channel",
             )
-            ref = self._adapter_spawn(argv, cwd, role, project, kind="claude")
+            # 秘密は **mcp-config に載せず** pane プロセス env で渡す。mcp-config は
+            # fork/resume が verbatim replay する面そのものなので、そこへ載せた瞬間に
+            # 「fork が replay できない信号」という lease の存在理由が消える。
+            ref = self._adapter_spawn(
+                argv, cwd, role, project, kind="claude",
+                env_extra={"ORG_BROKER_CHANNEL_OBSERVER": observer_secret},
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
             # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1297,6 +1412,12 @@ class Broker(TokenMixin, StoreMixin):
             self._release_name(name)
             self._revoke_token(token)
             self._revoke_token(delivery_cred)
+            # observer lease も巻き戻す (Issue #165): 秘密を受け取る pane が生まれ
+            # なかったので、残すと誰も提示できない armed lease (失効しない) だけが
+            # owner に残り、同 agent_id の後続 channel mint を塞ぐ。**自分が張った
+            # lease だけ**を落とす (上の解放後に同名で張られた新 lease を消さない)。
+            if leased is not None:
+                self.clear_observer(*leased)
             raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token,
@@ -1478,7 +1599,10 @@ def _tool_name_of(params: object) -> str:
     return "?"
 
 
-def _tool_error_message(params: object, exc: BaseException) -> str:
+def _tool_error_message(
+    params: object, exc: BaseException,
+    scrub: "Callable[[str], str] | None" = None,
+) -> str:
     """想定外例外を **診断可能な 1 行**へ落とす (Issue #151 C-1)。
 
     tool 名と例外クラス名 + str を載せる。``HerdrError`` 等の構造化例外は str が
@@ -1488,9 +1612,16 @@ def _tool_error_message(params: object, exc: BaseException) -> str:
     **引数は載せない**: tools/call の arguments には token / cred 等の秘匿値が
     載りうるため (scrub-policy)。詳細な traceback は journal 側 (daemon ローカル)
     にのみ残す (:meth:`_McpHandler._journal_tool_failure`)。
+
+    ただし ``str(exc)`` 自身が秘匿値を運ぶ回り込みがある: adapter は起動失敗時に
+    引数列をそのまま例外文へ載せるので、spawn 経路が env に載せた observer 秘密が
+    ここへ現れうる (Issue #165)。``scrub`` に broker の
+    :meth:`~claude_org_runtime.broker.store.StoreMixin.scrub_secrets` を渡して伏せる
+    (省略時は無加工 = 従来どおり)。
     """
     name = _tool_name_of(params)
-    return f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+    msg = f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+    return scrub(msg) if scrub is not None else msg
 
 
 class _McpHandler(BaseHTTPRequestHandler):
@@ -1511,16 +1642,21 @@ class _McpHandler(BaseHTTPRequestHandler):
         足りないため、traceback を daemon ローカルの queue.jsonl にのみ残す。
         journal 書込み自体の失敗 (disk full 等) で例外が再び do_POST を貫通しては
         本末転倒なので、ここは握り潰す。
+
+        error / traceback とも **live な observer 秘密を伏せてから**書く (Issue #165):
+        adapter は起動失敗時に引数列を例外文へ載せるので、spawn 経路が env で渡した
+        秘密がそのまま queue.jsonl に残りうる (このファイルは 0600 ではない)。
         """
         try:
+            scrub = self.broker.scrub_secrets
             self.broker._journal(
                 "tool_call_failed",
                 agent_id=bind.agent_id,
                 tool=_tool_name_of(params),
-                error=f"{type(exc).__name__}: {exc}",
-                traceback="".join(
+                error=scrub(f"{type(exc).__name__}: {exc}"),
+                traceback=scrub("".join(
                     traceback.format_exception(type(exc), exc, exc.__traceback__)
-                ),
+                )),
             )
         except Exception:  # noqa: BLE001 - 診断のための best-effort
             pass
@@ -1869,7 +2005,8 @@ class _McpHandler(BaseHTTPRequestHandler):
                         "id": req_id,
                         "error": {
                             "code": -32603,
-                            "message": _tool_error_message(params, e),
+                            "message": _tool_error_message(
+                                params, e, self.broker.scrub_secrets),
                         },
                     },
                 )
