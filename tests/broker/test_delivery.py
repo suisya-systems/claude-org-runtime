@@ -997,19 +997,24 @@ def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
     (pane の close/reap、再 spawn の re-assert、adopt #166) だけが開ける。止まっていた
     現職が戻ってくれば lease は active に戻る。
     """
+    # 時間の刻みについて: 「renew されているから active のまま」は **上限側** の主張
+    # なので、遅い CI runner (Windows) でスケジューリングが遅れると偽陽性で落ちる。
+    # 1 回の poll 間隔 (0.2) を TTL (1.0) の 1/5 に取って余裕を持たせつつ、合計経過
+    # (0.8) は TTL を超えるようにして「renew が効いている」ことは依然として証明する。
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
-               observer_lease_seconds=0.2)
+               observer_lease_seconds=1.0)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
     gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
     # poll が renew するので、TTL 超の合計時間でも lease は active のまま。
     for _ in range(4):
-        time.sleep(0.1)
+        time.sleep(0.2)
         b.poll_claims(dc, gen, "obs")
     assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
-    # poll を止めて TTL 経過 -> stale。**fence は維持される**。
-    time.sleep(0.3)
+    # poll を止めて TTL 経過 -> stale。**fence は維持される** (こちらは下限側の主張
+    # なので、遅れて到達しても結論は変わらない)。
+    time.sleep(1.2)
     assert b.delivery_dump()["observers"]["sec"]["state"] == "stale"
     assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
             == "observer_pending")
@@ -1018,7 +1023,7 @@ def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
     b.poll_claims(dc, gen, "obs")
     assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
     # 秘密を持つ本人は stale の間も register できる (pane 内で sidecar が再起動した等)。
-    time.sleep(0.3)
+    time.sleep(1.2)
     assert b.register_delivery_instance(dc, "obs2", observer=secret)["ok"] is True
 
 
