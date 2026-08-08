@@ -21,7 +21,25 @@ from .dedup import (
     DedupState, load_state, record_notified, save_state, should_notify,
 )
 from .notify import notify as run_notify, render_text
-from .readers import read_events, read_pending_decisions
+from .readers import (
+    read_broker_duplicates, read_events, read_pending_decisions,
+)
+
+# Default location of the org-broker's state dir relative to the
+# attention state root. Mirrors ``broker/notify.py`` DEFAULT_STATE_DIR
+# (".state/broker") — the broker journal lives one level under the
+# ``.state`` root the watcher already points at. Overridable with
+# ``--broker-state-dir`` for a daemon started with a non-default
+# ``--state-dir`` (Issue #167).
+BROKER_SUBDIR = "broker"
+
+# ASCII only: this string reaches ``--help`` on cp932 consoles.
+_BROKER_STATE_DIR_HELP = (
+    "org-broker state dir holding queue.jsonl, scanned for "
+    "duplicate_sidecar_detected (default: <state-dir>/"
+    f"{BROKER_SUBDIR}). Point this at a daemon started with a "
+    "non-default --state-dir."
+)
 
 
 def _state_paths(state_dir: Path) -> tuple[Path, Path, Path]:
@@ -33,6 +51,15 @@ def _state_paths(state_dir: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _resolve_broker_state_dir(
+    state_dir: Path, override: Optional[str],
+) -> Path:
+    """Resolve the broker state dir: flag if given, else ``<state_dir>/broker``."""
+    if override:
+        return Path(override).resolve()
+    return state_dir / BROKER_SUBDIR
+
+
 def _scan_once(
     state_dir: Path,
     cfg: AttentionConfig,
@@ -42,17 +69,34 @@ def _scan_once(
     backend: Optional[str] = None,
     emit_json: bool = False,
     log_stream=None,
+    broker_state_dir: Optional[Path] = None,
 ) -> list[AttentionEvent]:
-    """One classification + dispatch cycle. Returns the events notified."""
+    """One classification + dispatch cycle. Returns the events notified.
+
+    ``broker_state_dir`` (Issue #167) points at the org-broker's state
+    dir so ``duplicate_sidecar_detected`` journal lines reach the
+    operator. ``None`` skips the broker journal entirely, which keeps
+    callers that only care about ``.state`` unchanged.
+    """
     db_path, pending_path, dedup_path = _state_paths(state_dir)
     events = read_events(db_path)
     pending = read_pending_decisions(pending_path)
+    duplicates = (
+        read_broker_duplicates(
+            broker_state_dir,
+            now_epoch=now.timestamp(),
+            window_sec=cfg.duplicate_sidecar_window_sec,
+        )
+        if broker_state_dir is not None
+        else []
+    )
     classified = classify_all(
         events, pending, now,
         cfg.pending_decision_min, cfg.user_replied_min,
         notify_map=cfg.notify,
         pending_decision_max=cfg.pending_decision_max,
         pending_decision_drop=cfg.pending_decision_drop,
+        broker_duplicates=duplicates,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []
@@ -153,6 +197,9 @@ def cmd_attention_scan(args: argparse.Namespace) -> int:
         now=datetime.now(timezone.utc),
         dry_run=bool(args.dry_run),
         emit_json=bool(args.json),
+        broker_state_dir=_resolve_broker_state_dir(
+            state_dir, getattr(args, "broker_state_dir", None),
+        ),
     )
     return 0
 
@@ -160,6 +207,9 @@ def cmd_attention_scan(args: argparse.Namespace) -> int:
 def cmd_attention_watch(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
     cfg = _load_cfg_or_exit(args.config)
+    broker_state_dir = _resolve_broker_state_dir(
+        state_dir, getattr(args, "broker_state_dir", None),
+    )
     interval = max(1, int(cfg.poll_interval_sec))
     max_iterations: Optional[int] = getattr(args, "max_iterations", None)
     count = 0
@@ -169,6 +219,7 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
                 state_dir, cfg,
                 now=datetime.now(timezone.utc),
                 dry_run=False,
+                broker_state_dir=broker_state_dir,
             )
             count += 1
             if max_iterations is not None and count >= max_iterations:
@@ -196,6 +247,10 @@ def add_subparsers(
         help="path to attention config JSON (optional)",
     )
     scan_p.add_argument(
+        "--broker-state-dir", default=None,
+        help=_BROKER_STATE_DIR_HELP,
+    )
+    scan_p.add_argument(
         "--dry-run", action="store_true",
         help=(
             "classify and log, but never invoke an OS notification "
@@ -219,6 +274,10 @@ def add_subparsers(
     watch_p.add_argument(
         "--config", default=None,
         help="path to attention config JSON (optional)",
+    )
+    watch_p.add_argument(
+        "--broker-state-dir", default=None,
+        help=_BROKER_STATE_DIR_HELP,
     )
     watch_p.add_argument(
         "--max-iterations", type=int, default=None,

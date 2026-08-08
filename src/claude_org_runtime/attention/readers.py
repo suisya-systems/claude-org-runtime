@@ -9,6 +9,8 @@ an empty list — first-start environments (no ``state.db``, no
 from __future__ import annotations
 
 import json
+import math
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -23,6 +25,20 @@ RELEVANT_EVENT_KINDS: tuple[str, ...] = (
     "worker_completed",
     "pr_merged",
 )
+
+# Broker journal (Issue #167). ``.state/broker/queue.jsonl`` is the
+# org-broker's append-only journal; ``duplicate_sidecar_detected`` is the
+# line the daemon writes when two distinct sidecar instances poll for the
+# same owner inside one lease window (``broker/store.py``
+# ``_note_poll_locked``). Field shape: ``{ts, event, owner, instances}``.
+BROKER_JOURNAL_NAME = "queue.jsonl"
+DUPLICATE_SIDECAR_EVENT = "duplicate_sidecar_detected"
+
+# The journal is append-only and never rotated, so a running watcher must
+# not re-read it whole on every poll. Only the tail is parsed: 256 KiB is
+# ~1-2k journal lines, far more than one detection window's worth of
+# traffic even on a busy daemon.
+BROKER_JOURNAL_TAIL_BYTES = 256 * 1024
 
 
 def read_events(state_db_path: Path) -> list[dict[str, Any]]:
@@ -109,6 +125,94 @@ def read_pending_decisions(pending_path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         return []
     return [d for d in data if isinstance(d, dict)]
+
+
+def read_broker_duplicates(
+    broker_state_dir: Path,
+    *,
+    now_epoch: float,
+    window_sec: float,
+    tail_bytes: int = BROKER_JOURNAL_TAIL_BYTES,
+) -> list[dict[str, Any]]:
+    """Return recent ``duplicate_sidecar_detected`` lines from the broker journal.
+
+    Issue #167: the daemon already detects the double-claimer condition
+    but nothing consumed the signal, so an operator learned about a
+    double sidecar only by noticing that reports had stopped arriving.
+    This is the read half of the consumer; :func:`classifier.
+    classify_broker_duplicates` turns the rows into notifications.
+
+    Each returned row is ``{"ts": float, "owner": Any, "instances": Any}``
+    — the raw journal fields, normalized only in that ``ts`` is a usable
+    float. Rows older than ``window_sec`` are dropped: the store re-emits
+    per instance pair once per lease window (30s by default) for as long
+    as the condition lasts, so a short window is what makes the alert
+    mean "this is happening now" rather than "this happened once".
+
+    Missing file / unreadable journal / malformed lines all degrade to
+    "no duplicates" with at most a one-line warning, matching the other
+    loaders here: a long-running ``watch`` must not crash on a transient
+    filesystem problem.
+
+    A line whose ``ts`` is missing, non-numeric, or non-finite is
+    **skipped** rather than treated as fresh. That is the opposite of the
+    :func:`classifier._minutes_since` posture (malformed timestamp →
+    alert) and deliberately so: this signal repeats on its own while the
+    condition holds, so a dropped line costs at most one lease window of
+    delay, whereas an undateable line sitting in the tail would re-alert
+    every cooldown until the journal grew past it.
+    """
+    p = Path(broker_state_dir) / BROKER_JOURNAL_NAME
+    if not p.exists():
+        return []
+    try:
+        with p.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - max(0, tail_bytes))
+            f.seek(start)
+            raw = f.read()
+    except OSError as exc:
+        print(
+            f"warning: cannot read broker journal {p}: {exc}; "
+            "treating as no duplicate-sidecar signals",
+            file=sys.stderr,
+        )
+        return []
+    # ``errors="replace"`` keeps a tail cut mid-codepoint (or any single
+    # corrupt byte) from discarding the whole read; the damaged first
+    # line is dropped below whenever we did not start at byte 0.
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("event") != DUPLICATE_SIDECAR_EVENT:
+            continue
+        ts = rec.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        ts = float(ts)
+        # json.loads accepts NaN / Infinity; a non-finite ts would never
+        # age out of the window and would re-alert forever.
+        if not math.isfinite(ts):
+            continue
+        if now_epoch - ts > window_sec:
+            continue
+        out.append({
+            "ts": ts,
+            "owner": rec.get("owner"),
+            "instances": rec.get("instances"),
+        })
+    return out
 
 
 def _safe_payload(raw: Any) -> dict[str, Any]:

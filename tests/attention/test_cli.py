@@ -595,3 +595,162 @@ def test_scan_json_payload_delivered_flag(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert all("delivered" in ev for ev in payload)
+
+
+# ---------------------------------------------------------------------------
+# Broker journal consumer (Issue #167)
+# ---------------------------------------------------------------------------
+
+
+def _write_duplicate(
+    broker_dir: Path,
+    *,
+    age_sec: float = 5.0,
+    owner: str = "secretary",
+    instances=("inst-a", "inst-b"),
+) -> Path:
+    """Append one ``duplicate_sidecar_detected`` line aged off the frozen now."""
+    broker_dir.mkdir(parents=True, exist_ok=True)
+    path = broker_dir / "queue.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": _FROZEN_NOW.timestamp() - age_sec,
+            "event": "duplicate_sidecar_detected",
+            "owner": owner,
+            "instances": list(instances),
+        }) + "\n")
+    return path
+
+
+def _scan_json(parser, argv: list[str]) -> list[dict]:
+    import io
+    import sys
+    buf = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        args = parser.parse_args(argv)
+        assert args.func(args) == 0
+    finally:
+        sys.stdout = real_stdout
+    return json.loads(buf.getvalue())
+
+
+def test_scan_surfaces_duplicate_sidecar_from_broker_journal(
+    tmp_path: Path,
+) -> None:
+    """Issue #167 acceptance: the journal line becomes an operator signal."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_duplicate(state_dir / "broker")
+
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir), "--json",
+    ])
+    dups = [ev for ev in payload if ev["kind"] == "duplicate_sidecar"]
+    assert len(dups) == 1
+    assert dups[0]["severity"] == "urgent"
+    assert dups[0]["worker"] == "secretary"
+    assert "inst-a" in dups[0]["body"] and "inst-b" in dups[0]["body"]
+    assert dups[0]["delivered"] is True
+
+
+def test_scan_ignores_duplicate_older_than_window(tmp_path: Path) -> None:
+    """A resolved incident falls silent once it stops re-firing."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_duplicate(state_dir / "broker", age_sec=3600.0)
+
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir), "--json",
+    ])
+    assert [ev for ev in payload if ev["kind"] == "duplicate_sidecar"] == []
+
+
+def test_scan_duplicate_sidecar_dedupes_within_cooldown(tmp_path: Path) -> None:
+    """Repeated journal lines for one pair must not ring on every poll."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_duplicate(state_dir / "broker", age_sec=60.0)
+    _write_duplicate(state_dir / "broker", age_sec=30.0)
+    _write_duplicate(state_dir / "broker", age_sec=5.0)
+
+    parser = build_top_parser()
+    argv = ["attention", "scan", "--state-dir", str(state_dir), "--json"]
+    first = _scan_json(parser, argv)
+    assert len([ev for ev in first if ev["kind"] == "duplicate_sidecar"]) == 1
+    # Cooldown-gated (not write-once): the key lands in the ``pending``
+    # namespace so it re-alerts later, but not on the next poll.
+    dedup = json.loads(
+        (state_dir / "attention_notified.json").read_text(encoding="utf-8"),
+    )
+    assert any(
+        k.startswith("broker:duplicate_sidecar:secretary:")
+        for k in dedup["pending"]
+    )
+    second = _scan_json(parser, argv)
+    assert [ev for ev in second if ev["kind"] == "duplicate_sidecar"] == []
+
+
+def test_scan_duplicate_sidecar_new_pair_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """Killing one session and getting a new competitor is a new incident."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_duplicate(state_dir / "broker", instances=("inst-a", "inst-b"))
+
+    parser = build_top_parser()
+    argv = ["attention", "scan", "--state-dir", str(state_dir), "--json"]
+    _scan_json(parser, argv)
+    _write_duplicate(state_dir / "broker", instances=("inst-a", "inst-c"))
+    second = _scan_json(parser, argv)
+    dups = [ev for ev in second if ev["kind"] == "duplicate_sidecar"]
+    assert len(dups) == 1
+    assert "inst-c" in dups[0]["body"]
+
+
+def test_scan_without_broker_journal_is_a_no_op(tmp_path: Path) -> None:
+    """No broker state dir (broker never ran) must not disturb the scan."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir), "--json",
+    ])
+    assert [ev for ev in payload if ev["kind"] == "duplicate_sidecar"] == []
+    assert payload  # the ordinary .state events still classify
+
+
+def test_scan_broker_state_dir_override(tmp_path: Path) -> None:
+    """A daemon started with a non-default --state-dir is still reachable."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere" / "broker"
+    _write_duplicate(elsewhere)
+
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir),
+        "--broker-state-dir", str(elsewhere), "--json",
+    ])
+    assert [ev["kind"] for ev in payload] == ["duplicate_sidecar"]
+
+
+def test_watch_surfaces_duplicate_sidecar(tmp_path: Path) -> None:
+    """The watch loop (not just one-shot scan) reads the broker journal."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_duplicate(state_dir / "broker")
+
+    parser = build_top_parser()
+    args = parser.parse_args([
+        "attention", "watch", "--state-dir", str(state_dir),
+        "--max-iterations", "1",
+    ])
+    assert args.func(args) == 0
+    dedup = json.loads(
+        (state_dir / "attention_notified.json").read_text(encoding="utf-8"),
+    )
+    assert any(
+        k.startswith("broker:duplicate_sidecar:") for k in dedup["pending"]
+    )

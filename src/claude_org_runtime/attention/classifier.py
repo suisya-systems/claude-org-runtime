@@ -49,6 +49,13 @@ _CI_FAIL_STATUSES: frozenset[str] = frozenset(
     {"failed", "canceled", "incomplete"}
 )
 
+# Issue #167: dedup namespace for the broker-journal path. Anything that
+# is not ``state.db.events`` is cooldown-gated by :mod:`dedup` rather
+# than recorded once forever — which is what this signal wants, since a
+# double sidecar that is still live should keep re-alerting on a slow
+# cadence instead of going quiet after the first ping.
+BROKER_JOURNAL_SOURCE = "broker.queue.jsonl"
+
 
 @dataclass(frozen=True)
 class AttentionEvent:
@@ -282,6 +289,73 @@ def classify_pending(
     return None
 
 
+def classify_duplicate_sidecar(
+    record: Mapping[str, Any],
+    notify_map: Optional[Mapping[str, str]] = None,
+) -> AttentionEvent:
+    """Map one ``duplicate_sidecar_detected`` journal row to an event.
+
+    Issue #167. The row comes from :func:`readers.read_broker_duplicates`
+    and carries the owner whose channel is contested plus the two sidecar
+    instance ids competing for it. Both ride into the notification text —
+    the owner as ``{worker}``, the instance pair as ``{summary}`` — so the
+    operator can tell *which* sessions to look at without opening the
+    journal.
+
+    Never returns ``None``: unlike the ``events`` table, every row the
+    reader hands over is already the event of interest. A row with a
+    missing/garbled ``owner`` or ``instances`` still notifies (with
+    ``unknown`` in place of the missing part) rather than being dropped —
+    a malformed field is not a reason to stay silent about a live
+    double-claimer.
+    """
+    owner = _str_or_none(record.get("owner"))
+    instances = _instance_ids(record.get("instances"))
+    # Key on the contesting pair, not just the owner: when the operator
+    # kills one session and a *different* instance takes its place, that
+    # is a new incident and must not be swallowed by the cooldown of the
+    # previous pair.
+    key = (
+        f"broker:duplicate_sidecar:{owner or 'unknown'}"
+        f":{'+'.join(instances) or 'unknown'}"
+    )
+    summary = ", ".join(instances) or None
+    title, body = _default_text(
+        "duplicate_sidecar", worker=owner, summary=summary,
+    )
+    return AttentionEvent(
+        key=key, kind="duplicate_sidecar",
+        severity=_severity_for("duplicate_sidecar", notify_map),
+        title=title, body=body, source=BROKER_JOURNAL_SOURCE,
+        worker=owner, summary=summary,
+        created_at=_iso_from_epoch(record.get("ts")),
+    )
+
+
+def classify_broker_duplicates(
+    records: Iterable[Mapping[str, Any]],
+    notify_map: Optional[Mapping[str, str]] = None,
+) -> list[AttentionEvent]:
+    """Classify broker-journal duplicate rows, one event per contesting pair.
+
+    The store re-journals a live duplicate once per lease window, so a
+    single scan usually sees the same ``(owner, pair)`` several times.
+    Collapsing on :attr:`AttentionEvent.key` here — keeping the most
+    recent row — means one notification per incident per scan instead of
+    one per journal line, and keeps ``attention scan --json`` output a
+    list of distinct incidents.
+    """
+    latest: dict[str, tuple[float, AttentionEvent]] = {}
+    for rec in records:
+        ev = classify_duplicate_sidecar(rec, notify_map=notify_map)
+        ts = _epoch_or_none(rec.get("ts"))
+        ts = 0.0 if ts is None else ts
+        prev = latest.get(ev.key)
+        if prev is None or ts >= prev[0]:
+            latest[ev.key] = (ts, ev)
+    return [ev for _, ev in latest.values()]
+
+
 def classify_all(
     events: Iterable[dict[str, Any]],
     pending: Iterable[dict[str, Any]],
@@ -292,12 +366,15 @@ def classify_all(
     *,
     pending_decision_max: int = 1440,
     pending_decision_drop: int = 10080,
+    broker_duplicates: Iterable[Mapping[str, Any]] = (),
 ) -> list[AttentionEvent]:
-    """Classify both inputs in order: DB events first, then pending.
+    """Classify all inputs in order: DB events, pending, broker journal.
 
     The ``pending_decision_max`` / ``pending_decision_drop`` defaults
     mirror :class:`AttentionConfig` so test callers that pre-date
     Issue #26 keep working without passing the new ladder thresholds.
+    ``broker_duplicates`` (Issue #167) defaults to empty for the same
+    reason — callers that do not read the broker journal are unchanged.
     """
     out: list[AttentionEvent] = []
     for row in events:
@@ -313,6 +390,9 @@ def classify_all(
         )
         if ev is not None:
             out.append(ev)
+    out.extend(classify_broker_duplicates(
+        broker_duplicates, notify_map=notify_map,
+    ))
     return out
 
 
@@ -435,6 +515,14 @@ _DEFAULT_TEMPLATES: dict[str, tuple[str, str]] = {
         "Secretary awaiting user",
         "Secretary is waiting for the user on {task_id}.",
     ),
+    # Issue #167: two channel sidecars are claiming the same owner's
+    # queue. Only a human can resolve it (find the extra session and end
+    # it), and while it lasts the owner's messages are split between two
+    # readers — hence ``urgent`` in DEFAULT_NOTIFY.
+    "duplicate_sidecar": (
+        "Duplicate channel sidecar",
+        "{worker}: two sessions are claiming the same channel ({summary}).",
+    ),
 }
 
 
@@ -445,6 +533,7 @@ def _default_text(
     worker: Any = None,
     pr: Any = None,
     status: Any = None,
+    summary: Any = None,
 ) -> tuple[str, str]:
     title_fmt, body_fmt = _DEFAULT_TEMPLATES.get(
         kind, ("Attention", "{kind} event"),
@@ -455,7 +544,10 @@ def _default_text(
         "pr": _str_or_unknown(pr),
         "status": _str_or_unknown(status),
         "kind": kind,
-        "summary": "",
+        # Only the ``duplicate_sidecar`` default template consumes this;
+        # user-supplied templates take the ``notify._format_with_event``
+        # path instead, so widening it here changes no existing copy.
+        "summary": _str_or_unknown(summary),
     }
     return title_fmt.format_map(values), body_fmt.format_map(values)
 
@@ -471,6 +563,51 @@ def _str_or_none(v: Any) -> Optional[str]:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _instance_ids(v: Any) -> list[str]:
+    """Normalize the journal's ``instances`` field to a sorted id list.
+
+    ``store._note_poll_locked`` writes a 2-element list of sidecar
+    instance ids, already sorted. Sorting again makes the dedup key
+    independent of the order the daemon happened to write, and the
+    string coercion keeps a malformed entry from crashing the join in
+    :func:`classify_duplicate_sidecar`.
+    """
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = [s for s in (_str_or_none(x) for x in v) if s]
+    return sorted(out)
+
+
+def _epoch_or_none(ts: Any) -> Optional[float]:
+    """Coerce a journal ``ts`` to a usable float epoch (``None`` if not).
+
+    ``bool`` is excluded explicitly — it is an ``int`` subclass, so a
+    stray ``true`` would otherwise read as the epoch 1.
+    """
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    ts = float(ts)
+    return ts if math.isfinite(ts) else None
+
+
+def _iso_from_epoch(ts: Any) -> Optional[str]:
+    """Render the journal's float ``ts`` as ISO-8601 UTC (or ``None``).
+
+    The broker journal writes epoch seconds (``time.time()``) while every
+    other :attr:`AttentionEvent.created_at` is an ISO-8601 string —
+    ``broker_queue_event.schema.json`` calls out that divergence — so the
+    conversion happens here, at the boundary.
+    """
+    epoch = _epoch_or_none(ts)
+    if epoch is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(epoch, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def _coerce_int(v: Any) -> Optional[int]:

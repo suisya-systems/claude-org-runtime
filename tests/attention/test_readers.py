@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from claude_org_runtime.attention.readers import (
+    read_broker_duplicates,
     read_events,
     read_pending_decisions,
 )
@@ -112,3 +113,140 @@ def test_read_events_non_sqlite_file_returns_empty(
     # Either the connect failed or the master-table read failed; both
     # paths must surface a warning rather than raise.
     assert "state DB" in err
+
+
+# ---------------------------------------------------------------------------
+# Broker journal — duplicate_sidecar_detected (Issue #167)
+# ---------------------------------------------------------------------------
+
+
+def _write_journal(state_dir: Path, records: list[dict]) -> Path:
+    """Write ``queue.jsonl`` lines the way ``store._journal`` does."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "queue.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return path
+
+
+def _dup(ts: float, owner: str = "sec", instances=("a", "b")) -> dict:
+    return {
+        "ts": ts, "event": "duplicate_sidecar_detected",
+        "owner": owner, "instances": list(instances),
+    }
+
+
+def test_read_broker_duplicates_missing_journal_returns_empty(
+    tmp_path: Path,
+) -> None:
+    assert read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    ) == []
+
+
+def test_read_broker_duplicates_picks_only_the_duplicate_event(
+    tmp_path: Path,
+) -> None:
+    _write_journal(tmp_path / "broker", [
+        {"ts": 990.0, "event": "message_enqueued", "to_id": "sec"},
+        _dup(995.0),
+        {"ts": 999.0, "event": "claimed", "owner": "sec"},
+    ])
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    )
+    assert len(out) == 1
+    assert out[0]["owner"] == "sec"
+    assert out[0]["instances"] == ["a", "b"]
+    assert out[0]["ts"] == 995.0
+
+
+def test_read_broker_duplicates_drops_rows_outside_window(
+    tmp_path: Path,
+) -> None:
+    _write_journal(tmp_path / "broker", [
+        _dup(500.0, instances=("old-a", "old-b")),   # 500s ago -> stale
+        _dup(950.0, instances=("new-a", "new-b")),   # 50s ago -> live
+    ])
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    )
+    assert [r["instances"] for r in out] == [["new-a", "new-b"]]
+
+
+def test_read_broker_duplicates_skips_corrupt_and_undateable_rows(
+    tmp_path: Path,
+) -> None:
+    """Malformed lines are skipped, not surfaced as fresh.
+
+    An undateable row would sit in the tail and re-alert every cooldown
+    forever; the signal repeats on its own, so skipping costs at most
+    one lease window of delay.
+    """
+    path = _write_journal(tmp_path / "broker", [_dup(990.0)])
+    with path.open("a", encoding="utf-8") as f:
+        f.write("{not json\n")
+        f.write("[1, 2, 3]\n")                       # not an object
+        f.write("\n")                                # blank
+        f.write(json.dumps({"event": "duplicate_sidecar_detected"}) + "\n")
+        f.write(json.dumps(
+            {"ts": "990", "event": "duplicate_sidecar_detected"}) + "\n")
+        f.write(json.dumps(
+            {"ts": True, "event": "duplicate_sidecar_detected"}) + "\n")
+        f.write('{"ts": NaN, "event": "duplicate_sidecar_detected"}\n')
+        f.write('{"ts": Infinity, "event": "duplicate_sidecar_detected"}\n')
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    )
+    assert [r["ts"] for r in out] == [990.0]
+
+
+def test_read_broker_duplicates_tail_only_drops_partial_first_line(
+    tmp_path: Path,
+) -> None:
+    """Only the journal tail is parsed; the cut first line is discarded."""
+    records = [_dup(float(900 + i), instances=(f"a{i}", f"b{i}"))
+               for i in range(20)]
+    path = _write_journal(tmp_path / "broker", records)
+    size = path.stat().st_size
+    line_len = size // 20
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+        # Cut mid-line: 3.5 lines' worth of tail -> 3 usable rows.
+        tail_bytes=int(line_len * 3.5),
+    )
+    assert [r["instances"] for r in out] == [
+        ["a17", "b17"], ["a18", "b18"], ["a19", "b19"],
+    ]
+
+
+def test_read_broker_duplicates_survives_multibyte_tail_cut(
+    tmp_path: Path,
+) -> None:
+    """A tail boundary inside a UTF-8 codepoint must not kill the read."""
+    _write_journal(tmp_path / "broker", [
+        _dup(990.0, owner="ワーカー日本語", instances=("x", "y")),
+        _dup(995.0, owner="sec"),
+    ])
+    data = (tmp_path / "broker" / "queue.jsonl").read_bytes()
+    # Start one byte into the 3-byte codepoint opening the first line's
+    # owner value, so the tail begins mid-character.
+    cut = data.index("ワーカー日本語".encode("utf-8")) + 1
+    tail = len(data) - cut
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+        tail_bytes=tail,
+    )
+    assert [r["owner"] for r in out] == ["sec"]
+
+
+def test_read_broker_duplicates_unreadable_journal_warns(
+    tmp_path: Path, capsys,
+) -> None:
+    """A directory where the journal should be degrades to no signals."""
+    (tmp_path / "broker" / "queue.jsonl").mkdir(parents=True)
+    assert read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    ) == []
+    assert "broker journal" in capsys.readouterr().err

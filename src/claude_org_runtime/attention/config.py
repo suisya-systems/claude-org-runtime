@@ -45,6 +45,13 @@ DEFAULT_NOTIFY: dict[str, Severity] = {
     # sole recovery path" tier, so it joins approval_blocked /
     # pending_decision at ``urgent`` by default.
     "secretary_awaiting_user": "urgent",
+    # Issue #167: two channel sidecars claiming one owner's queue. Also
+    # a "human is the sole recovery path" event — nothing in the runtime
+    # resolves it, the operator has to find and end the extra session —
+    # and while it lasts the owner's messages are split between two
+    # readers, which is the silent-loss shape this signal exists to
+    # expose. Hence ``urgent`` despite the Part B anomaly rebalance.
+    "duplicate_sidecar": "urgent",
 }
 
 # Placeholder allowlist from design §6. Anything outside this set
@@ -89,6 +96,15 @@ class AttentionConfig:
     pending_decision_max: int = 1440  # 24h
     pending_decision_drop: int = 10080  # 7d
     user_replied_min: int = 15
+    # Issue #167: how far back in the broker journal a
+    # ``duplicate_sidecar_detected`` line still counts as "happening
+    # now". The store re-emits per instance pair once per lease window
+    # (30s by default) for as long as both sidecars keep polling, so any
+    # window comfortably above that keeps a live incident alerting while
+    # letting a resolved one fall silent. Matching ``cooldown_sec`` is
+    # the natural default: an incident that has not re-fired within one
+    # notification cooldown is over.
+    duplicate_sidecar_window_sec: int = 300
     max_title_chars: int = 80
     max_body_chars: int = 240
     # Sparse map of *explicit user overrides* only (Issue #26 round-4
@@ -159,6 +175,7 @@ def load_config(path: Path | None) -> AttentionConfig:
         "pending_decision_min",
         "pending_decision_max", "pending_decision_drop",
         "user_replied_min",
+        "duplicate_sidecar_window_sec",
         "max_title_chars", "max_body_chars",
     ):
         if key in raw:
