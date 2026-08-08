@@ -1590,6 +1590,104 @@ def test_sidecar_subprocess_claims_emits_and_confirms(tmp_path):
         b.stop()
 
 
+def _start_sidecar(env: dict) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "claude_org_runtime.broker.channel_sidecar"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    proc.stdin.write(
+        (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18"}}) + "\n").encode()
+    )
+    proc.stdin.write(
+        (json.dumps({"jsonrpc": "2.0",
+                     "method": "notifications/initialized"}) + "\n").encode()
+    )
+    proc.stdin.flush()
+    return proc
+
+
+def _await(predicate, timeout: float = 15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        got = predicate()
+        if got:
+            return got
+        time.sleep(0.1)
+    return None
+
+
+def test_spawn_lease_end_to_end_over_the_wire(tmp_path, fake_adapter):
+    """#165 + #169 を **別プロセス + 実 HTTP** で結線する。
+
+    子 claude は起こせないので、その手前まで忠実に組む: spawn_claude が組み立てた
+    (a) mcp-config の channel env ブロック (fork が verbatim replay できる面) と
+    (b) pane プロセス env (fork が継承できない面) を、実際の子と同じ形で合成して
+    sidecar subprocess に渡す。
+
+    - mcp-config だけを持つ sidecar (= fork replay) は claim できず、**latch もせず**
+      再試行し続ける (再試行は daemon 側の count が増えることで外から観測できる)。
+    - pane env の秘密も持つ sidecar (= spawn された本人) は register して配達する。
+    """
+    b = Broker(state_dir=tmp_path / "broker", adapter=fake_adapter, port=0,
+               lease_seconds=30.0)
+    b.start()
+    forked = legit = None
+    try:
+        fake_adapter.add_pane(active=True)
+        disp = _ops(b)
+        dispatch_tool(b, disp, "spawn_claude_pane",
+                      {"direction": "vertical", "name": "w", "cwd": "/repo"})
+        argv = fake_adapter.spawned[-1]["argv"]
+        cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+        replayable = cfg["mcpServers"]["org-broker-channel"]["env"]
+        pane_env = fake_adapter.spawned[-1]["env"]
+        assert "ORG_BROKER_CHANNEL_OBSERVER" not in replayable   # 秘密は replay 面に無い
+
+        b.register_local([t for t, bd in b._binds.items()
+                          if bd.agent_id == "w" and bd.scope == "full"][0])
+        src = b.issue_token("src", "src", "worker")
+        b.register_local(src)
+        b.enqueue(b.get_bind(src), "w", "for-the-live-session")
+
+        base = {**os.environ, **replayable,
+                "ORG_BROKER_CHANNEL_POLL_INTERVAL": "0.2",
+                "PYTHONPATH": os.pathsep.join(sys.path)}
+
+        # (1) fork replay: mcp-config だけを replay した sidecar。
+        forked = _start_sidecar(dict(base))
+        rec = _await(lambda: b.delivery_dump()["standdowns"].get("w"))
+        assert rec is not None, "fork's refusal was not recorded"
+        inst, first = next(iter(rec.items()))
+        assert first["reason"] == "observer_pending" and first["latched"] is False
+        # **latch していない**ことを外から観測する: 再試行のたび count が増える。
+        assert _await(lambda:
+                      b.delivery_dump()["standdowns"]["w"][inst]["count"] >= 3), \
+            "fork stopped retrying (it latched) instead of staying recoverable"
+        # 当然、行は claim されず残っている (fork は message を破壊しない)。
+        assert _row_states(b, "w") == [UNDELIVERED]
+
+        # (2) spawn された本人: pane env の秘密を持つので register して配達できる。
+        legit = _start_sidecar({**base,
+                                "ORG_BROKER_CHANNEL_OBSERVER":
+                                    pane_env["ORG_BROKER_CHANNEL_OBSERVER"]})
+        assert _await(lambda: _row_states(b, "w") == [DELIVERED]), \
+            "the spawned session's sidecar never delivered the row"
+        # fork は今も claim していない (takeover は起きていない)。
+        assert b._delivery_instances["w"] != inst
+    finally:
+        for proc in (forked, legit):
+            if proc is None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        b.stop()
+
+
 # ---------------------------------------------------------------------------
 # Issue #151 A: 意味的 kind の受け渡しと venv 継承方式の backend 分岐
 # ---------------------------------------------------------------------------
