@@ -1496,9 +1496,14 @@ def test_fenced_instance_poll_does_not_renew_the_incumbent_lease(tmp_path):
     # fence された instance の poll: 拒否され、lease の失効時刻を動かさない。
     assert b.poll_claims(dc, gen, "fork")["error"] == "stale_sidecar"
     assert b._observer_leases["sec"].expires_at == before
-    # 現世代 instance の poll は renew する。
+    # 現世代 instance の poll は renew する。**時計の分解能に依存させない**: Windows の
+    # ``time.time()`` は ~15.6ms 刻みなので、連続 2 回の呼び出しが同値を返しうる
+    # (renew されていても ``> before`` が偽になる)。期限を明らかに過去へ倒してから
+    # poll し、TTL 分先へ飛ぶことを見る。stale からの復帰 (止まっていた現職が戻る
+    # ケース) も同時に踏む。
+    b._observer_leases["sec"].expires_at = 1.0
     b.poll_claims(dc, gen, "obs")
-    assert b._observer_leases["sec"].expires_at > before
+    assert b._observer_leases["sec"].expires_at > time.time() + 25.0
 
 
 def test_delivery_dump_exposes_standdowns_and_clears_them_on_register(tmp_path):
