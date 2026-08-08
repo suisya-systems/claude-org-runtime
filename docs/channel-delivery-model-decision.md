@@ -155,25 +155,45 @@ This is the core of the judgement, and it is genuinely in favour of broadcast:
 For an operator-facing report channel, duplication is the safer direction. We accept this argument. It is the
 strongest case for switching, and it is why the decision below is a genuine trade rather than a dismissal.
 
-The reason it does not carry the decision is §6.1: broadcast's advantage applies to the owners that are
-*currently unprotected*, while it actively **regresses** the one owner that is currently protected - and that
-owner is the operator's own report channel.
+The reason it does not carry the decision is §6.2: the failure direction argument is about the *push* path,
+but the same silent loss is reachable through the *pull* path, which broadcast leaves untouched. Buying a
+better failure direction on one of two paths, at the cost of a delivery-core rewrite, does not eliminate the
+failure class - it narrows it. §6.1 and §6.3 add further costs, but §6.2 is what makes the trade unattractive.
 
 ---
 
 ## 6. Why we are not switching
 
-### 6.1 The thesis inverts for the one owner that matters most
+### 6.1 Broadcast turns a persisted credential into a standing read capability
 
-Today, for the secretary (the only owner with an observer lease), a fork's register is rejected `unobserved`
-(`store.py:412-418`); the sidecar sets `_stood_down` and its push loop returns before entering the claim loop
-(`channel_sidecar.py:191-198`, `:254-258`). The fork can never mutate a row. The row stays `UNDELIVERED`, and
-both fallbacks - `drain` and the PTY nudge - stay armed.
+Today, for the secretary (the only owner with an observer lease), a fork's *sidecar* is rejected `unobserved`
+(`store.py:412-418`); it sets `_stood_down` and its push loop returns before entering the claim loop
+(`channel_sidecar.py:191-198`, `:254-258`). It never claims, never emits, never confirms.
 
-Under broadcast, that same fork is promoted from "consumes nothing" to "a first-class consumer whose ack is
-authoritative". The owner that is correct today gets worse, and it is precisely the operator-facing channel
-that #162 is about. Broadcast helps the unprotected majority and harms the protected minority; the protected
-minority is the one the human actually watches.
+Two corrections to how this argument was first drafted, both of which narrow it:
+
+- It holds **only** for sidecar activity. The lease does not protect the secretary from a fork's *pull*: per
+  §4.4, `drain()` authenticates nothing beyond the replayed `AgentBind`, so a forked session's
+  `check_messages` still consumes the secretary's rows and marks them `DELIVERED`. The secretary is not
+  "correct today" in general - it is correct only against the push path.
+- Broadcast does **not** cost the watched session its copy. With the per-row-per-instance state that §6.3
+  identifies as mandatory, a fork's ack completes only that fork's own delivery and does not retire the
+  incumbent's. Retiring a row on any single ack is a defect of the proposal *as drafted* (§6.3), not a
+  property of broadcast as a model, and charging broadcast for it would be comparing against a known-broken
+  variant.
+
+What survives is a **confidentiality** cost rather than an availability one. The delivery credential is stored
+literally in the mcp-config (`tokens.py:161-178`, which deliberately avoids `${VAR}` indirection), and for the
+secretary that config is persisted to `<state-dir>/secretary-mcp.json` at mode 0600 (`launcher.py:195-217`,
+`:558`). Today a holder of that file gets **nothing** on the push path: register returns `unobserved`, the
+generation is untouched, and no claim is ever issued. Under broadcast the same holder receives a **full copy
+of every message** sent to the operator's own report channel, because broadcast's premise is that any
+registered instance is entitled to a copy.
+
+So broadcast would not silence the watched session, but it would convert a persisted, replayable credential
+from an inert artifact into a standing read capability on the most sensitive queue in the system. That cost is
+real and lands on the owner the operator actually watches - though it is narrower than "broadcast regresses
+the protected owner", which is how this point was originally put here.
 
 ### 6.2 Switching does not close #162
 
@@ -341,10 +361,15 @@ disqualified**, and **switch viable-with-work**.
 - The *implementation-cost* judge (keep) held that the test surface decides it: ~50 of 77 tests rewritten in
   an incident-prone path, with no testability gain, since fork-replay is trivially testable under every option.
 
-The decision goes to keep because two facts surfaced late outweigh the majority: broadcast **regresses the one
-owner currently protected** (§6.1), and it **does not close #162** because the pull path is unfenced (§6.2).
-The first was raised by the adversarial reviewer rather than by any judge; the second was conceded by the
-correctness judge, which explicitly noted that no option closes the pull door.
+The decision goes to keep on two grounds that outweigh the majority: switching **does not close #162**,
+because the pull path is unfenced and a fork replays the full agent token (§6.2) - conceded by the correctness
+judge, which explicitly noted that no option closes the pull door - and the migration is large while its
+specification was demonstrably not converged (§6.3).
+
+A third argument, that broadcast regresses the one protected owner, was raised by the adversarial reviewer and
+initially carried more weight here than it deserved. Review narrowed it: with per-instance acks the watched
+session still receives its copy, so the cost is confidentiality rather than lost delivery (§6.1). It counts
+against switching but is not load-bearing, and the original phrasing overstated it.
 
 A **hybrid** ("keep claim, degrade a contested owner to fan-out") was evaluated and rejected. Its safety is
 contingent on a wall-clock contention window that collapses under the sidecar's own 5-second HTTP timeout, and
