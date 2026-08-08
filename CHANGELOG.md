@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `attention scan` / `attention watch` now consume the org-broker journal
+  and raise a `duplicate_sidecar` notification when two channel sidecars
+  are claiming the same owner's queue (Issue #167). Detection has been in
+  the daemon since Issue #125 -- `poll_claims` records every polling
+  instance *before* the fencing decision, so even a stale generation
+  leaves evidence -- but nothing in the repo read the resulting
+  `duplicate_sidecar_detected` line. An operator learned about a double
+  sidecar by noticing that reports had stopped arriving, which is exactly
+  the failure mode the signal was added to make visible.
+
+  The watcher reads only the **tail** of `.state/broker/queue.jsonl` (the
+  journal is append-only and never rotated), walking backwards until it
+  passes `duplicate_sidecar_window_sec` (default 300s) so the bytes read
+  follow the configured window rather than a fixed cap -- a busy daemon
+  cannot push a still-live incident out of view. That window is what makes
+  the alert mean "this is happening now": the store re-emits per instance
+  pair once per lease window for as long as both sidecars keep polling, so
+  a live incident keeps re-firing while a resolved one falls silent by
+  itself. The daemon-side per-pair cooldown is untouched, and the
+  notification is dedup'd on the contesting `(owner, instance-pair)` — a
+  *new* competitor after the operator kills one session counts as a new
+  incident rather than being swallowed by the previous pair's cooldown.
+
+  Defaults: severity `urgent` (nothing in the runtime resolves a double
+  claimer -- only a human can find and end the extra session), title
+  `Duplicate channel sidecar`, body naming the owner and both instance
+  ids. `--broker-state-dir` overrides the default `<state-dir>/broker`
+  location for a daemon started with a non-default `--state-dir`.
+
 ## [0.1.39] - 2026-08-06
 
 ### Fixed

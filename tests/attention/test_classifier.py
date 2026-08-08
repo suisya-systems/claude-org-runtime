@@ -14,7 +14,10 @@ from claude_org_runtime.attention.classifier import (
     AttentionEvent,
     _NOTIFY_SUBKIND_TO_KIND,
     _default_text,
+    _iso_from_epoch,
     classify_all,
+    classify_broker_duplicates,
+    classify_duplicate_sidecar,
     classify_event,
     classify_pending,
 )
@@ -623,3 +626,100 @@ def test_secretary_awaiting_user_default_text_non_empty() -> None:
     # task_id must reach the body — it's the only identifying field on a
     # paused-secretary notification, and ja templates lean on it.
     assert "issue-28" in body
+
+
+# ---------------------------------------------------------------------------
+# duplicate_sidecar — broker journal consumer (Issue #167)
+# ---------------------------------------------------------------------------
+
+
+def _dup_row(ts: float = 1000.0, owner="sec", instances=("b1", "a2")) -> dict:
+    return {"ts": ts, "owner": owner, "instances": list(instances)}
+
+
+def test_duplicate_sidecar_names_owner_and_both_instances() -> None:
+    """Acceptance: the signal identifies which sessions are competing."""
+    ev = classify_duplicate_sidecar(_dup_row())
+    assert ev.kind == "duplicate_sidecar"
+    assert ev.severity == "urgent"
+    assert ev.worker == "sec"
+    # Sorted so the key does not depend on journal write order.
+    assert ev.summary == "a2, b1"
+    assert "sec" in ev.body
+    assert "a2, b1" in ev.body
+    assert ev.title == "Duplicate channel sidecar"
+
+
+def test_duplicate_sidecar_is_cooldown_gated_not_write_once() -> None:
+    """Source must stay out of the ``state.db.events`` dedup namespace.
+
+    ``dedup.should_notify`` records ``state.db.events`` keys forever; a
+    live double sidecar has to keep re-alerting on the cooldown cadence.
+    """
+    ev = classify_duplicate_sidecar(_dup_row())
+    assert ev.source == "broker.queue.jsonl"
+
+
+def test_duplicate_sidecar_key_is_per_contesting_pair() -> None:
+    same = classify_duplicate_sidecar(_dup_row(instances=("a", "b")))
+    reordered = classify_duplicate_sidecar(_dup_row(instances=("b", "a")))
+    other_pair = classify_duplicate_sidecar(_dup_row(instances=("a", "c")))
+    other_owner = classify_duplicate_sidecar(
+        _dup_row(owner="w1", instances=("a", "b")),
+    )
+    assert same.key == reordered.key
+    assert other_pair.key != same.key
+    assert other_owner.key != same.key
+
+
+def test_duplicate_sidecar_ts_becomes_iso_created_at() -> None:
+    ev = classify_duplicate_sidecar(_dup_row(ts=1767225600.0))
+    assert ev.created_at == "2026-01-01T00:00:00Z"
+
+
+def test_duplicate_sidecar_malformed_fields_still_notify() -> None:
+    """A garbled field is not a reason to stay silent about a live pair."""
+    ev = classify_duplicate_sidecar({"ts": 1.0, "instances": "not-a-list"})
+    assert ev.kind == "duplicate_sidecar"
+    assert ev.worker is None
+    assert ev.summary is None
+    assert "unknown" in ev.body
+    assert ev.key == "broker:duplicate_sidecar:unknown:unknown"
+
+
+def test_duplicate_sidecar_severity_override_applies() -> None:
+    ev = classify_duplicate_sidecar(
+        _dup_row(), notify_map={"duplicate_sidecar": "normal"},
+    )
+    assert ev.severity == "normal"
+
+
+def test_classify_broker_duplicates_collapses_repeats_per_pair() -> None:
+    """The store re-journals a live pair once per lease window."""
+    out = classify_broker_duplicates([
+        _dup_row(ts=1000.0, instances=("a", "b")),
+        _dup_row(ts=1030.0, instances=("a", "b")),
+        _dup_row(ts=1060.0, instances=("a", "b")),
+        _dup_row(ts=1010.0, instances=("a", "c")),
+    ])
+    assert len(out) == 2
+    by_summary = {ev.summary: ev for ev in out}
+    # Newest row wins for the repeated pair.
+    assert by_summary["a, b"].created_at == _iso_from_epoch(1060.0)
+    assert set(by_summary) == {"a, b", "a, c"}
+
+
+def test_classify_all_appends_broker_duplicates() -> None:
+    out = classify_all(
+        [], [], _NOW, pending_decision_min=15, user_replied_min=15,
+        broker_duplicates=[_dup_row()],
+    )
+    assert [ev.kind for ev in out] == ["duplicate_sidecar"]
+
+
+def test_classify_all_without_broker_duplicates_is_unchanged() -> None:
+    out = classify_all(
+        [_row(id=1, kind="worker_completed", payload={"task_id": "x"})],
+        [], _NOW, pending_decision_min=15, user_replied_min=15,
+    )
+    assert [ev.kind for ev in out] == ["worker_completed"]

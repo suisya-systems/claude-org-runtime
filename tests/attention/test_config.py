@@ -401,3 +401,27 @@ def test_explicit_inversion_in_config_still_rejected(tmp_path: Path) -> None:
         ValueError, match="pending_decision_max must be greater than"
     ):
         load_config(path)
+
+
+def test_duplicate_sidecar_window_default_and_override(tmp_path: Path) -> None:
+    """Issue #167: the broker-journal freshness window is operator-tunable."""
+    assert AttentionConfig().duplicate_sidecar_window_sec == 300
+    p = tmp_path / "attention.json"
+    p.write_text(
+        json.dumps({"duplicate_sidecar_window_sec": 60}), encoding="utf-8",
+    )
+    assert load_config(p).duplicate_sidecar_window_sec == 60
+
+
+def test_duplicate_sidecar_window_rejects_non_int(tmp_path: Path) -> None:
+    p = tmp_path / "attention.json"
+    p.write_text(
+        json.dumps({"duplicate_sidecar_window_sec": "60"}), encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_config(p)
+
+
+def test_duplicate_sidecar_default_severity_is_urgent() -> None:
+    """Only a human can resolve a double claimer, so it rides at urgent."""
+    assert DEFAULT_NOTIFY["duplicate_sidecar"] == "urgent"

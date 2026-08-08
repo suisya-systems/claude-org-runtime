@@ -1,9 +1,11 @@
 """Attention scan/watch surface for ``claude-org-runtime`` (Issue #19/#20).
 
-The ``attention`` subpackage classifies events from ``.state/state.db``
-and ``.state/pending_decisions.json`` into human-required notifications
-(approval blocked, CI failed, pending decision, etc.) and dispatches
-desktop notifications + terminal-bell fallback. See
+The ``attention`` subpackage classifies events from ``.state/state.db``,
+``.state/pending_decisions.json`` and the org-broker journal
+``.state/broker/queue.jsonl`` (Issue #167) into human-required
+notifications (approval blocked, CI failed, pending decision, duplicate
+sidecar, etc.) and dispatches desktop notifications + terminal-bell
+fallback. See
 ``docs/design/attention-notification.md`` (claude-org-ja) §5 / §6 for the
 authoritative requirements.
 
@@ -18,7 +20,13 @@ Public re-exports keep the import surface stable for ja consumers:
 from __future__ import annotations
 
 from . import notify as _notify_module  # keep submodule accessible
-from .classifier import AttentionEvent, classify_all, classify_event, classify_pending
+from .classifier import (
+    AttentionEvent,
+    classify_all,
+    classify_broker_duplicates,
+    classify_event,
+    classify_pending,
+)
 from .config import AttentionConfig, Template, load_config
 from .notify import FormattedNotification, render_text
 from .notify import notify as send_notification
@@ -34,6 +42,7 @@ __all__ = [
     "FormattedNotification",
     "Template",
     "classify_all",
+    "classify_broker_duplicates",
     "classify_event",
     "classify_pending",
     "load_config",
