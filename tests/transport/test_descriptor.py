@@ -4,9 +4,10 @@
 Covers:
 - descriptor golden for both flags (server / prefix / inject / role->tools),
 - drift lock: broker tier sets are derived from ``broker.surface.tools_for``,
-- renga required-14 == ``tools/check_renga_compat`` REQUIRED_MCP_TOOLS surface,
+- renga required-15 == ``tools/check_renga_compat`` REQUIRED_MCP_TOOLS surface,
 - flag resolution (explicit > env > default broker; ORG_TRANSPORT=renga fallback),
-- bit-equivalence anchor: renga surface == bundled schema's shared renga 14.
+- bit-equivalence anchor: renga surface == bundled schema's shared renga 15,
+- per-role renga allowlist requirements (who does / does not get ``server_info``).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from claude_org_runtime.transport import descriptor as td
 # golden snapshots (both flags)
 # ---------------------------------------------------------------------------
 
-# renga: 全ロール一様の required 14 (check_renga_compat REQUIRED_MCP_TOOLS と一致)。
+# renga: 全ロール一様の required 15 (check_renga_compat REQUIRED_MCP_TOOLS と一致)。
 _GOLDEN_RENGA_TOOLS = (
     "set_summary",
     "list_peers",
@@ -40,6 +41,7 @@ _GOLDEN_RENGA_TOOLS = (
     "send_keys",
     "spawn_claude_pane",
     "set_pane_identity",
+    "server_info",
 )
 
 # broker: tier 別 (catalogue 順)。secretary=13 / dispatcher=12 / worker=4。
@@ -154,17 +156,17 @@ def test_unknown_role_falls_back_to_messaging_on_broker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# renga required 14 == check_renga_compat REQUIRED_MCP_TOOLS surface
+# renga required 15 == check_renga_compat REQUIRED_MCP_TOOLS surface
 # ---------------------------------------------------------------------------
 
 
-def test_renga_required_is_exactly_14() -> None:
-    assert len(td.RENGA_REQUIRED_TOOLS) == 14
-    assert len(set(td.RENGA_REQUIRED_TOOLS)) == 14
+def test_renga_required_is_exactly_15() -> None:
+    assert len(td.RENGA_REQUIRED_TOOLS) == 15
+    assert len(set(td.RENGA_REQUIRED_TOOLS)) == 15
 
 
 def test_renga_required_matches_known_required_set() -> None:
-    # renga 0.18.0 REQUIRED_MCP_TOOLS (tools/check_renga_compat.py の SoT)。
+    # renga 2.0.0 REQUIRED_MCP_TOOLS (tools/check_renga_compat.py の SoT)。
     expected = {
         "send_message",
         "set_summary",
@@ -180,8 +182,19 @@ def test_renga_required_matches_known_required_set() -> None:
         "spawn_pane",
         "new_tab",
         "focus_pane",
+        "server_info",
     }
     assert set(td.RENGA_REQUIRED_TOOLS) == expected
+
+
+def test_server_info_appended_last_preserving_legacy_order() -> None:
+    """``server_info`` は列末尾に足す (既存 14 面の順序を動かさない)。
+
+    順序は ja の ``user_common`` required_allow との bit 等価 anchor なので、
+    列中への挿入は ja 側生成物の byte 差分を生む。末尾追加であることを固定する。
+    """
+    assert td.RENGA_REQUIRED_TOOLS[-1] == "server_info"
+    assert td.RENGA_REQUIRED_TOOLS[:14] == _GOLDEN_RENGA_TOOLS[:14]
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +243,7 @@ def test_get_surface_default_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bit-equivalence anchor: renga surface == bundled schema's shared renga 14
+# bit-equivalence anchor: renga surface == bundled schema's shared renga 15
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +260,7 @@ def _schema_user_common_renga_tools() -> list[str]:
 
 
 def test_renga_surface_bit_equivalent_to_schema_user_common() -> None:
-    """descriptor の renga allowlist (順序込み) == 現行 schema の共有 renga 14。
+    """descriptor の renga allowlist (順序込み) == 現行 schema の共有 renga 15。
 
     これが「flag=renga で現行と bit 等価 (非破壊)」の anchor。descriptor を
     SoT に切り替えても ja の共有 surface が byte 同一であることを固定する。
@@ -278,34 +291,84 @@ def _schema_roles_renga_bare_tools() -> dict[str, set[str]]:
 
 
 def test_every_role_schema_renga_is_subset_of_descriptor() -> None:
-    """**per-role drift 検知**: 各ロールの現行 schema renga 集合 ⊆ descriptor 14。
+    """**per-role drift 検知**: 各ロールの現行 schema renga 集合 ⊆ descriptor 15。
 
     descriptor の renga capability surface が各ロールの defense-in-depth
-    subset (例 secretary 12 面) を漏れなく包含する faithful superset である
+    subset (例 secretary 13 面) を漏れなく包含する faithful superset である
     ことを固定する。schema が descriptor に無い renga tool を足したら fail し、
     drift を検知する (codex review 指摘への回帰)。
     """
-    descriptor_14 = set(td.RENGA_REQUIRED_TOOLS)
+    descriptor_15 = set(td.RENGA_REQUIRED_TOOLS)
     per_role = _schema_roles_renga_bare_tools()
     # 少なくとも user_common / secretary は renga 面を持つ (前提崩れの検知)。
     assert "user_common" in per_role
     assert "secretary" in per_role
     for role, names in per_role.items():
-        missing = names - descriptor_14
+        missing = names - descriptor_15
         assert not missing, f"{role}: schema renga tools absent from descriptor: {missing}"
 
 
-def test_schema_secretary_is_narrowed_subset_not_full_14() -> None:
-    """secretary の schema renga 面は 14 の真部分集合 (narrowing が機能)。
+def test_schema_secretary_is_narrowed_subset_not_full_15() -> None:
+    """secretary の schema renga 面は 15 の真部分集合 (narrowing が機能)。
 
-    descriptor は capability surface (14) を返すが、schema の per-role
-    narrowing は subset であることを明示的に固定する (uniform-14 と per-role
+    descriptor は capability surface (15) を返すが、schema の per-role
+    narrowing は subset であることを明示的に固定する (uniform-15 と per-role
     narrowing の関係を文書化する回帰)。
     """
     per_role = _schema_roles_renga_bare_tools()
     secretary = per_role["secretary"]
-    descriptor_14 = set(td.RENGA_REQUIRED_TOOLS)
-    assert secretary < descriptor_14  # 真部分集合
+    descriptor_15 = set(td.RENGA_REQUIRED_TOOLS)
+    assert secretary < descriptor_15  # 真部分集合
     # secretary は人間補助の new_tab / focus_pane を含まない (§3.1)。
     assert "new_tab" not in secretary
     assert "focus_pane" not in secretary
+
+
+# ---------------------------------------------------------------------------
+# per-role renga requirements (Issue #161: who gets ``server_info``)
+# ---------------------------------------------------------------------------
+#
+# server_info は capability probe であり、capability-gated 呼び出しを行う
+# ロール (= 自分で pane / tab を建てる user_common・secretary) にだけ
+# required_allow として要求する。worker / curator / dispatcher の
+# required_allow には足さない: worker / curator は user_common を継承して面を
+# 得るため二重宣言が要らず、dispatcher は bypassPermissions で動くので
+# permissions.allow が no-op (§role_configs_schema roles.dispatcher)。
+# ここはロール宣言の意図そのものなので、集合の大小ではなく明示 assert で固定する。
+
+_SERVER_INFO_ENTRY = "mcp__renga-peers__server_info"
+
+
+def _schema_role_required_allow(role: str) -> list[str]:
+    resource = files("claude_org_runtime.settings").joinpath(
+        "role_configs_schema.json"
+    )
+    schema = json.loads(resource.read_text(encoding="utf-8"))
+    return list(schema["roles"][role]["required_allow"])
+
+
+def test_schema_user_common_renga_is_exactly_15_with_server_info() -> None:
+    """user_common (全ロール継承の共有 surface) は renga 15 面ちょうど。"""
+    names = _schema_roles_renga_bare_tools()["user_common"]
+    assert len(names) == 15
+    assert "server_info" in names
+    # 共有ファイルなので descriptor の capability surface と完全一致する。
+    assert names == set(td.RENGA_REQUIRED_TOOLS)
+
+
+def test_schema_secretary_renga_is_exactly_13_with_server_info() -> None:
+    """secretary は narrowing 後も server_info を持ち、renga 13 面ちょうど。"""
+    names = _schema_roles_renga_bare_tools()["secretary"]
+    assert len(names) == 13
+    assert "server_info" in names
+
+
+@pytest.mark.parametrize("role", ["worker", "curator", "dispatcher"])
+def test_schema_role_does_not_declare_server_info(role: str) -> None:
+    """worker / curator / dispatcher の required_allow に server_info を足さない。
+
+    worker / curator は user_common 継承、dispatcher は bypassPermissions。
+    どちらもロール固有宣言は不要で、足すと「継承で足りる面をロール側でも
+    宣言する」前例になり drift 源になる。
+    """
+    assert _SERVER_INFO_ENTRY not in _schema_role_required_allow(role)

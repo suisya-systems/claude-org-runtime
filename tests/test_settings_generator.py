@@ -2838,11 +2838,11 @@ def test_transport_allowlist_default_renga_fallback(
     entries = generator.transport_allowlist("worker")
     assert all(e.startswith("mcp__renga-peers__") for e in entries)
     assert "mcp__renga-peers__send_message" in entries
-    assert len(entries) == 14  # 全ロール一様 required 14
+    assert len(entries) == 15  # 全ロール一様 required 15
 
 
 def test_transport_allowlist_renga_bit_equivalent_to_schema() -> None:
-    """**bit 等価回帰**: flag=renga の共有 surface == 現行 schema の renga 14。
+    """**bit 等価回帰**: flag=renga の共有 surface == 現行 schema の renga 15。
 
     renga fallback (ORG_TRANSPORT=renga) で現行と byte 同一 (非破壊) である
     ことの回帰固定 (§5.3)。

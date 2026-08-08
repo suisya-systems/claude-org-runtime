@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `server_info`, renga 2.0.0's capability probe, is now part of the renga
+  transport surface: `transport.descriptor.RENGA_REQUIRED_TOOLS` grows from
+  14 to 15 entries, and the bundled `role_configs_schema.json` gains
+  `mcp__renga-peers__server_info` in `user_common` (14 -> 15 renga entries)
+  and `secretary` (12 -> 13) (Issue #161).
+
+  This closes a gap against the ja-side source of truth: `check_renga_compat`'s
+  `REQUIRED_MCP_TOOLS` has listed `server_info` since renga 2.0.0, so a
+  compat check could pass while the surface the runtime projects still
+  withheld the tool. `server_info` reports the running server's advertised
+  capability tokens without making a capability-gated request, which is what
+  lets a caller pre-flight a token (`spawn_tab`, say) instead of reading a
+  `[server_too_old]` error out of a failed call.
+
+  The entry is appended **last** in both the descriptor tuple and the schema
+  column. Order is the bit-equivalence anchor between the descriptor and ja's
+  `user_common` `required_allow`, so appending keeps the existing 14 entries
+  byte-identical for consumers that regenerate settings from the descriptor;
+  a mid-column insert would not. A test pins the position.
+
+  `worker`, `curator` and `dispatcher` deliberately do **not** declare
+  `server_info` in their own `required_allow`: worker and curator inherit the
+  shared `user_common` surface, and dispatcher runs under
+  `bypassPermissions`, where `permissions.allow` is a no-op. Per-role
+  expectations (`user_common` = 15, `secretary` = 13 including `server_info`,
+  the other three absent) are now asserted explicitly rather than left to
+  subset relations.
+
+  Not changed: `dispatcher delegate-plan --server-capability` remains a
+  caller-supplied assertion. The planner is offline -- it reads `list_panes` /
+  `list_peers` snapshots from disk and never calls MCP -- so it cannot probe
+  regardless of the tool being allowlisted. Whether a probe result should
+  replace that assertion is a separate question.
+
 ## [0.1.40] - 2026-08-08
 
 ### Added

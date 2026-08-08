@@ -14,18 +14,18 @@ A :class:`TransportSurface` answers three questions for one transport flag:
 
 renga (§3.1): server ``renga-peers``, injection
 ``--dangerously-load-development-channels server:renga-peers``, **全ロール同一
-surface = required 14 面** (``tools/check_renga_compat.py`` の
-``REQUIRED_MCP_TOOLS`` / renga 0.18.0 と一致)。renga には構造的 tier gating が
+surface = required 15 面** (``tools/check_renga_compat.py`` の
+``REQUIRED_MCP_TOOLS`` / renga 2.0.0 と一致)。renga には構造的 tier gating が
 無いため、transport surface はロールに依らず一様。
 
 **capability surface vs per-role narrowing (重要)**: descriptor が表すのは
-transport の *capability surface*。renga ではこれが全ロール一様の 14 面である。
+transport の *capability surface*。renga ではこれが全ロール一様の 15 面である。
 一方 ``role_configs_schema.json`` の各ロール ``required_allow`` に並ぶ
 ``mcp__renga-peers__*`` (例: secretary は ``focus_pane``/``new_tab`` を外した
-12 面) は、共有 ``user_common`` の 14 面の上にかける **defense-in-depth の
+13 面) は、共有 ``user_common`` の 15 面の上にかける **defense-in-depth の
 allowlist 絞り込み (subset)** であり、descriptor が再現する対象ではない
 (§5.3「renga 時の全ロール同一 surface を allowlist で絞る」モデル)。bit 等価の
-anchor は共有 ``user_common`` の renga 14 面 (= REQUIRED_MCP_TOOLS) であり、
+anchor は共有 ``user_common`` の renga 15 面 (= REQUIRED_MCP_TOOLS) であり、
 各ロールの subset 関係は不変条件としてテストで固定する (per-role drift 検知)。
 ロール別の絞り込みをどう per-role ファイルへ反映するかは ja 側配線 (ja#513) の
 責務で、本 runtime のスコープ外。
@@ -63,7 +63,7 @@ TRANSPORTS = ("renga", "broker")
 # renga required surface (SoT mirror)
 # ---------------------------------------------------------------------------
 #
-# tools/check_renga_compat.py の REQUIRED_MCP_TOOLS (renga 0.18.0, ちょうど 14)
+# tools/check_renga_compat.py の REQUIRED_MCP_TOOLS (renga 2.0.0, ちょうど 15)
 # と一致する順序付き正本。順序は ja の user_common ``required_allow``
 # (= 全ロールが継承する共有 surface) と bit 一致させ、ja が descriptor から
 # 再生成しても現行 settings と byte 同一になるようにする (§5.3 bit 等価)。
@@ -82,6 +82,14 @@ RENGA_REQUIRED_TOOLS = (
     "send_keys",
     "spawn_claude_pane",
     "set_pane_identity",
+    # capability probe (renga 2.0.0, Issue #161)。capability-gated 呼び出しの
+    # 前に server 側 advertisement を pre-flight するための面で、それ自体は
+    # capability gate を持たない。列末尾に足すことで既存 14 面の順序は不変。
+    # NOTE: これは transport の *allowlist* に probe を載せるだけで、
+    # ``dispatcher.runner`` の ``--server-capability`` は従来どおり **caller の
+    # assertion** のまま (planner は MCP を一切呼ばないオフライン処理なので
+    # probe できない)。probe 結果を assertion の代わりに使うかは別 Issue。
+    "server_info",
 )
 
 # ---------------------------------------------------------------------------
@@ -95,7 +103,7 @@ RENGA_REQUIRED_TOOLS = (
 # - curator / worker -> worker (messaging 4 のみ。pane 操作を一切呼ばない, §5.6)
 # - user_common (全ロール共有の ~/.claude/settings.json) -> worker
 #   broker では上位 tier の pane 操作は各ロール自身の settings ファイルが担うため、
-#   共有ファイルの broker baseline は messaging 4 に収める (renga の共有 14 とは
+#   共有ファイルの broker baseline は messaging 4 に収める (renga の共有 15 とは
 #   flag 依存で異なる。これは flag-aware 化が生む正当な差分であり bit 等価の対象外)。
 _ROLE_TO_BROKER_TIER: dict[str, str] = {
     "secretary": "secretary",
@@ -156,7 +164,7 @@ class TransportSurface:
     def tools_for_role(self, role: str) -> tuple[str, ...]:
         """role が公開される **bare** MCP tool 名集合を返す。
 
-        renga: 全ロール一様の required 14。broker: role -> tier マップ経由で
+        renga: 全ロール一様の required 15。broker: role -> tier マップ経由で
         ``broker.surface.tools_for`` から導出 (drift 防止)。未知 role は broker
         では messaging-only (worker tier) にフォールバックする
         (``capped_auth_role`` と同じ最小権限既定)。

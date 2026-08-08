@@ -76,7 +76,8 @@
         "mcp__renga-peers__poll_events",
         "mcp__renga-peers__send_keys",
         "mcp__renga-peers__spawn_claude_pane",
-        "mcp__renga-peers__set_pane_identity"
+        "mcp__renga-peers__set_pane_identity",
+        "mcp__renga-peers__server_info"
       ],
       "allowed_allow_regex": [],
       "required_deny": [],
@@ -101,6 +102,7 @@
         "mcp__renga-peers__poll_events",
         "mcp__renga-peers__send_keys",
         "mcp__renga-peers__set_pane_identity",
+        "mcp__renga-peers__server_info",
         "Bash(git add:*)",
         "Bash(git commit:*)",
         "Bash(git status:*)",
