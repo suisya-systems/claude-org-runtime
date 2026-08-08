@@ -29,6 +29,7 @@ import secrets
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -116,6 +117,10 @@ class Broker(TokenMixin, StoreMixin):
         # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
         # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。
         self._observer_leases: dict[str, ObserverLease] = {}
+        # stand-down 観測面 (Issue #169)。owner -> 最後の register 拒否記録。sidecar 側の
+        # stand-down は子プロセス内の Event で外から見えないため、daemon 側に残して
+        # delivery_dump で晒す (「黙っている pane」を journal を読まずに発見できる)。
+        self._delivery_standdowns: dict[str, dict[str, dict]] = {}
         self._nudge_threads: dict[str, threading.Thread] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -1175,6 +1180,7 @@ class Broker(TokenMixin, StoreMixin):
         self, argv: list[str], cwd: str | None,
         role: str | None, project: str | None,
         kind: str | None = None,
+        env_extra: dict[str, str] | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1208,8 +1214,16 @@ class Broker(TokenMixin, StoreMixin):
         (``"claude"`` / ``"codex"`` / generic は None)。``supports_agent_kind`` な
         backend にのみ渡す。**argv[0] からの推測はしない** (venv wrapper 経路では
         argv[0] がシェルに、generic spawn では任意コマンドになり破綻するため)。
+
+        ``env_extra`` (Issue #165) は呼び元が pane プロセス env へ追加する変数。
+        observer lease の非 replay 秘密 (``ORG_BROKER_CHANNEL_OBSERVER``) の運搬に使う。
+        **mcp-config ではなく process env** で運ぶのが要点で、fork/resume は mcp-config
+        を verbatim replay しても process env は継承しないため秘密を replay できない。
+        **先に** 敷いてから broker 所有のキー (state dir / venv) を載せるので、呼び元が
+        それらを上書きすることはない。
         """
-        env = {"ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
+        env = {**(env_extra or {}),
+               "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
         if getattr(self.adapter, "venv_path_via_pane_env", False):
             env.update(venv_pane_env(cwd, self.root_cwd))
         else:
@@ -1253,6 +1267,9 @@ class Broker(TokenMixin, StoreMixin):
             return _err(err)
         token: str | None = None  # generic spawn では None のまま
         delivery_cred: str | None = None  # channel sidecar 用 (§9.4)。失敗時 revoke
+        # observer lease を張った (owner, secret)。失敗時に **自分が張った lease だけ**
+        # を clear するため秘密も持つ (compare-and-delete)。
+        leased: tuple[str, str] | None = None
         try:
             auth_role = surface.capped_auth_role(role, caller.auth_role)
             agent_id = name or self._gen_agent_id("claude")
@@ -1283,12 +1300,27 @@ class Broker(TokenMixin, StoreMixin):
             mcp_config["mcpServers"]["org-broker-channel"] = (
                 self.channel_server_config(delivery_cred, agent_id)
             )
+            # observed-session binding を **子 pane にも** 張る (Issue #165)。ここまでは
+            # spawn 経路が delivery cred と channel sidecar を配りながら lease を張らず、
+            # dispatcher と全 worker が last-register-wins に落ちていた。その状態では
+            # fork/resume の register が決定的に original を fence し、message は誰も
+            # 見ていない session へ配達されて沈黙する (§4.1: これは稀な race ではなく
+            # 既定挙動)。lease は armed (失効しない) で置かれ、この pane の sidecar が
+            # 初回 register で秘密を提示した時に activate する。
+            observer_secret = self.assert_observer(agent_id)
+            leased = (agent_id, observer_secret)
             argv = surface.build_claude_argv(
                 mcp_config_json=json.dumps(mcp_config),
                 model=model, permission_mode=permission_mode, extra_args=extra,
                 channel_server="org-broker-channel",
             )
-            ref = self._adapter_spawn(argv, cwd, role, project, kind="claude")
+            # 秘密は **mcp-config に載せず** pane プロセス env で渡す。mcp-config は
+            # fork/resume が verbatim replay する面そのものなので、そこへ載せた瞬間に
+            # 「fork が replay できない信号」という lease の存在理由が消える。
+            ref = self._adapter_spawn(
+                argv, cwd, role, project, kind="claude",
+                env_extra={"ORG_BROKER_CHANNEL_OBSERVER": observer_secret},
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
             # 成功時は予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1297,6 +1329,12 @@ class Broker(TokenMixin, StoreMixin):
             self._release_name(name)
             self._revoke_token(token)
             self._revoke_token(delivery_cred)
+            # observer lease も巻き戻す (Issue #165): 秘密を受け取る pane が生まれ
+            # なかったので、残すと誰も提示できない armed lease (失効しない) だけが
+            # owner に残り、同 agent_id の後続 channel mint を塞ぐ。**自分が張った
+            # lease だけ**を落とす (上の解放後に同名で張られた新 lease を消さない)。
+            if leased is not None:
+                self.clear_observer(*leased)
             raise
         self.bind_pane(token, ref.pane_id)
         self._register_pane(ref.pane_id, agent_id, name, role, cwd, "claude", token,
@@ -1478,7 +1516,10 @@ def _tool_name_of(params: object) -> str:
     return "?"
 
 
-def _tool_error_message(params: object, exc: BaseException) -> str:
+def _tool_error_message(
+    params: object, exc: BaseException,
+    scrub: "Callable[[str], str] | None" = None,
+) -> str:
     """想定外例外を **診断可能な 1 行**へ落とす (Issue #151 C-1)。
 
     tool 名と例外クラス名 + str を載せる。``HerdrError`` 等の構造化例外は str が
@@ -1488,9 +1529,16 @@ def _tool_error_message(params: object, exc: BaseException) -> str:
     **引数は載せない**: tools/call の arguments には token / cred 等の秘匿値が
     載りうるため (scrub-policy)。詳細な traceback は journal 側 (daemon ローカル)
     にのみ残す (:meth:`_McpHandler._journal_tool_failure`)。
+
+    ただし ``str(exc)`` 自身が秘匿値を運ぶ回り込みがある: adapter は起動失敗時に
+    引数列をそのまま例外文へ載せるので、spawn 経路が env に載せた observer 秘密が
+    ここへ現れうる (Issue #165)。``scrub`` に broker の
+    :meth:`~claude_org_runtime.broker.store.StoreMixin.scrub_secrets` を渡して伏せる
+    (省略時は無加工 = 従来どおり)。
     """
     name = _tool_name_of(params)
-    return f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+    msg = f"[tool_failed] {name}: {type(exc).__name__}: {exc}"
+    return scrub(msg) if scrub is not None else msg
 
 
 class _McpHandler(BaseHTTPRequestHandler):
@@ -1511,16 +1559,21 @@ class _McpHandler(BaseHTTPRequestHandler):
         足りないため、traceback を daemon ローカルの queue.jsonl にのみ残す。
         journal 書込み自体の失敗 (disk full 等) で例外が再び do_POST を貫通しては
         本末転倒なので、ここは握り潰す。
+
+        error / traceback とも **live な observer 秘密を伏せてから**書く (Issue #165):
+        adapter は起動失敗時に引数列を例外文へ載せるので、spawn 経路が env で渡した
+        秘密がそのまま queue.jsonl に残りうる (このファイルは 0600 ではない)。
         """
         try:
+            scrub = self.broker.scrub_secrets
             self.broker._journal(
                 "tool_call_failed",
                 agent_id=bind.agent_id,
                 tool=_tool_name_of(params),
-                error=f"{type(exc).__name__}: {exc}",
-                traceback="".join(
+                error=scrub(f"{type(exc).__name__}: {exc}"),
+                traceback=scrub("".join(
                     traceback.format_exception(type(exc), exc, exc.__traceback__)
-                ),
+                )),
             )
         except Exception:  # noqa: BLE001 - 診断のための best-effort
             pass
@@ -1869,7 +1922,8 @@ class _McpHandler(BaseHTTPRequestHandler):
                         "id": req_id,
                         "error": {
                             "code": -32603,
-                            "message": _tool_error_message(params, e),
+                            "message": _tool_error_message(
+                                params, e, self.broker.scrub_secrets),
                         },
                     },
                 )

@@ -38,6 +38,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids. `--broker-state-dir` overrides the default `<state-dir>/broker`
   location for a daemon started with a non-default `--state-dir`.
 
+### Fixed
+
+- Channel delivery: the observer lease now covers the `spawn_claude` path, and a
+  sidecar's stand-down is no longer an unrecoverable latch (Issues #165 + #169).
+  These ship together on purpose - see below.
+
+  Before this change the observer lease, the only signal a forked session cannot
+  replay, was asserted for exactly one owner (`org up`'s secretary).
+  `spawn_claude` handed out a delivery credential and wired a channel sidecar but
+  never asserted a lease, so every dispatcher and worker pane fell through to
+  last-register-wins. A forked or resumed session's registration therefore
+  **deterministically fenced the original**, which then polled forever and emitted
+  nothing while messages were delivered into a session nobody was watching. The
+  journal read `claimed` + `delivered`; the operator saw silence. That was the
+  default for every spawned pane, not a rare race
+  (`docs/channel-delivery-model-decision.md` §4.1).
+
+  `spawn_claude` now asserts the lease and hands the secret to the child through
+  the **pane process environment**, never through `--mcp-config`: the mcp-config is
+  precisely what a fork replays verbatim, which is the whole reason the secret has
+  to travel out of band. Owners with no asserted lease are untouched and keep
+  last-register-wins, so callers without an env handoff do not lose push.
+
+  Extending the lease to every owner also multiplies the number of sessions that
+  can be refused at registration, and the sidecar's `_stood_down` latch had no
+  clear path - a legitimate hand-started session would have been muted permanently.
+  Registration refusals are therefore now split by **what the daemon can actually
+  know**, namely whether the caller presented a secret at all:
+
+  - presented a secret that does not match the active lease -> the caller once held
+    one and was rotated out, so it is superseded. Still `unobserved`, still latches.
+    Retrying cannot make a superseded instance legitimate, which is the reason the
+    latch exists.
+  - presented no secret -> a fork replay and an operator's hand-started session are
+    indistinguishable here, and guessing between them is the job of the explicit
+    adopt path (#166), not of this code. New non-latching `observer_pending`: the
+    push loop retries at poll cadence instead of going silent for good.
+
+  A refused registration does not bump the generation and does not move in-flight
+  rows, so retrying cannot ping-pong the generation with the live session.
+
+  Stood-down state is also observable from outside the sidecar process now:
+  `delivery_dump` reports, per owner and per instance, which sidecar is not
+  claiming, why, since when, and whether that state is permanent. Sidecars fenced
+  at poll time (`stale_sidecar`) are included - they are the common case, and
+  recording only registration refusals would have missed them.
+
+  The observer secret is redacted from tool-call error messages and from the
+  journal. Adapters put their whole argument vector into failure messages, which
+  reach both the calling agent and `queue.jsonl` (a file that, unlike
+  `admin.token`, is not 0600).
+
 ## [0.1.39] - 2026-08-06
 
 ### Fixed

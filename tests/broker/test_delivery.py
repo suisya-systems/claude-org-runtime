@@ -30,7 +30,7 @@ import urllib.request
 
 import pytest
 
-from claude_org_runtime.broker import sidecar
+from claude_org_runtime.broker import sidecar, store
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.store import CLAIMED, DELIVERED, PULL, PUSH, UNDELIVERED
 from claude_org_runtime.broker.surface import dispatch_tool
@@ -901,8 +901,12 @@ def test_spawn_rejects_collision_with_bind_only_agent(tmp_path, fake_adapter):
 # ============================== Issue #129 observed-session binding (問題 A)
 def test_observer_lease_gates_generation_bump(tmp_path):
     """assert_observer 済 owner は、秘密を提示する sidecar だけが generation を bump できる。
-    秘密無し / 不一致の register (fork replay 相当) は ``unobserved`` で拒否し generation
-    不変 (observed live session の takeover を断つ)。"""
+    秘密無し / 不一致の register (fork replay 相当) は拒否し generation 不変 (observed
+    live session の takeover を断つ)。
+
+    Issue #169: 拒否コードは 2 種類に分かれる — 秘密未提示は非 latch の
+    ``observer_pending``、不一致提示 (= supersede された) は latch する ``unobserved``。
+    """
     b = Broker(state_dir=tmp_path, adapter=None)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
@@ -911,12 +915,13 @@ def test_observer_lease_gates_generation_bump(tmp_path):
     reg = b.register_delivery_instance(dc, "obs", observer=secret)
     assert reg["ok"] is True and reg["generation"] == 1
     assert b._delivery_generations["sec"] == 1
-    # fork replay: 秘密無し -> unobserved、generation は 1 のまま、現世代 instance も不変。
+    # fork replay: 秘密無し -> observer_pending、generation は 1 のまま、現世代 instance
+    # も不変 (fence は Issue #129 のまま効いている)。
     forked = b.register_delivery_instance(dc, "fork", observer=None)
-    assert forked["ok"] is False and forked["error"] == "unobserved"
+    assert forked["ok"] is False and forked["error"] == "observer_pending"
     assert b._delivery_generations["sec"] == 1
     assert b._delivery_instances["sec"] == "obs"
-    # 間違った秘密でも同様に拒否する。
+    # 間違った秘密は「かつて秘密を持っていた = supersede された」なので latch 側。
     wrong = b.register_delivery_instance(dc, "fork2", observer="not-the-secret")
     assert wrong["error"] == "unobserved" and b._delivery_generations["sec"] == 1
 
@@ -930,8 +935,9 @@ def test_observer_fork_cannot_take_over_delivery(tmp_path):
     dc = b.issue_delivery_cred("sec")
     gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
     b.enqueue(src, "sec", "human-facing-message")
-    # fork が秘密無しで register (unobserved) — generation を奪えない。
-    assert b.register_delivery_instance(dc, "fork", observer=None)["error"] == "unobserved"
+    # fork が秘密無しで register (observer_pending) — generation を奪えない。
+    assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
+            == "observer_pending")
     # observed sidecar は現世代のまま claim できる (message 喪失しない)。
     res = b.poll_claims(dc, gen, "obs")
     assert [r["entry"]["message"] for r in res["rows"]] == ["human-facing-message"]
@@ -940,11 +946,12 @@ def test_observer_fork_cannot_take_over_delivery(tmp_path):
 
 
 def test_no_observer_lease_keeps_last_register_wins(tmp_path):
-    """lease 未 assert の owner (子 pane 等) は従来の last-register-wins が不変。
+    """lease 未 assert の owner は従来の last-register-wins が不変。
 
-    Phase 2 が observer 束縛の無い owner の push 配信を回帰させないことの回帰ガード
-    (observer lease は org up secretary 経路だけが assert し、spawn_claude 子は assert
-    しない = 従来どおり generation を bump して claim できる)。
+    observer 束縛の無い owner の push 配信を回帰させないことの回帰ガード。Issue #165 で
+    lease を張る経路は増えたが、**張っていない owner** (admin mint の channel token で
+    起動した caller 等、秘密の handoff を持たない呼び元) は従来どおり generation を
+    bump して claim できなければならない (child push を壊さない、が #165 の制約)。
     """
     b = Broker(state_dir=tmp_path, adapter=None)
     _registered(b, "w")
@@ -962,8 +969,9 @@ def test_observer_lease_armed_survives_slow_startup(tmp_path):
     secret = b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
     time.sleep(0.2)   # TTL(0.1) を超える起動遅延 (段1 folder-trust 放置等)
-    # armed lease は失効していない: 秘密無し fork は依然 unobserved。
-    assert b.register_delivery_instance(dc, "fork", observer=None)["error"] == "unobserved"
+    # armed lease は失効していない: 秘密無し fork は依然 refuse される。
+    assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
+            == "observer_pending")
     # 秘密を持つ observed sidecar は register できる (保護が失われていない)。
     assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
     # register で activate されるので、以後は TTL 計時が始まる (dump に失効時刻が入る)。
@@ -1011,6 +1019,204 @@ def test_assert_observer_rotates_secret(tmp_path):
     dc = b.issue_delivery_cred("sec")
     assert b.register_delivery_instance(dc, "old", observer=s1)["error"] == "unobserved"
     assert b.register_delivery_instance(dc, "new", observer=s2)["ok"] is True
+
+
+# ============================== Issue #165 observer lease on the spawn path
+def _pane_env(fake_adapter) -> dict:
+    return fake_adapter.spawned[-1]["env"]
+
+
+def test_spawn_claude_asserts_observer_lease_and_hands_secret_via_pane_env(
+    tmp_path, fake_adapter,
+):
+    """spawn_claude が observer lease を張り、秘密を **pane プロセス env** で子へ渡す。
+
+    #165 の本体。以前この経路は delivery cred と channel sidecar を配りながら lease を
+    張らず、dispatcher / 全 worker が last-register-wins に落ちていた (§4.1)。秘密は
+    mcp-config に **載せない** — mcp-config は fork が verbatim replay する面そのもので、
+    そこへ載せた瞬間に「fork が replay できない信号」という lease の存在理由が消える。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "worker-foo", "cwd": "/repo"})
+    # lease が張られ、armed (expires_at=None = 失効しない) で置かれている。
+    lease = b._observer_leases["worker-foo"]
+    assert lease.expires_at is None
+    # 秘密は pane プロセス env に載る。
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    assert secret == lease.secret and secret
+    # **mcp-config にも argv にも載らない** (fork の replay 面に秘密を置かない)。
+    argv = fake_adapter.spawned[-1]["argv"]
+    assert secret not in json.dumps(argv)
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert secret not in json.dumps(cfg)
+    # broker 所有の env キーは呼び元の env_extra に潰されない。
+    assert _pane_env(fake_adapter)["ORG_BROKER_STATE_DIR"]
+
+
+def test_spawn_claude_lease_fences_fork_but_not_the_spawned_session(
+    tmp_path, fake_adapter,
+):
+    """acceptance (#165): fork の register は generation を奪えず、original は push を
+    受け取り続ける。lease 未 assert の owner は従来どおり (別テストで固定)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "w" and bd.scope == "delivery"][0]
+    b.register_local([t for t, bd in b._binds.items()
+                      if bd.agent_id == "w" and bd.scope == "full"][0])
+    # spawn された session の sidecar (env の秘密を提示できる) は register できる。
+    gen = b.register_delivery_instance(dc, "orig", observer=secret)["generation"]
+    b.enqueue(disp, "w", "for-the-live-session")
+    # mcp-config を replay した fork は秘密を持てないので generation を奪えない。
+    forked = b.register_delivery_instance(dc, "fork", observer=None)
+    assert forked["error"] == "observer_pending"
+    assert b._delivery_instances["w"] == "orig"
+    # original は fork イベントを跨いで push を受け取り続ける。
+    rows = b.poll_claims(dc, gen, "orig")["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["for-the-live-session"]
+    assert b.poll_claims(dc, gen, "fork")["error"] == "stale_sidecar"
+
+
+def test_spawn_claude_lease_armed_survives_a_session_slower_than_the_ttl(
+    tmp_path, fake_adapter,
+):
+    """acceptance (#165): 起動が TTL より遅い session が TTL で fence されない。
+
+    2 相ライフサイクル (armed = 失効しない -> 初回 observed register で activate ->
+    poll heartbeat で renew) を spawn 経路で固定する。段1 folder-trust プロンプトの
+    放置等で初回 register が TTL を大きく超えても、秘密を持つ session は登録できる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter,
+               observer_lease_seconds=0.1)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "slow", "cwd": "/repo"})
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "slow" and bd.scope == "delivery"][0]
+    time.sleep(0.25)          # TTL(0.1) の 2 倍以上の起動遅延
+    # armed lease は失効していないので fork はまだ弾かれる。
+    assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
+            == "observer_pending")
+    # 遅れて起きた本人は登録でき、そこで初めて TTL 計時が始まる (activate)。
+    assert b.register_delivery_instance(dc, "slow-obs", observer=secret)["ok"] is True
+    assert isinstance(b._observer_leases["slow"].expires_at, float)
+
+
+def test_spawn_failure_clears_observer_lease(tmp_path):
+    """spawn (adapter) 失敗時に observer lease も巻き戻す (誰も提示できない armed lease を
+    owner に残さない)。delivery cred の失敗時 revoke と同型。"""
+    class BoomAdapter(FakeAdapter):
+        def spawn(self, argv, cwd=None, new_window=True, space=None, env=None):
+            raise RuntimeError("boom")
+
+    adapter = BoomAdapter()
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    with pytest.raises(RuntimeError):
+        dispatch_tool(b, disp, "spawn_claude_pane",
+                      {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    assert "w" not in b._observer_leases
+
+
+def test_name_collision_spawn_cannot_rotate_a_live_agents_lease(tmp_path, fake_adapter):
+    """``assert_observer`` は ``issue_token(unique=True)`` の **後** で呼ぶ。順序が
+    load-bearing になった (Issue #165 + #169)。
+
+    先に rotate してしまうと、``spawn_claude_pane(name="<live agent>")`` を投げるだけで
+    被害 agent の lease が回り、被害者自身の sidecar が「かつての秘密」を提示する側に
+    なる = latch する拒否 (``unobserved``) を受けて **恒久的に mute** される。権限の
+    要らない、他人のセッションを黙らせる操作になってしまう。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    victim = b.issue_token("secretary", "secretary", "secretary")
+    b.register_local(victim)
+    live_secret = b.assert_observer("secretary")     # 稼働中の observed session
+    disp = _ops(b)
+    out = dispatch_tool(b, disp, "spawn_claude_pane",
+                        {"direction": "vertical", "name": "secretary", "cwd": "/repo"})
+    assert out.get("isError") and "name_taken" in out["content"][0]["text"]
+    # 被害者の lease は回っていない = 被害者の sidecar は今までどおり register できる。
+    assert b._observer_leases["secretary"].secret == live_secret
+    dc = b.issue_delivery_cred("secretary")
+    assert b.register_delivery_instance(dc, "victim", observer=live_secret)["ok"] is True
+
+
+def test_spawn_failure_rollback_does_not_clear_someone_elses_lease(tmp_path):
+    """巻き戻しは **自分が張った lease だけ** を落とす (compare-and-delete)。
+
+    失敗経路では name 予約と token が先に解放されるので、その隙に同名で別 caller が
+    新しい lease を張れる。無条件 pop だと、その新 lease を消してしまう (新 session は
+    mute されないが fork 保護だけが黙って外れる = 気付けない劣化)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    mine = b.assert_observer("w")
+    theirs = b.assert_observer("w")           # 別 caller が rotate した (= 自分のは失効)
+    assert b.clear_observer("w", mine) is False
+    assert b._observer_leases["w"].secret == theirs
+    assert b.clear_observer("w", theirs) is True
+    assert "w" not in b._observer_leases
+
+
+def test_spawn_failure_error_and_journal_do_not_leak_the_observer_secret(tmp_path):
+    """adapter は起動失敗時に引数列をそのまま例外文へ載せる。その文字列は呼び元への
+    tools/call エラーになり、traceback ごと queue.jsonl にも残る (このファイルは
+    admin.token と違い 0600 ではない)。秘密が両方から伏せられていること。"""
+    class LeakyAdapter(FakeAdapter):
+        def spawn(self, argv, cwd=None, new_window=True, space=None, env=None):
+            # tmux / wezterm と同型: 引数列を例外文へ載せる。
+            leak = " ".join(f"{k}={v}" for k, v in (env or {}).items())
+            raise RuntimeError(f"spawn failed: -e {leak}")
+
+    adapter = LeakyAdapter()
+    b = Broker(state_dir=tmp_path, adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+    with pytest.raises(RuntimeError) as excinfo:
+        dispatch_tool(b, disp, "spawn_claude_pane",
+                      {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    raw = str(excinfo.value)
+    secret = raw.split("ORG_BROKER_CHANNEL_OBSERVER=")[1].split()[0]
+    # 巻き戻しで lease は消えている = 値一致だけの scrub では捕まらない状況を再現する。
+    assert "w" not in b._observer_leases
+    scrubbed = b.scrub_secrets(raw)
+    assert secret not in scrubbed
+    assert "[REDACTED_OBSERVER_SECRET]" in scrubbed
+    # 他の診断情報は残る (読めない診断にしない)。
+    assert "spawn failed" in scrubbed
+
+
+def test_scrub_secrets_redacts_live_secret_without_the_env_prefix(tmp_path):
+    """前置の無い剥き出しの値も、live な lease と一致すれば伏せる。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    secret = b.assert_observer("sec")
+    assert secret not in b.scrub_secrets(f"boom while starting: {secret}")
+    # JSON 形 (herdr の env params) も代入形として伏せる。
+    payload = '{"env": {"ORG_BROKER_CHANNEL_OBSERVER": "abc123_-XY"}}'
+    assert "abc123_-XY" not in b.scrub_secrets(payload)
+
+
+def test_spawn_codex_and_generic_do_not_assert_a_lease(tmp_path, fake_adapter):
+    """channel sidecar を持たない spawn 経路は lease を張らない (張ると誰も秘密を提示
+    できず、その owner の register が恒久的に refuse される)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_codex_pane",
+                  {"direction": "vertical", "name": "cx", "cwd": "/repo"})
+    dispatch_tool(b, disp, "spawn_pane",
+                  {"direction": "vertical", "command": "top", "cwd": "/repo"})
+    assert b._observer_leases == {}
 
 
 # ============================== Issue #129 bg-hosted suppress guard (問題 B / Phase 1)
@@ -1082,6 +1288,185 @@ def test_admin_mint_channel_not_requested_has_no_observer_secret(tmp_path):
     assert res["observer_secret"] is None and "sec2" not in b._observer_leases
 
 
+# ============================== Issue #169 recoverable stand-down
+def _journal_events(b, event: str) -> list[dict]:
+    path = b.state_dir / "queue.jsonl"
+    if not path.exists():
+        return []
+    return [r for r in (json.loads(l) for l in path.read_text(encoding="utf-8")
+                        .splitlines() if l.strip())
+            if r["event"] == event]
+
+
+def test_superseded_instance_cannot_win_the_claim_back_by_retrying(tmp_path):
+    """acceptance (#169): supersede された instance は再試行だけでは claim を取り戻せない。
+
+    latch が存在する理由そのもの。rotate で置き換えられた session が古い秘密を提示し
+    続けても、generation は現職のまま動かない。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    s1 = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    assert b.register_delivery_instance(dc, "old", observer=s1)["ok"] is True
+    s2 = b.assert_observer("sec")             # 新 session が lease を rotate
+    assert b.register_delivery_instance(dc, "new", observer=s2)["generation"] == 2
+    # 旧 session が粘る: 何度再試行しても latch する拒否のままで generation は不変。
+    for _ in range(5):
+        res = b.register_delivery_instance(dc, "old", observer=s1)
+        assert res["error"] == "unobserved"     # LATCHING_REFUSALS
+    assert b._delivery_generations["sec"] == 2
+    assert b._delivery_instances["sec"] == "new"
+
+
+def test_pending_instance_recovers_once_the_incumbent_stops_heartbeating(tmp_path):
+    """acceptance (#169): transient な理由で stand-down した session が **再起動なしで**
+    回復する。回復の条件は「粘ったから」ではなく「現職が heartbeat を止めたから」。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+               observer_lease_seconds=0.2)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
+    # 現職が poll している間は、秘密無しの再試行は何度打っても通らない。
+    for _ in range(3):
+        b.poll_claims(dc, gen, "obs")          # heartbeat = lease renew
+        assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
+                == "observer_pending")
+    # 現職が poll を止め TTL 経過 -> lease 失効 -> 同じ再試行が通る (プロセス再起動なし)。
+    time.sleep(0.3)
+    assert b.register_delivery_instance(dc, "manual", observer=None)["ok"] is True
+
+
+def test_fenced_instance_poll_does_not_renew_the_incumbent_lease(tmp_path):
+    """§8.1「『直近に poll した誰か』ではなく『現世代 instance』を見る」の固定。
+
+    fence された instance は stale_sidecar を受けたあとも poll を続ける。その poll が
+    lease を延命できてしまうと、現職が死んでも lease が生き続け回復が塞がる (逆に、
+    fenced な instance が自分で自分の道を開けるようにもなる)。renew は現世代 instance の
+    poll だけが打つ。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, observer_lease_seconds=30.0)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
+    before = b._observer_leases["sec"].expires_at
+    assert isinstance(before, float)
+    # fence された instance の poll: 拒否され、lease の失効時刻を動かさない。
+    assert b.poll_claims(dc, gen, "fork")["error"] == "stale_sidecar"
+    assert b._observer_leases["sec"].expires_at == before
+    # 現世代 instance の poll は renew する。
+    b.poll_claims(dc, gen, "obs")
+    assert b._observer_leases["sec"].expires_at > before
+
+
+def test_delivery_dump_exposes_standdowns_and_clears_them_on_register(tmp_path):
+    """acceptance (#169): stood-down 状態がプロセスの外から観測できる。
+
+    sidecar 側の ``_stood_down`` は子プロセス内の Event で外から見えないため、daemon が
+    「どの owner の どの instance が・なぜ・いつから claim していないか」を持つ。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    b.register_delivery_instance(dc, "obs", observer=secret)
+    # 非 latch の拒否: 再試行中であることが count / since で読める。
+    b.register_delivery_instance(dc, "manual", observer=None)
+    b.register_delivery_instance(dc, "manual", observer=None)
+    rec = b.delivery_dump()["standdowns"]["sec"]["manual"]
+    assert rec["reason"] == "observer_pending"
+    assert rec["latched"] is False and rec["count"] == 2
+    assert rec["last"] >= rec["since"]
+    # latch する拒否は別 instance の枠に latched=True で残る (互いを潰さない)。
+    b.register_delivery_instance(dc, "old", observer="stale")
+    per_owner = b.delivery_dump()["standdowns"]["sec"]
+    assert per_owner["old"]["reason"] == "unobserved"
+    assert per_owner["old"]["latched"] is True
+    assert per_owner["manual"]["count"] == 2      # 上書きされていない
+    # register が通った instance の記録だけ消える (他 instance の mute は残す —
+    # takeover の瞬間に観測面を白紙に戻さない)。
+    b.reset_delivery_state("sec")
+    b.register_delivery_instance(dc, "manual")
+    assert b.delivery_dump()["standdowns"] == {}
+
+
+def test_standdown_records_survive_two_claimants_without_overwriting(tmp_path):
+    """2 つの instance が交互に再試行しても互いの記録を潰さない。
+
+    owner に 1 枠しかないと ``since`` が毎秒 now に戻り、「1 時間黙っている pane」が
+    「0 秒前から」に見える。latch した正統 instance の記録が、粘っている fork に
+    消されることもある (一番残すべき 1 行が消える)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    for _ in range(5):
+        b.register_delivery_instance(dc, "fork-a", observer=None)
+        b.register_delivery_instance(dc, "fork-b", observer=None)
+    per_owner = b.delivery_dump()["standdowns"]["sec"]
+    assert set(per_owner) == {"fork-a", "fork-b"}
+    assert per_owner["fork-a"]["count"] == 5 and per_owner["fork-b"]["count"] == 5
+    assert all(r["last"] >= r["since"] for r in per_owner.values())
+
+
+def test_standdown_records_are_bounded_and_keep_the_latched_ones(tmp_path):
+    """記録は owner あたり上限付き。溢れたら **latch していない古い記録から** 捨てる
+    (latch = そのプロセスが二度と claim しないという、一番残す価値のある事実)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    b.register_delivery_instance(dc, "superseded", observer="stale")   # latched
+    for i in range(store._STANDDOWN_MAX_PER_OWNER + 4):
+        b.register_delivery_instance(dc, f"fork-{i}", observer=None)
+    per_owner = b.delivery_dump()["standdowns"]["sec"]
+    assert len(per_owner) <= store._STANDDOWN_MAX_PER_OWNER
+    assert "superseded" in per_owner        # latch した記録は生き残る
+
+
+def test_fenced_poll_is_recorded_as_a_standdown(tmp_path):
+    """黙っている sidecar の多数派は register 拒否ではなく **poll の fence** (世代交代
+    された instance)。それが観測面から抜けていると「なぜ静かなのか」に答えられない。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "w")
+    dc = b.issue_delivery_cred("w")
+    gen = b.register_delivery_instance(dc, "i1")["generation"]
+    b.register_delivery_instance(dc, "i2")          # i1 を世代交代させる
+    assert b.poll_claims(dc, gen, "i1")["error"] == "stale_sidecar"
+    rec = b.delivery_dump()["standdowns"]["w"]["i1"]
+    assert rec["reason"] == "stale_sidecar" and rec["latched"] is False
+    assert _journal_events(b, "delivery_poll_fenced")[0]["instance"] == "i1"
+
+
+def test_repeated_pending_refusals_do_not_grow_the_journal(tmp_path):
+    """非 latch の拒否は poll cadence で繰り返されるので、毎回 journal すると
+    queue.jsonl が毎秒太る。同一 (instance, reason) の再試行は 1 行に畳む。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    for _ in range(20):
+        b.register_delivery_instance(dc, "manual", observer=None)
+    assert len(_journal_events(b, "delivery_register_unobserved")) == 1
+    # 継続状態は journal ではなく dump 側が持つ。
+    assert b.delivery_dump()["standdowns"]["sec"]["manual"]["count"] == 20
+
+
+def test_reset_delivery_state_clears_standdowns(tmp_path):
+    """close_pane 相当の reset で stand-down 記録も消える (同名 respawn の誤読を防ぐ)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    b.register_delivery_instance(dc, "manual", observer=None)
+    assert "sec" in b._delivery_standdowns
+    b.reset_delivery_state("sec")
+    assert b._delivery_standdowns == {}
+
+
 # ============================== Issue #129 HTTP wire (observer / bg_hosted)
 def test_claim_owner_observer_and_bg_over_http(broker):
     """/claim-owner が observer 秘密 (Phase 2) と bg_hosted marker (Phase 1) を配線する。"""
@@ -1092,8 +1477,12 @@ def test_claim_owner_observer_and_bg_over_http(broker):
     st, body = _post(broker.base_url + "/claim-owner", delivery,
                      {"instance_id": "obs", "observer": secret})
     assert st == 200 and body["ok"] is True and body["generation"] == 1
-    # 秘密無し (fork replay) は unobserved。
+    # 秘密無し (fork replay) は非 latch の observer_pending (Issue #169)。
     st, body = _post(broker.base_url + "/claim-owner", delivery, {"instance_id": "fork"})
+    assert st == 200 and body["error"] == "observer_pending"
+    # 秘密を提示したが不一致 (= supersede された) は latch する unobserved。
+    st, body = _post(broker.base_url + "/claim-owner", delivery,
+                     {"instance_id": "old", "observer": "stale-secret"})
     assert st == 200 and body["error"] == "unobserved"
     # bg_hosted marker は suppress。
     st, body = _post(broker.base_url + "/claim-owner", delivery,
