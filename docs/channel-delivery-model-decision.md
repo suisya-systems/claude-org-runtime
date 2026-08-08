@@ -57,9 +57,17 @@ Exclusivity is enforced by three mechanisms, all of which exist to tell two side
 ## 3. The failure class
 
 A forked or resumed session is a legitimate child. It replays the persisted mcp-config verbatim, so its
-sidecar presents the *same* delivery credential. `poll_claims` hands each row to whichever sidecar polls
-first; the row is emitted into a session nobody is watching, and confirmed. The journal reads `claimed` +
-`delivered`. The human sees nothing.
+sidecar presents the *same* delivery credential and is indistinguishable from the original by credential
+alone.
+
+The takeover happens at **registration**, not in a poll race. `/claim-owner` bumps the owner's generation and
+records the caller as the sole current-generation claimer (`store.py:419-422`), so the last sidecar to
+register wins outright and every other instance is refused `stale_sidecar` on every subsequent poll
+(`store.py:471-480`) regardless of who polls first. The winner's rows are emitted into a session nobody is
+watching, then confirmed. The journal reads `claimed` + `delivered`. The human sees nothing.
+
+Where an observer lease *is* active, the replayed sidecar is instead rejected at registration (`unobserved`,
+`store.py:412-418`) and never reaches the claim loop. §4.1 shows how rarely that applies.
 
 ---
 
@@ -224,10 +232,20 @@ wrong on first writing is not one whose cost can be estimated with confidence.
 ### 6.4 The bar the decision was held to
 
 Switching required showing a concrete failure that **cannot be closed without changing the model**. The
-failure found is severe and real (§4.1) - but it is closable within the model, cheaply: a **live-incumbent
-guard** in the ten-line last-register-wins branch (`store.py:419-422`), reusing the `_delivery_poll_seen` map
-the daemon already maintains, refusing a generation bump while an incumbent instance is demonstrably still
-polling. The bar is therefore not met.
+failure in §4.1 is severe and real, and its worst property - that a fork *deterministically* displaces the
+original - is closable within the model, cheaply: a **live-incumbent guard** in the ten-line
+last-register-wins branch (`store.py:419-422`), reusing the `_delivery_poll_seen` map the daemon already
+maintains, refusing a generation bump while the current instance is demonstrably still polling (constraints
+in §8.1).
+
+The bar is not *fully* met, and this note should not pretend otherwise. The residual in §8.1 - an abandoned
+but still-polling incumbent indefinitely blocking the session the operator is actually watching - is **not**
+closable in-model without extending the observer lease, and broadcast would solve it, since both instances
+would simply receive a copy. That is a genuine point in favour of switching.
+
+It does not carry the decision, because it is bounded by §6.2: broadcast would fix this on the push path while
+leaving the identical failure reachable through the unfenced pull path, at the cost in §6.3. The residual is
+therefore an argument for extending the observer lease (§9 condition 3), not for replacing the delivery model.
 
 ---
 
@@ -261,8 +279,12 @@ Operationally, until (3) has a consumer, the fork failure is diagnosable only by
 
 Ordered by severity. Each should be filed separately.
 
-1. **Live-incumbent guard on last-register-wins** (`store.py:419-422`). Closes §4.1, the default-silence path
-   for every `spawn_claude` owner. This is the single highest-value fix and the reason "keep" is defensible.
+1. **Live-incumbent guard on last-register-wins** (`store.py:419-422`). Removes the *deterministic* fork
+   takeover in §4.1 - a fork can no longer displace a live incumbent - which is the highest-value single fix
+   and the reason keeping is defensible. It does **not** fully close silent delivery: per §8.1, an incumbent
+   that is alive and polling but abandoned keeps confirming into a session nobody watches, and blocks the
+   resumed session the operator is actually looking at. Only proof of which session is observed removes that.
+   Item 1 is a mitigation, not a fix.
 2. **Give `duplicate_sidecar_detected` a consumer.** Surface it where an operator sees it. Until then the
    detector is inert.
 3. **Rework `_stood_down` into a recoverable state** (§7.4). Note the trap: a naive periodic re-register
