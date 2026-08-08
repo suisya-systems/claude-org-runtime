@@ -65,6 +65,7 @@ class Broker(TokenMixin, StoreMixin):
         admin_token: str | None = None,
         lease_seconds: float = 30.0,
         observer_lease_seconds: float = 90.0,
+        observer_arming_seconds: float = 600.0,
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
@@ -87,9 +88,20 @@ class Broker(TokenMixin, StoreMixin):
         # の trade-off)。reclaim_warn_threshold 超で reclaim された行は印字する。
         self.lease_seconds = lease_seconds
         # observed-session binding (Issue #129 問題 A): observer lease の TTL。observed
-        # sidecar の register/poll heartbeat (~POLL_INTERVAL 毎) が renew するため、
-        # session 継続中は失効せず、poll が止まった dead session のみ TTL 経過で解放する。
+        # sidecar の poll heartbeat (~POLL_INTERVAL 毎) が renew する。TTL 切れは
+        # **fence の解除ではなく** 「heartbeat が途絶えている」印にすぎない (Issue #169
+        # の sticky lease。heartbeat 停止は死亡の証拠にならないため)。
         self.observer_lease_seconds = observer_lease_seconds
+        # spawn 経路が張る lease の **活性化期限** (Issue #165)。一度も observed
+        # register が来ないまま超過したら lease を落として今日の last-register-wins に
+        # 戻す (秘密が子へ届かない backend / ホストでの恒久無音を防ぐ安全弁)。
+        #
+        # 桁の根拠 (値そのものより桁が本質): 下は「正常な起動」より十分大きく — pane の
+        # 起動 + MCP handshake は通常 1 桁秒で、段2/3 の folder-trust は呼び出し元
+        # エージェントが send_keys で承認するため分オーダーに収まる。上は「人間が
+        # 組織全体の沈黙に気付くまで」より十分小さく。TTL (90s) の数倍以上離して、
+        # 遅い起動が期限に触れないようにもする。10 分はこの間の広い谷にある。
+        self.observer_arming_seconds = observer_arming_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
@@ -1305,9 +1317,19 @@ class Broker(TokenMixin, StoreMixin):
             # dispatcher と全 worker が last-register-wins に落ちていた。その状態では
             # fork/resume の register が決定的に original を fence し、message は誰も
             # 見ていない session へ配達されて沈黙する (§4.1: これは稀な race ではなく
-            # 既定挙動)。lease は armed (失効しない) で置かれ、この pane の sidecar が
-            # 初回 register で秘密を提示した時に activate する。
-            observer_secret = self.assert_observer(agent_id)
+            # 既定挙動)。lease は armed で置かれ、この pane の sidecar が初回 register で
+            # 秘密を提示した時に activate する。
+            #
+            # **活性化期限つき**なのが launcher / secretary 経路との違い: spawn は秘密を
+            # adapter の env 経路で渡すが、その到達は backend 実装依存 (tmux は -e、
+            # wezterm は argv 書き換え、herdr 17 は pane.split 経由のシェル継承) で、
+            # リポジトリ外の挙動に依存する。届かない環境では pane 自身の sidecar が秘密を
+            # 提示できないため、無期限 armed だと **その owner の push が恒久的に無音**
+            # になる。期限内に一度も observed register が無ければ lease を落として今日の
+            # last-register-wins へ戻す (誰も秘密を提示できていない = 守るべき現職が
+            # いない、ので戻して失う保護は無い)。
+            observer_secret = self.assert_observer(
+                agent_id, arming_seconds=self.observer_arming_seconds)
             leased = (agent_id, observer_secret)
             argv = surface.build_claude_argv(
                 mcp_config_json=json.dumps(mcp_config),

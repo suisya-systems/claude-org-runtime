@@ -79,6 +79,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A refused registration does not bump the generation and does not move in-flight
   rows, so retrying cannot ping-pong the generation with the live session.
 
+  For that retry to be safe rather than merely delayed, an activated lease is now
+  **sticky**: a lapsed TTL marks the lease `stale` and keeps fencing instead of
+  falling back to last-register-wins. A stopped heartbeat is not evidence of death
+  - Ctrl+Z on the pane sends SIGTSTP to the whole process group, and a laptop
+  suspend, a slow MCP restart or an NTP clock step all produce the same gap - while
+  the incumbent registers exactly once per lifetime and a fork retries every
+  second. A TTL-expiry door is therefore a door only a fork can walk through. What
+  opens it instead is an external act: the pane closing or being reaped (a death
+  the broker actually observed), a respawn rotating the lease, or the explicit
+  adopt path when #166 lands. An incumbent that comes back and resumes polling
+  simply moves its lease back to `active`.
+
+  Leases asserted on the spawn path carry an **activation deadline** (10 minutes by
+  default, `observer_arming_seconds`), because the secret's journey to the child
+  crosses backend-specific machinery - tmux `-e`, a wezterm argv rewrite, a herdr
+  `pane.split` and shell inheritance - and the last leg, whether Claude Code passes
+  its environment to a stdio MCP server, is outside this repository. Where that
+  handoff fails, the pane's own sidecar cannot present the secret, and an
+  never-expiring armed lease would mute that owner permanently. If no observed
+  registration ever arrives, the lease is dropped, `observer_arming_expired` is
+  journalled, and the owner returns to today's behaviour - safe precisely because
+  "nobody ever presented the secret" is the definition of "there is no incumbent to
+  protect". The launcher/secretary path keeps its unbounded arming window, since a
+  human may sit on the stage-1 folder-trust prompt. Relatedly, only a registration
+  bearing the secret can activate an armed lease; a poll no longer can, which also
+  closes the gap noted in the decision note's §7 item 5.
+
   Stood-down state is also observable from outside the sidecar process now:
   `delivery_dump` reports, per owner and per instance, which sidecar is not
   claiming, why, since when, and whether that state is permanent. Sidecars fenced

@@ -974,28 +974,52 @@ def test_observer_lease_armed_survives_slow_startup(tmp_path):
             == "observer_pending")
     # 秘密を持つ observed sidecar は register できる (保護が失われていない)。
     assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
-    # register で activate されるので、以後は TTL 計時が始まる (dump に失効時刻が入る)。
-    assert isinstance(b.delivery_dump()["observers"]["sec"], float)
+    # register で activate されるので、以後は TTL 計時が始まる。
+    dumped = b.delivery_dump()["observers"]["sec"]
+    assert dumped["state"] == "active" and isinstance(dumped["expires_at"], float)
 
 
-def test_observer_lease_renewed_by_poll_and_expires(tmp_path):
-    """observer lease は現世代 poll heartbeat で renew し、poll が止まると TTL 経過で失効する
-    (dead observed session の stale lease が将来の register を永久に塞がない)。"""
+def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
+    """**この挙動は Issue #169 で意図的に変えた。元に戻さないこと。**
+
+    以前ここは「poll が止まって TTL 経過 -> lease 失効 -> 秘密無し register が通る」を
+    固定していた (dead session の stale lease が将来の register を塞がないように)。
+    その扉は塞いだ。理由:
+
+    - **heartbeat の停止は死亡の証拠にならない**。pane の Ctrl+Z (SIGTSTP はプロセス
+      グループ全体に効く)、ラップトップ suspend、MCP サーバー再起動の長期化、NTP に
+      よる wall-clock ステップでも 90 秒の空白は開く。
+    - **現職は生涯 1 回しか register しない** (generation war 防止の既存設計) のに対し、
+      fork は 1 秒ごとに register を叩き続ける。だから扉が一度開くと、そこに居るのは
+      常に fork だけで、現職は二度と取り返せない。
+
+    = TTL 失効を扉にすると、それは実質「fork 専用の扉」になる。扉は **外部の行為**
+    (pane の close/reap、再 spawn の re-assert、adopt #166) だけが開ける。止まっていた
+    現職が戻ってくれば lease は active に戻る。
+    """
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
                observer_lease_seconds=0.2)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
     gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
-    # poll が renew するので、TTL 超の合計時間でも lease は生き続ける。
+    # poll が renew するので、TTL 超の合計時間でも lease は active のまま。
     for _ in range(4):
         time.sleep(0.1)
         b.poll_claims(dc, gen, "obs")
-    assert "sec" in b.delivery_dump()["observers"]      # まだ束縛されている
-    # poll を止めて TTL 経過 -> 失効。以後は last-register-wins に戻り、秘密無し register が
-    # 通る (dead session を lease が塞がない)。
+    assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
+    # poll を止めて TTL 経過 -> stale。**fence は維持される**。
     time.sleep(0.3)
-    assert b.register_delivery_instance(dc, "recover", observer=None)["ok"] is True
+    assert b.delivery_dump()["observers"]["sec"]["state"] == "stale"
+    assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
+            == "observer_pending")
+    assert b._delivery_instances["sec"] == "obs"        # 世代交代していない
+    # 止まっていた現職が戻れば active に戻る (suspend からの復帰など)。
+    b.poll_claims(dc, gen, "obs")
+    assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
+    # 秘密を持つ本人は stale の間も register できる (pane 内で sidecar が再起動した等)。
+    time.sleep(0.3)
+    assert b.register_delivery_instance(dc, "obs2", observer=secret)["ok"] is True
 
 
 def test_reset_delivery_state_clears_observer_lease(tmp_path):
@@ -1319,23 +1343,86 @@ def test_superseded_instance_cannot_win_the_claim_back_by_retrying(tmp_path):
     assert b._delivery_instances["sec"] == "new"
 
 
-def test_pending_instance_recovers_once_the_incumbent_stops_heartbeating(tmp_path):
-    """acceptance (#169): transient な理由で stand-down した session が **再起動なしで**
-    回復する。回復の条件は「粘ったから」ではなく「現職が heartbeat を止めたから」。"""
+def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path):
+    """acceptance (#169): stand-down した session が **再起動なしで** 回復する。
+
+    ただし回復の条件は「粘ったから」でも「時間が経ったから」でもなく、**外部が
+    現職の消滅を宣言したから** — ここでは pane の close/reap
+    (:meth:`reset_delivery_state`)、つまり broker が実際に観測した死。
+    """
     b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
                observer_lease_seconds=0.2)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
     gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
-    # 現職が poll している間は、秘密無しの再試行は何度打っても通らない。
+    # 現職が poll していても、止まっていても、秘密無しの再試行は通らない。
     for _ in range(3):
-        b.poll_claims(dc, gen, "obs")          # heartbeat = lease renew
+        b.poll_claims(dc, gen, "obs")
         assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
                 == "observer_pending")
-    # 現職が poll を止め TTL 経過 -> lease 失効 -> 同じ再試行が通る (プロセス再起動なし)。
-    time.sleep(0.3)
+    time.sleep(0.3)                                    # heartbeat 途絶 (stale) でも同じ
+    assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
+            == "observer_pending")
+    # pane が実際に閉じた (close_pane / reap) -> lease は落ちる -> 同じ再試行が通る。
+    # 再試行を続けていた sidecar は **プロセス再起動なしで** 配送に復帰する。
+    b.reset_delivery_state("sec")
     assert b.register_delivery_instance(dc, "manual", observer=None)["ok"] is True
+
+
+def test_spawn_lease_expires_if_it_is_never_activated(tmp_path, fake_adapter):
+    """acceptance (#165 の安全弁): 秘密が子へ届かない環境で恒久無音にならない。
+
+    spawn 経路の lease は活性化期限つき。期限内に一度も observed register が来なければ
+    (= 誰も秘密を提示できていない = 守るべき現職が存在しない)、lease を落として今日の
+    last-register-wins に戻す。保護が外れる瞬間なので journal に必ず残す。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter, observer_arming_seconds=0.1)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "w" and bd.scope == "delivery"][0]
+    # 期限内は armed のまま fence する (秘密を持たない register は通らない)。
+    assert (b.register_delivery_instance(dc, "no-secret")["error"]
+            == "observer_pending")
+    assert b.delivery_dump()["observers"]["w"]["state"] == "armed"
+    time.sleep(0.15)
+    # 期限切れ: lease が落ちて今日の挙動 (last-register-wins) に戻る。
+    assert b.register_delivery_instance(dc, "no-secret")["ok"] is True
+    assert "w" not in b._observer_leases
+    assert _journal_events(b, "observer_arming_expired")[0]["owner"] == "w"
+
+
+def test_secretary_path_lease_never_expires_while_armed(tmp_path):
+    """launcher / secretary 経路は **無期限 armed** のまま (段1 folder-trust は人間の
+    承認待ちで、分どころか時間オーダーで放置されうる)。活性化期限は spawn 経路だけ。"""
+    b = Broker(state_dir=tmp_path, adapter=None, observer_arming_seconds=0.1)
+    _registered(b, "sec")
+    secret = b.assert_observer("sec")          # arming_seconds を渡さない = 無期限
+    dc = b.issue_delivery_cred("sec")
+    time.sleep(0.15)
+    assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
+            == "observer_pending")
+    assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
+
+
+def test_poll_does_not_activate_an_armed_lease(tmp_path):
+    """armed の activate は「秘密を提示した register」の専権。
+
+    poll で activate できてしまうと、秘密を一度も提示していない instance が lease を
+    活性化でき (docs §7 項目5)、活性化期限 = 「誰も提示できていないなら今日の挙動へ
+    戻す」という #165 の安全弁が黙って無効化される。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, observer_arming_seconds=30.0)
+    _registered(b, "w")
+    dc = b.issue_delivery_cred("w")
+    gen = b.register_delivery_instance(dc, "i1")["generation"]   # lease 前に register
+    b.assert_observer("w", arming_seconds=30.0)                  # 後から lease を張る
+    b.poll_claims(dc, gen, "i1")                                 # 現世代 instance の poll
+    assert b._observer_leases["w"].expires_at is None            # armed のまま
+    assert b.delivery_dump()["observers"]["w"]["state"] == "armed"
 
 
 def test_fenced_instance_poll_does_not_renew_the_incumbent_lease(tmp_path):
