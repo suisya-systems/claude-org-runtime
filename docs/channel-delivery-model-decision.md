@@ -10,9 +10,19 @@ exclusive claim as the default mode for all other owners until the at-most-once 
 
 ## 1. Decision
 
-Introduce `BROADCAST` as a third per-owner delivery mode alongside the existing `PUSH` and `PULL`. Enable it
-first for the operator-facing owner (the secretary). Leave every other owner on exclusive claim until §6.5 is
-resolved.
+Introduce `BROADCAST` as a third per-owner delivery mode alongside the existing `PUSH` and `PULL`, and adopt
+it per owner in stages, beginning with the operator-facing owner (the secretary).
+
+**Two prerequisites gate the first flip**, and neither is satisfied today:
+
+- A human ruling on whether duplicated *agent action* is tolerable (§6.5). Every owner on this queue is an
+  agent that acts on injection, so no owner is exempt, and cross-session duplication is not fixable by
+  receiver-side dedupe.
+- Confirmation that `BROADCAST` can be added as a parallel mode without changing behaviour for owners still
+  in `PUSH` (§6.7, §8 item 2).
+
+Until both are met, every owner stays on exclusive claim. The decision recorded here is the *direction* and
+the mechanism; the scope and timing of any flip are deferred.
 
 This is **not** the contention-triggered hybrid evaluated and rejected earlier (§10.1). That design flipped an
 owner between modes dynamically on a wall-clock contention window, and it fell to a timing argument. This one
@@ -25,9 +35,12 @@ Three things make this the derived answer rather than a compromise:
   hypothetical risk; it is current behavior, and it is invisible to the operator.
 - Broadcast closes a correctness defect that exclusive claim **cannot** close in-model (§6.4), and it fails
   toward duplication rather than silence (§5).
-- The one genuine reason not to broadcast everything - at-most-once traffic (§6.5) - is a property of
-  *particular owners*, not of the model, and the per-owner mode machinery to act on that distinction
-  **already exists** (§6.6).
+- The countervailing risk - duplicated agent action (§6.5) - is real and applies to **every** owner, but its
+  incremental harm is narrower than it first appears: under exclusive claim the fork's session already wakes
+  and acts on the message it stole, so broadcast adds the *legitimate* delivery rather than a second spurious
+  one. It still needs a ruling, which is why it gates the first flip.
+- The per-owner mode machinery needed to stage this **already exists** (§6.6), so the change can be made
+  reversibly, one owner at a time, without rewriting the delivery core.
 
 The central finding of the analysis stands regardless of mode: **the underlying problem is identity, not
 delivery model.** The persisted mcp-config carries both the full agent token and the delivery credential in
@@ -152,8 +165,13 @@ transferable:
   making it structurally non-replayable in exactly the way broker's delivery credential is not.
 
 renga is not a more reliable design to copy. It is a *less* reliable one that fails in a different direction.
-What is worth taking from it is the failure direction, not the machinery. Broker's broadcast mode must be
-built on broker's own durable-row substrate.
+What is worth taking from it is the failure direction, not the machinery.
+
+One correction to that contrast, which an earlier draft of this note got wrong: broker's advantage over renga
+is **per-row delivery state, not durability**. `_rows` is in-memory and `store.py:325-332` states explicitly
+that the journal is never replayed and there is no crash recovery. A daemon restart discards every
+unacknowledged row, and would discard per-instance fan-out state with it. Broadcast has to be designed on that
+basis; it does not inherit durability broker does not have (§7.7).
 
 ---
 
@@ -207,7 +225,7 @@ Also made in an earlier draft, also withdrawn.
 
 The observation behind it is true - §4.4, the pull path is unfenced - but it does **not** distinguish the two
 models, because the defect is **common to both**. Exclusive claim leaves the pull path exactly as it is (§8
-item 5 defers it to a separate issue), so the argument charged broadcast for a hole that keeping also declines
+item 7 defers it to a separate issue), so the argument charged broadcast for a hole that keeping also declines
 to close.
 
 The asymmetry, if anything, runs the other way: a full broadcast migration must confront pull reconciliation,
@@ -269,27 +287,48 @@ every pane. Broadcast closes it outright: both instances simply receive a copy, 
 Under the earlier weighting this point was acknowledged and then outweighed by migration cost. With (a)
 discounted, it stands as a **correctness** argument for broadcast, and it is unrebutted.
 
-### 6.5 The one real argument against broadcasting everything
+### 6.5 Duplicate delivery means duplicate agent action - for every owner
 
-Duplication is cheap when the recipient is a human reading reports. It is **not** cheap when the recipient is
-an agent that will act on the message.
+An earlier draft of this section claimed duplication is cheap for the operator-facing owner because "a human
+reads it", and located the risk in worker owners. **Both halves were wrong**, and the correction matters
+enough to change the rollout plan.
 
-This queue carries both. Operator-facing reports go to the secretary; DELEGATE-class instructions go to worker
-owners. A duplicate report costs a moment of confusion. A duplicate delegate instruction delivered to two live
-sessions of the same worker can cause **double execution of a non-idempotent task** - and unlike silence, that
-failure is not merely invisible, it is actively harmful.
+**No owner is exempt.** This channel is not a display surface. Its entire purpose is *in-band injection that
+wakes an idle session* (`channel_sidecar.py` module docstring), and every owner on this queue is a Claude
+agent that acts on what it receives. The secretary decomposes and delegates (`prompts/templates/secretary.md`
+- "Task decomposition and delegation via `/org-delegate`"). So two live secretary sessions woken by the same
+message can each delegate. There is no owner whose traffic is merely read.
 
-Note carefully what this is and is not:
+**The risk sits with the dispatcher, not workers.** `prompts/templates/dispatcher.md:17,23`: the dispatcher
+receives `DELEGATE` messages from the secretary and spawns worker panes. A duplicated `DELEGATE` therefore
+makes two dispatcher sessions spawn duplicate panes and mutate dispatch state. Gating the rollout on "worker
+owners" would have protected the wrong class entirely.
 
-- It is **not** an argument that broadcast is wrong. It is an argument that the right delivery policy depends
-  on **what the owner's traffic means**, which varies per owner.
-- It is **not** symmetrical with the defects charged against exclusive claim. §4.1 fires today with no
-  precondition; this one requires a fork *and* non-idempotent traffic *and* both sessions acting.
+**Receiver-side dedupe cannot fix this.** Per §4.3, `msg_id` dedupe is per-process; the duplicate under
+broadcast lands in a *different* session, which cannot see what the first one received. Cross-session
+duplicate action is therefore not addressable by dedupe at all - only by idempotent actions, or by a shared
+coordination point, which is what exclusive claim is.
 
-Resolving it needs a ruling this note cannot make: whether DELEGATE-class traffic requires at-most-once
-delivery, or whether workers are expected to be idempotent under redelivery (the current design already
-redelivers on lease reap and epoch flip, so some tolerance is already assumed). Until it is ruled, worker
-owners stay on exclusive claim.
+**But the incremental harm is smaller than it looks.** Under exclusive claim, when a fork wins the register,
+the fork's sidecar emits into the fork session and *that agent wakes and acts* (§3). The spurious actor
+already acts today. Comparing the fork scenario:
+
+| | spurious action | legitimate action | operator sees |
+|---|---|---|---|
+| exclusive claim | 1 (fork) | 0 | nothing |
+| broadcast | 1 (fork) | 1 | the message |
+
+Broadcast does not add a spurious actor. It adds the *legitimate* delivery on top of a spurious action that
+already occurs. The real cost is two executions where today there is one - but today's one is the wrong one,
+performed invisibly.
+
+That is genuinely arguable in both directions and depends on the action. Two spawned panes are messy but
+visible; one ghost pane spawned by an invisible session is worse to diagnose and never reconciled. This note
+does not resolve it.
+
+**Status: deferred.** Whether duplicated agent action is tolerable is a question about the org's agent design,
+not about the broker, and it needs a human ruling. It is raised here as an open point and **gates every
+rollout step, including the first** (§8 item 1). Until it is ruled, no owner is flipped.
 
 ### 6.6 Staged adoption is available on machinery that already exists
 
@@ -314,10 +353,15 @@ broker vs renga at the transport layer (`transport/descriptor.py:52-56`); dogfoo
 mean running renga, a different system. `flip_mode` is the correct mechanism and is strictly better suited -
 finer granularity, runtime-flippable, already epoch-fenced.
 
-**First target: the secretary.** It is the right dogfood owner because a human watches it continuously, so
-both failure directions are immediately observable by the one detector that matters; its traffic is reports to
-a human, so duplication is harmless (§6.5 does not apply); and it is the only owner with an observer lease
-today, so the new mode can be compared against the protection actually in place.
+**First target: the secretary** - but for narrower reasons than an earlier draft claimed. It is **not** exempt
+from §6.5; a duplicated report can make two secretary sessions each delegate. What makes it the right first
+target is observability and reversibility: a human is present continuously, so both failure directions are
+seen by the one detector that matters, and a spurious delegation is visible and can be undone. Note the
+trade-off honestly - it is also the owner where broadcast's *benefit* is smallest, since it is the one owner
+that holds an observer lease today and so is already protected on the push path (§4.1).
+
+The alternative first target, the dispatcher, is where the §4.1 defect actually fires but also where duplicate
+action is most damaging (duplicate pane spawns, §6.5). It should not go first.
 
 ### 6.7 What the decision rests on
 
@@ -329,17 +373,27 @@ What carries the decision:
 2. Broadcast closes a residual that exclusive claim cannot close in-model (§6.4) - a correctness argument,
    unrebutted.
 3. Failure direction favours broadcast where a human is the recipient (§5).
-4. The one countervailing argument (§6.5) is owner-specific, not model-wide.
+4. The countervailing argument (§6.5) applies to every owner, but the spurious actor already acts under
+   exclusive claim, so broadcast's increment is the legitimate delivery rather than a second wrong one.
 5. The residual risk in §6.3(b) is preventable by three known design rules and containable by staging on
    machinery that already exists (§6.6).
 
-Points 1-3 argue for broadcast. Point 4 argues against broadcasting *everything*. Point 5 says the change can
-be made without betting the system on it. The conjunction is the staged per-owner decision in §1.
+Points 1-3 argue for broadcast. Point 4 is the genuine cost, and it is unresolved - it sets the direction as
+gated rather than immediate. Point 5 says the change can be made reversibly, one owner at a time. The
+conjunction is the staged, prerequisite-gated decision in §1.
+
+**This is the weakest of the three derivations this note has produced, and it should be read as such.** The
+first (keep, on three grounds) lost two grounds to review. The second (staged broadcast, on the premise that
+duplication is cheap for a human-facing owner) lost that premise to review - the channel wakes agents, it does
+not display to humans. What survives is narrower: broadcast is directionally right *because the spurious
+action already happens and broadcast at least adds the correct one*, and the mechanism to try it reversibly
+exists. If the §6.5 ruling says duplicated agent action is not tolerable, this derivation fails at point 4 and
+the answer is exclusive claim plus the identity work in §8 - not a patched broadcast.
 
 **What would make this wrong:** if adding a third mode turns out to entangle rather than parallel the claim
 path - i.e. if `BROADCAST` cannot be added without changing `poll_claims`/`confirm_delivered` behaviour for
 owners still in `PUSH` - then §6.6's containment argument fails and the risk in §6.3(b) returns at full
-weight. **Validate that first**, before any owner is flipped (§8 item 0).
+weight. **Validate that first**, before any owner is flipped (§8 item 2).
 
 ---
 
@@ -348,7 +402,7 @@ weight. **Validate that first**, before any owner is flipped (§8 item 0).
 1. **The identity problem is untouched by the mode choice.** mcp-config is replayable and carries both
    credentials; process env is not. That asymmetry is an assumption about Claude Code's fork/resume behaviour
    which we neither control nor test against.
-2. **The pull path stays unfenced** until §8 item 5 lands, under either mode (§6.2).
+2. **The pull path stays unfenced** until §8 item 7 lands, under either mode (§6.2).
 3. **Receiver-side dedupe still does not exist** (§4.2). Broadcast makes it matter more, since same-session
    redelivery becomes more likely, not less.
 4. **`_stood_down` is a latch with no `clear()`** (`channel_sidecar.py:86`).
@@ -357,6 +411,10 @@ weight. **Validate that first**, before any owner is flipped (§8 item 0).
 6. **`duplicate_sidecar_detected` has no consumer** (`store.py:203-235`, `:466-468`). Detection without a
    consumer is not observability - though note that broadcast makes this less load-bearing, since the
    duplicate delivery itself becomes the operator-visible signal.
+7. **There is no durability at all.** `_rows` is in-memory and the journal is never replayed
+   (`store.py:325-332`). A daemon restart drops every undelivered row silently, under either mode, and would
+   drop per-instance fan-out state too. Neither model addresses this, and broadcast does not inherit
+   durability broker does not have (§4.5).
 
 ---
 
@@ -364,21 +422,25 @@ weight. **Validate that first**, before any owner is flipped (§8 item 0).
 
 Ordered. Each filed separately.
 
-0. **Validate the containment assumption** (§6.7): confirm `BROADCAST` can be added as a parallel per-owner
-   mode without altering behaviour for owners in `PUSH`. This gates everything below.
-1. **Implement `BROADCAST` mode** with the three design rules from §6.3 as explicit invariants: never retire
+1. **Obtain a ruling on duplicated agent action** (§6.5). Every owner is an agent that acts on injection, and
+   cross-session duplication is not fixable by dedupe. This gates **every** flip, including the first, and it
+   is a question for the org's agent design rather than for the broker. If the ruling is "not tolerable", the
+   decision in §1 does not survive - see §6.7.
+2. **Validate the containment assumption** (§6.7): confirm `BROADCAST` can be added as a parallel per-owner
+   mode without altering behaviour for owners in `PUSH`. Gates every flip.
+3. **Live-incumbent guard on last-register-wins** (`store.py:419-422`, constraints in §8.1). Independent of
+   the above and worth landing first regardless: it improves every owner on exclusive claim, which under the
+   gating above is currently all of them.
+4. **Implement `BROADCAST` mode** with the three design rules from §6.3 as explicit invariants: never retire
    on a single ack; on liveness ambiguity offer anyway; scope pull suppression to the calling session.
-2. **Implement receiver-side `msg_id` dedupe** (§4.2). Currently a promise; broadcast makes it load-bearing.
-3. **Enable for the secretary owner and observe.** Success criteria in §9.
-4. **Live-incumbent guard on last-register-wins** (`store.py:419-422`, constraints in §8.1). Still worth
-   landing: it improves every owner that remains on exclusive claim, which under this decision is most of
-   them.
-5. **Track the pull / full-token identity door** (§4.4). Not a delivery-model question.
-6. **Rework `_stood_down` into a recoverable state** (§7.4). Note the trap: a naive periodic re-register
+5. **Implement receiver-side `msg_id` dedupe** (§4.2). Currently a promise. It does *not* address §6.5, but
+   broadcast makes same-session redelivery more likely and it becomes load-bearing.
+6. **Flip the secretary owner and observe.** Only after items 1, 2, 4, 5. Criteria in §9.
+7. **Track the pull / full-token identity door** (§4.4). Not a delivery-model question; required under either
+   model.
+8. **Rework `_stood_down` into a recoverable state** (§7.4). Note the trap: a naive periodic re-register
    converts the observer lease from a permanent fence into a TTL-delayed fork takeover, which is worse. Do not
-   land this without item 4.
-7. **Resolve the at-most-once question for DELEGATE traffic** (§6.5). This gates any extension beyond the
-   operator-facing owner.
+   land this without item 3.
 
 ### 8.1 Design constraints on the live-incumbent guard
 
@@ -416,7 +478,10 @@ replacement forever. Compare the recorded timestamp against `lease_seconds` expl
 
 1. The secretary owner has run in `BROADCAST` for a sustained period with no observed row loss, and observed
    duplicates are attributable to real fork/resume events rather than to liveness misjudgement.
-2. The at-most-once question in §6.5 is ruled, and the owner's traffic is on the tolerant side of the ruling.
+2. No duplicated agent action with lasting effect has been observed there (§6.5) - specifically, no duplicate
+   delegation that a human had to unwind.
+3. The dispatcher is sequenced **last**, not first: it is where the §4.1 defect actually fires, but also where
+   duplicate action is most damaging (duplicate pane spawns and dispatch-state mutation, §6.5).
 
 **Roll back to exclusive claim (via `flip_mode`) if:**
 
@@ -467,7 +532,13 @@ Recorded so a reader can follow why it reversed.
    work is performed by an agent. What remains is (b), the risk of introducing new silence into a path whose
    failures humans cannot detect.
 5. **Re-derived: staged per-owner broadcast**, once (b) proved containable on existing per-owner mode
-   machinery (§6.6) and the only model-wide objection proved to be owner-specific (§6.5).
+   machinery (§6.6).
+6. **Corrected again under review**, this time against the new conclusion. Three claims favouring broadcast
+   were wrong: that the operator-facing owner is exempt from duplicate-action risk (it is an agent that
+   delegates, and the channel wakes it rather than displaying to a human); that `DELEGATE` traffic lands on
+   worker owners (it lands on the *dispatcher*, which spawns panes); and that broker offers a durable-row
+   substrate (`_rows` is in-memory with no journal replay). The direction survived; the rollout plan did not,
+   and §6.5 is now a gate on every flip rather than an owner-specific caveat.
 
 Two observations a future reader should weigh:
 
@@ -479,5 +550,5 @@ rather than derived, and it was treated as such here.
 
 **The reversal is not itself proof of correctness.** The same discipline applies in the new direction: §6.5 is
 a real limit on broadcast, and it is the reason this decision is staged and per-owner rather than a switch. If
-§8 item 0 shows the mode cannot be added in parallel, the derivation in §6.7 fails at point 5 and should be
+§8 item 2 shows the mode cannot be added in parallel, the derivation in §6.7 fails at point 5 and should be
 re-run - not patched.
