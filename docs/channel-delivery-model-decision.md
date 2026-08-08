@@ -179,15 +179,33 @@ anything is owed. That is why §8 exists and why observability (§8 item 3) is p
 
 ### 6.1 The actor cap is load-bearing for the organisation, not just for delivery
 
-Exclusive claim's real property is not "exactly-once delivery". It is that **at most one actor acts on a
-given message**, regardless of how many sessions hold a replayable credential. That cap is what the
-organisation's stated invariants assume: one worker to one task to one scope; the multi-step
-`pending_decisions` register update; name uniqueness enforced at spawn.
+Exclusive claim's relevant property is not "exactly-once delivery" - and, correcting the first statement of
+this section, it is **not** a guarantee that at most one actor acts on a message either. Delivery is
+at-least-once by construction, and there is a real window in which two sessions act on the same row:
 
-Broadcast removes the cap definitionally - entitlement to a copy is entitlement to act. Whether the
-organisation can tolerate N actors is a question about the organisation's design, and it is not answerable
-from inside the broker. **That is the whole basis for this decision**, and it is why the decision is
-conservative rather than confident: it declines to make an organisational change through a delivery-path note.
+1. Sidecar A claims row R and emits it (`channel_sidecar.py:290`). Session A is woken and acts.
+2. Before A confirms, a new instance registers. `register_delivery_instance` requeues A's still-`CLAIMED` row
+   to `UNDELIVERED` (`store.py:424-428`), and A's later confirm is rejected as stale (`store.py:551-567`).
+3. Sidecar B claims R and emits it. Session B is woken and acts.
+
+With no receiver-side dedupe (§4.2), and none possible across processes (§4.3), both sessions act. **The
+current design already violates a strict at-most-once reading of the organisation's invariants**, in a window
+roughly one poll interval wide.
+
+What exclusive claim actually provides is that **duplicate action is a bounded race, not a design property.**
+It is confined to the emit-to-requeue window, it is per-message, and it does not scale with the number of
+replayed instances. Broadcast makes duplicate action the steady state: entitlement to a copy is entitlement to
+act, and acting sessions scale with replays.
+
+**That difference is the basis for this decision.** Moving an exposure from "rare, bounded, and arguably a
+bug" to "always, unbounded, and by design" is an organisational change rather than a broker one, and a
+delivery-path note is the wrong place to make it.
+
+What this correction costs, stated plainly: the ruling that selected this option was expressed in terms of a
+cap at one actor, and that cap does not exist as an absolute. What survives is the distinction between a
+bounded race and a design property - weaker, but real. And if the organisation's invariants do require strict
+at-most-once action, they are **already** violated today (§7.8), which is a defect to fix rather than a
+property to preserve.
 
 ### 6.2 The branch analysis, corrected
 
@@ -205,7 +223,11 @@ an *accidental* fork, live, singular. Enumerated properly:
 |---|---|---|
 | accidental fork, original live | 1 spurious, 0 legitimate | 1 spurious, 1 legitimate |
 | **intentional resume, old pane abandoned** | **0 spurious, 1 legitimate** | **1 spurious, 1 legitimate** |
-| N replayed instances | actors capped at 1 | spurious = N |
+| N replayed instances | 1 actor in steady state | acting sessions = N |
+
+These counts are **steady-state**, not guarantees. Per §6.1 there is a race window in which exclusive claim
+also produces two acting sessions; it is bounded per message and does not scale with N, which is the
+distinction that matters here.
 
 The middle row is the common shape in this organisation - a human opens a new pane, resumes, and leaves the
 old one running. There, last-register-wins happens to select the *new* session, so exclusive claim is simply
@@ -274,6 +296,11 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
 6. **There is no durability.** `_rows` is in-memory, the journal is never replayed (`store.py:325-332`). A
    daemon restart drops every undelivered row silently. Neither model addresses this.
 7. **`duplicate_sidecar_detected` has no consumer** (`store.py:203-235`, `:466-468`) - item 3.
+8. **Duplicate agent action is already reachable today** (§6.1): a row emitted but not yet confirmed is
+   requeued when a new instance registers (`store.py:424-428`), so two sessions can be woken by the same
+   message. This is inherent to emitting before confirming and is not fixed by keeping. If strict
+   at-most-once action is required, it needs its own item - and receiver-side dedupe (§4.2) does not solve it,
+   since the two sessions are different processes.
 
 ---
 
@@ -387,10 +414,16 @@ load-bearing step indefinitely is a decision not to act, written as a decision t
 
 ### 10.3 On the reliability of this document
 
-Across five review rounds, adversarial review produced nine findings (one P1, eight P2). **Every one was an
+Across six review rounds, adversarial review produced ten findings (two P1, eight P2). **Every one was an
 overclaim in favour of whatever conclusion the note was arguing at the time.** When the conclusion reversed at
 step 3, the direction of the bias reversed with it - six findings had favoured keeping, the next three
-favoured broadcast. None ran against the then-current position.
+favoured broadcast, and the tenth favoured keeping again once the decision returned there. None ran against
+the then-current position, in six consecutive rounds spanning two reversals.
+
+The tenth is the sharpest instance, because it struck the ruling's own stated basis: §6.1 originally claimed
+exclusive claim caps acting actors at one. It does not - delivery is at-least-once and there is a real
+duplicate-action window (§6.1, §7.8). The decision survived on a corrected and weaker basis, but the ground it
+was selected on had to be restated after selection.
 
 Two things follow, and a reader should weigh both:
 
