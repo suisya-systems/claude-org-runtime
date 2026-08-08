@@ -1,8 +1,7 @@
 # Channel delivery model: owner-scoped exclusive claim vs broadcast + dedupe
 
-**Status:** Decided (re-derived once - see §10.2).
-**Decision:** Adopt broadcast **per owner, in stages**, starting with the operator-facing channel. Keep
-exclusive claim as the default mode for all other owners until the at-most-once question in §6.5 is settled.
+**Status:** Decided, after two reversals (§10.2).
+**Decision:** Keep the owner-scoped exclusive claim. Harden it with identity work (§8). Do not adopt broadcast.
 **Refs:** #162 (this decision), #125 (generation/instance fencing), #129 (observer lease, bg-hosted marker).
 **Scope:** This note contains a decision only. No behavior change ships with it.
 
@@ -10,43 +9,25 @@ exclusive claim as the default mode for all other owners until the at-most-once 
 
 ## 1. Decision
 
-Introduce `BROADCAST` as a third per-owner delivery mode alongside the existing `PUSH` and `PULL`, and adopt
-it per owner in stages, beginning with the operator-facing owner (the secretary).
+Keep exclusive claim as the delivery model. Close the failure class in §3 with **identity** work rather than by
+changing how rows are handed out.
 
-**Two prerequisites gate the first flip**, and neither is satisfied today:
+The basis is narrow and deliberate: **exclusive claim caps the number of acting control-plane actors at one,
+and that cap is presupposed by this organisation's stated invariants** - one worker to one task to one scope,
+the multi-step `pending_decisions` register update, name uniqueness at spawn. Broadcast removes the cap by
+construction: every registered instance is entitled to act. Removing it is an *organisational* design change,
+not a broker design change, and a note about the broker's delivery path is the wrong place to make it.
 
-- A human ruling on whether duplicated *agent action* is tolerable (§6.5). Every owner on this queue is an
-  agent that acts on injection, so no owner is exempt, and cross-session duplication is not fixable by
-  receiver-side dedupe.
-- Confirmation that `BROADCAST` can be added as a parallel mode without changing behaviour for owners still
-  in `PUSH` (§6.7, §8 item 2).
+Note what this decision is **not** based on:
 
-Until both are met, every owner stays on exclusive claim. The decision recorded here is the *direction* and
-the mechanism; the scope and timing of any flip are deferred.
+- Not on broadcast introducing a novel hazard. §6.2 shows the comparison is genuinely mixed by branch.
+- Not on migration cost. Labour is discounted in both directions (§6.4).
+- Not on the claim that duplication is cheap because a human reads the channel. That premise was refuted
+  (§5) - every owner here is an agent that acts on injection.
 
-This is **not** the contention-triggered hybrid evaluated and rejected earlier (§10.1). That design flipped an
-owner between modes dynamically on a wall-clock contention window, and it fell to a timing argument. This one
-is **static per-owner policy**: an owner is in one mode until an operator flips it. There is no window, no
-oscillation, and no contested-mode row state.
-
-Three things make this the derived answer rather than a compromise:
-
-- The status quo is **silently broken by default** for every `spawn_claude` owner (§4.1). This is not a
-  hypothetical risk; it is current behavior, and it is invisible to the operator.
-- Broadcast closes a correctness defect that exclusive claim **cannot** close in-model (§6.4), and it fails
-  toward duplication rather than silence (§5).
-- The countervailing risk - duplicated agent action (§6.5) - is real and applies to **every** owner, but its
-  incremental harm is narrower than it first appears: under exclusive claim the fork's session already wakes
-  and acts on the message it stole, so broadcast adds the *legitimate* delivery rather than a second spurious
-  one. It still needs a ruling, which is why it gates the first flip.
-- The per-owner mode machinery needed to stage this **already exists** (§6.6), so the change can be made
-  reversibly, one owner at a time, without rewriting the delivery core.
-
-The central finding of the analysis stands regardless of mode: **the underlying problem is identity, not
-delivery model.** The persisted mcp-config carries both the full agent token and the delivery credential in
-replayable form, and the only non-replayable discriminator (the observer secret in process env) is applied to
-exactly one owner and only on the push path. The identity work in §8 is required under *either* model and is
-not superseded by this decision.
+"Keep" does **not** mean "keep as-is". The current implementation is silently broken by default for most
+owners (§4.1), and the identity holes reach past delivery into bind and session ownership (§4.5). The work in
+§8 is required, and it is the substance of this decision rather than an afterthought to it.
 
 ---
 
@@ -92,7 +73,7 @@ Where an observer lease *is* active, the replayed sidecar is instead rejected at
 
 ## 4. What we verified
 
-Everything in this section was read in the source, not inferred. Several premises did not survive.
+Read in the source, not inferred. Several premises did not survive.
 
 ### 4.1 "This works today" is false for the majority of owners
 
@@ -100,11 +81,10 @@ The observer lease is **opt-in and almost never on**. It is asserted only when a
 `observer: True` (`server.py:278-283`, `:318-319`), which in practice is only `org up`'s secretary.
 `spawn_claude` issues a delivery credential and attaches the channel sidecar but **never asserts a lease**.
 
-For every worker and dispatcher pane, therefore, `register_delivery_instance` falls through to
-**last-register-wins** (`store.py:419-422`). A fork does not merely have a chance of winning - its register
-*deterministically* fences the original, which then receives `stale_sidecar` on every poll and deliberately
-never re-registers, because re-registering would start a generation war (`channel_sidecar.py:279-286`). It
-polls forever and emits nothing.
+For every worker and dispatcher pane, `register_delivery_instance` therefore falls through to
+**last-register-wins** (`store.py:419-422`). A fork's register *deterministically* fences the original, which
+then receives `stale_sidecar` on every poll and deliberately never re-registers, because re-registering would
+start a generation war (`channel_sidecar.py:279-286`). It polls forever and emits nothing.
 
 Both fallbacks are disarmed in this state:
 
@@ -114,387 +94,254 @@ Both fallbacks are disarmed in this state:
   the claim window it fires a nudge for an inbox that reads empty; once the fork confirms, the row is
   `DELIVERED`, `pending` goes false, and the nudge stops entirely.
 
-This is the worst shape a fault can take: silence that survives the operator's own recovery attempt and leaves
-no symptom where a human looks. It is the **default** for `spawn_claude`-spawned owners, not a corner case.
+Silence that survives the operator's own recovery attempt, leaving no symptom where a human looks. It is the
+**default** for `spawn_claude`-spawned owners.
 
 ### 4.2 Broker has no receiver-side dedupe
 
 The sidecar keeps no seen-set. `msg_id` is written exactly once - into the notification meta
-(`channel_sidecar.py:148`) - and is never read anywhere in `src/`. Every other occurrence in the repository is
-a docstring or a log string. Dedupe is a *delegated promise to the host*, not an implemented mechanism, and
-nothing in this repository can verify the host honours it.
+(`channel_sidecar.py:148`) - and never read anywhere in `src/`. Every other occurrence is a docstring or a log
+string. Dedupe is a delegated promise to the host, and nothing here can verify the host honours it.
 
 ### 4.3 "Broadcast + dedupe" is two answers to two different problems
 
-The shorthand name suggests one mechanism with two halves. It is not.
-
 - `msg_id` dedupe addresses **redelivery to the same session** (lease expiry, epoch flip).
-- The duplication broadcast introduces is delivery to a **different session** (the fork), which receiver-side
-  dedupe would not suppress - **and must not**, since that second copy reaching the still-live session is the
-  entire point of the proposal.
+- The duplication broadcast introduces is delivery to a **different session**, which receiver-side dedupe
+  would not suppress - and must not, since that second copy is the entire point.
 
-Adopting broadcast therefore means building the fan-out *and*, separately, the dedupe that does not exist.
+Dedupe is per-process, so it cannot coordinate two sessions. Cross-session duplicate *action* is not
+addressable by dedupe at all.
 
-### 4.4 The PULL path is completely unfenced
+### 4.4 The PULL path is unfenced
 
-All three mechanisms guard only the push path. `drain()` takes only an `AgentBind` - no generation, no
-instance id, no observer check (`store.py:343-361`) - and a fork replays the **full agent token** too, since
-`mcp_config_for` embeds it in static headers (`tokens.py:192-205`).
+`drain()` takes only an `AgentBind` - no generation, no instance id, no observer check (`store.py:343-361`) -
+and a fork replays the **full agent token**, since `mcp_config_for` embeds it in static headers
+(`tokens.py:192-205`). A forked session's `check_messages` destructively consumes the operator's rows with
+zero fencing. This is the #162 failure with no sidecar involved, and it is independent of delivery model.
 
-A forked session's `check_messages` therefore destructively consumes the operator's rows with zero fencing,
-and they are never redelivered. **This is the #162 failure with no sidecar involved at all**, and it is
-independent of which delivery model is chosen (§6.2).
+### 4.5 The identity holes reach past delivery into bind and session ownership
 
-### 4.5 renga's shape does not port
+Bind identity is keyed on **token**, not session, and a fork replays the token. Two consequences, both
+verified, neither touched by any delivery model:
 
-renga does not have this failure class because its delivery is a broadcast, but the mechanism is not
-transferable:
+- **Session steal.** `initialize` mints a fresh `session_id` and writes it onto the *shared* bind, setting
+  `registered = True` (`server.py:1802-1806`). When a fork initializes, it overwrites the original's session.
+  The original's next `tools/call` fails `[session_invalid]` (`server.py:1789`) - the original is evicted from
+  its own bind by a sibling.
+- **DELETE collateral.** A fork's clean shutdown sets `bind.session_id = None` and `bind.registered = False`
+  (`server.py:1560`, `:1563`). `enqueue` only resolves to `registered` binds (`store.py:311-317`), so
+  `send_message` addressed to a **still-live** original returns `[peer_not_found]`. A sibling's orderly exit
+  silently un-addresses a running agent.
 
-- The bus is **in-process**. `EventBus::emit` clones the event into a per-subscriber bounded `sync_channel`
-  (`CHANNEL_CAPACITY = 256`, `src/ipc/events.rs:34`, `:89-122`). Subscribers are IPC connections inside a
-  single long-lived server process. Broker's sidecars are separate processes polling over HTTP, with per-row
-  state persisted in the daemon.
-- It is explicitly **best-effort**. A slow subscriber has its events **dropped** and is told so via a
-  synthetic `EventsDropped` meta-event (`events.rs:113-120`). The module documents itself as "not a reliable
-  replication source".
-- There is **no persistence and no ack**. If no subscriber is live at emit time, the message evaporates. There
-  is no analogue of `/confirm-delivered` anywhere in renga.
-- There is **no message id in the wire type at all** (`src/ipc/mod.rs:941-956`). Receiver-side msg-id dedupe
-  is not merely absent in renga - it is impossible. The receiver relies solely on the pane filter
-  (`src/mcp_peer/mod.rs:3136-3143`), and renga's addressing key (`RENGA_PANE_ID`) is read from process env,
-  making it structurally non-replayable in exactly the way broker's delivery credential is not.
+These support the central thesis more strongly than the delivery analysis does: **the problem is identity, and
+no choice of delivery model reaches it.**
 
-renga is not a more reliable design to copy. It is a *less* reliable one that fails in a different direction.
-What is worth taking from it is the failure direction, not the machinery.
+### 4.6 renga's shape does not port
 
-One correction to that contrast, which an earlier draft of this note got wrong: broker's advantage over renga
-is **per-row delivery state, not durability**. `_rows` is in-memory and `store.py:325-332` states explicitly
-that the journal is never replayed and there is no crash recovery. A daemon restart discards every
-unacknowledged row, and would discard per-instance fan-out state with it. Broadcast has to be designed on that
-basis; it does not inherit durability broker does not have (§7.7).
+- The bus is **in-process**: `EventBus::emit` clones into a per-subscriber bounded `sync_channel`
+  (`CHANNEL_CAPACITY = 256`, `src/ipc/events.rs:34`, `:89-122`). Broker's sidecars are separate processes
+  polling over HTTP.
+- It is explicitly **best-effort**: a slow subscriber has events **dropped**, signalled by a synthetic
+  `EventsDropped` (`events.rs:113-120`). The module documents itself as "not a reliable replication source".
+- **No persistence, no ack.** If no subscriber is live at emit time the message evaporates; there is no
+  analogue of `/confirm-delivered`.
+- **No message id in the wire type** (`src/ipc/mod.rs:941-956`), so receiver-side dedupe is impossible there.
+  The receiver relies solely on the pane filter (`src/mcp_peer/mod.rs:3136-3143`), keyed on `RENGA_PANE_ID`
+  from process env - structurally non-replayable in the way broker's credential is not.
 
----
-
-## 5. Failure direction
-
-This is the core of the judgement:
-
-- Exclusive claim fails toward **silence**. Silence is invisible, unbounded, and indistinguishable from "no
-  one sent anything".
-- Broadcast fails toward **duplication**. Duplication is visible, self-limiting, and self-reporting: the
-  duplicate arrives in the channel the operator already reads, requiring no dashboard, no alert plumbing, and
-  no consumer.
-
-For an operator-facing report channel, duplication is the safer direction, and the scarce resource this
-protects is **human attention**. A duplicate costs a human one second of confusion. A silence costs an
-unbounded amount of time, because nothing signals that anything is owed.
-
-This argument carries substantial weight in the derivation below. What limits it is not cost (§6.3) but
-traffic semantics (§6.5): duplication is only cheap where the recipient is a human reading reports.
+Note also, correcting an earlier draft: broker's advantage over renga is **per-row delivery state, not
+durability**. `_rows` is in-memory and the journal is never replayed (`store.py:325-332`). A daemon restart
+discards every undelivered row (§7.6).
 
 ---
 
-## 6. Deriving the decision
+## 5. Failure direction, and the premise that failed
 
-### 6.1 Withdrawn: "broadcast regresses the one protected owner"
+The original framing: exclusive claim fails toward **silence** (invisible, unbounded), broadcast fails toward
+**duplication** (visible, self-limiting), and for an operator-facing report channel duplication is safer.
 
-This argument was made and weighted heavily in the first draft. It did not survive review; it is recorded here
-so that it is not raised again.
+**The second half of that premise is false here.** This channel is not a display surface. Its purpose is
+*in-band injection that wakes an idle session* (`channel_sidecar.py` module docstring), and every owner on
+this queue is a Claude agent that acts on what it receives - the secretary decomposes and delegates
+(`prompts/templates/secretary.md`), the dispatcher receives `DELEGATE` and spawns worker panes
+(`prompts/templates/dispatcher.md:17,23`). There is no owner whose traffic is merely read.
 
-**The protection is narrower than claimed.** The observer lease rejects a fork's *sidecar*, which sets
-`_stood_down` and never enters the claim loop (`store.py:412-418`, `channel_sidecar.py:191-198`, `:254-258`).
-It does nothing about a fork's *pull*. Per §4.4, a forked session's `check_messages` still consumes the
-secretary's rows. The secretary is correct only against the push path.
+So "duplication" here means **duplicate agent action**, not a duplicate line of text. The failure-direction
+argument does not transfer from report channels to control planes, and it is not a carrying reason in this
+decision.
 
-**The harm attributed to broadcast was a drafting defect, not a property of the model.** With per-row
-per-instance state, a fork's ack completes only that fork's delivery and the watched session still receives
-its copy. Retiring a row on any single ack is a defect of one draft (§6.3), and charging broadcast for it
-compares against a known-broken variant.
+What remains true and is retained: silence is the worse *diagnostic* failure, because nothing signals that
+anything is owed. That is why §8 exists and why observability (§8 item 3) is part of it.
 
-**The fallback confidentiality form also fails.** The secretary's mcp-config is persisted to
-`<state-dir>/secretary-mcp.json` at mode 0600 (`launcher.py:195-217`, `:558`) with the delivery credential in
-it literally - but that same file carries the **full agent token** (`server.py:296`, `tokens.py:192-205`),
-which already grants destructive read of the entire queue via `check_messages`. Broadcast would add a route to
-data the file holder can already read, not a new capability.
+---
 
-Net: **broadcast costs the protected owner nothing that keeping does not already cost it.**
+## 6. Why exclusive claim
 
-### 6.2 Withdrawn: "switching does not close #162"
+### 6.1 The actor cap is load-bearing for the organisation, not just for delivery
 
-Also made in an earlier draft, also withdrawn.
+Exclusive claim's real property is not "exactly-once delivery". It is that **at most one actor acts on a
+given message**, regardless of how many sessions hold a replayable credential. That cap is what the
+organisation's stated invariants assume: one worker to one task to one scope; the multi-step
+`pending_decisions` register update; name uniqueness enforced at spawn.
 
-The observation behind it is true - §4.4, the pull path is unfenced - but it does **not** distinguish the two
-models, because the defect is **common to both**. Exclusive claim leaves the pull path exactly as it is (§8
-item 7 defers it to a separate issue), so the argument charged broadcast for a hole that keeping also declines
-to close.
+Broadcast removes the cap definitionally - entitlement to a copy is entitlement to act. Whether the
+organisation can tolerate N actors is a question about the organisation's design, and it is not answerable
+from inside the broker. **That is the whole basis for this decision**, and it is why the decision is
+conservative rather than confident: it declines to make an organisational change through a delivery-path note.
 
-The asymmetry, if anything, runs the other way: a full broadcast migration must confront pull reconciliation,
-and one that does so need not retain today's destructive global `drain()` semantics.
+### 6.2 The branch analysis, corrected
 
-The pull path belongs to the identity work in §8, not to the case for either model.
+An earlier draft of this note argued broadcast adds no spurious actor, on this table:
 
-### 6.3 What remains once migration labour is discounted
-
-The surviving argument for keeping was migration cost. That argument mixes two different things, and they
-deserve different weights:
-
-- **(a) The labour of migrating** - rewriting roughly 44 of 77 delivery tests, redesigning a specification
-  that was wrong on first drafting. This is **discounted**. The work is performed by an agent; engineering
-  hours are not the scarce resource here, and a decision that preserves a known-broken default in order to
-  avoid keystrokes is not defensible.
-- **(b) The risk of changing semantics in a path that has already produced silent-failure incidents.** This is
-  **not** discounted - but the reason is not effort. It is that the scarce resource is the **human attention
-  needed to notice silence**, and this path has already demonstrated that it can fail without any signal
-  reaching a human.
-
-Restated as "what can break" rather than "what is hard", (b) is the observation that **a broadcast migration's
-own failure modes are themselves silence-shaped** in at least three places:
-
-1. **Retirement.** If a row is retired on any single ack, a fork's ack retires it before the watched
-   session's instance is offered a copy - silence. *Design rule: never retire on a single ack. Retire only
-   when every live instance has acked, or do not delete at all and track per-instance cursors.*
-2. **Liveness/membership.** Broadcast needs a live-instance set. Judging a live-but-slow instance dead removes
-   it from the fan-out and it stops receiving copies - silence. Today's analogue (lease reap) fails toward
-   *redelivery* instead, because the row returns to `UNDELIVERED`. *Design rule: on ambiguity, offer anyway;
-   never drop an instance from the fan-out to resolve uncertainty.*
-3. **Push/pull reconciliation.** `drain()`'s single-drainer property rests explicitly on row-level claim
-   ownership rather than on mode (`store.py:348-349`). Removing exclusivity means rebuilding that invariant;
-   a pull predicate that errs toward *hiding* a row produces silence. *Design rule: scope pull suppression to
-   the calling session only, never to another instance's ack.*
-
-This is a real risk and it is the one thing that genuinely argues for caution. Two facts bound it:
-
-- Each of the three has a known design rule that keeps the failure on the duplication side. They are not
-  unknown unknowns; they are the specific defects adversarial review already surfaced in the draft spec.
-- It must be weighed against a silence path that is **already firing by default** (§4.1). The comparison is
-  not "risk of silence vs. no silence" - it is "a known, currently-firing silence path" vs. "new silence paths
-  that are preventable by rule and containable by staging (§6.6)".
-
-### 6.4 The residual that only broadcast closes
-
-Exclusive claim's §4.1 defect can be mitigated in-model: a **live-incumbent guard** in the ten-line
-last-register-wins branch (`store.py:419-422`), reusing `_delivery_poll_seen`, refusing a generation bump
-while the current instance is demonstrably still polling (constraints in §8.1).
-
-But that guard converts "last register wins" into "incumbent wins", and neither rule is right without proof of
-which session a human is watching. The residual: **an incumbent that is alive and polling but abandoned - a
-background pane nobody reads - keeps confirming messages into an unwatched session and indefinitely blocks
-the resumed session the operator is actually looking at.** Not 30 seconds; unbounded.
-
-This residual is **not closable inside the exclusive-claim model** without extending the observer lease to
-every pane. Broadcast closes it outright: both instances simply receive a copy, and the watched one shows it.
-
-Under the earlier weighting this point was acknowledged and then outweighed by migration cost. With (a)
-discounted, it stands as a **correctness** argument for broadcast, and it is unrebutted.
-
-### 6.5 Duplicate delivery means duplicate agent action - for every owner
-
-An earlier draft of this section claimed duplication is cheap for the operator-facing owner because "a human
-reads it", and located the risk in worker owners. **Both halves were wrong**, and the correction matters
-enough to change the rollout plan.
-
-**No owner is exempt.** This channel is not a display surface. Its entire purpose is *in-band injection that
-wakes an idle session* (`channel_sidecar.py` module docstring), and every owner on this queue is a Claude
-agent that acts on what it receives. The secretary decomposes and delegates (`prompts/templates/secretary.md`
-- "Task decomposition and delegation via `/org-delegate`"). So two live secretary sessions woken by the same
-message can each delegate. There is no owner whose traffic is merely read.
-
-**The risk sits with the dispatcher, not workers.** `prompts/templates/dispatcher.md:17,23`: the dispatcher
-receives `DELEGATE` messages from the secretary and spawns worker panes. A duplicated `DELEGATE` therefore
-makes two dispatcher sessions spawn duplicate panes and mutate dispatch state. Gating the rollout on "worker
-owners" would have protected the wrong class entirely.
-
-**Receiver-side dedupe cannot fix this.** Per §4.3, `msg_id` dedupe is per-process; the duplicate under
-broadcast lands in a *different* session, which cannot see what the first one received. Cross-session
-duplicate action is therefore not addressable by dedupe at all - only by idempotent actions, or by a shared
-coordination point, which is what exclusive claim is.
-
-**But the incremental harm is smaller than it looks.** Under exclusive claim, when a fork wins the register,
-the fork's sidecar emits into the fork session and *that agent wakes and acts* (§3). The spurious actor
-already acts today. Comparing the fork scenario:
-
-| | spurious action | legitimate action | operator sees |
+| fork scenario | spurious | legitimate | operator sees |
 |---|---|---|---|
 | exclusive claim | 1 (fork) | 0 | nothing |
 | broadcast | 1 (fork) | 1 | the message |
 
-Broadcast does not add a spurious actor. It adds the *legitimate* delivery on top of a spurious action that
-already occurs. The real cost is two executions where today there is one - but today's one is the wrong one,
-performed invisibly.
+**That was arithmetic over a single branch**, and the branch chosen was the one most favourable to broadcast:
+an *accidental* fork, live, singular. Enumerated properly:
 
-That is genuinely arguable in both directions and depends on the action. Two spawned panes are messy but
-visible; one ghost pane spawned by an invisible session is worse to diagnose and never reconciled. This note
-does not resolve it.
+| branch | exclusive claim | broadcast |
+|---|---|---|
+| accidental fork, original live | 1 spurious, 0 legitimate | 1 spurious, 1 legitimate |
+| **intentional resume, old pane abandoned** | **0 spurious, 1 legitimate** | **1 spurious, 1 legitimate** |
+| N replayed instances | actors capped at 1 | spurious = N |
 
-**Status: deferred.** Whether duplicated agent action is tolerable is a question about the org's agent design,
-not about the broker, and it needs a human ruling. It is raised here as an open point and **gates every
-rollout step, including the first** (§8 item 1). Until it is ruled, no owner is flipped.
+The middle row is the common shape in this organisation - a human opens a new pane, resumes, and leaves the
+old one running. There, last-register-wins happens to select the *new* session, so exclusive claim is simply
+correct, and broadcast **adds** a spurious actor by waking the abandoned pane. The bottom row is the general
+case: exclusive claim caps actors at one; broadcast scales spurious actors with the number of replays.
 
-### 6.6 Staged adoption is available on machinery that already exists
+The original table also rested on an assumption this note had already abandoned elsewhere: that we can tell
+which session the human is watching. If we could, the whole problem would be solved.
 
-The decisive practical finding. Delivery mode is **already per-owner and already atomically flippable**:
+### 6.3 Arguments that did not survive review
 
-- `_delivery_modes: dict[str, str]` maps `agent_id -> PUSH/PULL`, defaulting to `PUSH` (`server.py:105`).
-- `flip_mode(owner, mode)` bumps the mode-epoch and atomically requeues that owner's in-flight `CLAIMED` rows,
-  with stale-epoch confirms rejected afterwards (`store.py:599-626`).
-- It is exposed as an admin RPC at runtime (`server.py:1607-1618`).
-- Reverting an owner to defaults is a designed operation (`reset_delivery_state`, `store.py:650`).
+Recorded so they are not raised again.
 
-So `BROADCAST` can be added as a **third value of an existing per-owner enum**, not as a replacement of the
-delivery core. The claim path stays intact and stays the default; broadcast is a parallel mode selected per
-owner, and rollback is an existing atomic call.
+**"Broadcast regresses the one protected owner."** Withdrawn. The observer lease protects only the push path
+(§4.4 shows pull is open), the harm attributed to broadcast came from a drafting defect rather than the model,
+and the confidentiality form fails because `secretary-mcp.json` already carries the **full agent token**
+(`server.py:296`, `tokens.py:192-205`), which grants destructive queue read via `check_messages`. Broadcast
+would add a route to data the file holder can already read.
 
-That reduces (b) from "change the semantics of the delivery path for everyone at once" to "enable a new mode
-for one owner, watch it, and flip it back with a call that already exists". Blast radius equals the set of
-owners flipped.
+**"Switching does not close #162."** Withdrawn. True but not distinguishing: the unfenced pull path is common
+to both models, and keeping defers it too (§8 item 4). The asymmetry runs the other way, since a broadcast
+migration would be forced to confront pull reconciliation.
 
-**A correction to the framing this was raised under:** `ORG_TRANSPORT` is *not* the right lever. It selects
-broker vs renga at the transport layer (`transport/descriptor.py:52-56`); dogfooding broadcast under it would
-mean running renga, a different system. `flip_mode` is the correct mechanism and is strictly better suited -
-finer granularity, runtime-flippable, already epoch-fenced.
+**"Duplication is cheap because a human reads the channel."** Refuted in §5.
 
-**First target: the secretary** - but for narrower reasons than an earlier draft claimed. It is **not** exempt
-from §6.5; a duplicated report can make two secretary sessions each delegate. What makes it the right first
-target is observability and reversibility: a human is present continuously, so both failure directions are
-seen by the one detector that matters, and a spurious delegation is visible and can be undone. Note the
-trade-off honestly - it is also the owner where broadcast's *benefit* is smallest, since it is the one owner
-that holds an observer lease today and so is already protected on the push path (§4.1).
+### 6.4 Cost is not a reason, in either direction
 
-The alternative first target, the dispatcher, is where the §4.1 defect actually fires but also where duplicate
-action is most damaging (duplicate pane spawns, §6.5). It should not go first.
+Migration labour is discounted: the work is performed by an agent, and preserving a broken default to avoid
+keystrokes is not defensible.
 
-### 6.7 What the decision rests on
+**This cuts both ways.** Discounting broadcast's ~44-of-77 test rewrite equally discounts the labour of
+extending the observer lease to every spawned pane (§8 item 1). Neither side gets a cost argument, and the
+decision rests entirely on which failure model is right.
 
-Reasons **withdrawn** under review: §6.1, §6.2. Reason **discounted** by reweighting: §6.3(a).
+What is *not* discounted is the risk of changing semantics in a path whose failures are silent, since the
+scarce resource is the human attention needed to notice silence. But that is a reason for care in
+implementation, not a reason to prefer one model.
 
-What carries the decision:
+### 6.5 What this decision does not buy
 
-1. The status quo fails silently by default for most owners (§4.1) - verified, current, invisible.
-2. Broadcast closes a residual that exclusive claim cannot close in-model (§6.4) - a correctness argument,
-   unrebutted.
-3. Failure direction favours broadcast where a human is the recipient (§5).
-4. The countervailing argument (§6.5) applies to every owner, but the spurious actor already acts under
-   exclusive claim, so broadcast's increment is the legitimate delivery rather than a second wrong one.
-5. The residual risk in §6.3(b) is preventable by three known design rules and containable by staging on
-   machinery that already exists (§6.6).
+Stated plainly, because a decision recorded without its weaknesses is not usable.
 
-Points 1-3 argue for broadcast. Point 4 is the genuine cost, and it is unresolved - it sets the direction as
-gated rather than immediate. Point 5 says the change can be made reversibly, one owner at a time. The
-conjunction is the staged, prerequisite-gated decision in §1.
-
-**This is the weakest of the three derivations this note has produced, and it should be read as such.** The
-first (keep, on three grounds) lost two grounds to review. The second (staged broadcast, on the premise that
-duplication is cheap for a human-facing owner) lost that premise to review - the channel wakes agents, it does
-not display to humans. What survives is narrower: broadcast is directionally right *because the spurious
-action already happens and broadcast at least adds the correct one*, and the mechanism to try it reversibly
-exists. If the §6.5 ruling says duplicated agent action is not tolerable, this derivation fails at point 4 and
-the answer is exclusive claim plus the identity work in §8 - not a patched broadcast.
-
-**What would make this wrong:** if adding a third mode turns out to entangle rather than parallel the claim
-path - i.e. if `BROADCAST` cannot be added without changing `poll_claims`/`confirm_delivered` behaviour for
-owners still in `PUSH` - then §6.6's containment argument fails and the risk in §6.3(b) returns at full
-weight. **Validate that first**, before any owner is flipped (§8 item 2).
+1. **It depends on an unverifiable external assumption.** The observer fence works because mcp-config is
+   replayed on fork/resume and process env is not. We neither control nor test that behaviour. If it changes,
+   the fence **dissolves silently** - a design chosen to defeat silence would fail in exactly that shape. The
+   mitigating point: the current observer lease already depends on this, so §8 adds no new exposure, only
+   more reliance on an existing bet.
+2. **The pull door narrows but does not close.** The full token is in the persisted config *by design*: HTTP
+   MCP can only carry static headers (`tokens.py:192-205`), so there is no `${VAR}` indirection available.
+   Item 4 can reduce the window; it cannot reach zero without changing how the token is transported.
+3. **Adoption is discipline-dependent.** A legitimate session started by hand (`claude --resume`) carries no
+   observer secret, so it registers `unobserved`, sets `_stood_down`, and - because that latch has no
+   `clear()` (`channel_sidecar.py:86`) - **never receives push for the life of the process**. Extending the
+   lease without item 2 converts today's silent theft into a legitimate session that is silently mute.
 
 ---
 
-## 7. What this does not fix
+## 7. What keeping does not fix
 
-1. **The identity problem is untouched by the mode choice.** mcp-config is replayable and carries both
-   credentials; process env is not. That asymmetry is an assumption about Claude Code's fork/resume behaviour
-   which we neither control nor test against.
-2. **The pull path stays unfenced** until §8 item 7 lands, under either mode (§6.2).
-3. **Receiver-side dedupe still does not exist** (§4.2). Broadcast makes it matter more, since same-session
-   redelivery becomes more likely, not less.
-4. **`_stood_down` is a latch with no `clear()`** (`channel_sidecar.py:86`).
+1. **Identity, not delivery, is the root** (§4.5). Session steal and DELETE collateral remain until item 4.
+2. **The pull path stays unfenced** until item 4 (§4.4).
+3. **Receiver-side dedupe still does not exist** (§4.2).
+4. **`_stood_down` is an unrecoverable latch** (`channel_sidecar.py:86`) - item 5.
 5. **`poll_claims` renews and activates an armed lease for whatever instance is current-generation**
    (`store.py:485-487`) without checking it ever presented the secret.
-6. **`duplicate_sidecar_detected` has no consumer** (`store.py:203-235`, `:466-468`). Detection without a
-   consumer is not observability - though note that broadcast makes this less load-bearing, since the
-   duplicate delivery itself becomes the operator-visible signal.
-7. **There is no durability at all.** `_rows` is in-memory and the journal is never replayed
-   (`store.py:325-332`). A daemon restart drops every undelivered row silently, under either mode, and would
-   drop per-instance fan-out state too. Neither model addresses this, and broadcast does not inherit
-   durability broker does not have (§4.5).
+6. **There is no durability.** `_rows` is in-memory, the journal is never replayed (`store.py:325-332`). A
+   daemon restart drops every undelivered row silently. Neither model addresses this.
+7. **`duplicate_sidecar_detected` has no consumer** (`store.py:203-235`, `:466-468`) - item 3.
 
 ---
 
 ## 8. Work items (not in this PR)
 
-Ordered. Each filed separately.
+In the order ruled. Each filed separately.
 
-1. **Obtain a ruling on duplicated agent action** (§6.5). Every owner is an agent that acts on injection, and
-   cross-session duplication is not fixable by dedupe. This gates **every** flip, including the first, and it
-   is a question for the org's agent design rather than for the broker. If the ruling is "not tolerable", the
-   decision in §1 does not survive - see §6.7.
-2. **Validate the containment assumption** (§6.7): confirm `BROADCAST` can be added as a parallel per-owner
-   mode without altering behaviour for owners in `PUSH`. Gates every flip.
-3. **Live-incumbent guard on last-register-wins** (`store.py:419-422`, constraints in §8.1). Independent of
-   the above and worth landing first regardless: it improves every owner on exclusive claim, which under the
-   gating above is currently all of them.
-4. **Implement `BROADCAST` mode** with the three design rules from §6.3 as explicit invariants: never retire
-   on a single ack; on liveness ambiguity offer anyway; scope pull suppression to the calling session.
-5. **Implement receiver-side `msg_id` dedupe** (§4.2). Currently a promise. It does *not* address §6.5, but
-   broadcast makes same-session redelivery more likely and it becomes load-bearing.
-6. **Flip the secretary owner and observe.** Only after items 1, 2, 4, 5. Criteria in §9.
-7. **Track the pull / full-token identity door** (§4.4). Not a delivery-model question; required under either
-   model.
-8. **Rework `_stood_down` into a recoverable state** (§7.4). Note the trap: a naive periodic re-register
-   converts the observer lease from a permanent fence into a TTL-delayed fork takeover, which is worse. Do not
-   land this without item 3.
+1. **Extend the observer lease to the `spawn_claude` path.** This closes §4.1, the default-silence path for
+   every spawned pane, and is the single highest-value item. `_adapter_spawn` already carries an env-injection
+   route, so this repeats for spawned panes what `launcher.py` already does for the secretary. Land item 2
+   with or before it (see §6.5.3).
+2. **An explicit adopt / handover path.** Rotate the lease and hand the secret to a new session's env, so a
+   deliberate takeover is expressible. Without this, item 1 turns a hand-started legitimate session into a
+   permanently mute one.
+3. **Give `duplicate_sidecar_detected` a consumer.** Detection already exists; only the notification is
+   missing. This is the cheapest observability win and directly attacks the "silence is undiagnosable"
+   property.
+4. **Pull door and shared-bind identity** (§4.4, §4.5): session steal on `initialize`, DELETE collateral on a
+   sibling's exit, and destructive `drain()` under a replayed token. Hardest, and separate - this is the root
+   cause, not a delivery concern.
+5. **Make `_stood_down` recoverable** (§6.5.3). Note the trap: a naive periodic re-register converts the
+   observer lease from a permanent fence into a TTL-delayed fork takeover, which is worse than the latch.
 
-### 8.1 Design constraints on the live-incumbent guard
+A **live-incumbent guard** on the last-register-wins branch (`store.py:419-422`) was evaluated as an
+alternative to item 1. It is not in the ruled order because item 1 supersedes it where the lease is present,
+but it remains the fallback if lease extension proves unstable, and its design constraints are non-obvious
+enough to record - see §8.1.
 
-Three constraints, each derived from a specific code path:
+### 8.1 Design constraints on the live-incumbent guard (if it is ever built)
 
-**Scope it to the no-lease branch.** The last-register-wins branch (`store.py:419-422`) is reached both when
-there is no active lease *and* when there is an active lease and the caller presented the correct secret
-(`store.py:412-418` falls through on a match). A guard placed unconditionally there would also fence the
-*legitimate* secretary sidecar on restart. The observer secret is non-replayable proof; incumbency is
-circumstantial. **Proof beats incumbency:** apply the guard only when `lease is None`.
+**Scope it to the no-lease branch.** The last-register-wins branch is reached both when no lease is active
+*and* when a lease is active and the caller presented the correct secret (`store.py:412-418` falls through on
+a match). An unconditional guard would fence the *legitimate* secretary sidecar on restart. Proof beats
+incumbency: apply only when `lease is None`.
 
-**Use a new error code; never reuse `unobserved`.** The sidecar latches `_stood_down` on exactly two codes,
-`suppressed_bg_hosted` and `unobserved` (`channel_sidecar.py:191-198`), and that latch has no `clear()`.
-Rejecting with `unobserved` would mute a legitimate restart *permanently*. With a distinct non-latching code
-the push loop retries about once a second while `_current_generation()` is `None`
-(`channel_sidecar.py:266-276`) and recovers once the incumbent ages out.
+**Use a new error code; never reuse `unobserved`.** The sidecar latches `_stood_down` on exactly two codes
+(`channel_sidecar.py:191-198`), and the latch has no `clear()`. Rejecting with `unobserved` would mute a
+legitimate restart permanently. A distinct non-latching code lets the push loop retry about once a second
+while `_current_generation()` is `None` (`channel_sidecar.py:266-276`).
 
-**Key the guard on the current instance, not on "any recent poller".** `_note_poll_locked` runs *before* the
-fence, deliberately, so stale-generation polls still produce a duplicate signal (`store.py:466-468`), and a
-fenced fork keeps polling forever (`channel_sidecar.py:279-286`). A guard treating any recent poller as an
-incumbent would let a *rejected fork* block the original's legitimate re-registration. Test specifically
-whether `_delivery_instances[owner]` has polled recently.
+**Key on the current instance, not "any recent poller".** `_note_poll_locked` runs *before* the fence,
+deliberately, so stale-generation polls still register (`store.py:466-468`), and a fenced fork keeps polling
+forever (`channel_sidecar.py:279-286`). A guard treating any recent poller as incumbent would let a rejected
+fork block the original's legitimate re-registration.
 
 **Apply the staleness threshold inside the guard.** The governing window is `lease_seconds` (default 30s), not
 `observer_lease_seconds` (default 90s): `_delivery_poll_seen` is pruned with `window = self.lease_seconds`
 (`store.py:215-221`). But that pruning runs only inside `_note_poll_locked`, reached only from `poll_claims`
-(`store.py:468`) - **registration never prunes**. A guard testing for mere *presence* would block a
-replacement forever. Compare the recorded timestamp against `lease_seconds` explicitly.
+(`store.py:468`) - **registration never prunes**. A guard testing for mere presence would block a replacement
+forever.
 
 ---
 
-## 9. Conditions to extend, and to roll back
+## 9. Conditions to revisit
 
-**Extend broadcast to further owners when:**
+Reopen the delivery-model question if:
 
-1. The secretary owner has run in `BROADCAST` for a sustained period with no observed row loss, and observed
-   duplicates are attributable to real fork/resume events rather than to liveness misjudgement.
-2. No duplicated agent action with lasting effect has been observed there (§6.5) - specifically, no duplicate
-   delegation that a human had to unwind.
-3. The dispatcher is sequenced **last**, not first: it is where the §4.1 defect actually fires, but also where
-   duplicate action is most damaging (duplicate pane spawns and dispatch-state mutation, §6.5).
-
-**Roll back to exclusive claim (via `flip_mode`) if:**
-
-1. Any row is observed reaching *no* live instance - the §6.3(b) failure. This is the stop condition; silence
-   introduced by the new mode is strictly worse than the silence it replaces, because it would be novel and
-   unmonitored.
-2. Queue growth becomes unbounded because retirement never fires (the safe-side failure of design rule 1),
-   and per-instance cursors do not resolve it.
-3. The host is shown to coalesce or drop duplicate `notifications/claude/channel` frames, which would mean
-   the operator-visibility premise in §5 is false and broadcast's main advantage does not exist.
-
-**Reconsider the whole decision if** the fork/resume inheritance assumption breaks - Claude Code begins
-propagating process env across resume, or stops replaying mcp-config verbatim (§7.1).
+1. **The organisation's actor-count invariant changes.** If one-worker-one-task and the register's multi-step
+   update stop being assumed, §6.1's basis dissolves and broadcast becomes a live option. This is the
+   condition that actually governs - the others are secondary.
+2. **The fork/resume inheritance assumption breaks** (§6.5.1): Claude Code begins propagating process env
+   across resume, or stops replaying mcp-config verbatim. The observer fence would fail silently, and the
+   decision would rest on nothing.
+3. **Items 1-3 land and §4.1 still fires** in real `queue.jsonl` data. That would mean identity work cannot
+   close the failure class in-model, which is the premise this decision assumes.
+4. **A per-row delivery policy becomes necessary** - e.g. if some traffic is established as idempotent and
+   some not. That points at policy set at enqueue rather than a global model, which neither option here
+   evaluated.
 
 ---
 
@@ -502,53 +349,56 @@ propagating process env across resume, or stops replaying mcp-config verbatim (�
 
 ### 10.1 The independent evaluation
 
-Three independent judges scored the options on separate lenses. Two recommended **switch**; one recommended
-**keep** on migration-cost grounds. An adversarial reviewer assigned to refute each option marked **keep
-disqualified**, **hybrid disqualified**, and **switch viable-with-work**.
+Three judges scored the options on separate lenses: two recommended **switch**, one **keep** on migration-cost
+grounds. An adversarial reviewer marked **keep disqualified**, **hybrid disqualified**, **switch
+viable-with-work**.
 
-- *Operator-safety* (switch): today's failure is silence that survives the operator's own recovery attempt;
-  under broadcast the duplicate *is* the fault report, delivered where the operator already looks.
-- *Correctness-under-fork* (switch): keep is "silently wrong by default for most owners"; broadcast is the
-  only option that stops asking a question no replayable credential can answer.
-- *Implementation-cost* (keep): ~44 of 77 tests rewritten in an incident-prone path, with no testability gain.
+The majority is not followed. Its two switch votes rested on the failure-direction argument (refuted for a
+control plane in §5) and on keep being "silently wrong by default" (true, §4.1, and addressed by §8 rather
+than by changing models). The keep vote rested on migration cost, which is discounted (§6.4) - so this
+decision agrees with the minority's conclusion while rejecting its reasoning.
 
-The **hybrid rejected there** was contention-triggered: an owner degraded to fan-out when the daemon detected
-two live pollers within a 5-second window. It fell to a timing argument - the sidecar's own daemon POST
-timeout is exactly 5 seconds (`channel_sidecar.py:164`), so a single hung request can exceed the whole
-detection window - and to needing contested-mode per-row state. The decision in §1 is **static per-owner
-policy** and shares neither property.
+The **hybrid rejected there** was contention-triggered: degrade an owner to fan-out when the daemon sees two
+live pollers within a 5-second window. It fell to timing - the sidecar's own daemon POST timeout is exactly 5
+seconds (`channel_sidecar.py:164`) - and to needing contested-mode per-row state.
 
 ### 10.2 How this decision moved
 
-Recorded so a reader can follow why it reversed.
+Recorded so a reader can follow two reversals.
 
-1. **First derivation: keep**, on three grounds - broadcast regresses the protected owner (§6.1), switching
-   does not close #162 (§6.2), and migration cost (§6.3). Ratified on that basis.
-2. **§6.1 withdrawn** under adversarial review: the protection is push-only, the harm was a drafting defect,
-   and the confidentiality fallback fails because the same file already carries the full token.
-3. **§6.2 withdrawn** under adversarial review: the unfenced pull path is common to both models and cannot
-   distinguish them; the asymmetry runs the other way.
-4. **§6.3 split and (a) discounted** on reweighting: migration *labour* is not a scarce resource when the
-   work is performed by an agent. What remains is (b), the risk of introducing new silence into a path whose
-   failures humans cannot detect.
-5. **Re-derived: staged per-owner broadcast**, once (b) proved containable on existing per-owner mode
-   machinery (§6.6).
-6. **Corrected again under review**, this time against the new conclusion. Three claims favouring broadcast
-   were wrong: that the operator-facing owner is exempt from duplicate-action risk (it is an agent that
-   delegates, and the channel wakes it rather than displaying to a human); that `DELEGATE` traffic lands on
-   worker owners (it lands on the *dispatcher*, which spawns panes); and that broker offers a durable-row
-   substrate (`_rows` is in-memory with no journal replay). The direction survived; the rollout plan did not,
-   and §6.5 is now a gate on every flip rather than an owner-specific caveat.
+1. **First derivation: keep**, on three grounds - broadcast regresses the protected owner, switching does not
+   close #162, migration cost. Ratified on that basis.
+2. **Two grounds withdrawn** under adversarial review (§6.3), leaving only cost.
+3. **Reweighted**: migration *labour* discounted, since the work is performed by an agent. With the sole
+   surviving ground discounted, the decision was **re-derived as staged per-owner broadcast**.
+4. **That derivation's premise was refuted**: it assumed the operator-facing owner was exempt because "a human
+   reads it". The channel wakes agents; the secretary delegates; `DELEGATE` lands on the dispatcher, which
+   spawns panes. No owner is exempt (§5).
+5. **Second opinion identified the remaining error**: the fork comparison table was arithmetic over the single
+   branch most favourable to broadcast. Across branches, exclusive claim caps actors at one and broadcast
+   scales spurious actors with replays (§6.2).
+6. **Final: keep exclusive claim, harden identity** - on the narrow ground that the actor cap is an
+   organisational invariant and not the broker's to remove (§6.1).
 
-Two observations a future reader should weigh:
+The staged-rollout plan from step 3 fell with it, and deserves its own epitaph: it nominated as first target
+the owner where broadcast's benefit was *smallest* (the secretary, already lease-protected) and sequenced last
+the owner where the benefit was real (the dispatcher, where §4.1 actually fires). A plan that defers its only
+load-bearing step indefinitely is a decision not to act, written as a decision to act.
 
-**Every review finding ran in the same direction.** Across four rounds, adversarial review produced one P1 and
-five P2 findings. All six were corrections of arguments overstated *in favour of keeping* - the conclusion the
-note was arguing at the time. None was an error in the opposite direction. A systematic one-way bias in the
-supporting arguments is itself evidence about how much the original conclusion was being reasoned toward
-rather than derived, and it was treated as such here.
+### 10.3 On the reliability of this document
 
-**The reversal is not itself proof of correctness.** The same discipline applies in the new direction: §6.5 is
-a real limit on broadcast, and it is the reason this decision is staged and per-owner rather than a switch. If
-§8 item 2 shows the mode cannot be added in parallel, the derivation in §6.7 fails at point 5 and should be
-re-run - not patched.
+Across five review rounds, adversarial review produced nine findings (one P1, eight P2). **Every one was an
+overclaim in favour of whatever conclusion the note was arguing at the time.** When the conclusion reversed at
+step 3, the direction of the bias reversed with it - six findings had favoured keeping, the next three
+favoured broadcast. None ran against the then-current position.
+
+Two things follow, and a reader should weigh both:
+
+- The bias is not a preference for an answer; it is a pull toward the answer currently held. Immediately
+  before the round that produced the three pro-broadcast findings, an explicit four-point self-check against
+  exactly that inversion was written and reported. All three findings passed through it. Self-review cannot
+  detect a tilt in the frame it is conducted from.
+- **The conclusion is therefore better evidenced than the reasoning that reached it.** Keep survived both a
+  hostile derivation and a reversal, and the ground it finally rests on (§6.1) came from outside this note. A
+  reader should trust §4 (verified facts) most, §6.1 next, and treat the rest as reasoning that has repeatedly
+  needed correction.
