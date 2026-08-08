@@ -236,10 +236,14 @@ def _tail_lines_back_to(
     top of the file — i.e. the caller cannot assume the window is fully
     covered.
     """
+    # Chunks are collected newest-first and joined once at the end: each
+    # iteration must inspect only the bytes it just read, or the walk
+    # would re-decode the whole accumulated tail per chunk (quadratic —
+    # and ``watch`` pays it on every poll).
+    parts: list[bytes] = []
     with path.open("rb") as f:
         size = f.seek(0, os.SEEK_END)
         pos = size
-        buf = b""
         capped = False
         while pos > 0:
             if size - pos >= max_scan_bytes:
@@ -247,10 +251,13 @@ def _tail_lines_back_to(
                 break
             start = max(0, pos - chunk_bytes)
             f.seek(start)
-            buf = f.read(pos - start) + buf
+            parts.append(f.read(pos - start))
             pos = start
-            if _spans_cutoff(buf, cutoff, at_file_start=pos == 0):
+            if _chunk_reaches_cutoff(
+                parts[-1], cutoff, at_file_start=pos == 0,
+            ):
                 break
+    buf = b"".join(reversed(parts))
     # ``errors="replace"`` keeps a chunk boundary landing mid-codepoint
     # (or any single corrupt byte) from discarding the whole read; the
     # damaged first line is dropped whenever we did not reach byte 0.
@@ -260,20 +267,27 @@ def _tail_lines_back_to(
     return lines, capped
 
 
-def _spans_cutoff(buf: bytes, cutoff: float, *, at_file_start: bool) -> bool:
-    """True when the oldest complete line in ``buf`` predates ``cutoff``.
+def _chunk_reaches_cutoff(
+    chunk: bytes, cutoff: float, *, at_file_start: bool,
+) -> bool:
+    """True when the oldest complete line in ``chunk`` predates ``cutoff``.
 
     The journal is a single daemon appending in time order, so the first
-    complete line is the oldest one held; once it is older than the
-    cutoff, everything inside the window is already in ``buf``. Lines
-    without a usable ``ts`` (corrupt, or a schema the daemon has not
-    written since) simply do not end the walk.
+    complete line of the oldest chunk read so far is the oldest line
+    held; once it predates the cutoff, everything inside the window has
+    already been read. Lines without a usable ``ts`` (corrupt, or a
+    schema the daemon has not written since) simply do not end the walk,
+    which is what ``max_scan_bytes`` ultimately bounds.
     """
-    lines = buf.decode("utf-8", "replace").splitlines()
+    lines = chunk.split(b"\n")
     if not at_file_start and lines:
+        # The leading fragment continues into the bytes before this
+        # chunk; the trailing one continues into the chunk already read.
+        # Both are skipped by :func:`_journal_record` as unparseable, so
+        # only the ordering of the scan matters here.
         lines = lines[1:]
-    for line in lines:
-        rec = _journal_record(line)
+    for raw in lines:
+        rec = _journal_record(raw.decode("utf-8", "replace"))
         if rec is None:
             continue
         ts = _journal_ts(rec)

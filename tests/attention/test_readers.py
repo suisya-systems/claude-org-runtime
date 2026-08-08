@@ -250,6 +250,41 @@ def test_read_broker_duplicates_stops_walking_past_the_window(
     assert capsys.readouterr().err == ""
 
 
+def test_read_broker_duplicates_walk_inspects_each_chunk_once(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The backward walk must stay linear in the bytes it reads.
+
+    Re-inspecting the whole accumulated tail on every chunk would make
+    the walk quadratic, and ``attention watch`` pays it on every poll.
+    Pin the shape: each cutoff check sees only the chunk just read.
+    """
+    from claude_org_runtime.attention import readers as readers_mod
+
+    records: list[dict] = [
+        {"ts": 900.0 + i * 0.001, "event": "claimed", "owner": "sec"}
+        for i in range(400)
+    ]
+    records.append(_dup(995.0))
+    _write_journal(tmp_path / "broker", records)
+
+    seen: list[int] = []
+    real = readers_mod._chunk_reaches_cutoff
+
+    def _spy(chunk, cutoff, *, at_file_start):
+        seen.append(len(chunk))
+        return real(chunk, cutoff, at_file_start=at_file_start)
+
+    monkeypatch.setattr(readers_mod, "_chunk_reaches_cutoff", _spy)
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+        chunk_bytes=256,
+    )
+    assert [r["ts"] for r in out] == [995.0]
+    assert len(seen) > 1              # the walk really did span chunks
+    assert max(seen) <= 256           # never re-reads the accumulated tail
+
+
 def test_read_broker_duplicates_reports_a_capped_scan(
     tmp_path: Path, capsys,
 ) -> None:
