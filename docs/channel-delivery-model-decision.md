@@ -24,8 +24,8 @@ in separate issues rather than bundled here.
 The central finding is that **this was never a delivery-model problem. It is an identity problem.** The
 persisted mcp-config carries both the full agent token and the delivery credential in replayable form, and the
 only non-replayable discriminator in the system (the observer secret in process env) is applied to exactly one
-owner and only on the push path. Neither delivery model fixes that; broadcast merely relocates the failure
-from the push path to the pull path.
+owner and only on the push path. Neither delivery model fixes that on its own, and the identity work in §8 is
+required either way.
 
 Required follow-up work is listed in §8. It is deliberately not bundled here.
 
@@ -163,12 +163,10 @@ This is the core of the judgement, and it is genuinely in favour of broadcast:
 For an operator-facing report channel, duplication is the safer direction. We accept this argument. It is the
 strongest case for switching, and it is why the decision below is a genuine trade rather than a dismissal.
 
-The reason it does not carry the decision is §6.2: the failure direction argument is about the *push* path,
-but the same silent loss is reachable through the *pull* path, which broadcast leaves untouched. Buying a
-better failure direction on one of two paths, at the cost of a delivery-core rewrite, does not eliminate the
-failure class - it narrows it. §6.3 adds migration cost on top, but §6.2 is what makes the trade
-unattractive. Note that §6.1 does **not** contribute: the argument that broadcast harms the protected owner
-was examined and withdrawn.
+The reason it does not carry the decision is §6.3: the migration is large and its specification was not
+converged, while the worst property of the §4.1 defect is cheaply mitigable inside the current model (§6.4).
+That is a cost-and-risk answer to a correctness argument, and §6.5 states plainly how much weight it can
+bear. Two further reasons originally given here, §6.1 and §6.2, were examined and withdrawn.
 
 ---
 
@@ -199,13 +197,25 @@ sits in it literally. But that same file carries the **full agent token** (`serv
 create a new capability.
 
 Net position: **broadcast costs the protected owner nothing that keeping does not already cost it.** The case
-for keeping rests on §6.2 and §6.3, not on this.
+for keeping does not rest on this section at all; see §6.5.
 
-### 6.2 Switching does not close #162
+### 6.2 A second argument that did not survive review
 
-Per §4.4, the pull path is unfenced and a fork replays the full token. Broadcast changes only the push path.
-After a full migration, `check_messages` from a forked session would still destructively consume the
-operator's rows. Switching relocates the failure rather than eliminating it, while paying full migration cost.
+This section originally argued that switching does not close #162: per §4.4 the pull path is unfenced and a
+fork replays the full token, so after a full migration `check_messages` from a forked session would still
+destructively consume the operator's rows. The observation is true and important. It does **not** support
+keeping, and it is withdrawn as a reason.
+
+The defect is **common to both models**, so it cannot distinguish them. Keeping leaves the pull path exactly
+as it is - §8 item 5 defers it to a separate issue - so the argument charged switching for a hole that keeping
+also declines to close.
+
+The asymmetry, if anything, runs the other way. §6.3 lists PULL reconciliation as mandatory work for a full
+broadcast migration, so a migration would be forced to confront the pull path, and one that performs that
+reconciliation need not retain today's destructive global `drain()` semantics.
+
+What the pull path actually demonstrates is the §1 thesis - that this is an identity problem rather than a
+delivery-model problem. It belongs in §8 item 5, not in the case for either model.
 
 ### 6.3 The migration cost is large and the specification is not converged
 
@@ -243,9 +253,28 @@ but still-polling incumbent indefinitely blocking the session the operator is ac
 closable in-model without extending the observer lease, and broadcast would solve it, since both instances
 would simply receive a copy. That is a genuine point in favour of switching.
 
-It does not carry the decision, because it is bounded by §6.2: broadcast would fix this on the push path while
-leaving the identical failure reachable through the unfenced pull path, at the cost in §6.3. The residual is
-therefore an argument for extending the observer lease (§9 condition 3), not for replacing the delivery model.
+It does not carry the decision, but only because of the migration cost and risk in §6.3. On correctness alone
+this point favours switching, and it stands unrebutted. The narrower reading - that it argues for extending
+the observer lease (§9 condition 3) rather than for replacing the delivery model - is a preference about which
+fix to buy, not a refutation.
+
+### 6.5 What the decision actually rests on
+
+Four rounds of adversarial review removed two of the three reasons originally given for keeping: §6.1
+(broadcast regresses the protected owner) and §6.2 (switching does not close #162). Both were withdrawn in
+full.
+
+What remains is **§6.3**: the migration is large, lands in a path that has already produced incidents, and its
+specification was demonstrably wrong on first writing - while the worst property of the §4.1 defect, the
+deterministic fork takeover, is cheaply mitigable inside the current model (§6.4).
+
+That is a **cost-and-risk argument, not a correctness argument**. It is a legitimate basis for declining to
+rewrite a delivery core, and it is the basis on which this decision was ratified. But it is materially weaker
+than the case as originally put, and §6.4 concedes a correctness point to switching that stands unrebutted.
+
+Stated plainly for anyone revisiting this: keeping is the cheaper and lower-risk answer, not the more correct
+one. A reader who weighs correctness above migration risk should treat §9 conditions 1 and 3 as the live route
+to reopening it.
 
 ---
 
@@ -382,15 +411,19 @@ disqualified**, and **switch viable-with-work**.
 - The *implementation-cost* judge (keep) held that the test surface decides it: ~50 of 77 tests rewritten in
   an incident-prone path, with no testability gain, since fork-replay is trivially testable under every option.
 
-The decision goes to keep on two grounds that outweigh the majority: switching **does not close #162**,
-because the pull path is unfenced and a fork replays the full agent token (§6.2) - conceded by the correctness
-judge, which explicitly noted that no option closes the pull door - and the migration is large while its
-specification was demonstrably not converged (§6.3).
+The decision goes to keep on the single ground stated in §6.3: the migration is large, lands in an
+incident-prone path, and its specification was demonstrably not converged, while the §4.1 defect's worst
+property is cheaply mitigable in-model (§6.4).
 
-A third argument, that broadcast regresses the one protected owner, was raised by the adversarial reviewer and
-carried substantial weight in the original draft of this note. It did **not** survive review and has been
-withdrawn in full (§6.1). Readers weighing this decision should note that one of the three reasons originally
-given for it turned out to be wrong; the decision stands on the remaining two.
+**Two of the three reasons originally given here did not survive review and have been withdrawn in full**:
+that broadcast regresses the protected owner (§6.1), and that switching fails to close #162 (§6.2). Both were
+overstatements in the same direction - toward the conclusion this note reaches.
+
+Readers weighing this decision should know that it was ratified while three reasons were on the table and now
+rests on one; that the surviving reason is about cost and risk rather than correctness; and that §6.4 concedes
+a correctness point to switching which stands unrebutted. That does not make keeping wrong - declining to
+rewrite a delivery core on migration-risk grounds is a legitimate engineering call - but it is a narrower
+justification than the one originally offered.
 
 A **hybrid** ("keep claim, degrade a contested owner to fan-out") was evaluated and rejected. Its safety is
 contingent on a wall-clock contention window that collapses under the sidecar's own 5-second HTTP timeout, and
