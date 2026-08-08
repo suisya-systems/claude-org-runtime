@@ -152,7 +152,7 @@ def transport_allowlist(
 
     ``role`` is a runtime role name (``secretary`` / ``dispatcher`` /
     ``curator`` / ``worker`` / ``user_common``). Under ``renga`` every role
-    sees the same required-14 surface; under ``broker`` the role maps to a
+    sees the same required-15 surface; under ``broker`` the role maps to a
     broker auth tier.
     """
     return list(
