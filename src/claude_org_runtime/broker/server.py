@@ -714,6 +714,30 @@ class Broker(TokenMixin, StoreMixin):
         return _ok({"ok": True, "target": target})
 
     # ---------------------------------------------------- pane: 共通 cleanup / reap
+    def _detach_owner_panes_locked(self, owner: str) -> list[str]:
+        """adopt 済み owner の pane meta に「切り離し済み」印を付ける (#166)。
+
+        **_lock 保持中に呼ばれる** (:meth:`~claude_org_runtime.broker.store.
+        StoreMixin.adopt_delivery` の critical section から)。印を付けた pane id を返す。
+
+        adopt は配達所有権を **別プロセス** へ移す。移した後の旧 pane は所有権を持たない
+        抜け殻で、``org adopt`` は operator に「都合のよい時に閉じてよい」と案内する。
+        ところが pane の close / reap は :meth:`_cleanup_pane` を通り、そこは pane を
+        「その owner の唯一の実体」とみなして **token を revoke し、delivery cred を
+        revoke し、delivery state を reset し、未配達行を捨てる**。案内どおりに閉じた
+        瞬間に adopt 済み session が MCP も配達も失う (Codex review P1)。
+
+        pane meta を消さずに **印を付ける** のが要点: 消すと close_pane が pane を
+        見つけられなくなり、抜け殻を畳む手段まで失う。印は「この pane を閉じてよいが、
+        その owner の資格情報と queue は道連れにするな」を意味する。
+        """
+        detached: list[str] = []
+        for pane_id, meta in self._pane_meta.items():
+            if meta.get("agent_id") == owner and not meta.get("adopted_away"):
+                meta["adopted_away"] = True
+                detached.append(pane_id)
+        return detached
+
     def _cleanup_pane(self, handle: "PaneId") -> tuple[str | None, bool]:
         """pane の bookkeeping を掃除する — close_pane と自己終了 reap の共通経路。
 
@@ -743,10 +767,18 @@ class Broker(TokenMixin, StoreMixin):
             meta = self._pane_meta.pop(str(handle), None)
             agent_id = meta.get("agent_id") if meta else None
             tok = meta.get("token") if meta else None
-            if tok and tok in self._binds:
+            # adopt (#166) で切り離された pane は **抜け殻**。配達所有権は別プロセスへ
+            # 移っており、この pane は既にその owner の実体ではない。meta は落として
+            # pane を畳めるようにするが、資格情報と queue には触らない: ここで従来どおり
+            # 掃除すると、adopt 済み session の token / delivery cred / 未配達行を、
+            # 旧 pane を閉じただけで巻き添えに殺す (:meth:`_detach_owner_panes_locked`)。
+            adopted_away = bool(meta.get("adopted_away")) if meta else False
+            if tok and tok in self._binds and not adopted_away:
                 b = self._binds[tok]
                 b.revoked = True
                 b.registered = False
+        if adopted_away:
+            return agent_id, meta is not None
         # delivery 掃除は **token-backed pane** に限る (tok が真の時のみ)。generic
         # spawn_pane は token=None で登録され、channel sidecar も delivery cred も queue
         # 行も持たない。その meta agent_id は bind-only の別 live agent (admin_mint_token

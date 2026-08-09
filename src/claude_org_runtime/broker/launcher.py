@@ -665,6 +665,23 @@ def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
                   f"{pending['in_flight_rows']} rows)")
         return 0
 
+    # **fence する前に** ローカル引数を検証する (Codex review P1)。adopt_delivery は
+    # 現職をその場で fence するので、その後で argv 組み立てが例外を投げると owner は
+    # claimer 不在のまま arming deadline まで放置される — しかも原因は operator の
+    # typo という、最も直しやすいはずのもの。spawn_claude が token 発行前に argv を
+    # pre-validate するのと同じ理由・同じ順序 (副作用の前に検証)。
+    claude_args = list(args.claude_arg or [])
+    try:
+        build_up_argv(
+            {"mcpServers": {}}, model=args.model,
+            permission_mode=args.permission_mode, extra=claude_args,
+            resume=args.resume, continue_session=args.continue_session,
+        )
+    except surface.ToolArgError as exc:
+        print(f"org adopt: invalid launch arguments: {exc}", file=sys.stderr)
+        print("org adopt: nothing was rotated.", file=sys.stderr)
+        return 2
+
     try:
         res = _admin_rpc(host, port, admin_token, "adopt_delivery", {
             "owner": owner, "in_flight": args.in_flight, "force": args.force,
@@ -684,8 +701,12 @@ def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
           f"(adoption {adoption_id}, generation {res['generation']})")
     print(f"org adopt: in-flight policy={res['in_flight_policy']} "
           f"rows={res['in_flight_rows']}")
-    print(f"org adopt: the previous session is fenced now and will NOT deliver "
-          f"again; close its pane when convenient.")
+    detached = res.get("detached_panes") or []
+    if detached:
+        print(f"org adopt: detached the previous pane(s) {', '.join(detached)} from "
+              "this owner; closing them will not affect the adopting session.")
+    print("org adopt: the previous session is fenced now and will NOT deliver "
+          "again; close its pane when convenient.")
     print(f"org adopt: this adoption must land within {res['arming_seconds']:.0f}s "
           "or the daemon reverts the handover and reports it to the attention watcher.")
 
@@ -706,7 +727,7 @@ def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
 
     argv = build_up_argv(
         res["mcp_config"], model=args.model,
-        permission_mode=args.permission_mode, extra=list(args.claude_arg or []),
+        permission_mode=args.permission_mode, extra=claude_args,
         resume=args.resume, continue_session=args.continue_session,
     )
     print(f"org adopt: launching claude for owner={owner} "

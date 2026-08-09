@@ -1933,6 +1933,73 @@ def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path):
     assert expired[0]["restored_generation"] == gen
 
 
+def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
+    tmp_path, fake_adapter,
+):
+    """**回帰**: adopt 済み owner の旧 pane を閉じても、adopting session の資格情報と
+    未配達行は道連れにならない。
+
+    ``_cleanup_pane`` は pane を「その owner の唯一の実体」とみなし、close / reap で
+    token を revoke し delivery cred を revoke し delivery state を reset し未配達行を
+    捨てる。adopt は所有権を別プロセスへ移すので、この前提は adopt の瞬間に偽になる。
+    しかも ``org adopt`` は operator に「旧 pane は都合のよい時に閉じてよい」と案内する
+    = 案内どおりに操作した瞬間に、たった今引き継いだ session が MCP も配達も失う。
+    pane meta には切り離し印だけを付け、pane 自体は今までどおり畳めるようにする。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter, lease_seconds=30.0)
+    src = _registered(b, "src")
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    owner_token = [t for t, bd in b._binds.items()
+                   if bd.agent_id == "w" and bd.scope == "full"][0]
+    b.register_local(owner_token)   # 配送先になるには registered が要る
+    res = b.adopt_delivery("w")
+    assert res["ok"] is True and res["detached_panes"] == [str(out["id"])]
+    assert b.enqueue(src, "w", "must-survive-closing-the-husk")["ok"] is True
+
+    closed = b.close_pane_target(str(out["id"]))   # 案内どおり抜け殻を閉じる
+    assert closed.get("ok") is not False
+    assert str(out["id"]) not in b._pane_meta      # pane は畳めている
+
+    # adopting session が使う資格情報と queue は生きている。
+    assert b._binds[owner_token].revoked is False
+    live_creds = [t for t, bd in b._binds.items()
+                  if bd.agent_id == "w" and bd.scope == "delivery" and not bd.revoked]
+    assert live_creds, "delivery cred was revoked with the superseded pane"
+    assert _row_states(b, "w") == [UNDELIVERED]
+    # そして adopt 済みの秘密で register すれば実際に配達が始まる。
+    reg = b.register_delivery_instance(
+        live_creds[0], "adopted", observer=res["observer_secret"])
+    assert reg["ok"] is True
+    rows = b.poll_claims(live_creds[0], reg["generation"], "adopted")["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["must-survive-closing-the-husk"]
+
+
+def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path):
+    """**回帰**: ``force`` で先行 adopt を supersede した時、復帰先は先行 adopt が
+    fence した **後** の中間状態ではなく、最初に fence する前の現職でなければならない。
+
+    素直に「今の generation / instance」を控えると、それは先行 adopt が既に bump し
+    instance を空にした後の値になる。その状態を「原状」として復帰すると、instance が
+    空のままの generation が入り、元の sidecar は stale のまま = 復帰したつもりで owner は
+    無音のまま残る。adopt を 2 回続けて失敗させるという、最も慌てている時に踏む経路。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+               adopt_arming_seconds=0.05)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.adopt_delivery("dst")                       # 1 回目: 現職を fence
+    b.adopt_delivery("dst", force=True)           # 2 回目: 1 回目を supersede
+    b.enqueue(src, "dst", "back-to-the-original-incumbent")
+    time.sleep(0.1)
+    rows = b.poll_claims(dc, gen, iid)["rows"]    # 元の現職が復活していること
+    assert [r["entry"]["message"] for r in rows] == ["back-to-the-original-incumbent"]
+    assert b._delivery_generations["dst"] == gen
+    assert b._delivery_instances["dst"] == iid
+
+
 def test_expired_adopt_does_not_clobber_a_lease_installed_after_the_deadline(tmp_path):
     """compare-and-delete: 期限切れが落とすのは **自分が張った lease だけ**。
 

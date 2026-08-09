@@ -1298,6 +1298,38 @@ def test_org_adopt_unreachable_daemon_says_nothing_was_rotated(
     err.encode("cp932")
 
 
+@pytest.mark.parametrize("bad", [
+    {"resume": "sid", "continue_session": True},        # 相互排他の session selector
+    {"resume": "--print"},                              # 値位置に headless flag
+    {"resume": "   "},                                  # 空の session id
+    {"claude_arg": ["--resume", "other"]},              # 予約 flag を args[] から
+    {"claude_arg": ["-p"]},                             # headless flag
+])
+def test_org_adopt_validates_launch_args_before_rotating(
+    tmp_path, monkeypatch, capsys, bad,
+):
+    """**回帰**: ローカル引数の不正は **fence する前に** 落とす (rc 2、RPC を投げない)。
+
+    adopt_delivery は現職をその場で fence するので、その後で argv 組み立てが例外を
+    投げると owner は claimer 不在のまま arming deadline まで放置される — しかも原因は
+    operator の typo という、最も直しやすいはずのもの。さらに素通しだと ToolArgError が
+    traceback のまま端末に出る。spawn_claude が token 発行前に argv を pre-validate する
+    のと同じ理由・同じ順序 (副作用の前に検証)。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    calls = _stub_admin_rpc(monkeypatch, adopt=_adopt_ok())
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, **bad), launch=launch)
+
+    assert rc == 2
+    assert calls == [], "the owner was fenced before the arguments were validated"
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "invalid launch arguments" in err and "nothing was rotated" in err
+
+
 def test_org_adopt_surfaces_rpc_error_verbatim(tmp_path, monkeypatch, capsys):
     """``ok: False`` の error 文字列をそのまま stderr に出す (rc 2、起動なし)。
 

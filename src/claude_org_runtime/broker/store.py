@@ -603,6 +603,9 @@ class StoreMixin:
                         "adoption_id": pending.adoption_id,
                         "armed_seconds_remaining": max(0.0, pending.armed_until - now)}
                 else:
+                    # 失効時の原状復帰に使う fence **前**の状態。
+                    prev_gen = self._generation_of(owner)
+                    prev_instance = self._delivery_instances.get(owner)
                     if pending is not None:
                         # force による明示 supersede。**先行 adopt が敗けたことを残す**
                         # (先行 CLI が起動した session はこの後 unobserved で沈黙する
@@ -611,12 +614,17 @@ class StoreMixin:
                             "owner": owner,
                             "adoption_id": pending.adoption_id,
                         }))
+                        # **現状ではなく先行 adopt の原状を引き継ぐ**。ここで現状を
+                        # 読むと、それは既に先行 adopt が fence した後の状態
+                        # (generation は上がり instance は空) なので、この adopt も
+                        # 失効した時の「復帰」が中間状態の復元になり、元の sidecar は
+                        # stale のまま = 無音が残る。復帰先は常に **最初に fence する
+                        # 前の現職** でなければならない (Codex review P2)。
+                        prev_gen = pending.previous_generation
+                        prev_instance = pending.fenced_instance
                     adoption_id = secrets.token_hex(8)
                     secret = self._rotate_observer_locked(
                         owner, arming_seconds, adoption_id=adoption_id)
-                    # fence **前**の状態を控える (失効時の原状復帰用。B/A3)。
-                    prev_gen = self._generation_of(owner)
-                    prev_instance = self._delivery_instances.get(owner)
                     gen = self._generation_of(owner) + 1
                     self._delivery_generations[owner] = gen
                     # **現世代 instance を消す** = 旧 sidecar は次 poll で stale_sidecar。
@@ -639,17 +647,27 @@ class StoreMixin:
                         previous_generation=prev_gen, fenced_instance=prev_instance,
                         started_at=now,
                     )
+                    # 旧 pane の bookkeeping から owner を切り離す (Codex review P1)。
+                    # adopt 後の旧 pane は配達所有権を持たない抜け殻で、operator には
+                    # 「都合のよい時に閉じてよい」と案内する。その close / reap は
+                    # _cleanup_pane を通り、owner の **token と delivery cred を revoke
+                    # し delivery state を reset し未配達行を捨てる** ので、切り離さないと
+                    # 案内どおりに閉じた瞬間に adopt 済み session が丸ごと死ぬ。
+                    detached = self._detach_owner_panes_locked(owner)
                     journal.append(("delivery_adopt_started", {
                         "owner": owner, "adoption_id": adoption_id,
                         "generation": gen, "in_flight_policy": in_flight,
                         "in_flight_rows": moved, "arming_seconds": arming_seconds,
-                        "forced": force,
+                        "forced": force, "detached_panes": detached,
                     }))
                     result = {
                         "ok": True, "owner": owner, "adoption_id": adoption_id,
                         "observer_secret": secret, "generation": gen,
                         "in_flight_policy": in_flight, "in_flight_rows": moved,
                         "arming_seconds": arming_seconds, "armed_until": armed_until,
+                        # 切り離した旧 pane。operator に「これは閉じてよい」と
+                        # 具体的に言えるようにする (抜け殻を残す方が事故のもと)。
+                        "detached_panes": detached,
                         # 検証と同一 lock スコープで取った owner の資格情報。呼び元
                         # (server の admin ハンドラ) が --mcp-config へ畳んで **必ず
                         # pop する** 内部フィールドで、ワイヤには出さない。
@@ -1451,3 +1469,6 @@ class StoreMixin:
 
     if TYPE_CHECKING:  # server が供給する配達トリガ (型チェッカ向け宣言)
         def _trigger_nudge(self, target: "AgentBind") -> None: ...
+
+        # server が供給する pane 切り離し (#166)。**_lock 保持中に呼ばれる**。
+        def _detach_owner_panes_locked(self, owner: str) -> list[str]: ...
