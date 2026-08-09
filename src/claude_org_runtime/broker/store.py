@@ -200,6 +200,29 @@ class ObserverLease:
 
 
 @dataclass
+class AdoptRollback:
+    """adopt が失効した時に戻す **原状一式** (#166)。
+
+    個別フィールドではなく 1 つのオブジェクトにまとめてあるのが要点。adopt は
+    ``force`` で先行 adopt を supersede でき、その時の復帰先は「今の状態」ではなく
+    **最初に fence する前の現職** でなければならない。フィールドごとに引き継ぎを書くと、
+    復帰状態を 1 つ足すたびに supersede 経路へ足し忘れる余地が生まれる (実際に
+    generation/instance を直した後、token と pane を足した時に同じ穴が再発した)。
+    一式で持てば引き継ぎは ``rollback = pending.rollback`` の 1 行になり、部分的に
+    忘れることが構造的にできなくなる。
+    """
+
+    # fence 前の delivery generation と現世代 instance。
+    generation: int
+    instance: str | None
+    # 旧プロセスへ渡してあった full token (付け替え前)。
+    token: str
+    # adopt が切り離した pane id。空でない場合、失効時に **その pane がまだ在るか** が
+    # 「instance を復帰してよいか」の判定材料になる。
+    detached_panes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PendingAdoption:
     """進行中の明示 adopt 操作 (#166)。owner ごとに高々 1 件。
 
@@ -226,7 +249,7 @@ class PendingAdoption:
     in_flight_rows: int
     # adopt が installed した generation (fence 後の現世代)。
     fenced_generation: int
-    # fence **前** の (generation, instance)。失効時の **原状復帰** に使う。
+    # 失効時に戻す **原状一式** (:class:`AdoptRollback`)。
     #
     # 復帰が要るのは、fence された旧 sidecar が二度と register し直さないため
     # (``channel_sidecar.py``: ``stale_sidecar`` は latch しないが、再 register は
@@ -234,17 +257,14 @@ class PendingAdoption:
     # 通らない)。lease を落とすだけでは「adopt に失敗したので保護は外したが、
     # 配達できる sidecar は 1 つも居ない」状態が恒久的に残り、**arming deadline が
     # 防ぐはずだった恒久無音そのもの**になる。
-    previous_generation: int
-    fenced_instance: str | None
+    #
+    # ``force`` で先行 adopt を supersede する時は、これを **丸ごと** 引き継ぐ
+    # (:class:`AdoptRollback` の docstring 参照)。
+    rollback: AdoptRollback
     started_at: float
-    # 旧プロセスへ渡してあった full token と、adopting session へ渡した付け替え後の
-    # token。失効時に元へ戻すために両方持つ (:meth:`StoreMixin._sweep_adoptions_locked`)。
-    previous_token: str = ""
+    # adopting session へ渡した付け替え後の full token。失効時に
+    # ``rollback.token`` へ戻す対象を compare-and-restore で特定するために持つ。
     adopted_token: str = ""
-    # adopt が切り離した pane id。失効時に (a) 印を戻し、(b) **その pane がまだ在るか**
-    # で instance を復帰してよいかを判断するために持つ。pane ごと消えているなら、
-    # 復帰しても claim するのは死んだ instance なので「復帰した」と報告してはいけない。
-    detached_panes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -517,6 +537,7 @@ class StoreMixin:
             # pane の印も戻す (Codex review P1)。戻さないと、失効して所有権が旧
             # session に返っているのに、その pane を閉じても資格情報も未配達行も
             # 掃除されない = 死んだ owner の bind が居座って同名 respawn を塞ぐ。
+            rollback = pending.rollback
             reattached = self._reattach_owner_panes_locked(owner)
             # **pane ごと消えていたら instance は戻さない**。切り離した pane が既に
             # close/reap されているなら、復帰させる instance の sidecar はもう存在
@@ -524,23 +545,23 @@ class StoreMixin:
             # 戻した」と言い切る一方で実際には誰も claim せず、**失敗を知らせるための
             # イベントが失敗を隠す**。pane を持たない owner (org up の secretary 等)
             # は detached_panes が空なので、この判定の対象外。
-            pane_gone = bool(pending.detached_panes) and not reattached
+            pane_gone = bool(rollback.detached_panes) and not reattached
             restored = False
             if (self._generation_of(owner) == pending.fenced_generation
                     and owner not in self._delivery_instances):
-                self._delivery_generations[owner] = pending.previous_generation
-                if pending.fenced_instance is not None and not pane_gone:
-                    self._delivery_instances[owner] = pending.fenced_instance
+                self._delivery_generations[owner] = rollback.generation
+                if rollback.instance is not None and not pane_gone:
+                    self._delivery_instances[owner] = rollback.instance
                     restored = True
             # full token も元へ戻す (compare-and-restore)。adopt は旧プロセスの token を
             # 付け替えて MCP 面を切っているので、失効時に戻さないと「配達は旧 session に
             # 返ったのに MCP は死んだまま」という半死状態が残る。付け替え後の token が
             # 今も現役の時だけ戻す (別経路が触っていれば手を出さない)。
             token_restored = False
-            if (pending.adopted_token and pending.previous_token
+            if (pending.adopted_token and rollback.token
+                    and pending.adopted_token != rollback.token
                     and pending.adopted_token in self._binds):
-                self._rekey_bind_locked(pending.adopted_token,
-                                        pending.previous_token)
+                self._rekey_bind_locked(pending.adopted_token, rollback.token)
                 token_restored = True
             journal.append(("delivery_adopt_expired", {
                 "owner": owner,
@@ -549,8 +570,7 @@ class StoreMixin:
                 "lease_dropped": dropped,
                 "generation": pending.fenced_generation,
                 "restored": restored,
-                "restored_generation": (pending.previous_generation if restored
-                                        else None),
+                "restored_generation": rollback.generation if restored else None,
                 "pane_gone": pane_gone,
                 "token_restored": token_restored,
             }))
@@ -635,10 +655,22 @@ class StoreMixin:
                         "adoption_id": pending.adoption_id,
                         "armed_seconds_remaining": max(0.0, pending.armed_until - now)}
                 else:
-                    # 失効時の原状復帰に使う fence **前**の状態。
-                    prev_gen = self._generation_of(owner)
-                    prev_instance = self._delivery_instances.get(owner)
-                    if pending is not None:
+                    # 旧 pane の bookkeeping から owner を切り離す (Codex review P1)。
+                    # adopt 後の旧 pane は配達所有権を持たない抜け殻で、operator には
+                    # 「都合のよい時に閉じてよい」と案内する。その close / reap は
+                    # _cleanup_pane を通り、owner の **token と delivery cred を revoke
+                    # し delivery state を reset し未配達行を捨てる** ので、切り離さないと
+                    # 案内どおりに閉じた瞬間に adopt 済み session が丸ごと死ぬ。
+                    detached = self._detach_owner_panes_locked(owner)
+                    if pending is None:
+                        # 失効時に戻す原状一式を、まだ何も触っていないこの時点で撮る。
+                        rollback = AdoptRollback(
+                            generation=self._generation_of(owner),
+                            instance=self._delivery_instances.get(owner),
+                            token=full_token,
+                            detached_panes=list(detached),
+                        )
+                    else:
                         # force による明示 supersede。**先行 adopt が敗けたことを残す**
                         # (先行 CLI が起動した session はこの後 unobserved で沈黙する
                         # ので、その原因が journal から辿れないと診断不能になる)。
@@ -646,14 +678,14 @@ class StoreMixin:
                             "owner": owner,
                             "adoption_id": pending.adoption_id,
                         }))
-                        # **現状ではなく先行 adopt の原状を引き継ぐ**。ここで現状を
-                        # 読むと、それは既に先行 adopt が fence した後の状態
-                        # (generation は上がり instance は空) なので、この adopt も
-                        # 失効した時の「復帰」が中間状態の復元になり、元の sidecar は
-                        # stale のまま = 無音が残る。復帰先は常に **最初に fence する
-                        # 前の現職** でなければならない (Codex review P2)。
-                        prev_gen = pending.previous_generation
-                        prev_instance = pending.fenced_instance
+                        # **現状ではなく先行 adopt の原状を丸ごと引き継ぐ**。今の状態は
+                        # 既に先行 adopt が fence / 付け替え / 切り離しをした **後** の
+                        # 中間状態なので、それを「原状」として復帰すると、generation は
+                        # 中間値、token は先行 adopt が発行した方、pane は切り離し済で
+                        # 空 — どれも元の現職ではない。復帰先は常に **最初に fence する
+                        # 前の現職** (Codex review P2 / round 3 P1)。一式を丸ごと写す
+                        # ことで、復帰状態を将来足しても引き継ぎ漏れが起きない。
+                        rollback = pending.rollback
                     adoption_id = secrets.token_hex(8)
                     secret = self._rotate_observer_locked(
                         owner, arming_seconds, adoption_id=adoption_id)
@@ -672,13 +704,6 @@ class StoreMixin:
                         else:
                             row.state = DELIVERED
                     armed_until = now + arming_seconds
-                    # 旧 pane の bookkeeping から owner を切り離す (Codex review P1)。
-                    # adopt 後の旧 pane は配達所有権を持たない抜け殻で、operator には
-                    # 「都合のよい時に閉じてよい」と案内する。その close / reap は
-                    # _cleanup_pane を通り、owner の **token と delivery cred を revoke
-                    # し delivery state を reset し未配達行を捨てる** ので、切り離さないと
-                    # 案内どおりに閉じた瞬間に adopt 済み session が丸ごと死ぬ。
-                    detached = self._detach_owner_panes_locked(owner)
                     # 旧プロセスへ渡してあった full token を **付け替える** (Codex
                     # review P1)。切り離した旧 pane は生きたまま残りうるので、bind を
                     # 共有したままだと 2 プロセスが 1 つの ``session_id`` を奪い合い、
@@ -690,9 +715,8 @@ class StoreMixin:
                         adoption_id=adoption_id, owner=owner, secret=secret,
                         armed_until=armed_until, in_flight_policy=in_flight,
                         in_flight_rows=moved, fenced_generation=gen,
-                        previous_generation=prev_gen, fenced_instance=prev_instance,
-                        started_at=now, previous_token=full_token,
-                        adopted_token=adopted_token, detached_panes=list(detached),
+                        rollback=rollback, started_at=now,
+                        adopted_token=adopted_token,
                     )
                     journal.append(("delivery_adopt_started", {
                         "owner": owner, "adoption_id": adoption_id,

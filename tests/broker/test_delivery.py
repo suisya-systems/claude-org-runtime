@@ -2058,6 +2058,50 @@ def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
     assert "w" not in b._delivery_instances
 
 
+def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
+    tmp_path, fake_adapter,
+):
+    """**回帰**: ``force`` は原状 **一式** を引き継ぐ (generation だけではない)。
+
+    復帰状態は generation / instance / full token / 切り離した pane の 4 点あり、
+    supersede 時に一部だけ引き継ぐと、その adopt も失効した時に中途半端な復元になる:
+    token は先行 adopt が発行した方に戻り (旧プロセスは締め出されたまま)、pane 情報が
+    空なので既に閉じた pane を「まだ在る」と誤判定して死んだ instance を ``restored``
+    と名乗る。一式を丸ごと写すことで、復帰状態を将来足しても引き継ぎ漏れが起きない。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter, adopt_arming_seconds=0.05)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    original_token = [t for t, bd in b._binds.items()
+                      if bd.agent_id == "w" and bd.scope == "full"][0]
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "w" and bd.scope == "delivery"][0]
+    gen = b.register_delivery_instance(dc, "orig", observer=secret)["generation"]
+
+    first = b.adopt_delivery("w")
+    assert first["detached_panes"] == [str(out["id"])]
+    second = b.adopt_delivery("w", force=True)
+    # 2 回目は既に切り離し済なので detached は空 — ここで現状を撮ると pane 情報を失う。
+    assert second["detached_panes"] == []
+    time.sleep(0.1)
+    b.adopt_status("w")                            # sweep 入口
+
+    expired = _journal_events(b, "delivery_adopt_expired")[-1]
+    # 元の現職まで戻っている (先行 adopt の中間状態ではない)。
+    assert b._delivery_generations["w"] == gen
+    assert b._delivery_instances["w"] == "orig"
+    assert expired["restored"] is True and expired["pane_gone"] is False
+    # token も **最初の** 現職のものへ戻る (先行 adopt が発行した方ではない)。
+    assert b.get_bind(original_token) is not None
+    assert b.get_bind(first["_owner_token"]) is None
+    assert b.get_bind(second["_owner_token"]) is None
+    # pane の切り離し印も外れている (閉じれば通常どおり掃除される)。
+    assert b._pane_meta[str(out["id"])].get("adopted_away") is None
+
+
 def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path):
     """**回帰**: ``force`` で先行 adopt を supersede した時、復帰先は先行 adopt が
     fence した **後** の中間状態ではなく、最初に fence する前の現職でなければならない。
