@@ -34,6 +34,28 @@ RELEVANT_EVENT_KINDS: tuple[str, ...] = (
 BROKER_JOURNAL_NAME = "queue.jsonl"
 DUPLICATE_SIDECAR_EVENT = "duplicate_sidecar_detected"
 
+# Delivery-ownership signals (Issue #166). Two more lines the daemon
+# already writes but nobody read, both meaning "this owner is not
+# receiving push and only a human can fix it":
+#
+# ``delivery_register_superseded`` — a sidecar presented an observer
+# secret that no longer matches, i.e. a session that was superseded by a
+# rotate. It latches and never claims again, so this fires once per
+# bypassing session. Field shape: ``{ts, event, owner, instance, state,
+# latched}``.
+#
+# ``delivery_adopt_expired`` — an explicit adopt was armed but no
+# adopting sidecar registered before the deadline, so the daemon reverted
+# the handover. Field shape: ``{ts, event, owner, adoption_id,
+# armed_seconds, lease_dropped, generation, restored,
+# restored_generation}``.
+#
+# Neither repeats. That is why they get their own, much longer freshness
+# window than ``duplicate_sidecar_detected`` (which re-emits per lease
+# window) — see ``config.delivery_signal_window_sec``.
+DELIVERY_SUPERSEDED_EVENT = "delivery_register_superseded"
+DELIVERY_ADOPT_EXPIRED_EVENT = "delivery_adopt_expired"
+
 # The journal is append-only and never rotated, so a running watcher must
 # not re-read it whole on every poll. Instead the tail is walked backwards
 # one chunk at a time and the walk stops at the first line older than the
@@ -181,6 +203,75 @@ def read_broker_duplicates(
     delay, whereas an undateable line sitting in the tail would re-alert
     every cooldown until the journal grew past it.
     """
+    return [
+        {"ts": rec["ts"], "owner": rec.get("owner"),
+         "instances": rec.get("instances")}
+        for rec in _read_broker_events(
+            broker_state_dir, frozenset((DUPLICATE_SIDECAR_EVENT,)),
+            now_epoch=now_epoch, window_sec=window_sec,
+            chunk_bytes=chunk_bytes, max_scan_bytes=max_scan_bytes,
+            what="duplicate-sidecar",
+        )
+    ]
+
+
+def read_broker_delivery_signals(
+    broker_state_dir: Path,
+    *,
+    now_epoch: float,
+    window_sec: float,
+    chunk_bytes: int = BROKER_JOURNAL_CHUNK_BYTES,
+    max_scan_bytes: int = BROKER_JOURNAL_MAX_SCAN_BYTES,
+) -> list[dict[str, Any]]:
+    """Return recent delivery-ownership signals from the broker journal.
+
+    Issue #166. Two conditions that leave an owner receiving no push and
+    that no part of the runtime resolves on its own:
+
+    * a session was **superseded** (``delivery_register_superseded``) —
+      it presented a stale observer secret, so it latched and will never
+      claim again. Reached by a fork/resume replay, or by a session that
+      was live when somebody else adopted the owner.
+    * an **adopt expired** (``delivery_adopt_expired``) — the operator
+      started a handover but no adopting session ever registered, so the
+      daemon reverted the fence.
+
+    Both are one-shot, unlike ``duplicate_sidecar_detected``. The caller
+    therefore passes a much longer ``window_sec``: a repeating signal can
+    afford a short window because it will fire again, and these cannot.
+
+    Rows are returned **raw** (only ``ts`` normalized to a float) so the
+    classifier can name the specific instance or adoption in the
+    notification; the two event shapes do not share a field set beyond
+    ``owner``, and flattening them here would throw away exactly the
+    detail an operator needs to act.
+    """
+    return _read_broker_events(
+        broker_state_dir,
+        frozenset((DELIVERY_SUPERSEDED_EVENT, DELIVERY_ADOPT_EXPIRED_EVENT)),
+        now_epoch=now_epoch, window_sec=window_sec,
+        chunk_bytes=chunk_bytes, max_scan_bytes=max_scan_bytes,
+        what="delivery-ownership",
+    )
+
+
+def _read_broker_events(
+    broker_state_dir: Path,
+    event_names: frozenset[str],
+    *,
+    now_epoch: float,
+    window_sec: float,
+    chunk_bytes: int,
+    max_scan_bytes: int,
+    what: str,
+) -> list[dict[str, Any]]:
+    """Tail the broker journal for ``event_names`` inside the freshness window.
+
+    Shared engine for the journal consumers. Returns each matching record
+    as-is with ``ts`` normalized to a float; per-event projection is the
+    caller's job. ``what`` only names the signal class in the two warning
+    lines, so a degraded read says which consumer went quiet.
+    """
     p = Path(broker_state_dir) / BROKER_JOURNAL_NAME
     if not p.exists():
         return []
@@ -194,7 +285,7 @@ def read_broker_duplicates(
     except OSError as exc:
         print(
             f"warning: cannot read broker journal {p}: {exc}; "
-            "treating as no duplicate-sidecar signals",
+            f"treating as no {what} signals",
             file=sys.stderr,
         )
         return []
@@ -202,23 +293,19 @@ def read_broker_duplicates(
         print(
             f"warning: broker journal {p} scanned back "
             f"{max_scan_bytes} bytes without reaching the "
-            f"{window_sec}s freshness window; older duplicate-sidecar "
+            f"{window_sec}s freshness window; older {what} "
             "signals inside the window may be missing",
             file=sys.stderr,
         )
     out: list[dict[str, Any]] = []
     for line in lines:
         rec = _journal_record(line)
-        if rec is None or rec.get("event") != DUPLICATE_SIDECAR_EVENT:
+        if rec is None or rec.get("event") not in event_names:
             continue
         ts = _journal_ts(rec)
         if ts is None or ts < cutoff:
             continue
-        out.append({
-            "ts": ts,
-            "owner": rec.get("owner"),
-            "instances": rec.get("instances"),
-        })
+        out.append({**rec, "ts": ts})
     return out
 
 

@@ -23,6 +23,7 @@ from . import notify as _notify_module  # keep submodule accessible
 from .classifier import (
     AttentionEvent,
     classify_all,
+    classify_broker_delivery_signals,
     classify_broker_duplicates,
     classify_event,
     classify_pending,
@@ -42,6 +43,7 @@ __all__ = [
     "FormattedNotification",
     "Template",
     "classify_all",
+    "classify_broker_delivery_signals",
     "classify_broker_duplicates",
     "classify_event",
     "classify_pending",

@@ -52,6 +52,19 @@ DEFAULT_NOTIFY: dict[str, Severity] = {
     # readers, which is the silent-loss shape this signal exists to
     # expose. Hence ``urgent`` despite the Part B anomaly rebalance.
     "duplicate_sidecar": "urgent",
+    # Issue #166: delivery ownership signals. Both are "human is the sole
+    # recovery path" and both mean an owner is receiving no push, so they
+    # join ``duplicate_sidecar`` at ``urgent``.
+    #
+    # ``delivery_superseded`` is not noise after a clean adopt: the
+    # superseded sidecar latches and never claims again, so the line is
+    # written once per session that actually went mute - a fork/resume
+    # replay, or a session that was live when the owner was adopted.
+    "delivery_superseded": "urgent",
+    # ``delivery_adopt_expired`` is the failure report for an explicit
+    # operator action. It is the mechanism that stops "the daemon issued
+    # a secret" from being mistaken for "the handover happened".
+    "delivery_adopt_expired": "urgent",
 }
 
 # Placeholder allowlist from design §6. Anything outside this set
@@ -105,6 +118,15 @@ class AttentionConfig:
     # the natural default: an incident that has not re-fired within one
     # notification cooldown is over.
     duplicate_sidecar_window_sec: int = 300
+    # Issue #166: how far back a delivery-ownership signal
+    # (``delivery_register_superseded`` / ``delivery_adopt_expired``)
+    # still counts as "happening now". Deliberately much longer than
+    # ``duplicate_sidecar_window_sec``: those two are **one-shot** (the
+    # store's stand-down record short-circuits a repeat, and an expiry
+    # happens once by construction), so unlike a duplicate sidecar they
+    # will not fire again to catch a later scan. A short window would
+    # quietly drop a still-unresolved mute.
+    delivery_signal_window_sec: int = 3600
     max_title_chars: int = 80
     max_body_chars: int = 240
     # Sparse map of *explicit user overrides* only (Issue #26 round-4
@@ -176,6 +198,7 @@ def load_config(path: Path | None) -> AttentionConfig:
         "pending_decision_max", "pending_decision_drop",
         "user_replied_min",
         "duplicate_sidecar_window_sec",
+        "delivery_signal_window_sec",
         "max_title_chars", "max_body_chars",
     ):
         if key in raw:

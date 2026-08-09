@@ -22,7 +22,8 @@ from .dedup import (
 )
 from .notify import notify as run_notify, render_text
 from .readers import (
-    read_broker_duplicates, read_events, read_pending_decisions,
+    read_broker_delivery_signals, read_broker_duplicates, read_events,
+    read_pending_decisions,
 )
 
 # Default location of the org-broker's state dir relative to the
@@ -76,7 +77,9 @@ def _scan_once(
     ``broker_state_dir`` (Issue #167) points at the org-broker's state
     dir so ``duplicate_sidecar_detected`` journal lines reach the
     operator. ``None`` skips the broker journal entirely, which keeps
-    callers that only care about ``.state`` unchanged.
+    callers that only care about ``.state`` unchanged. The same dir also
+    feeds the delivery-ownership signals (Issue #166), read with their
+    own, longer freshness window because they do not repeat.
     """
     db_path, pending_path, dedup_path = _state_paths(state_dir)
     events = read_events(db_path)
@@ -90,6 +93,15 @@ def _scan_once(
         if broker_state_dir is not None
         else []
     )
+    delivery_signals = (
+        read_broker_delivery_signals(
+            broker_state_dir,
+            now_epoch=now.timestamp(),
+            window_sec=cfg.delivery_signal_window_sec,
+        )
+        if broker_state_dir is not None
+        else []
+    )
     classified = classify_all(
         events, pending, now,
         cfg.pending_decision_min, cfg.user_replied_min,
@@ -97,6 +109,7 @@ def _scan_once(
         pending_decision_max=cfg.pending_decision_max,
         pending_decision_drop=cfg.pending_decision_drop,
         broker_duplicates=duplicates,
+        broker_delivery_signals=delivery_signals,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []

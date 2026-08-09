@@ -9,11 +9,13 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import pytest
 
 from claude_org_runtime.broker import cli as broker_cli
+from claude_org_runtime.broker import launcher as broker_launcher
 from claude_org_runtime.broker import surface
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.surface import tools_for
@@ -94,6 +96,88 @@ def test_top_level_cli_forwards_root_role():
     parser = build_top_parser()
     args = parser.parse_args(["broker", "serve", "--root-role", "secretary"])
     assert args.root_role == "secretary"
+
+
+# --- org adopt (明示 adopt #166) の parser 配線 ---------------------------------
+# adopt は operator が配達所有権を新セッションへ渡す唯一の入口。既定値がずれると
+# 「requeue のつもりが drop」「rotate しないつもりが rotate した」のように、操作の
+# 意味そのものが黙って変わる。既定値と func 束縛を parser の段で固定する。
+
+def _org_adopt_parser():
+    """top-level parser から ``org adopt`` サブパーサを引く。"""
+    parser = build_top_parser()
+    groups = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert groups, "org は subparsers action に登録されている"
+    org_p = groups[0].choices["org"]
+    org_groups = [a for a in org_p._actions if isinstance(a, argparse._SubParsersAction)]
+    assert org_groups, "adopt は org の subparsers action に登録されている"
+    return org_p, org_groups[0].choices["adopt"]
+
+
+def test_top_level_cli_exposes_org_adopt_with_documented_defaults():
+    """``org adopt`` が org_adopt に束縛され、既定が requeue / 非 force / 非 status。
+
+    既定が drop 側に倒れると in-flight 行を黙って捨て、既定が force 側に倒れると
+    先行 adopt を無言で無効化する。どちらも「既定で安全側」の設計判断そのものなので、
+    退行を parser の段で拾う。
+    """
+    parser = build_top_parser()
+    args = parser.parse_args(["org", "adopt", "--owner", "w1", "--resume", "sid"])
+    assert args.func is broker_launcher.org_adopt
+    assert args.owner == "w1"
+    assert args.resume == "sid"
+    assert args.continue_session is False
+    assert args.in_flight == "requeue"
+    assert args.force is False
+    assert args.status is False
+
+
+def test_org_adopt_continue_flag_sets_continue_session():
+    """``--continue`` は dest=continue_session に落ちる (argparse 予約語との衝突回避)。
+
+    dest 指定が外れると ``args.continue`` は Python の予約語で参照できず、org_adopt が
+    session selector を組めないまま起動する (会話を引き継がない adopt になる)。
+    """
+    parser = build_top_parser()
+    args = parser.parse_args(["org", "adopt", "--continue"])
+    assert args.continue_session is True
+    assert args.resume is None
+
+
+def test_org_adopt_rejects_unknown_in_flight_policy():
+    """``--in-flight`` は requeue / drop 以外を argparse の段で拒否する。
+
+    未知の値が素通りするとその判定が store の in-flight policy 検査まで届き、lease を
+    rotate した後に失敗しうる。操作前に落とすことで rotate 済み無音状態を作らせない。
+    """
+    parser = build_top_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["org", "adopt", "--in-flight", "requeue-later"])
+
+
+def test_org_adopt_help_is_cp932_encodable():
+    """``org adopt --help`` の出力が ASCII のみで cp932 コンソールでも壊れない。
+
+    argparse は help を端末へ直接書くため、em-dash 等が 1 文字でも混ざると cp932 端末で
+    UnicodeEncodeError になり ``--help`` がクラッシュする。pytest は stdout を UTF-8 で
+    捕まえるので実端末でしか露見しない。ここで明示的に encode して押さえる。
+    """
+    org_p, adopt_p = _org_adopt_parser()
+    # 前提の担保: #166 の flag が実際にこの parser に載っている (空の action 列で
+    # 検証が空回りするのを防ぐ)。
+    options = {opt for a in adopt_p._actions for opt in a.option_strings}
+    assert {"--owner", "--resume", "--continue", "--in-flight", "--force",
+            "--status"} <= options
+
+    helps = [a.help for a in adopt_p._actions if a.help]
+    assert helps
+    for text in helps:
+        text.encode("ascii")
+        text.encode("cp932")
+    # 描画済みページも同じコンソールへ届く (usage 行 / metavar / description)。
+    adopt_p.format_help().encode("cp932")
+    # ``org --help`` 側に出る adopt の一行説明も同じ経路に乗る。
+    org_p.format_help().encode("cp932")
 
 
 # --- end-to-end: --root-role → 発行 token の auth_role → tools/list 公開面 ---

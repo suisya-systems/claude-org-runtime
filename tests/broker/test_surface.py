@@ -242,6 +242,148 @@ def test_build_claude_argv_rejects_subcommand_and_dashdash():
         build_claude_argv(mcp_config_json="{}", extra_args=["--"])
 
 
+# ------------------------------------------ session selector (明示 adopt #166)
+# adopt は「新しい観測秘密を持った claude プロセスを起こす」操作なので、引き継ぐ
+# 会話の指定 (--resume / --continue) が builder の一級入力になる。自由形式
+# extra_args に穴を開けず構造化フィールドだけで表現する契約をここで固定する。
+
+def test_build_claude_argv_resume_emits_one_structured_selector():
+    """resume=... は --resume <id> をちょうど 1 本描画し、default-deny guard を通る。
+
+    ここが壊れると adopt した新プロセスが会話を引き継げないか、guard に弾かれて
+    そもそも起動しない。どちらの場合も lease は既に rotate 済みなので、owner は
+    誰にも配送されない無音状態のまま取り残される。
+    """
+    argv = build_claude_argv(mcp_config_json="{}", resume="abc123")
+    assert argv.count("--resume") == 1
+    assert argv[argv.index("--resume") + 1] == "abc123"
+    # builder 内部でも通しているが、guard 適用の脱落を明示的に押さえる。
+    surface._guard_interactive_claude_argv(argv)
+
+
+def test_build_claude_argv_continue_session_emits_one_flag():
+    """continue_session=True は --continue をちょうど 1 本だけ描画する。
+
+    複数本になると claude 側の flag 解釈に依存した argv になり、adopt が
+    「直前の会話を継ぐ」という単一の意味に落ちなくなる。
+    """
+    argv = build_claude_argv(mcp_config_json="{}", continue_session=True)
+    assert argv.count("--continue") == 1
+    assert "--resume" not in argv
+    surface._guard_interactive_claude_argv(argv)
+
+
+def test_build_claude_argv_rejects_resume_in_extra_args():
+    """--resume は args[] からは持ち込めない (space 区切り形 / --resume=<id> 結合形とも)。
+
+    予約が外れると caller が構造化フィールドと別の session selector を args[] で
+    重ねられ、builder 側の相互排他検査を素通りする (design review Major (c))。
+    """
+    for bad in (["--resume", "sid"], ["--resume=sid"]):
+        with pytest.raises(ToolArgError):
+            build_claude_argv(mcp_config_json="{}", extra_args=bad)
+
+
+def test_build_claude_argv_rejects_conflicting_session_selectors():
+    """resume と continue 系の同時指定は拒否する (構造化フィールド / args[] のどちらでも)。
+
+    両方載った argv は「どちらの会話を継ぐか」を claude の解決順に暗黙依存させる。
+    adopt は所有権の移譲操作なので、引き継ぎ先の会話が実行環境依存で決まってはいけない。
+    """
+    with pytest.raises(ToolArgError):
+        build_claude_argv(mcp_config_json="{}", resume="sid", continue_session=True)
+    with pytest.raises(ToolArgError):
+        build_claude_argv(mcp_config_json="{}", resume="sid", extra_args=["--continue"])
+
+
+def test_build_claude_argv_folds_duplicate_continue_from_extra_args():
+    """continue_session=True と args[] の --continue が重なっても flag は 1 本に畳む。
+
+    冪等に --continue を付けてくる caller (org up 系の呼び出し) を壊さないための
+    契約。畳まないと重複 flag で guard/claude 側の挙動が caller 依存になる。
+    """
+    argv = build_claude_argv(
+        mcp_config_json="{}", continue_session=True, extra_args=["--continue"],
+    )
+    assert argv.count("--continue") == 1
+    surface._guard_interactive_claude_argv(argv)
+
+
+def test_build_claude_argv_continue_in_value_position_is_not_the_flag():
+    """値位置の "--continue" (例 --add-dir --continue) は flag と見なさない。
+
+    素朴な ``"--continue" in args`` 判定だと、--continue という名前のディレクトリを
+    --add-dir に渡しただけで (a) 構造化 continue が「重複」扱いで消える、(b) resume
+    指定が誤って相互排他違反になる、という二つの誤動作が起きる。arity 走査を固定する。
+    """
+    # (a) 構造化フィールド由来の --continue は値位置の同名文字列と独立に 1 本出る。
+    argv = build_claude_argv(
+        mcp_config_json="{}", continue_session=True,
+        extra_args=["--add-dir", "--continue"],
+    )
+    at = argv.index("--add-dir")
+    assert "--continue" in argv[:at]          # builder が出した本物の flag
+    assert argv[at + 1] == "--continue"       # --add-dir の値はそのまま残る
+    # (b) resume と併用しても相互排他違反にはならない。
+    argv = build_claude_argv(
+        mcp_config_json="{}", resume="sid", extra_args=["--add-dir", "--continue"],
+    )
+    assert argv[argv.index("--resume") + 1] == "sid"
+    assert argv[argv.index("--add-dir") + 1] == "--continue"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n", 123])
+def test_build_claude_argv_rejects_blank_or_non_string_resume(bad):
+    """空文字 / 空白のみ / 非文字列の resume は builder の段で拒否する。
+
+    空の session id をそのまま描画すると ``--resume`` が値を食えず、後続 flag を
+    値として飲み込んだ argv が組み上がる (guard も「値がある」ため通してしまう)。
+    """
+    with pytest.raises(ToolArgError):
+        build_claude_argv(mcp_config_json="{}", resume=bad)
+
+
+def test_build_claude_argv_rejects_dash_leading_resume():
+    """先頭 '-' の resume 値は拒否する (headless flag の値位置密輸を含む)。
+
+    値位置は guard の allowlist 検査が緩いので、``--resume --print`` のような形で
+    課金経路の headless flag を持ち込む余地を builder の段で構造的に閉じる。
+    """
+    with pytest.raises(ToolArgError):
+        build_claude_argv(mcp_config_json="{}", resume="-x")
+    with pytest.raises(ToolArgError):
+        build_claude_argv(mcp_config_json="{}", resume="--print")
+
+
+def test_build_claude_argv_without_selectors_is_byte_identical():
+    """selector を渡さない既存 caller の argv は 1 バイトも変わらない。
+
+    #166 は adopt 用の追加入力であり、spawn_claude_pane / org up の既存経路に
+    余分な flag が混ざれば launcher argv の bit 等価 (§9.7) が崩れる。
+    """
+    argv = build_claude_argv(
+        mcp_config_json='{"mcpServers":{}}', model="opus",
+        permission_mode="acceptEdits", extra_args=["--add-dir", "/repo"],
+    )
+    assert argv == [
+        "claude", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
+        "--permission-mode", "acceptEdits", "--model", "opus",
+        "--add-dir", "/repo",
+    ]
+
+
+def test_build_claude_argv_still_accepts_bare_continue_in_extra_args():
+    """args[] 単独の --continue は引き続き受理する (意図的な後方互換)。
+
+    --resume と違い --continue は予約しない。既存 caller を壊さないための判断
+    なので、将来これを予約する変更が「気付かないうちの破壊的変更」ではなく
+    意識的な選択になるよう、現行の受理をここで固定する。
+    """
+    argv = build_claude_argv(mcp_config_json="{}", extra_args=["--continue"])
+    assert argv.count("--continue") == 1
+    surface._guard_interactive_claude_argv(argv)
+
+
 # ---------------------------------------------- codex builder (MANDATORY guard)
 def test_build_codex_argv_allows_interactive_flags():
     assert build_codex_argv(extra_args=[]) == ["codex"]

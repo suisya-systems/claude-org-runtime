@@ -66,6 +66,7 @@ class Broker(TokenMixin, StoreMixin):
         lease_seconds: float = 30.0,
         observer_lease_seconds: float = 90.0,
         observer_arming_seconds: float = 600.0,
+        adopt_arming_seconds: float = store.DEFAULT_ADOPT_ARMING_SECONDS,
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
@@ -102,6 +103,16 @@ class Broker(TokenMixin, StoreMixin):
         # 組織全体の沈黙に気付くまで」より十分小さく。TTL (90s) の数倍以上離して、
         # 遅い起動が期限に触れないようにもする。10 分はこの間の広い谷にある。
         self.observer_arming_seconds = observer_arming_seconds
+        # 明示 adopt (#166) の **活性化期限**。adopt は旧 sidecar をその場で fence する
+        # ので、adopting session の起動が失敗すると誰も配達しない窓が残る。期限内に
+        # adopting register が来なければ adopt を失敗確定させ lease を落とし、
+        # ``delivery_adopt_expired`` で operator へ能動通知する。
+        #
+        # 桁の根拠: observer_arming_seconds (10 分 = 段1 folder-trust の人間承認待ちを
+        # 含む spawn 用) より **短く** 取る。adopt は operator が今まさに端末の前で
+        # 実行する操作で、resume は既存の会話を開くだけなので分オーダーで完了する。
+        # 一方 TTL (90s) の数倍は離し、遅い起動が期限に触れないようにする。
+        self.adopt_arming_seconds = adopt_arming_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
@@ -129,6 +140,10 @@ class Broker(TokenMixin, StoreMixin):
         # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
         # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。
         self._observer_leases: dict[str, ObserverLease] = {}
+        # 明示 adopt (#166)。owner -> 進行中の adopt (高々 1 件)。adopt は rotate と
+        # 同時に generation を fence するため、ここに載っている間は当該 owner に claimer
+        # が 1 つも居ない = 完了 (adopting register) か失効かで必ず決着させる。_lock で守る。
+        self._pending_adoptions: dict[str, store.PendingAdoption] = {}
         # stand-down 観測面 (Issue #169)。owner -> 最後の register 拒否記録。sidecar 側の
         # stand-down は子プロセス内の Event で外から見えないため、daemon 側に残して
         # delivery_dump で晒す (「黙っている pane」を journal を読まずに発見できる)。
@@ -346,6 +361,63 @@ class Broker(TokenMixin, StoreMixin):
             "mcp_config": mcp_config,
             "observer_secret": observer_secret,
         }
+
+    def admin_adopt_delivery(self, params: dict) -> dict:
+        """配達所有権の明示 handover (#166、admin RPC の実体)。
+
+        :meth:`~claude_org_runtime.broker.store.StoreMixin.adopt_delivery` が rotate と
+        fence を原子的に行い、ここではその結果に **adopting session が使う
+        ``--mcp-config``** を畳んで返す。config は store が「owner 実在検証と同じ lock
+        スコープ」で返した既存 bind の資格情報から組む: adopt は新しい identity を作る
+        操作ではなく既存 owner の配達所有権を移す操作なので、token を mint し直さない
+        (mint すると同 agent_id の重複 bind になり配送解決が曖昧化する)。
+
+        **認可は admin token に限定する** (事前 Codex design review Major (e))。
+        adopt は observer lease より強い操作 (現職を無条件に fence できる) なので、
+        MCP ツール面にも delivery credential にも出さない — lease より弱い主体が
+        所有権を奪える経路を作らないため。``/admin`` は ``admin.token`` (0600) の
+        bearer のみ受理し、その検証は :meth:`_AdminHandler._handle_admin` が行う。
+        """
+        owner = params.get("owner")
+        if not isinstance(owner, str) or not owner:
+            return {"ok": False,
+                    "error": "[invalid_params] owner must be a non-empty string"}
+        in_flight = params.get("in_flight", store.ADOPT_INFLIGHT_REQUEUE)
+        if not isinstance(in_flight, str):
+            return {"ok": False, "error": "[invalid_params] in_flight must be a string"}
+        force = params.get("force", False)
+        if not isinstance(force, bool):
+            # bool を厳密に要求する (truthy 文字列で現職の fence が誤って上書きされない
+            # ように。channel / observer / bg_hosted と同じ検証方針)。
+            return {"ok": False, "error": "[invalid_params] force must be a boolean"}
+        arming_seconds = params.get("arming_seconds", self.adopt_arming_seconds)
+        if isinstance(arming_seconds, bool) or not isinstance(
+                arming_seconds, (int, float)):
+            return {"ok": False,
+                    "error": "[invalid_params] arming_seconds must be a number"}
+        result = self.adopt_delivery(
+            owner, in_flight=in_flight, force=force,
+            arming_seconds=float(arming_seconds),
+        )
+        # 内部フィールドは必ず落とす (ワイヤに出さない契約)。失敗経路には元々無い。
+        owner_token = result.pop("_owner_token", "")
+        delivery_cred = result.pop("_delivery_cred", "")
+        if not result.get("ok"):
+            return result
+        mcp_config = self.mcp_config_for(owner_token)
+        mcp_config["mcpServers"]["org-broker-channel"] = (
+            self.channel_server_config(delivery_cred, owner)
+        )
+        result["mcp_config"] = mcp_config
+        return result
+
+    def admin_adopt_status(self, params: dict) -> dict:
+        """owner の adopt 進行状況を返す (#166、admin RPC の実体)。**秘密は含めない**。"""
+        owner = params.get("owner")
+        if not isinstance(owner, str) or not owner:
+            return {"ok": False,
+                    "error": "[invalid_params] owner must be a non-empty string"}
+        return self.adopt_status(owner)
 
     @property
     def url(self) -> str:
@@ -1753,6 +1825,26 @@ class _McpHandler(BaseHTTPRequestHandler):
             else:
                 result = broker.flip_mode(owner, mode)
                 self._send_json(200 if result.get("ok") else 400, result)
+        elif method in ("adopt_delivery", "adopt_status"):
+            # 配達所有権の明示 handover / その進行状況 (#166)。現職を無条件に fence
+            # できるため admin 面に限定する (上で admin.token bearer を定数時間比較済み)。
+            #
+            # **/admin には catch-all が無い** (do_POST は素で分岐し、tools/call の
+            # except Exception は /mcp 専用)。ここで漏らすと応答を書かないままソケットが
+            # 閉じ、CLI からは「daemon 不到達」と区別できない — adopt は現職を fence
+            # した後に落ちうる操作なので、その取り違えは最悪の診断ミスになる。
+            # 例外文は scrub_secrets を通す (observer 秘密の回り込みを断つ)。
+            code = ("adopt_failed" if method == "adopt_delivery"
+                    else "adopt_status_failed")
+            try:
+                if method == "adopt_delivery":
+                    result = broker.admin_adopt_delivery(params)
+                else:
+                    result = broker.admin_adopt_status(params)
+            except Exception as exc:
+                result = {"ok": False, "error": broker.scrub_secrets(
+                    f"[{code}] {type(exc).__name__}: {exc}")}
+            self._send_json(200 if result.get("ok") else 400, result)
         elif method == "delivery_dump":
             # 配送ライフサイクルの横断スナップショット (owner/state を晒すため admin)。
             self._send_json(200, {"ok": True, **broker.delivery_dump()})

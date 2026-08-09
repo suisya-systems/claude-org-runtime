@@ -134,12 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
     broker_sub = broker_p.add_subparsers(dest="cmd", required=True)
     broker_cli.add_subparsers(broker_sub)
 
-    # org (up / down launcher — thin wrapper over the broker control plane)
+    # org (up / adopt / down launcher — thin wrapper over the broker control plane)
     org_p = sub.add_parser(
         "org",
         help=(
             "org session launcher: 'up' ensures a broker daemon and launches the "
-            "secretary TUI; 'down' stops the daemon (signal-free) and verifies it."
+            "secretary TUI; 'adopt' hands an owner's delivery ownership to a new "
+            "session; 'down' stops the daemon (signal-free) and verifies it."
         ),
     )
     org_sub = org_p.add_subparsers(dest="cmd", required=True)

@@ -1612,6 +1612,535 @@ def test_reset_delivery_state_clears_standdowns(tmp_path):
     assert b._delivery_standdowns == {}
 
 
+# ============================== Issue #166 explicit adopt / handover (store)
+def test_adopt_fences_the_incumbent_sidecar_immediately(tmp_path):
+    """adopt が返った瞬間に旧 sidecar は claim 権を失う (rotate だけでは handover に
+    ならない)。
+
+    :meth:`poll_claims` は observer 秘密を **再検証しない**。秘密を差し替えるだけだと、
+    旧 session は adopting sidecar が register するまで claim/confirm を続けられる =
+    引き継いだつもりの会話が旧 pane に届き続ける。generation の bump を rotate と同一
+    lock スコープに置くことで、handover 境界を RPC の成功ではなく fence にする。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    res = b.adopt_delivery("dst")
+    assert res["ok"] is True and res["generation"] == gen + 1
+    b.enqueue(src, "dst", "must-not-reach-the-old-session")
+    fenced = b.poll_claims(dc, gen, iid)
+    assert fenced["error"] == "stale_sidecar" and fenced["rows"] == []
+    assert _row_states(b, "dst") == [UNDELIVERED]   # 旧 sidecar は claim していない
+
+
+def test_adopt_clears_the_registered_instance_so_nobody_can_deliver(tmp_path):
+    """adopt 後 register までの窓では **どの instance も** 配達できない。
+
+    generation を進めるだけだと、旧 sidecar は ``stale_sidecar`` 応答で知った新世代番号を
+    自分の instance_id で replay して配達を続けられる (既存の replay 攻撃面)。現世代
+    instance を空にして初めて「誰も claim できない窓」= 引き継ぎ境界になる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc, _gen, iid = _sidecar(b, "dst")
+    res = b.adopt_delivery("dst")
+    assert "dst" not in b._delivery_instances
+    for instance in (iid, "brand-new-instance"):
+        got = b.poll_claims(dc, res["generation"], instance)
+        assert got["error"] == "stale_sidecar" and got["rows"] == []
+
+
+def test_message_enqueued_during_the_adopt_window_is_held_not_lost(tmp_path):
+    """fence されている間に届いた message は **保持** され、adopting sidecar の register
+    後に配達される。
+
+    adopt は「誰も配達できない窓」を意図的に開けるので、その窓に落ちた message が捨て
+    られる (または旧 pane へ流れる) と、handover のたびに人間の依頼が静かに消える。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, _gen, iid = _sidecar(b, "dst")
+    res = b.adopt_delivery("dst")
+    b.enqueue(src, "dst", "for-the-adopting-session")
+    assert _row_states(b, "dst") == [UNDELIVERED]
+    assert b.poll_claims(dc, res["generation"], iid)["rows"] == []
+    reg = b.register_delivery_instance(dc, "adopting",
+                                       observer=res["observer_secret"])
+    rows = b.poll_claims(dc, reg["generation"], "adopting")["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["for-the-adopting-session"]
+
+
+def test_adopting_register_with_the_new_secret_completes_the_adoption(tmp_path):
+    """adopt の完了条件は「秘密の発行に成功した」ではなく「adopting instance が現世代の
+    claimer として登録された」こと。
+
+    RPC 成功を完了にすると、起動に失敗した adopt が成功として記録され、誰も配達しない
+    owner が沈黙のまま残る。完了は journal からも読めなければならない (失敗と完了を
+    後から区別できないと、無音の原因を特定できない)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc, _gen, _iid = _sidecar(b, "dst")
+    res = b.adopt_delivery("dst")
+    reg = b.register_delivery_instance(dc, "adopting",
+                                       observer=res["observer_secret"])
+    assert reg["ok"] is True and reg["generation"] == res["generation"] + 1
+    assert b._pending_adoptions == {}
+    done = _journal_events(b, "delivery_adopt_completed")
+    assert len(done) == 1
+    assert done[0]["adoption_id"] == res["adoption_id"] and done[0]["owner"] == "dst"
+    assert done[0]["instance"] == "adopting"
+    # 「どの register が adopt を締めたか」は register 行からも読める。
+    assert [r["adopted"] for r in _journal_events(
+        b, "delivery_generation_registered")] == [False, True]
+
+
+def test_pre_adopt_secret_cannot_register_after_the_adopt(tmp_path):
+    """adopt 前の秘密を持つ sidecar は latch する ``unobserved`` で拒否される。
+
+    ここが非 latch (``observer_pending``) だと、handover 元の session が 1 秒ごとに
+    register を叩き続け、adopting session が register する前の窓を掠め取りうる。
+    adopt は「かつて秘密を持っていた側」を確実に降ろす操作でなければならない。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    old_secret = b.assert_observer("dst")
+    dc = b.issue_delivery_cred("dst")
+    b.register_delivery_instance(dc, "old", observer=old_secret)
+    res = b.adopt_delivery("dst")
+    before = b._delivery_generations["dst"]
+    for _ in range(3):
+        refused = b.register_delivery_instance(dc, "old-retry", observer=old_secret)
+        assert refused["error"] == "unobserved"    # LATCHING_REFUSALS
+    assert b._delivery_generations["dst"] == before      # generation を奪えない
+    assert b._pending_adoptions["dst"].adoption_id == res["adoption_id"]
+
+
+def test_adopt_requeue_returns_in_flight_rows_and_leaves_other_owners_alone(tmp_path):
+    """``in_flight="requeue"`` は当該 owner の in-flight ``CLAIMED`` だけを差し戻す。
+
+    旧 host が emit 済かは daemon には分からないので、requeue は「沈黙より重複」を選ぶ
+    既定である。件数を応答に載せるのはその帰結を operator が後から追えるようにするため。
+    owner で絞り込みが漏れると、無関係な agent の live claim を剥がして不要な再配送
+    (= 別 pane での重複 action) を撒く。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)
+    src = _registered(b, "src")
+    _registered(b, "dst")
+    _registered(b, "other")
+    dc, gen, iid = _sidecar(b, "dst")
+    oc, ogen, oiid = _sidecar(b, "other", instance="io")
+    b.enqueue(src, "dst", "m1")
+    b.enqueue(src, "dst", "m2")
+    b.enqueue(src, "other", "not-yours")
+    b.poll_claims(dc, gen, iid)
+    b.poll_claims(oc, ogen, oiid)
+    assert _row_states(b, "dst") == [CLAIMED, CLAIMED]
+    res = b.adopt_delivery("dst", in_flight="requeue")
+    assert res["in_flight_policy"] == "requeue" and res["in_flight_rows"] == 2
+    assert _row_states(b, "dst") == [UNDELIVERED, UNDELIVERED]
+    assert _row_states(b, "other") == [CLAIMED]      # 他 owner の claim は無傷
+
+
+def test_adopt_drop_policy_retires_the_in_flight_rows(tmp_path):
+    """``in_flight="drop"`` は in-flight 行を ``DELIVERED`` にして **二度と配らない**。
+
+    at-most-once が要る運用 (旧 host が既に action 済) 向けの選択肢。ここで行が生き残る
+    と、drop を選んだ operator が意図した「重複 action を断つ」保証が pull 経路
+    (check_messages) 側から破れる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.enqueue(src, "dst", "m1")
+    b.enqueue(src, "dst", "m2")
+    b.poll_claims(dc, gen, iid)
+    res = b.adopt_delivery("dst", in_flight="drop")
+    assert res["in_flight_policy"] == "drop" and res["in_flight_rows"] == 2
+    assert _row_states(b, "dst") == [DELIVERED, DELIVERED]
+    assert b.drain(dst) == []       # pull 経路からも戻ってこない
+
+
+def test_adopt_started_journal_records_the_in_flight_choice(tmp_path):
+    """選んだ policy と件数を ``delivery_adopt_started`` に残す。
+
+    応答は CLI の標準出力に流れて消えるが、「あの handover で会話末尾を捨てたのか
+    重複させたのか」は事後に必ず問われる。journal に残らないと、静かに片方へ倒れていた
+    ことを後から証明できない。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.enqueue(src, "dst", "in-flight")
+    b.poll_claims(dc, gen, iid)
+    res = b.adopt_delivery("dst", in_flight="drop")
+    started = _journal_events(b, "delivery_adopt_started")
+    assert len(started) == 1
+    assert started[0]["owner"] == "dst"
+    assert started[0]["adoption_id"] == res["adoption_id"]
+    assert started[0]["generation"] == res["generation"]
+    assert started[0]["in_flight_policy"] == "drop"
+    assert started[0]["in_flight_rows"] == 1
+    assert started[0]["forced"] is False
+
+
+def test_old_sidecar_confirm_after_adopt_is_fenced_not_idempotent(tmp_path):
+    """adopt 後の旧 sidecar の confirm は ``stale_sidecar``。**冪等成功にしない**。
+
+    ``drop`` policy は行を ``DELIVERED`` にするので、generation 照合を confirm の冪等
+    分岐より後ろに置くと旧 sidecar は ``{"ok": True, "idempotent": True}`` を受け取る。
+    旧 host は「自分が届けた」と信じて何事もなく次を待ち、adopt が起きたことに永久に
+    気付かない (二重 host が観測面から消える)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.enqueue(src, "dst", "x")
+    claimed = b.poll_claims(dc, gen, iid)
+    rid = claimed["rows"][0]["id"]
+    b.adopt_delivery("dst", in_flight="drop")
+    conf = b.confirm_delivered(dc, rid, claimed["epoch"], gen, iid)
+    assert conf["ok"] is False and conf["error"] == "stale_sidecar"
+    assert "idempotent" not in conf
+
+
+def test_second_adopt_needs_force_and_force_supersedes_the_first(tmp_path):
+    """並行 adopt を **暗黙の敗北にしない** (last-rotate-wins をそのまま晒さない)。
+
+    rotate は last-rotate-wins なので、2 回目を黙って通すと 1 回目の CLI は「成功」を
+    受け取った後で既に無効な秘密を持つ session を起動し、その session は ``unobserved``
+    で恒久沈黙する。既定は拒否し、上書きは ``force`` という明示の選択にする。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    first = b.adopt_delivery("dst")
+    busy = b.adopt_delivery("dst")
+    assert busy["ok"] is False and "[adopt_in_flight]" in busy["error"]
+    assert busy["adoption_id"] == first["adoption_id"]
+    # 拒否は先行 adopt を一切動かさない (拒否のついでに秘密が回ると最悪)。
+    assert b._pending_adoptions["dst"].adoption_id == first["adoption_id"]
+    assert b._observer_leases["dst"].secret == first["observer_secret"]
+    second = b.adopt_delivery("dst", force=True)
+    assert second["ok"] is True and second["adoption_id"] != first["adoption_id"]
+    sup = _journal_events(b, "delivery_adopt_superseded")
+    assert len(sup) == 1 and sup[0]["adoption_id"] == first["adoption_id"]
+    # 先行 adopt が起動した session は latch する拒否を受ける (沈黙の原因が journal に
+    # 残っているので診断できる)。
+    assert b.register_delivery_instance(
+        dc, "first-session", observer=first["observer_secret"])["error"] == "unobserved"
+
+
+def test_adopt_unknown_owner_installs_no_lease(tmp_path):
+    """存在しない owner への adopt は拒否し、**lease を残さない**。
+
+    typo を成功にすると、operator は handover したつもりで、実際には誰も居ない名前に
+    armed lease を張って終わる。その lease は失効しないので、後日その名前で起動した
+    session が ``observer_pending`` で永久に claim できなくなる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    res = b.adopt_delivery("typo-worker")
+    assert res["ok"] is False and "[unknown_owner]" in res["error"]
+    assert "typo-worker" not in b._observer_leases
+    assert b._pending_adoptions == {}
+    # その名前で後から起動する session を塞いでいない。
+    _registered(b, "typo-worker")
+    dc = b.issue_delivery_cred("typo-worker")
+    assert b.register_delivery_instance(dc, "i1")["ok"] is True
+
+
+def test_adopt_owner_without_delivery_credential_is_refused(tmp_path):
+    """delivery cred を持たない owner の adopt は拒否する (lease も張らない)。
+
+    adopting session の channel sidecar はこの cred で ``/claim-owner`` を叩くので、
+    無ければ handover しても配送は始まらない。「成功したのに何も起きない」を返すより、
+    mint / spawn からやり直せと loud に落とす方が回復が早い。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "pull-only")
+    res = b.adopt_delivery("pull-only")
+    assert res["ok"] is False and "[no_delivery_credential]" in res["error"]
+    assert "pull-only" not in b._observer_leases
+    assert b._pending_adoptions == {}
+
+
+def test_adopt_rejects_invalid_in_flight_and_arming_seconds(tmp_path):
+    """不正な policy / 期限は **副作用ゼロで** 弾く。
+
+    検証が fence の後ろに落ちると、引数を打ち間違えただけで旧 sidecar が降ろされ、
+    誰も配達しない owner が残る (操作は失敗したのに配送だけ止まる、最も不可解な壊れ方)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    bad = b.adopt_delivery("dst", in_flight="purge")
+    assert bad["ok"] is False and "[invalid_in_flight]" in bad["error"]
+    for value in (0, -1.0, "soon"):
+        got = b.adopt_delivery("dst", arming_seconds=value)
+        assert got["ok"] is False and "[invalid_arming_seconds]" in got["error"]
+    assert b._pending_adoptions == {} and "dst" not in b._observer_leases
+    assert "dst" not in b._delivery_generations
+
+
+def test_adopt_expires_when_the_adopting_session_never_registers(tmp_path):
+    """期限内に adopting register が来なければ adopt は **失敗** で、必ず journal に残る。
+
+    adopt は旧 sidecar をその場で降ろすので、起動に失敗すると誰も配達しない owner が
+    残る。この失敗が沈黙すると「秘密は出したので成功」という最悪の記録だけが残り、
+    attention watcher が operator へ能動通知する材料も無くなる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    assert res["arming_seconds"] == 0.05
+    time.sleep(0.1)                       # 期限を **過ぎた** ことだけを主張する
+    b.adopt_status("dst")                 # sweep 入口
+    expired = _journal_events(b, "delivery_adopt_expired")
+    assert len(expired) == 1
+    assert expired[0]["owner"] == "dst"
+    assert expired[0]["adoption_id"] == res["adoption_id"]
+    assert expired[0]["lease_dropped"] is True
+    assert b._pending_adoptions == {} and "dst" not in b._observer_leases
+    assert b.adopt_status("dst")["pending"] is None
+
+
+def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path):
+    """**回帰**: 期限切れは lease を落とすだけでは足りない。fence 前の
+    ``(generation, instance)`` を戻して、旧 sidecar の配達を実際に復活させる。
+
+    fence された旧 sidecar は ``stale_sidecar`` で latch せず poll を続けるだけで、
+    **register し直さない** (一度成功した instance は再 register 経路を通らない)。復帰が
+    無いと「lease は外れたが claimer が 1 つも居ない」owner が pane を閉じるまで残る =
+    arming deadline が防ぐはずだった恒久無音そのものになる。journal ではなく
+    ``poll_claims`` が通ることで固定する (ここは fenced sidecar の poll 自身が sweep 入口
+    でもある)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+               adopt_arming_seconds=0.05)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.adopt_delivery("dst")
+    b.enqueue(src, "dst", "back-to-the-incumbent")
+    time.sleep(0.1)
+    rows = b.poll_claims(dc, gen, iid)["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["back-to-the-incumbent"]
+    assert b._delivery_generations["dst"] == gen
+    assert b._delivery_instances["dst"] == iid
+    expired = _journal_events(b, "delivery_adopt_expired")
+    assert len(expired) == 1
+    assert expired[0]["restored"] is True
+    assert expired[0]["restored_generation"] == gen
+
+
+def test_expired_adopt_does_not_clobber_a_lease_installed_after_the_deadline(tmp_path):
+    """compare-and-delete: 期限切れが落とすのは **自分が張った lease だけ**。
+
+    期限後に別経路 (再 spawn の re-assert / 後続 adopt) が張り直した lease を巻き添えに
+    すると、今まさに有効な fork 保護が黙って外れる。新しい session は mute されないので
+    誰も気付かないまま、replay した fork が takeover できる状態に戻る。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    b.adopt_delivery("dst")
+    time.sleep(0.1)
+    fresh = b.assert_observer("dst")      # 期限後に張り直された別 caller の lease
+    b.adopt_status("dst")                 # sweep 入口
+    assert b._pending_adoptions == {}
+    assert b._observer_leases["dst"].secret == fresh
+    assert _journal_events(b, "delivery_adopt_expired")[0]["lease_dropped"] is False
+    assert b.register_delivery_instance(dc, "fresh-obs", observer=fresh)["ok"] is True
+
+
+def test_expired_adopt_does_not_restore_the_fence_after_someone_registered(tmp_path):
+    """compare-and-restore: 期限切れが **現に配達している sidecar を蹴らない**。
+
+    adopt を経ずに再 spawn した session が先に register していると、無条件の原状復帰は
+    現世代 instance を旧 instance へ差し替えてしまい、生きている session を無音にする。
+    復帰は「現世代が adopt の張った世代のままで、かつ誰も register していない」時だけ。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, _gen, _iid = _sidecar(b, "dst")
+    b.adopt_delivery("dst")
+    # adopt の秘密ではなく、再 spawn の re-assert で立った別 session が先に register する。
+    respawn = b.assert_observer("dst")
+    reg = b.register_delivery_instance(dc, "respawned", observer=respawn)
+    assert "dst" in b._pending_adoptions          # adoption_id が違うので締まっていない
+    # 期限だけを過去へ倒す (sleep で待つ形にすると「register は期限前に入る」という
+    # 上限側の仮定が要り、遅い runner で崩れる。ここで見たいのは時間の経過ではなく
+    # sweep の compare-and-restore)。
+    b._pending_adoptions["dst"].armed_until = 0.0
+    b.enqueue(src, "dst", "for-the-live-session")   # lock 外の sweep 入口
+    expired = _journal_events(b, "delivery_adopt_expired")
+    assert len(expired) == 1
+    assert expired[0]["restored"] is False and expired[0]["restored_generation"] is None
+    assert expired[0]["lease_dropped"] is False
+    assert b._observer_leases["dst"].secret == respawn
+    assert b._delivery_instances["dst"] == "respawned"
+    rows = b.poll_claims(dc, reg["generation"], "respawned")["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["for-the-live-session"]
+
+
+def test_an_expired_adoption_does_not_block_the_next_adopt(tmp_path):
+    """失敗した adopt が owner を人質に取らない。
+
+    sweep が adopt 入口の先頭に無いと、1 回目が失敗した owner は期限の記録が残ったまま
+    ``[adopt_in_flight]`` を返し続け、operator は「既に死んでいる adopt」に対して
+    ``force`` を強要される (force は先行 session を降ろす意味を持つので、意味論が濁る)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    first = b.adopt_delivery("dst")
+    time.sleep(0.1)
+    second = b.adopt_delivery("dst")
+    assert second["ok"] is True and second["adoption_id"] != first["adoption_id"]
+    assert _journal_events(b, "delivery_adopt_expired")[0]["adoption_id"] == \
+        first["adoption_id"]
+    # 期限切れ経路であって force の supersede ではない。
+    assert _journal_events(b, "delivery_adopt_superseded") == []
+
+
+def test_expired_adopt_is_swept_by_check_messages_when_nothing_polls(tmp_path):
+    """poll 入口だけに sweep を置かない。
+
+    adopt の主用途は「session が死んだ owner の引き継ぎ」で、そこでは poll する sidecar
+    が 1 つも居ない。まさに通知したいケース (adopt したが起動に失敗した dead owner) だけ
+    が永久に検知されないのを防ぐため、pull 経路 (check_messages) も sweep 入口になる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    src, dst = _registered(b, "src"), _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    b.enqueue(src, "dst", "someone-is-waiting")
+    time.sleep(0.1)
+    assert [m["message"] for m in b.drain(dst)] == ["someone-is-waiting"]
+    expired = _journal_events(b, "delivery_adopt_expired")
+    assert len(expired) == 1 and expired[0]["adoption_id"] == res["adoption_id"]
+
+
+def test_adopt_arms_an_owner_that_never_registered_a_sidecar(tmp_path):
+    """generation も lease も無い owner で adopt が成立する。
+
+    adopt の主用途は「session が死んだ / 手起動で resume した」owner の引き継ぎであり、
+    そこでは register 済 (= generation あり) でも observed (= lease あり) でもない。
+    既存状態を前提にすると、本来の用途がまるごと弾かれる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    assert "dst" not in b._delivery_generations and "dst" not in b._observer_leases
+    res = b.adopt_delivery("dst")
+    assert res["ok"] is True and res["generation"] == 1
+    lease = b._observer_leases["dst"]
+    assert lease.secret == res["observer_secret"]
+    # armed (TTL では失効しない) + 有限の活性化期限、という adopt 経路の相。
+    assert lease.expires_at is None and isinstance(lease.arming_until, float)
+    assert b._pending_adoptions["dst"].adoption_id == res["adoption_id"]
+    # 秘密を渡された adopting session だけが claimer になれる。
+    assert b.register_delivery_instance(
+        dc, "adopting", observer=res["observer_secret"])["ok"] is True
+
+
+def test_reset_delivery_state_cancels_a_pending_adoption(tmp_path):
+    """pane が閉じたら進行中 adopt は cancel する (黙って消さない)。
+
+    残すと期限まで後続 adopt が ``[adopt_in_flight]`` で塞がれ、期限後には「もう居ない
+    owner の adopt が失敗した」という誤解を招く通知が出る。cancel を journal に残すのは、
+    ``delivery_adopt_expired`` が来ないことの説明を残すため。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    b.reset_delivery_state("dst")
+    assert b._pending_adoptions == {}
+    cancelled = _journal_events(b, "delivery_adopt_cancelled")
+    assert len(cancelled) == 1
+    assert cancelled[0]["owner"] == "dst"
+    assert cancelled[0]["adoption_id"] == res["adoption_id"]
+    assert cancelled[0]["reason"] == "delivery_reset"
+    # cancel 済なので次の adopt は force 無しで通る。
+    assert b.adopt_delivery("dst")["ok"] is True
+
+
+def test_delivery_dump_exposes_the_pending_adoption_without_the_secret(tmp_path):
+    """「誰も配達していない窓」を dump 単独で説明できるようにする (秘密は載せない)。
+
+    adopt〜register の間は generations / instances だけ見ても「instance が消えている」
+    としか読めず、事故と区別できない。一方 dump は admin 診断で人手に渡り貼り付けられる
+    面なので、ここに秘密が載ると handover を横取りできる材料が配られる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst", in_flight="drop")
+    dump = b.delivery_dump()
+    rec = dump["adoptions"]["dst"]
+    assert rec["adoption_id"] == res["adoption_id"]
+    assert rec["in_flight_policy"] == "drop" and rec["in_flight_rows"] == 0
+    assert rec["fenced_generation"] == res["generation"]
+    assert res["observer_secret"] not in json.dumps(dump)
+
+
+def test_adopt_never_writes_the_observer_secret_to_the_journal(tmp_path):
+    """queue.jsonl は ``admin.token`` と違い 0600 ではない。
+
+    adopt の秘密がここに落ちると、ファイルを読めるだけで配達所有権を横取りできる =
+    「fork が replay できない信号」という lease の存在理由が消える。adopt / 完了 /
+    status のどの経路でも書かないことを、実ファイルの本文で固定する。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=300.0)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    b.enqueue(src, "dst", "x")
+    b.poll_claims(dc, gen, iid)
+    res = b.adopt_delivery("dst")
+    b.register_delivery_instance(dc, "adopting", observer=res["observer_secret"])
+    b.adopt_status("dst")
+    text = (b.state_dir / "queue.jsonl").read_text(encoding="utf-8")
+    assert res["observer_secret"] not in text
+    assert "delivery_adopt_completed" in text     # vacuous pass でないことの担保
+
+
+def test_scrub_secrets_redacts_a_pending_adoptions_secret_after_a_rotate(tmp_path):
+    """lease が後続 rotate で差し替わった **後** も、進行中 adopt の秘密は伏せる。
+
+    adopt が起こした session の spawn 失敗例外は、その秘密を env 代入形ではなく剥き出しの
+    値として運びうる (adapter 実装依存)。live な lease の一致だけを見ていると、rotate した
+    瞬間からその値が診断文字列と queue.jsonl へ素通りする。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    b.assert_observer("dst")      # lease は別秘密へ rotate (pending はまだ生きている)
+    assert b._observer_leases["dst"].secret != res["observer_secret"]
+    scrubbed = b.scrub_secrets(
+        f"spawn failed while adopting: {res['observer_secret']}")
+    assert res["observer_secret"] not in scrubbed
+    assert "[REDACTED_OBSERVER_SECRET]" in scrubbed
+    assert "spawn failed while adopting" in scrubbed   # 診断は読めるまま
+
+
+def test_adopt_arming_seconds_defaults_to_the_broker_tunable(tmp_path):
+    """既定の活性化期限は ``Broker(adopt_arming_seconds=...)`` から取る。
+
+    モジュール定数 (300s) を直接読むと tunable が黙って効かなくなり、期限まわりのテストは
+    「300 秒待たないので何も起きない」= vacuous pass に化ける (壊れているのに緑になる)。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=1.5)
+    _registered(b, "dst")
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    assert res["arming_seconds"] == 1.5
+    assert store.DEFAULT_ADOPT_ARMING_SECONDS != 1.5   # 定数の素通しではない
+    # 期限も tunable 由来 (定数由来なら now+300 になり、この上限を必ず超える)。
+    assert b._pending_adoptions["dst"].armed_until <= time.time() + 1.5
+
+
 # ============================== Issue #129 HTTP wire (observer / bg_hosted)
 def test_claim_owner_observer_and_bg_over_http(broker):
     """/claim-owner が observer 秘密 (Phase 2) と bg_hosted marker (Phase 1) を配線する。"""

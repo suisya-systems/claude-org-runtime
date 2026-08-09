@@ -13,7 +13,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Literal, Mapping, Optional
 
+from . import readers
 from .config import DEFAULT_NOTIFY
+
+# NOTE: importing :mod:`readers` here is for its journal **event-name
+# constants** only, never its loaders - this module stays pure. Sharing
+# the names is what keeps the filter and the classifier from drifting
+# apart (a reader that surfaces a row the classifier silently drops is
+# exactly the kind of quiet gap this feature exists to close). No cycle:
+# ``readers`` imports nothing from this package.
 
 Severity = Literal["urgent", "normal"]
 
@@ -356,6 +364,92 @@ def classify_broker_duplicates(
     return [ev for _, ev in latest.values()]
 
 
+def classify_delivery_signal(
+    record: Mapping[str, Any],
+    notify_map: Optional[Mapping[str, str]] = None,
+) -> Optional[AttentionEvent]:
+    """Map one delivery-ownership journal row to an event, or ``None``.
+
+    Issue #166. The row comes from :func:`readers.
+    read_broker_delivery_signals` and is one of two events, both meaning
+    "this owner receives no push and only a human can restore it":
+
+    * ``delivery_register_superseded`` — a session presented an observer
+      secret that no longer matches. It has latched and will never claim
+      again for the life of that process. Either a fork/resume replay
+      (which is the fence working as designed, but the operator still
+      wants to know a session went mute) or a session that was live when
+      the owner was adopted.
+    * ``delivery_adopt_expired`` — an adopt was armed and nothing
+      registered before the deadline, so the daemon reverted the fence.
+      This is the failure report for an explicit operator action, and it
+      is the reason issuing the secret is not treated as success.
+
+    Returns ``None`` for an unrecognised ``event`` rather than notifying:
+    unlike the duplicate-sidecar reader, this one filters two names out
+    of a shared journal, so a third name arriving here means the reader
+    and the classifier disagree — inventing a notification for it would
+    turn a version skew into operator noise.
+    """
+    event = _str_or_none(record.get("event"))
+    owner = _str_or_none(record.get("owner"))
+    if event == readers.DELIVERY_ADOPT_EXPIRED_EVENT:
+        adoption = _str_or_none(record.get("adoption_id"))
+        # ``restored`` is the operationally decisive bit: True means the
+        # previous session's delivery was handed back, False means the
+        # owner is left with no claimer at all.
+        restored = record.get("restored")
+        summary = (
+            f"adoption {adoption or 'unknown'} expired; "
+            + ("previous session restored" if restored
+               else "no session is claiming this owner")
+        )
+        key = f"broker:delivery_adopt_expired:{owner or 'unknown'}:{adoption or 'unknown'}"
+        kind = "delivery_adopt_expired"
+    elif event == readers.DELIVERY_SUPERSEDED_EVENT:
+        instance = _str_or_none(record.get("instance"))
+        summary = f"sidecar {instance or 'unknown'} was superseded and stopped claiming"
+        # Key on the instance, not just the owner: a second session going
+        # mute later is a new incident and must not be swallowed by the
+        # cooldown of the first.
+        key = f"broker:delivery_superseded:{owner or 'unknown'}:{instance or 'unknown'}"
+        kind = "delivery_superseded"
+    else:
+        return None
+    title, body = _default_text(kind, worker=owner, summary=summary)
+    return AttentionEvent(
+        key=key, kind=kind, severity=_severity_for(kind, notify_map),
+        title=title, body=body, source=BROKER_JOURNAL_SOURCE,
+        worker=owner, summary=summary,
+        created_at=_iso_from_epoch(record.get("ts")),
+    )
+
+
+def classify_broker_delivery_signals(
+    records: Iterable[Mapping[str, Any]],
+    notify_map: Optional[Mapping[str, str]] = None,
+) -> list[AttentionEvent]:
+    """Classify delivery-ownership rows, collapsing repeats per incident.
+
+    Both underlying events are one-shot, so collapsing is normally a
+    no-op — it is here so that a daemon restart or a journal that somehow
+    carries the same ``(owner, instance)`` twice yields one notification
+    per incident per scan, matching
+    :func:`classify_broker_duplicates`. Unrecognised rows are dropped.
+    """
+    latest: dict[str, tuple[float, AttentionEvent]] = {}
+    for rec in records:
+        ev = classify_delivery_signal(rec, notify_map=notify_map)
+        if ev is None:
+            continue
+        ts = _epoch_or_none(rec.get("ts"))
+        ts = 0.0 if ts is None else ts
+        prev = latest.get(ev.key)
+        if prev is None or ts >= prev[0]:
+            latest[ev.key] = (ts, ev)
+    return [ev for _, ev in latest.values()]
+
+
 def classify_all(
     events: Iterable[dict[str, Any]],
     pending: Iterable[dict[str, Any]],
@@ -367,14 +461,16 @@ def classify_all(
     pending_decision_max: int = 1440,
     pending_decision_drop: int = 10080,
     broker_duplicates: Iterable[Mapping[str, Any]] = (),
+    broker_delivery_signals: Iterable[Mapping[str, Any]] = (),
 ) -> list[AttentionEvent]:
     """Classify all inputs in order: DB events, pending, broker journal.
 
     The ``pending_decision_max`` / ``pending_decision_drop`` defaults
     mirror :class:`AttentionConfig` so test callers that pre-date
     Issue #26 keep working without passing the new ladder thresholds.
-    ``broker_duplicates`` (Issue #167) defaults to empty for the same
-    reason — callers that do not read the broker journal are unchanged.
+    ``broker_duplicates`` (Issue #167) and ``broker_delivery_signals``
+    (Issue #166) default to empty for the same reason — callers that do
+    not read the broker journal are unchanged.
     """
     out: list[AttentionEvent] = []
     for row in events:
@@ -392,6 +488,9 @@ def classify_all(
             out.append(ev)
     out.extend(classify_broker_duplicates(
         broker_duplicates, notify_map=notify_map,
+    ))
+    out.extend(classify_broker_delivery_signals(
+        broker_delivery_signals, notify_map=notify_map,
     ))
     return out
 
@@ -522,6 +621,21 @@ _DEFAULT_TEMPLATES: dict[str, tuple[str, str]] = {
     "duplicate_sidecar": (
         "Duplicate channel sidecar",
         "{worker}: two sessions are claiming the same channel ({summary}).",
+    ),
+    # Issue #166: a session stopped claiming its owner's channel because
+    # a rotate superseded it. Nothing in the runtime restores it - the
+    # process has latched for good - so the operator has to adopt the
+    # owner into a live session or close the pane.
+    "delivery_superseded": (
+        "Channel session superseded",
+        "{worker}: {summary}. Adopt the owner into a live session.",
+    ),
+    # Issue #166: an explicit adopt never landed. This is the failure
+    # report for an operator action, which is why it notifies even when
+    # the previous session was handed its delivery back.
+    "delivery_adopt_expired": (
+        "Delivery adopt expired",
+        "{worker}: {summary}.",
     ),
 }
 

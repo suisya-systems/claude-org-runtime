@@ -425,3 +425,46 @@ def test_duplicate_sidecar_window_rejects_non_int(tmp_path: Path) -> None:
 def test_duplicate_sidecar_default_severity_is_urgent() -> None:
     """Only a human can resolve a double claimer, so it rides at urgent."""
     assert DEFAULT_NOTIFY["duplicate_sidecar"] == "urgent"
+
+
+def test_delivery_signal_window_default_and_override(tmp_path: Path) -> None:
+    """Issue #166: the one-shot signals get a far longer freshness window.
+
+    ``delivery_register_superseded`` / ``delivery_adopt_expired`` never
+    re-fire, so if this defaulted to the duplicate-sidecar window (300s)
+    a watcher started five minutes after a session went mute would never
+    hear about it. Pin the default and keep it operator-tunable.
+    """
+    assert AttentionConfig().delivery_signal_window_sec == 3600
+    p = tmp_path / "attention.json"
+    p.write_text(
+        json.dumps({"delivery_signal_window_sec": 900}), encoding="utf-8",
+    )
+    assert load_config(p).delivery_signal_window_sec == 900
+
+
+def test_delivery_signal_window_rejects_non_int(tmp_path: Path) -> None:
+    """The new knob is validated like every other int key.
+
+    A string here would reach ``now_epoch - window_sec`` inside the
+    reader and raise mid-scan on a long-running watch, instead of
+    failing loudly when the config is loaded.
+    """
+    p = tmp_path / "attention.json"
+    p.write_text(
+        json.dumps({"delivery_signal_window_sec": "900"}), encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_config(p)
+
+
+def test_delivery_signal_default_severities_are_urgent() -> None:
+    """Both delivery-ownership kinds default to urgent.
+
+    Each means an owner is receiving no push and nothing in the runtime
+    will fix it — the "human is the sole recovery path" tier. Demoting
+    either to ``normal`` would let a silently muted session sit behind a
+    non-waking notification.
+    """
+    assert DEFAULT_NOTIFY["delivery_superseded"] == "urgent"
+    assert DEFAULT_NOTIFY["delivery_adopt_expired"] == "urgent"

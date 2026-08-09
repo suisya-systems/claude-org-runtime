@@ -736,6 +736,111 @@ def test_scan_broker_state_dir_override(tmp_path: Path) -> None:
     assert [ev["kind"] for ev in payload] == ["duplicate_sidecar"]
 
 
+def _write_adopt_expired(
+    broker_dir: Path,
+    *,
+    age_sec: float = 30.0,
+    owner: str = "secretary",
+    adoption_id: str = "ad0011",
+    restored: bool = False,
+) -> Path:
+    """Append one ``delivery_adopt_expired`` line aged off the frozen now."""
+    broker_dir.mkdir(parents=True, exist_ok=True)
+    path = broker_dir / "queue.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": _FROZEN_NOW.timestamp() - age_sec,
+            "event": "delivery_adopt_expired",
+            "owner": owner,
+            "adoption_id": adoption_id,
+            "armed_seconds": 300.0,
+            "lease_dropped": True,
+            "generation": 4,
+            "restored": restored,
+            "restored_generation": None,
+        }) + "\n")
+    return path
+
+
+def test_scan_surfaces_adopt_expiry_from_broker_journal(
+    tmp_path: Path,
+) -> None:
+    """Issue #166 acceptance: a failed handover reaches the operator.
+
+    The daemon cannot recover an adopt that nobody registered for, so
+    the journal line is the only trace. Without this wiring the operator
+    sees the CLI report a rotated secret and never learns that no
+    session ever picked the owner up.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_adopt_expired(state_dir / "broker")
+
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir), "--json",
+    ])
+    expired = [ev for ev in payload if ev["kind"] == "delivery_adopt_expired"]
+    assert len(expired) == 1
+    assert expired[0]["severity"] == "urgent"
+    assert expired[0]["worker"] == "secretary"
+    assert "ad0011" in expired[0]["body"]
+    # ``restored: False`` — the decisive half: nobody is claiming at all.
+    assert "no session is claiming this owner" in expired[0]["body"]
+    assert expired[0]["delivered"] is True
+
+
+def test_scan_adopt_expiry_dedupes_within_cooldown(tmp_path: Path) -> None:
+    """One failed adopt must not ring on every poll of the watch loop.
+
+    The line stays in the append-only journal for its whole freshness
+    window, so an ungated consumer would re-notify every ``poll_interval``
+    until it aged out — the alert-fatigue path that makes operators stop
+    reading these.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _write_adopt_expired(state_dir / "broker")
+
+    parser = build_top_parser()
+    argv = ["attention", "scan", "--state-dir", str(state_dir), "--json"]
+    first = _scan_json(parser, argv)
+    assert len([
+        ev for ev in first if ev["kind"] == "delivery_adopt_expired"
+    ]) == 1
+    # Cooldown-gated (not write-once): the key lands in the ``pending``
+    # namespace so it can re-alert later, but not on the next poll.
+    dedup = json.loads(
+        (state_dir / "attention_notified.json").read_text(encoding="utf-8"),
+    )
+    assert "broker:delivery_adopt_expired:secretary:ad0011" in dedup["pending"]
+    second = _scan_json(parser, argv)
+    assert [
+        ev for ev in second if ev["kind"] == "delivery_adopt_expired"
+    ] == []
+
+
+def test_scan_ignores_delivery_signal_older_than_its_window(
+    tmp_path: Path,
+) -> None:
+    """A stale journal must not page about a handover that already ended.
+
+    These lines never age out of the journal on their own, so the
+    freshness window is the only thing stopping a fresh watcher from
+    re-announcing every historical adopt failure as current.
+    """
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    # Default ``delivery_signal_window_sec`` is 3600.
+    _write_adopt_expired(state_dir / "broker", age_sec=7200.0)
+
+    payload = _scan_json(build_top_parser(), [
+        "attention", "scan", "--state-dir", str(state_dir), "--json",
+    ])
+    assert [
+        ev for ev in payload if ev["kind"] == "delivery_adopt_expired"
+    ] == []
+
+
 def test_watch_surfaces_duplicate_sidecar(tmp_path: Path) -> None:
     """The watch loop (not just one-shot scan) reads the broker journal."""
     state_dir = tmp_path / ".state"

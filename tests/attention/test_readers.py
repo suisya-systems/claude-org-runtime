@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from claude_org_runtime.attention.readers import (
+    read_broker_delivery_signals,
     read_broker_duplicates,
     read_events,
     read_pending_decisions,
@@ -335,3 +336,234 @@ def test_read_broker_duplicates_unreadable_journal_warns(
         tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
     ) == []
     assert "broker journal" in capsys.readouterr().err
+
+
+def test_read_broker_duplicates_projection_is_exactly_three_keys(
+    tmp_path: Path,
+) -> None:
+    """The published row shape must survive the shared-engine refactor.
+
+    Issue #166 moved this reader onto the same tail-walk as the
+    delivery-ownership one, which hands back whole journal records. If
+    the projection stopped narrowing them, ``event`` / ``instance`` /
+    anything else the daemon writes would start leaking into a payload
+    a downstream repo parses. Pin the key set exactly, not just the
+    three values.
+    """
+    _write_journal(tmp_path / "broker", [_dup(995.0)])
+    out = read_broker_duplicates(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=300.0,
+    )
+    assert [set(r) for r in out] == [{"ts", "owner", "instances"}]
+
+
+# ---------------------------------------------------------------------------
+# Broker journal — delivery-ownership signals (Issue #166)
+# ---------------------------------------------------------------------------
+
+
+def _superseded(
+    ts: float, owner: str = "sec", instance: str = "inst-old",
+) -> dict:
+    """One ``delivery_register_superseded`` line as the store writes it."""
+    return {
+        "ts": ts, "event": "delivery_register_superseded",
+        "owner": owner, "instance": instance,
+        "state": "active", "latched": True,
+    }
+
+
+def _adopt_expired(
+    ts: float, owner: str = "sec", adoption_id: str = "ad0011",
+    restored: bool = True,
+) -> dict:
+    """One ``delivery_adopt_expired`` line as the store writes it."""
+    return {
+        "ts": ts, "event": "delivery_adopt_expired",
+        "owner": owner, "adoption_id": adoption_id,
+        "armed_seconds": 300.0, "lease_dropped": True,
+        "generation": 4, "restored": restored,
+        "restored_generation": 3 if restored else None,
+    }
+
+
+def test_read_broker_delivery_signals_missing_journal_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """A broker that never ran must not crash the watcher's first poll."""
+    assert read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+    ) == []
+
+
+def test_read_broker_delivery_signals_picks_only_the_two_ownership_events(
+    tmp_path: Path,
+) -> None:
+    """Exactly two event names may reach the delivery classifier.
+
+    The journal carries every kind of line the daemon writes. Widening
+    this filter would page the operator about routine traffic, and
+    picking up ``duplicate_sidecar_detected`` here would re-notify a
+    live double sidecar on this reader's hour-long window instead of
+    the short one that signal is designed around.
+    """
+    _write_journal(tmp_path / "broker", [
+        {"ts": 950.0, "event": "message_enqueued", "to_id": "sec"},
+        {"ts": 960.0, "event": "duplicate_sidecar_detected",
+         "owner": "sec", "instances": ["a", "b"]},
+        {"ts": 970.0, "event": "lease_reaped", "owner": "sec"},
+        _superseded(980.0),
+        {"ts": 985.0, "event": "delivery_adopt_started",
+         "owner": "sec", "adoption_id": "ad0011"},
+        _adopt_expired(990.0),
+        {"ts": 995.0, "event": "delivery_generation_registered",
+         "owner": "sec", "generation": 5},
+    ])
+    out = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+    )
+    assert [r["event"] for r in out] == [
+        "delivery_register_superseded", "delivery_adopt_expired",
+    ]
+
+
+def test_read_broker_delivery_signals_drops_rows_outside_the_window(
+    tmp_path: Path,
+) -> None:
+    """A long-settled incident must not be replayed as if it were now.
+
+    Neither event repeats, so both sit in the append-only journal
+    forever. Without the cutoff every scan would re-surface an adopt
+    that expired weeks ago, and the operator would learn to ignore the
+    one signal that means "nobody is receiving push right now".
+    """
+    _write_journal(tmp_path / "broker", [
+        _adopt_expired(900.0, adoption_id="ancient"),    # 3700s ago
+        _superseded(4000.0, instance="live-inst"),       # 600s ago
+    ])
+    out = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=4600.0, window_sec=3600.0,
+    )
+    assert [r["event"] for r in out] == ["delivery_register_superseded"]
+    assert out[0]["instance"] == "live-inst"
+
+
+def test_read_broker_delivery_signals_keep_the_raw_per_event_fields(
+    tmp_path: Path,
+) -> None:
+    """The rows arrive raw, because the two events share almost no fields.
+
+    ``read_broker_duplicates`` projects down to three keys; doing that
+    here would drop ``adoption_id`` and ``instance``, and the classifier
+    would have nothing left to build a per-incident dedup key from — a
+    second session going mute would be swallowed by the cooldown of the
+    first. ``ts`` is still normalized to a float so the window math and
+    the ISO conversion have one type to work with.
+    """
+    _write_journal(tmp_path / "broker", [
+        _superseded(980, instance="inst-old"),
+        _adopt_expired(990, adoption_id="ad0011", restored=False),
+    ])
+    sup, exp = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+    )
+    assert sup["instance"] == "inst-old"
+    assert sup["latched"] is True
+    assert sup["state"] == "active"
+    assert exp["adoption_id"] == "ad0011"
+    assert exp["restored"] is False
+    # Written as ints above; both must come back as floats.
+    assert isinstance(sup["ts"], float) and sup["ts"] == 980.0
+    assert isinstance(exp["ts"], float) and exp["ts"] == 990.0
+
+
+def test_read_broker_delivery_signals_skips_corrupt_and_undateable_rows(
+    tmp_path: Path,
+) -> None:
+    """A half-written tail line must not take the whole signal down.
+
+    The daemon appends while the watcher reads, so a torn last line is
+    normal. Raising here would kill the poll that was supposed to report
+    an owner going mute — the failure mode this reader exists to catch.
+    """
+    path = _write_journal(tmp_path / "broker", [_adopt_expired(990.0)])
+    with path.open("a", encoding="utf-8") as f:
+        f.write("{not json\n")
+        f.write("[1, 2, 3]\n")                       # not an object
+        f.write("\n")                                # blank
+        f.write(json.dumps({"event": "delivery_adopt_expired"}) + "\n")
+        f.write(json.dumps(
+            {"ts": "990", "event": "delivery_adopt_expired"}) + "\n")
+        f.write(json.dumps(
+            {"ts": True, "event": "delivery_register_superseded"}) + "\n")
+        f.write('{"ts": NaN, "event": "delivery_adopt_expired"}\n')
+        f.write('{"ts": Infinity, "event": "delivery_adopt_expired"}\n')
+    out = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+    )
+    assert [r["ts"] for r in out] == [990.0]
+
+
+def test_read_broker_delivery_signals_unreadable_journal_warns(
+    tmp_path: Path, capsys,
+) -> None:
+    """A degraded read says which journal went quiet, then returns empty.
+
+    Silently returning ``[]`` would be indistinguishable from "nothing
+    is wrong", which is exactly the wrong answer for a consumer whose
+    whole job is reporting silence.
+    """
+    (tmp_path / "broker" / "queue.jsonl").mkdir(parents=True)
+    assert read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+    ) == []
+    assert "broker journal" in capsys.readouterr().err
+
+
+def test_read_broker_delivery_signals_reports_a_capped_scan(
+    tmp_path: Path, capsys,
+) -> None:
+    """Hitting the safety cap is said out loud, not silently truncated.
+
+    These signals are one-shot, so a truncated walk does not just delay
+    the alert — it loses it. The operator has to be told the window was
+    not fully covered.
+    """
+    records: list[dict] = [
+        {"event": "claimed", "owner": "sec", "note": "no ts at all"}
+        for _ in range(100)
+    ]
+    records.append(_adopt_expired(995.0))
+    _write_journal(tmp_path / "broker", records)
+    out = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+        chunk_bytes=128, max_scan_bytes=512,
+    )
+    # Partial degradation: what was reached is still reported.
+    assert [r["ts"] for r in out] == [995.0]
+    assert "freshness window" in capsys.readouterr().err
+
+
+def test_read_broker_delivery_signals_scan_follows_the_window(
+    tmp_path: Path, capsys,
+) -> None:
+    """A busy daemon must not push a one-shot signal out of view.
+
+    Nothing re-emits these lines, so whatever the daemon journals after
+    one (claims, deliveries, nudges) is all that stands between it and
+    the tail. A fixed-size tail read would drop a still-unresolved mute;
+    the backward walk keeps going until it passes the window.
+    """
+    records: list[dict] = [_adopt_expired(950.0, adoption_id="still-live")]
+    records += [
+        {"ts": 950.0 + i * 0.01, "event": "claimed", "owner": "sec",
+         "ids": ["row-" + "x" * 40]}
+        for i in range(200)
+    ]
+    _write_journal(tmp_path / "broker", records)
+    out = read_broker_delivery_signals(
+        tmp_path / "broker", now_epoch=1000.0, window_sec=3600.0,
+        chunk_bytes=256,   # far smaller than the trailing traffic
+    )
+    assert [r["adoption_id"] for r in out] == ["still-live"]
+    assert capsys.readouterr().err == ""

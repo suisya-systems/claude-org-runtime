@@ -16,7 +16,9 @@ from claude_org_runtime.attention.classifier import (
     _default_text,
     _iso_from_epoch,
     classify_all,
+    classify_broker_delivery_signals,
     classify_broker_duplicates,
+    classify_delivery_signal,
     classify_duplicate_sidecar,
     classify_event,
     classify_pending,
@@ -718,6 +720,182 @@ def test_classify_all_appends_broker_duplicates() -> None:
 
 
 def test_classify_all_without_broker_duplicates_is_unchanged() -> None:
+    out = classify_all(
+        [_row(id=1, kind="worker_completed", payload={"task_id": "x"})],
+        [], _NOW, pending_decision_min=15, user_replied_min=15,
+    )
+    assert [ev.kind for ev in out] == ["worker_completed"]
+
+
+# ---------------------------------------------------------------------------
+# delivery ownership — broker journal consumer (Issue #166)
+# ---------------------------------------------------------------------------
+
+
+def _expired_row(
+    ts: float = 1000.0, owner="sec", adoption_id="ad0011", restored=True,
+) -> dict:
+    """A ``delivery_adopt_expired`` row as the reader hands it over."""
+    return {
+        "ts": ts, "event": "delivery_adopt_expired", "owner": owner,
+        "adoption_id": adoption_id, "armed_seconds": 300.0,
+        "lease_dropped": True, "generation": 4, "restored": restored,
+        "restored_generation": 3 if restored else None,
+    }
+
+
+def _superseded_row(
+    ts: float = 1000.0, owner="sec", instance="inst-old",
+) -> dict:
+    """A ``delivery_register_superseded`` row as the reader hands it over."""
+    return {
+        "ts": ts, "event": "delivery_register_superseded", "owner": owner,
+        "instance": instance, "state": "active", "latched": True,
+    }
+
+
+def test_delivery_adopt_expired_names_the_adoption_that_failed() -> None:
+    """An adopt that never landed must reach the operator as its own incident.
+
+    Issuing the observer secret is not the handover; if this row went
+    unclassified, a failed adopt would look exactly like a successful
+    one from outside the daemon while the owner receives nothing.
+    """
+    ev = classify_delivery_signal(_expired_row(ts=1767225600.0))
+    assert ev is not None
+    assert ev.kind == "delivery_adopt_expired"
+    assert ev.severity == "urgent"
+    assert ev.key == "broker:delivery_adopt_expired:sec:ad0011"
+    assert ev.worker == "sec"
+    assert "ad0011" in ev.body
+    # Cooldown-gated namespace, not the write-once ``state.db.events`` one.
+    assert ev.source == "broker.queue.jsonl"
+    # The journal writes epoch seconds; every other created_at is ISO.
+    assert ev.created_at == "2026-01-01T00:00:00Z"
+
+
+def test_delivery_adopt_expired_body_separates_restored_from_orphaned() -> None:
+    """``restored`` decides whether the operator has to act right now.
+
+    ``restored: True`` means the previous session got its delivery back
+    and only the handover was lost; ``restored: False`` means no session
+    is claiming the owner at all. Same event, opposite urgency — a body
+    that collapsed the two would leave the operator unable to tell a
+    bookkeeping notice from an owner that is currently mute.
+    """
+    restored = classify_delivery_signal(_expired_row(restored=True))
+    orphaned = classify_delivery_signal(_expired_row(restored=False))
+    assert restored is not None and orphaned is not None
+    assert "previous session restored" in restored.body
+    assert "no session is claiming this owner" in orphaned.body
+
+
+def test_delivery_superseded_keys_on_the_instance_that_went_mute() -> None:
+    """A second session going mute later is a separate incident.
+
+    A superseded sidecar latches for the life of its process, so the
+    line is written once per muted session. Keying on the owner alone
+    would let the first session's cooldown swallow the report that a
+    replacement went mute too, which is the silent-loss shape this
+    signal exists to expose.
+    """
+    first = classify_delivery_signal(_superseded_row(instance="inst-a"))
+    second = classify_delivery_signal(_superseded_row(instance="inst-b"))
+    assert first is not None and second is not None
+    assert first.kind == "delivery_superseded"
+    assert first.severity == "urgent"
+    assert first.key == "broker:delivery_superseded:sec:inst-a"
+    assert first.key != second.key
+    assert "inst-a" in first.body
+
+
+def test_unrecognised_delivery_event_is_never_invented_into_an_alert() -> None:
+    """A third event name means reader and classifier disagree, not an incident.
+
+    This classifier is fed a filtered slice of a shared journal. If an
+    unknown name produced a notification anyway, a version skew between
+    the two halves would surface as urgent operator noise about ordinary
+    queue traffic.
+    """
+    assert classify_delivery_signal(
+        {"ts": 1.0, "event": "duplicate_sidecar_detected", "owner": "sec"},
+    ) is None
+    assert classify_delivery_signal({"ts": 1.0, "owner": "sec"}) is None
+    out = classify_broker_delivery_signals([
+        {"ts": 1.0, "event": "lease_reaped", "owner": "sec"},
+        _expired_row(),
+    ])
+    assert [ev.kind for ev in out] == ["delivery_adopt_expired"]
+
+
+def test_delivery_signal_with_missing_identifiers_still_notifies() -> None:
+    """A garbled field is not a reason to stay silent about a mute owner.
+
+    Dropping the row would trade a slightly vague notification for no
+    notification at all, and these events never fire again — the operator
+    would simply never hear that delivery stopped.
+    """
+    exp = classify_delivery_signal({
+        "ts": 1.0, "event": "delivery_adopt_expired", "restored": False,
+    })
+    assert exp is not None
+    assert exp.kind == "delivery_adopt_expired"
+    assert exp.worker is None
+    assert exp.key == "broker:delivery_adopt_expired:unknown:unknown"
+    assert "unknown" in exp.body
+    sup = classify_delivery_signal({
+        "ts": 1.0, "event": "delivery_register_superseded", "owner": "   ",
+    })
+    assert sup is not None
+    assert sup.key == "broker:delivery_superseded:unknown:unknown"
+
+
+def test_classify_broker_delivery_signals_collapses_repeats_per_incident() -> None:
+    """One notification per incident per scan, keeping the newest row.
+
+    Both events are one-shot, so a repeat means a daemon restart replayed
+    a journal (or the same owner/instance landed twice). Emitting one
+    event per journal line would turn that into a burst of identical
+    pages for a single mute.
+    """
+    out = classify_broker_delivery_signals([
+        _expired_row(ts=1000.0),
+        _expired_row(ts=1060.0),
+        _expired_row(ts=1030.0),
+        _superseded_row(ts=1010.0),
+    ])
+    assert len(out) == 2
+    by_kind = {ev.kind: ev for ev in out}
+    assert set(by_kind) == {"delivery_adopt_expired", "delivery_superseded"}
+    assert by_kind["delivery_adopt_expired"].created_at == _iso_from_epoch(
+        1060.0,
+    )
+
+
+def test_classify_all_appends_broker_delivery_signals() -> None:
+    """The new rows have to reach the same output list the CLI dispatches.
+
+    The classifier can be perfect and still notify nobody if
+    ``classify_all`` never folds the signals in — that gap is precisely
+    what left ``duplicate_sidecar_detected`` unconsumed for two issues.
+    """
+    out = classify_all(
+        [], [], _NOW, pending_decision_min=15, user_replied_min=15,
+        broker_duplicates=[_dup_row()],
+        broker_delivery_signals=[_expired_row(), _superseded_row()],
+    )
+    assert [ev.kind for ev in out] == [
+        "duplicate_sidecar", "delivery_adopt_expired", "delivery_superseded",
+    ]
+
+
+def test_classify_all_without_delivery_signals_is_unchanged() -> None:
+    """Pre-#166 callers keep working without passing the new keyword.
+
+    ``classify_all`` is called from ja-side code that this runtime is
+    pinned into; a required new argument would break those callers at
+    import-free runtime rather than at review time.
+    """
     out = classify_all(
         [_row(id=1, kind="worker_completed", payload={"task_id": "x"})],
         [], _NOW, pending_decision_min=15, user_replied_min=15,
