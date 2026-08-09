@@ -237,6 +237,14 @@ class PendingAdoption:
     previous_generation: int
     fenced_instance: str | None
     started_at: float
+    # 旧プロセスへ渡してあった full token と、adopting session へ渡した付け替え後の
+    # token。失効時に元へ戻すために両方持つ (:meth:`StoreMixin._sweep_adoptions_locked`)。
+    previous_token: str = ""
+    adopted_token: str = ""
+    # adopt が切り離した pane id。失効時に (a) 印を戻し、(b) **その pane がまだ在るか**
+    # で instance を復帰してよいかを判断するために持つ。pane ごと消えているなら、
+    # 復帰しても claim するのは死んだ instance なので「復帰した」と報告してはいけない。
+    detached_panes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -505,13 +513,35 @@ class StoreMixin:
             # **queue は復帰させない**: ``in_flight="drop"`` で ``DELIVERED`` にした
             # 行は戻さない (policy の帰結であって fence の副作用ではない)。戻すのは
             # 配達経路であって配達済みの判断ではない。
+            #
+            # pane の印も戻す (Codex review P1)。戻さないと、失効して所有権が旧
+            # session に返っているのに、その pane を閉じても資格情報も未配達行も
+            # 掃除されない = 死んだ owner の bind が居座って同名 respawn を塞ぐ。
+            reattached = self._reattach_owner_panes_locked(owner)
+            # **pane ごと消えていたら instance は戻さない**。切り離した pane が既に
+            # close/reap されているなら、復帰させる instance の sidecar はもう存在
+            # しない。それでも "restored" と報告すると、attention 通知が「旧 session に
+            # 戻した」と言い切る一方で実際には誰も claim せず、**失敗を知らせるための
+            # イベントが失敗を隠す**。pane を持たない owner (org up の secretary 等)
+            # は detached_panes が空なので、この判定の対象外。
+            pane_gone = bool(pending.detached_panes) and not reattached
             restored = False
             if (self._generation_of(owner) == pending.fenced_generation
                     and owner not in self._delivery_instances):
                 self._delivery_generations[owner] = pending.previous_generation
-                if pending.fenced_instance is not None:
+                if pending.fenced_instance is not None and not pane_gone:
                     self._delivery_instances[owner] = pending.fenced_instance
-                restored = True
+                    restored = True
+            # full token も元へ戻す (compare-and-restore)。adopt は旧プロセスの token を
+            # 付け替えて MCP 面を切っているので、失効時に戻さないと「配達は旧 session に
+            # 返ったのに MCP は死んだまま」という半死状態が残る。付け替え後の token が
+            # 今も現役の時だけ戻す (別経路が触っていれば手を出さない)。
+            token_restored = False
+            if (pending.adopted_token and pending.previous_token
+                    and pending.adopted_token in self._binds):
+                self._rekey_bind_locked(pending.adopted_token,
+                                        pending.previous_token)
+                token_restored = True
             journal.append(("delivery_adopt_expired", {
                 "owner": owner,
                 "adoption_id": pending.adoption_id,
@@ -521,6 +551,8 @@ class StoreMixin:
                 "restored": restored,
                 "restored_generation": (pending.previous_generation if restored
                                         else None),
+                "pane_gone": pane_gone,
+                "token_restored": token_restored,
             }))
         return journal
 
@@ -640,13 +672,6 @@ class StoreMixin:
                         else:
                             row.state = DELIVERED
                     armed_until = now + arming_seconds
-                    self._pending_adoptions[owner] = PendingAdoption(
-                        adoption_id=adoption_id, owner=owner, secret=secret,
-                        armed_until=armed_until, in_flight_policy=in_flight,
-                        in_flight_rows=moved, fenced_generation=gen,
-                        previous_generation=prev_gen, fenced_instance=prev_instance,
-                        started_at=now,
-                    )
                     # 旧 pane の bookkeeping から owner を切り離す (Codex review P1)。
                     # adopt 後の旧 pane は配達所有権を持たない抜け殻で、operator には
                     # 「都合のよい時に閉じてよい」と案内する。その close / reap は
@@ -654,6 +679,21 @@ class StoreMixin:
                     # し delivery state を reset し未配達行を捨てる** ので、切り離さないと
                     # 案内どおりに閉じた瞬間に adopt 済み session が丸ごと死ぬ。
                     detached = self._detach_owner_panes_locked(owner)
+                    # 旧プロセスへ渡してあった full token を **付け替える** (Codex
+                    # review P1)。切り離した旧 pane は生きたまま残りうるので、bind を
+                    # 共有したままだと 2 プロセスが 1 つの ``session_id`` を奪い合い、
+                    # どちらも [session_invalid] に落ちうる。配達所有権だけ移して MCP 面を
+                    # 共有したままにしない。adopting session には付け替え後の token を
+                    # --mcp-config で渡す。
+                    adopted_token = self._rekey_bind_locked(full_token)
+                    self._pending_adoptions[owner] = PendingAdoption(
+                        adoption_id=adoption_id, owner=owner, secret=secret,
+                        armed_until=armed_until, in_flight_policy=in_flight,
+                        in_flight_rows=moved, fenced_generation=gen,
+                        previous_generation=prev_gen, fenced_instance=prev_instance,
+                        started_at=now, previous_token=full_token,
+                        adopted_token=adopted_token, detached_panes=list(detached),
+                    )
                     journal.append(("delivery_adopt_started", {
                         "owner": owner, "adoption_id": adoption_id,
                         "generation": gen, "in_flight_policy": in_flight,
@@ -670,8 +710,9 @@ class StoreMixin:
                         "detached_panes": detached,
                         # 検証と同一 lock スコープで取った owner の資格情報。呼び元
                         # (server の admin ハンドラ) が --mcp-config へ畳んで **必ず
-                        # pop する** 内部フィールドで、ワイヤには出さない。
-                        "_owner_token": full_token,
+                        # pop する** 内部フィールドで、ワイヤには出さない。full token は
+                        # **付け替え後**の値 (旧プロセスの token はこの時点で無効)。
+                        "_owner_token": adopted_token,
                         "_delivery_cred": delivery_cred,
                     }
         for event_name, fields in journal:
@@ -1470,5 +1511,11 @@ class StoreMixin:
     if TYPE_CHECKING:  # server が供給する配達トリガ (型チェッカ向け宣言)
         def _trigger_nudge(self, target: "AgentBind") -> None: ...
 
-        # server が供給する pane 切り離し (#166)。**_lock 保持中に呼ばれる**。
+        # server が供給する pane 切り離し / 復帰 (#166)。**_lock 保持中に呼ばれる**。
         def _detach_owner_panes_locked(self, owner: str) -> list[str]: ...
+        def _reattach_owner_panes_locked(self, owner: str) -> list[str]: ...
+
+        # tokens.py (TokenMixin) が供給する bind の token 付け替え (#166)。
+        def _rekey_bind_locked(
+            self, old_token: str, new_token: str | None = None
+        ) -> str: ...

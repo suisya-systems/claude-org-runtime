@@ -738,6 +738,25 @@ class Broker(TokenMixin, StoreMixin):
                 detached.append(pane_id)
         return detached
 
+    def _reattach_owner_panes_locked(self, owner: str) -> list[str]:
+        """切り離し印を外し、**まだ存在する** pane id を返す (#166 の巻き戻し)。
+
+        **_lock 保持中に呼ばれる** (:meth:`~claude_org_runtime.broker.store.
+        StoreMixin._sweep_adoptions_locked` の critical section から)。
+
+        adopt が失効したら所有権は旧 session に返る。返るなら pane も元の関係に戻す:
+        印を残したままだと、その pane を閉じても資格情報も未配達行も掃除されず、死んだ
+        owner の bind が居座って同名 respawn を塞ぐ。返り値が空 = 切り離した pane は
+        既に閉じられている、という判定材料でもある (呼び元はそれを見て「旧 instance を
+        復帰させてよいか」を決める)。
+        """
+        reattached: list[str] = []
+        for pane_id, meta in self._pane_meta.items():
+            if meta.get("agent_id") == owner and meta.get("adopted_away"):
+                meta.pop("adopted_away", None)
+                reattached.append(pane_id)
+        return reattached
+
     def _cleanup_pane(self, handle: "PaneId") -> tuple[str | None, bool]:
         """pane の bookkeeping を掃除する — close_pane と自己終了 reap の共通経路。
 

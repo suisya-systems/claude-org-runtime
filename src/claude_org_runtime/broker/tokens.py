@@ -123,6 +123,32 @@ class TokenMixin:
         self._journal("token_issued", agent_id=agent_id, role=role, pane_id=pane_id)
         return token
 
+    def _rekey_bind_locked(self, old_token: str, new_token: str | None = None) -> str:
+        """bind を新しい token 文字列へ **付け替え** て返す。**_lock 保持中に呼ぶ**。
+
+        明示 adopt (#166) 用。adopt は同じ agent の配達所有権を別プロセスへ移すが、
+        bind をそのまま使い回すと **2 つの live プロセスが 1 つの bind を共有** する。
+        bind は ``session_id`` を 1 つしか持たないので、双方の ``initialize`` が互いの
+        session を上書きし、以後どちらも ``[session_invalid]`` に落ちうる (decision note
+        §4.5 の session steal と同じ形)。旧プロセスへ渡した token を無効化することで、
+        「配達所有権を移した」が「MCP 面も移った」を伴うようにする。
+
+        **bind オブジェクトは作り直さない**: 表の鍵だけ差し替える。registered / cwd /
+        role / auth_role / pane_id をそのまま引き継ぐので、handover の最中に owner が
+        「登録されていない agent」になって送信元から見えなくなることがない (その窓に
+        届いた message は queue に残るべきで、``[peer_not_found]`` で弾かれてはいけない)。
+        ``session_id`` だけは落とす — それは旧プロセスの MCP session の識別子であり、
+        引き継ぐ相手が居ない。
+
+        ``new_token`` を明示するのは **失効時の巻き戻し** 経路だけ (元の token へ戻す)。
+        """
+        bind = self._binds.pop(old_token)
+        token = new_token or secrets.token_urlsafe(32)
+        bind.token = token
+        bind.session_id = None
+        self._binds[token] = bind
+        return token
+
     def issue_delivery_cred(self, owner: str) -> str:
         """channel sidecar 用の delivery-scoped credential を発行する (§9.4)。
 

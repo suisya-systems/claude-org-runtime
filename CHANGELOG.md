@@ -57,8 +57,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Authorization is **admin-token only**. Adopt can fence a live incumbent
   unconditionally, so it is exposed neither on the MCP tool surface nor to a
   delivery credential; the owner's existence and its delivery credential are
-  verified in the same lock scope as the rotate, and the adopting session reuses
-  the owner's existing token rather than minting a second bind.
+  verified in the same lock scope as the rotate.
+
+  The owner's bind is **re-keyed** rather than reused or re-minted: the adopting
+  session gets a fresh bearer token for the same bind, and the token the previous
+  process holds stops resolving. Re-minting would leave two binds for one
+  `agent_id` and make delivery resolution ambiguous; reusing the token would
+  leave two live processes sharing one `session_id`, where each `initialize`
+  evicts the other's session. Because it is the same bind object, `registered`
+  and `cwd` carry across, so messages sent mid-handover still queue instead of
+  bouncing. Expiry rolls the re-key back along with the fence.
+
+  Closing the previous pane no longer collapses the handover: adopt marks that
+  pane detached, so its close/reap skips the credential and queue cleanup that
+  would otherwise revoke the adopted session's access. Expiry restores the
+  marking, and if the pane was already closed the expiry reports
+  `restored: false` rather than claiming it handed delivery back to a sidecar
+  that no longer exists.
 
 - The attention watcher gained operator-facing consumers for two more broker
   journal signals: `delivery_register_superseded` (a session was superseded and

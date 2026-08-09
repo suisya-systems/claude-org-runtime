@@ -1952,11 +1952,12 @@ def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
     disp = _ops(b)
     out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
                               {"direction": "vertical", "name": "w", "cwd": "/repo"}))
-    owner_token = [t for t, bd in b._binds.items()
-                   if bd.agent_id == "w" and bd.scope == "full"][0]
-    b.register_local(owner_token)   # 配送先になるには registered が要る
+    old_token = [t for t, bd in b._binds.items()
+                 if bd.agent_id == "w" and bd.scope == "full"][0]
+    b.register_local(old_token)     # 配送先になるには registered が要る
     res = b.adopt_delivery("w")
     assert res["ok"] is True and res["detached_panes"] == [str(out["id"])]
+    adopted_token = res["_owner_token"]             # 付け替え後の full token
     assert b.enqueue(src, "w", "must-survive-closing-the-husk")["ok"] is True
 
     closed = b.close_pane_target(str(out["id"]))   # 案内どおり抜け殻を閉じる
@@ -1964,7 +1965,7 @@ def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
     assert str(out["id"]) not in b._pane_meta      # pane は畳めている
 
     # adopting session が使う資格情報と queue は生きている。
-    assert b._binds[owner_token].revoked is False
+    assert b._binds[adopted_token].revoked is False
     live_creds = [t for t, bd in b._binds.items()
                   if bd.agent_id == "w" and bd.scope == "delivery" and not bd.revoked]
     assert live_creds, "delivery cred was revoked with the superseded pane"
@@ -1975,6 +1976,86 @@ def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
     assert reg["ok"] is True
     rows = b.poll_claims(live_creds[0], reg["generation"], "adopted")["rows"]
     assert [r["entry"]["message"] for r in rows] == ["must-survive-closing-the-husk"]
+
+
+def test_adopt_does_not_leave_two_live_processes_sharing_one_bind(tmp_path):
+    """**回帰**: adopt は旧プロセスの full token を無効化する (bind を共有させない)。
+
+    切り離した旧 pane は生きたまま残りうる。bind は ``session_id`` を 1 つしか持たない
+    ので、旧プロセスと adopting プロセスが同じ token を使うと双方の ``initialize`` が
+    互いの session を上書きし、以後どちらも ``[session_invalid]`` に落ちうる (旧プロセスの
+    MCP 再接続が新 session を蹴り出す形でも起きる)。所有権を移すなら MCP 面も移す。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    old_token = [t for t, bd in b._binds.items()
+                 if bd.agent_id == "dst" and bd.scope == "full"][0]
+    b.issue_delivery_cred("dst")
+    res = b.adopt_delivery("dst")
+    adopted = res["_owner_token"]
+
+    assert adopted != old_token
+    assert b.get_bind(old_token) is None          # 旧プロセスは締め出される
+    assert b.get_bind(adopted).agent_id == "dst"
+    assert b.get_bind(adopted).session_id is None  # 引き継ぐ session は無い
+    assert b.get_bind(adopted).registered is True  # 送信先としては生きたまま
+    # bind は増えていない (mint し直していない)。
+    assert len([bd for bd in b._binds.values()
+                if bd.agent_id == "dst" and bd.scope == "full"]) == 1
+
+
+def test_expired_adopt_gives_the_previous_process_its_token_back(tmp_path):
+    """**回帰**: 失効時は token 付け替えも巻き戻す。
+
+    巻き戻さないと「配達は旧 session に返したが MCP 面は締め出したまま」という半死
+    状態になる。復帰は配達経路だけでなく、その session が broker と話す手段まで含めて
+    初めて原状復帰になる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    old_token = [t for t, bd in b._binds.items()
+                 if bd.agent_id == "dst" and bd.scope == "full"][0]
+    b.issue_delivery_cred("dst")
+    adopted = b.adopt_delivery("dst")["_owner_token"]
+    time.sleep(0.1)
+    b.adopt_status("dst")                          # sweep 入口
+
+    assert b.get_bind(old_token) is not None       # 旧プロセスの token が戻る
+    assert b.get_bind(adopted) is None             # adopting 側の token は失効
+    assert _journal_events(b, "delivery_adopt_expired")[0]["token_restored"] is True
+
+
+def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
+    tmp_path, fake_adapter,
+):
+    """**回帰**: 切り離した pane が既に閉じられていたら ``restored`` を名乗らない。
+
+    pane を閉じた時点でその sidecar プロセスは消えている。それでも instance を復帰させて
+    ``restored: True`` と journal に書くと、attention 通知は「旧 session に戻した」と
+    言い切る一方で実際には誰も claim せず、**失敗を知らせるためのイベントが失敗を隠す**。
+    復帰できない時は復帰できないと言う方が、operator は次の一手 (再 adopt / 再 spawn) を
+    選べる。
+    """
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter, adopt_arming_seconds=0.05)
+    fake_adapter.add_pane(active=True)
+    disp = _ops(b)
+    out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
+                              {"direction": "vertical", "name": "w", "cwd": "/repo"}))
+    # spawn 経路は lease を張るので、pane 自身の秘密で register した現職を用意する。
+    secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
+    dc = [t for t, bd in b._binds.items()
+          if bd.agent_id == "w" and bd.scope == "delivery"][0]
+    assert b.register_delivery_instance(dc, "orig", observer=secret)["ok"] is True
+    res = b.adopt_delivery("w")
+    assert res["detached_panes"] == [str(out["id"])]
+    b.close_pane_target(str(out["id"]))            # 抜け殻を閉じる
+    time.sleep(0.1)
+    b.adopt_status("w")                            # sweep 入口
+
+    expired = _journal_events(b, "delivery_adopt_expired")[0]
+    assert expired["pane_gone"] is True
+    assert expired["restored"] is False            # 死んだ instance を名乗らない
+    assert "w" not in b._delivery_instances
 
 
 def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path):
