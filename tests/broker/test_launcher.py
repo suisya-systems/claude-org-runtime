@@ -51,6 +51,18 @@ def _down_args(state_dir, *, reap=False, root_cwd=None):
     return argparse.Namespace(state_dir=str(state_dir), reap=reap, root_cwd=root_cwd)
 
 
+def _adopt_args(state_dir, *, owner="w1", resume=None, continue_session=False,
+                in_flight="requeue", force=False, status=False, root_cwd=None,
+                model=None, permission_mode=None, claude_arg=None):
+    """``org adopt`` の args namespace (#166)。既定は parser の既定と揃える。"""
+    return argparse.Namespace(
+        state_dir=str(state_dir), owner=owner, resume=resume,
+        continue_session=continue_session, in_flight=in_flight, force=force,
+        status=status, root_cwd=root_cwd, model=model,
+        permission_mode=permission_mode, claude_arg=claude_arg,
+    )
+
+
 @pytest.fixture
 def live_daemon(tmp_path):
     """本物の started Broker (admin token 付き) + ディスク上の sidecar。
@@ -1011,6 +1023,527 @@ def test_launch_claude_fallback_includes_observer_secret(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "ORG_BROKER_CHANNEL_OBSERVER=obs-handoff-secret" in out
+
+
+# =========================== org adopt: 配達所有権の明示 handover (#166)
+# adopt は「daemon 側で旧 session を fence してから、新しい秘密を持つ claude を起こす」
+# 操作。fence は RPC 応答の時点で既に済んでいるので、CLI 側の分岐が 1 つ狂うと
+# 「所有権は動いたのに誰も配達しない」窓が残る。ここでは wrapper の分岐と、秘密が
+# **env 経路 (launch kwarg) だけ**を通ることを固定する。
+
+_ADOPT_MCP_CONFIG = {"mcpServers": {
+    "org-broker": {"type": "http", "url": "http://127.0.0.1:1/mcp",
+                   "headers": {"Authorization": "Bearer OWNER-TOKEN"}},
+    "org-broker-channel": {"command": "py",
+                           "args": ["-m", "claude_org_runtime.broker.channel_sidecar"],
+                           "env": {"ORG_BROKER_CHANNEL_OWNER": "w1"}},
+}}
+
+
+def _write_discoverable_sidecar(state_dir, *, host="127.0.0.1", port=59990):
+    """``org adopt`` が「走行中 daemon」を発見できる最小の sidecar を書く。
+
+    RPC はスタブするので host/port は到達不能で構わない (daemon 発見の分岐だけを
+    成立させるためのもの)。"""
+    sidecar.write_sidecar(
+        state_dir, pid=os.getpid(), host=host, port=port,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    sidecar.write_admin_token(state_dir, "ADMIN-SECRET")
+
+
+def _adopt_ok(*, adoption_id="ad-01", secret="rotated-observer-secret",
+              owner="w1", in_flight="requeue", rows=2):
+    """``adopt_delivery`` の成功応答 (server が mcp_config を畳んだ後の形)。"""
+    return {
+        "ok": True, "owner": owner, "adoption_id": adoption_id,
+        "observer_secret": secret, "generation": 8,
+        "in_flight_policy": in_flight, "in_flight_rows": rows,
+        "arming_seconds": 300.0, "armed_until": 1.0,
+        "mcp_config": _ADOPT_MCP_CONFIG,
+    }
+
+
+def _pending(adoption_id="ad-01", *, seconds=42.0, policy="requeue", rows=2):
+    """``adopt_status`` の pending ブロック (秘密を含まない契約)。"""
+    return {"adoption_id": adoption_id, "armed_seconds_remaining": seconds,
+            "in_flight_policy": policy, "in_flight_rows": rows,
+            "fenced_generation": 8}
+
+
+def _status_ok(pending=None, *, owner="w1"):
+    return {"ok": True, "owner": owner, "generation": 8, "instance_id": None,
+            "observer_state": "armed", "pending": pending}
+
+
+def _stub_admin_rpc(monkeypatch, *, adopt=None, status=None):
+    """``launcher._admin_rpc`` をスタブし ``(method, params)`` の呼び出し列を返す。
+
+    org_adopt は **モジュールグローバル** の ``_admin_rpc`` を呼ぶ契約なので、ここを
+    差し替えるだけで daemon 無しに全分岐を駆動できる (この契約が崩れて import 時
+    束縛になると、以降のテストは本物の RPC を叩いて別の失敗をする)。値に例外
+    インスタンスを渡すとその method で送出する (到達不能の再現)。
+    """
+    calls: list[tuple[str, dict]] = []
+
+    def fake(host, port, admin_token, method, params=None, **kw):
+        calls.append((method, dict(params or {})))
+        res = adopt if method == "adopt_delivery" else status
+        if isinstance(res, BaseException):
+            raise res
+        return res
+
+    monkeypatch.setattr(launcher, "_admin_rpc", fake)
+    return calls
+
+
+def _recording_launch():
+    """claude 起動 seam のスパイ。``(呼び出し記録, launch)`` を返す。"""
+    calls: list[dict] = []
+
+    def launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
+        calls.append({"argv": argv, "state_dir": state_dir,
+                      "observer_secret": observer_secret, "root_cwd": root_cwd})
+        return 0
+
+    return calls, launch
+
+
+def test_build_up_argv_forwards_session_selector():
+    """build_up_argv が resume / continue_session を builder へそのまま流す。
+
+    adopt が argv を自前で組み直すと default-deny guard の適用が二重実装になり、
+    片方だけ緩む。selector は既存 builder の構造化フィールドに流すことでのみ描画される
+    (相互排他の検査も builder 側の 1 箇所に残る)。
+    """
+    from claude_org_runtime.broker.surface import ToolArgError
+
+    cfg = {"mcpServers": {}}
+    argv = launcher.build_up_argv(cfg, resume="sess-abc")
+    assert argv[argv.index("--resume") + 1] == "sess-abc"
+    assert "--continue" not in argv
+
+    argv = launcher.build_up_argv(cfg, continue_session=True)
+    assert "--continue" in argv
+    assert "--resume" not in argv
+
+    # 相互排他は builder が持つ (adopt 側で握り潰さない)。
+    with pytest.raises(ToolArgError):
+        launcher.build_up_argv(cfg, resume="sess-abc", continue_session=True)
+
+
+def test_org_adopt_hands_rotated_secret_to_the_launched_process(tmp_path, monkeypatch):
+    """rotate された observer 秘密が ``launch`` の observer_secret kwarg で届く。
+
+    これが切れると adopt は「旧 session を fence しただけ」になり、新 session は秘密を
+    持てず ``unobserved`` で沈黙する = owner への push が恒久停止する (adopt が daemon 側で
+    先に fence する以上、起動側の取りこぼしは無音の配送停止になる)。同時に、秘密が
+    **argv に載っていない**ことも固定する: argv (= mcp-config) は fork/resume が replay
+    する面なので、そこへ載った瞬間 lease の存在根拠が消える。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    calls = _stub_admin_rpc(monkeypatch, adopt=_adopt_ok(),
+                            status=_status_ok(_pending("ad-01")))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, owner="w1"), launch=launch)
+
+    assert rc == 0
+    assert len(launched) == 1
+    assert launched[0]["observer_secret"] == "rotated-observer-secret"
+    assert "rotated-observer-secret" not in json.dumps(launched[0]["argv"])
+    # 子環境の state_dir / cwd アンカーも org up と同じ契約で渡る。
+    assert launched[0]["state_dir"] == sidecar.absolutize(state_dir)
+    assert launched[0]["root_cwd"] == os.getcwd()
+    # rotate は 1 回だけ。operator の選択 (policy / force) はそのまま daemon へ渡る。
+    assert [m for m, _ in calls] == ["adopt_delivery", "adopt_status"]
+    assert calls[0][1] == {"owner": "w1", "in_flight": "requeue", "force": False}
+
+
+def test_org_adopt_threads_resume_selector_into_argv(tmp_path, monkeypatch):
+    """``--resume <id>`` が起動 argv に構造化 selector として届く。
+
+    adopt は新プロセスを起こす以外に秘密を渡す手段が無いので、引き継ぎたい会話は
+    selector でしか繋がらない。ここが落ちると operator は「adopt したのに真っさらな
+    session が開いた」状態になり、直前の文脈を失う。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(monkeypatch, adopt=_adopt_ok(), status=_status_ok(_pending()))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(
+        _adopt_args(state_dir, resume="sess-123"), launch=launch)
+
+    assert rc == 0
+    argv = launched[0]["argv"]
+    assert argv[argv.index("--resume") + 1] == "sess-123"
+    assert "--continue" not in argv
+
+
+def test_org_adopt_threads_continue_selector_into_argv(tmp_path, monkeypatch):
+    """``--continue`` も同じく構造化 selector として argv に届く (resume は出さない)。
+
+    resume と continue が同時に出ると claude 側の解決順に暗黙依存する argv になるため、
+    片方だけが描画されることを固定する。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(monkeypatch, adopt=_adopt_ok(), status=_status_ok(_pending()))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(
+        _adopt_args(state_dir, continue_session=True), launch=launch)
+
+    assert rc == 0
+    argv = launched[0]["argv"]
+    assert "--continue" in argv
+    assert "--resume" not in argv
+
+
+def test_org_adopt_without_daemon_sidecar_refuses(tmp_path, monkeypatch, capsys):
+    """sidecar 不在 (daemon が居ない) は rc 2 で、claude を起動しない。
+
+    daemon が居なければ引き継ぐ配達所有権も存在しない。ここで起動してしまうと、
+    誰も配達できない session を「adopt 成功」として operator に渡すことになる。
+    """
+    state_dir = str(tmp_path / "broker")     # sidecar を書かない
+    _stub_admin_rpc(monkeypatch, adopt=AssertionError("must not RPC without a daemon"))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "no broker daemon sidecar" in err
+    assert "org up" in err                   # 次の一手を示す
+    # 可変部 (state-dir) はランナー依存で非 ASCII を含みうるので伏せてから検査する。
+    scrubbed = err.replace(sidecar.absolutize(state_dir), "<state-dir>")
+    scrubbed.encode("ascii")
+    scrubbed.encode("cp932")
+
+
+def test_org_adopt_refuses_when_admin_token_missing(tmp_path, monkeypatch, capsys):
+    """daemon.json はあるが admin.token が現れない半公開状態でも起動しない (rc 2)。
+
+    admin.token が無ければ fence を要求する術がない。それでも claude を起こすと、
+    旧 session が生きたまま新 session も走り、二重配達 / 二重応答の窓を作る。
+    """
+    state_dir = str(tmp_path / "broker")
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59991,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )                                        # admin.token は書かない
+    monkeypatch.setattr(launcher, "ADMIN_TOKEN_GRACE", 0.2)
+    _stub_admin_rpc(monkeypatch, adopt=AssertionError("must not RPC without a token"))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "admin.token" in err
+    assert "Not adopting" in err
+    err.encode("cp932")
+
+
+def test_org_adopt_never_cold_starts_a_daemon(tmp_path, monkeypatch, capsys):
+    """``org adopt`` は daemon を **起動しない** (org up と決定的に違う点)。
+
+    org up の解決関数を流用すると、adopt が daemon を起こしたうえ名前付き secretary を
+    mint してしまう — adopt の前提 (「その owner は既に居る」) と真逆の副作用で、
+    「引き継いだつもりで新しい空の org を作った」事故になる。daemon 起動の seam を
+    どちらも爆発させ、触れずに rc 2 で終わることを固定する。
+    """
+    def boom(*a, **k):
+        raise AssertionError("org adopt must never start a daemon")
+
+    monkeypatch.setattr(launcher, "_spawn_daemon", boom)
+    monkeypatch.setattr(launcher.subprocess, "Popen", boom)
+    state_dir = str(tmp_path / "broker")     # sidecar 不在 = up なら cold start する状況
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    assert not os.path.exists(os.path.join(state_dir, sidecar.SIDECAR_NAME))
+    assert "Nothing to adopt" in capsys.readouterr().err
+
+
+def test_org_adopt_unreachable_daemon_says_nothing_was_rotated(
+        tmp_path, monkeypatch, capsys):
+    """daemon 不到達は「何も rotate していない」と言い切る (rc 2、起動なし)。
+
+    adopt は現職を fence する操作なので、失敗時に所有権が動いたのか動いていないのかが
+    曖昧だと operator は次の一手を選べない。rotate は RPC が通って初めて起きるため、
+    URLError の時点では **確実に** 未変更 — その確定情報を文言として固定する。
+    """
+    import urllib.error
+
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(monkeypatch, adopt=urllib.error.URLError("refused"))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "nothing was rotated" in err
+    err.encode("cp932")
+
+
+@pytest.mark.parametrize("bad", [
+    {"resume": "sid", "continue_session": True},        # 相互排他の session selector
+    {"resume": "--print"},                              # 値位置に headless flag
+    {"resume": "   "},                                  # 空の session id
+    {"claude_arg": ["--resume", "other"]},              # 予約 flag を args[] から
+    {"claude_arg": ["-p"]},                             # headless flag
+])
+def test_org_adopt_validates_launch_args_before_rotating(
+    tmp_path, monkeypatch, capsys, bad,
+):
+    """**回帰**: ローカル引数の不正は **fence する前に** 落とす (rc 2、RPC を投げない)。
+
+    adopt_delivery は現職をその場で fence するので、その後で argv 組み立てが例外を
+    投げると owner は claimer 不在のまま arming deadline まで放置される — しかも原因は
+    operator の typo という、最も直しやすいはずのもの。さらに素通しだと ToolArgError が
+    traceback のまま端末に出る。spawn_claude が token 発行前に argv を pre-validate する
+    のと同じ理由・同じ順序 (副作用の前に検証)。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    calls = _stub_admin_rpc(monkeypatch, adopt=_adopt_ok())
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, **bad), launch=launch)
+
+    assert rc == 2
+    assert calls == [], "the owner was fenced before the arguments were validated"
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "invalid launch arguments" in err and "nothing was rotated" in err
+
+
+def test_org_adopt_surfaces_rpc_error_verbatim(tmp_path, monkeypatch, capsys):
+    """``ok: False`` の error 文字列をそのまま stderr に出す (rc 2、起動なし)。
+
+    daemon 側のエラーは何を直せばよいかを名指ししている ([no_delivery_credential] なら
+    channel 付きで mint し直す等)。CLI が自前の要約に置き換えると、その手掛かりが
+    operator に届かない。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    error = ("[no_delivery_credential] owner 'w1' holds no delivery credential; "
+             "nothing to adopt (mint or spawn it with channel first)")
+    calls = _stub_admin_rpc(monkeypatch, adopt={"ok": False, "error": error})
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    assert error in capsys.readouterr().err
+    # 失敗した adopt の後追い status は投げない (rotate していないので見るものが無い)。
+    assert [m for m, _ in calls] == ["adopt_delivery"]
+
+
+def test_org_adopt_status_reports_idle_owner_without_rotating(
+        tmp_path, monkeypatch, capsys):
+    """``--status`` は adopt_status だけを叩き、rotate も起動もしない (rc 0)。
+
+    状態を見るつもりのコマンドが所有権を動かしたら、確認行為そのものが現職を fence して
+    しまう。読み取り専用であることを呼び出し列で固定する (adopt_delivery が呼ばれたら
+    スタブが爆発する)。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    calls = _stub_admin_rpc(
+        monkeypatch, adopt=AssertionError("--status must not rotate"),
+        status=_status_ok(None),
+    )
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, status=True), launch=launch)
+
+    assert rc == 0
+    assert launched == []
+    assert [m for m, _ in calls] == ["adopt_status"]
+    out = capsys.readouterr().out
+    assert "owner=w1" in out and "generation=8" in out
+    assert "observer=armed" in out
+    assert "no adoption in flight" in out
+
+
+def test_org_adopt_status_reports_pending_adoption(tmp_path, monkeypatch, capsys):
+    """``--status`` は進行中 adopt の残り時間 / policy / 件数を出す (rc 0、起動なし)。
+
+    adopt は fence してから起動が landing するまでの窓を持つ。その窓で「誰も配達して
+    いない」ことを説明できる唯一の operator 向け経路がこの表示なので、pending 分岐が
+    無言になると、無音の配送停止と区別できなくなる。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(
+        monkeypatch, adopt=AssertionError("--status must not rotate"),
+        status=_status_ok(_pending("ad-77", seconds=12.5, policy="drop", rows=3)),
+    )
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, status=True), launch=launch)
+
+    assert rc == 0
+    assert launched == []
+    out = capsys.readouterr().out
+    assert "ad-77" in out
+    assert "12.5s more" in out
+    assert "drop" in out and "3 rows" in out
+
+
+@pytest.mark.parametrize("pending", [_pending("someone-elses-adopt"), None])
+def test_org_adopt_refuses_to_launch_when_preflight_shows_another_adoption(
+        tmp_path, monkeypatch, capsys, pending):
+    """exec 直前の preflight で自分の adoption が現職でないなら起動しない (rc 2)。
+
+    並行 ``--force`` に負けた側の秘密は既に無効で、それを持って起動した session は
+    ``unobserved`` のまま恒久沈黙する。負けを黙って起動に変えると、operator は「adopt は
+    成功した」と信じたまま届かない pane を眺めることになる。pending が別 ID の場合と、
+    そもそも消えている場合の双方を同じ扱いにする。
+    """
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(monkeypatch, adopt=_adopt_ok(adoption_id="ad-01"),
+                    status=_status_ok(pending))
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 2
+    assert launched == []
+    err = capsys.readouterr().err
+    assert "superseded" in err
+    err.encode("cp932")
+
+
+@pytest.mark.parametrize(
+    "status", [None, {"ok": False, "error": "[adopt_status_failed] boom"}])
+def test_org_adopt_preflight_failure_is_advisory_and_still_launches(
+        tmp_path, monkeypatch, status):
+    """preflight が失敗 / 不到達でも起動は続行する (preflight は助言に過ぎない)。
+
+    fence は adopt_delivery が返った時点で **既に完了している**。確認できないことを
+    理由に起動を止めると、fence 済みで誰も配達しない owner を残したまま CLI が降りる
+    ことになり、preflight が守るはずのもの (無音の配送停止) を自分で作ってしまう。
+    """
+    import urllib.error
+
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(
+        monkeypatch, adopt=_adopt_ok(),
+        status=urllib.error.URLError("refused") if status is None else status,
+    )
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+
+    assert rc == 0
+    assert len(launched) == 1
+    assert launched[0]["observer_secret"] == "rotated-observer-secret"
+
+
+def test_org_adopt_output_is_ascii_and_cp932_safe(tmp_path, monkeypatch, capsys):
+    """``org adopt`` が書く行はすべて ASCII で、cp932 コンソールでも壊れない。
+
+    pytest は stdout/stderr を UTF-8 で捕まえるため、em-dash が 1 文字混ざっても実端末
+    でしか露見せず、そこでは UnicodeEncodeError でコマンドごと落ちる。adopt は fence 済みの
+    状態を説明する経路なので、落ちれば「所有権は動いたが結果が読めない」最悪の診断状況に
+    なる。主要な全分岐の出力をまとめて検査する。
+    """
+    import urllib.error
+
+    state_dir = str(tmp_path / "broker")
+    collected: list[str] = []
+
+    def drain():
+        cap = capsys.readouterr()
+        collected.append(cap.out + cap.err)
+
+    launched, launch = _recording_launch()
+    # 1) sidecar 不在 (cold)。
+    launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+    drain()
+    # 2) daemon.json のみ = admin.token 欠落。
+    sidecar.write_sidecar(
+        state_dir, pid=4321, host="127.0.0.1", port=59992,
+        backend=default_backend(), started_at=time.time(), journal_offset=0,
+    )
+    monkeypatch.setattr(launcher, "ADMIN_TOKEN_GRACE", 0.05)
+    launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+    drain()
+    # 3) daemon 不到達。
+    sidecar.write_admin_token(state_dir, "ADMIN-SECRET")
+    _stub_admin_rpc(monkeypatch, adopt=urllib.error.URLError("refused"))
+    launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+    drain()
+    # 4) daemon が拒否。
+    _stub_admin_rpc(monkeypatch, adopt={"ok": False, "error": "[unknown_owner] no bind"})
+    launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+    drain()
+    # 5) --status (pending 有り)。
+    _stub_admin_rpc(monkeypatch, status=_status_ok(_pending("ad-99", seconds=7.5)))
+    launcher.org_adopt(_adopt_args(state_dir, status=True), launch=launch)
+    drain()
+    # 6) 成功 (rotate → 起動)。
+    _stub_admin_rpc(monkeypatch, adopt=_adopt_ok(), status=_status_ok(_pending()))
+    launcher.org_adopt(_adopt_args(state_dir), launch=launch)
+    drain()
+
+    assert len(collected) == 6
+    for text in collected:
+        assert text                                   # どの分岐も無言で終わらない
+        # 可変部 (state-dir) はランナー依存で非 ASCII を含みうるので伏せて検査する。
+        scrubbed = text.replace(sidecar.absolutize(state_dir), "<state-dir>")
+        scrubbed.encode("ascii")
+        scrubbed.encode("cp932")
+
+
+def test_org_adopt_end_to_end_records_adoption_on_live_daemon(live_daemon, capsys):
+    """本物の daemon に対する adopt が、daemon 側に adoption を実際に記録する。
+
+    スタブだけで固めると「CLI が期待どおりの JSON を組んだ」ことしか言えず、admin RPC の
+    method 名 / params 名 / 応答キーが実装とずれても緑のままになる。owner を channel 付きで
+    mint してから adopt し、daemon の delivery_dump に pending adoption が現れること、
+    起動 argv が inline ``--mcp-config`` (その owner の channel sidecar 入り) を運ぶことを
+    端から端で確認する。
+    """
+    b, state_dir = live_daemon
+    mint = b.admin_mint_token({"role": "worker", "name": "w1", "channel": True})
+    assert mint["ok"], mint
+    launched, launch = _recording_launch()
+
+    rc = launcher.org_adopt(_adopt_args(state_dir, owner="w1"), launch=launch)
+
+    assert rc == 0
+    # daemon 側に fence 済みの adoption が残っている (= RPC が本当に届いた)。
+    adoptions = b.delivery_dump()["adoptions"]
+    assert "w1" in adoptions
+    adoption_id = adoptions["w1"]["adoption_id"]
+    assert f"adoption {adoption_id}" in capsys.readouterr().out
+    # argv は inline --mcp-config を運ぶ (0600 ファイル経路に依存しない)。
+    argv = launched[0]["argv"]
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert cfg["mcpServers"]["org-broker-channel"]["env"][
+        "ORG_BROKER_CHANNEL_OWNER"] == "w1"
+    # 秘密は env 経路 (launch kwarg) だけを通り、replay される argv には現れない。
+    secret = launched[0]["observer_secret"]
+    assert secret and isinstance(secret, str)
+    assert secret not in json.dumps(argv)
 
 
 # ================================ resident pre-flight wiring (Issue #142)

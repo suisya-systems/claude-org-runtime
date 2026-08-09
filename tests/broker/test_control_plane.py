@@ -26,8 +26,11 @@ import pytest
 
 from claude_org_runtime.broker import cli as broker_cli
 from claude_org_runtime.broker import sidecar
+from claude_org_runtime.broker import store
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.surface import tools_for
+
+from .conftest import MiniMcpClient
 
 
 # --------------------------------------------------------------------- helpers
@@ -347,6 +350,401 @@ def test_admin_delivery_dump(admin_broker):
     """delivery_dump RPC が配送ライフサイクルの横断スナップショットを返す (admin scope)。"""
     res = _admin_post(admin_broker, {"method": "delivery_dump"}, "ADMIN-SECRET")
     assert res["ok"] is True and "by_state" in res and "modes" in res
+
+
+# ======================================================== admin: adopt (#166)
+def _mint_channel_owner(broker: Broker, name: str) -> tuple[str, str]:
+    """channel 付きの owner を 1 体 mint し ``(full token, delivery cred)`` を返す。
+
+    adopt は既存 owner の配達所有権を移す操作なので、full bind と delivery
+    credential を **両方** 持つ owner が前提になる (片方でも欠ければ store が弾く)。
+    """
+    res = _admin_post(broker, {"method": "mint_token",
+                               "params": {"role": "secretary", "name": name,
+                                          "channel": True}}, "ADMIN-SECRET")
+    assert res["ok"] is True
+    env = res["mcp_config"]["mcpServers"]["org-broker-channel"]["env"]
+    return res["token"], env["ORG_BROKER_CHANNEL_CRED"]
+
+
+def _adopt(broker: Broker, params: dict, token: str | None = "ADMIN-SECRET",
+           expect_status: int = 200):
+    """adopt_delivery admin RPC を 1 回叩く。"""
+    return _admin_post(broker, {"method": "adopt_delivery", "params": params},
+                       token, expect_status=expect_status)
+
+
+def _adopt_status(broker: Broker, params: dict, token: str | None = "ADMIN-SECRET",
+                  expect_status: int = 200):
+    """adopt_status admin RPC を 1 回叩く。"""
+    return _admin_post(broker, {"method": "adopt_status", "params": params},
+                       token, expect_status=expect_status)
+
+
+def _fence_state(broker: Broker, owner: str) -> tuple[dict, int]:
+    """「rotate が起きたか」を判定する 2 値 (進行中 adopt, 現 generation) を取る。
+
+    拒否されたはずの adopt が副作用だけ残していないことを、拒否系テストが
+    この 1 組で確認する。
+    """
+    dump = broker.delivery_dump()
+    return dump["adoptions"], dump["generations"].get(owner, 0)
+
+
+def test_admin_adopt_delivery_returns_handover_payload(admin_broker):
+    """adopt_delivery が adopting session を起動できる完全な handover 応答を返す。
+
+    ここが欠けると operator は「rotate は起きたが何を持って claude を起動すれば
+    よいか分からない」状態に置かれる。adopt は応答を返す時点で現職を fence 済み
+    なので、その窓は「誰も配達しない owner」を arming 期限まで放置することになる。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    before = time.time()
+    res = _adopt(admin_broker, {"owner": "sec"})
+    assert res["ok"] is True
+    assert res["owner"] == "sec"
+    assert isinstance(res["adoption_id"], str) and res["adoption_id"]
+    assert isinstance(res["observer_secret"], str) and res["observer_secret"]
+    # fence は RPC の内側で完了している (generation が進む)。
+    assert res["generation"] == 1
+    assert res["in_flight_policy"] == "requeue"      # 既定 policy
+    assert res["in_flight_rows"] == 0                # CLAIMED 行なし
+    # 有限の活性化期限が入る (**下限のみ**主張: 呼び出し前時刻 + arming 以上)。
+    assert res["armed_until"] >= before + res["arming_seconds"]
+    servers = res["mcp_config"]["mcpServers"]
+    # adopting session は full token の http server と channel sidecar の両方を要る。
+    assert servers["org-broker"]["type"] == "http"
+    assert servers["org-broker-channel"]["env"]["ORG_BROKER_CHANNEL_OWNER"] == "sec"
+
+
+def test_admin_adopt_delivery_does_not_leak_internal_keys(admin_broker):
+    """内部フィールド (``_owner_token`` / ``_delivery_cred``) がワイヤに出ない。
+
+    store は「検証と同一 lock スコープで取った資格情報」をこの 2 キーで返す。
+    server が pop し忘れると、admin 応答をそのまま端末やログに貼る運用で owner の
+    full token が mcp_config の外へもう 1 部流れる (露出面が黙って増える)。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec"})
+    assert "_owner_token" not in res
+    assert "_delivery_cred" not in res
+
+
+def test_admin_adopt_delivery_rekeys_the_bind_instead_of_minting_a_second(
+    admin_broker,
+):
+    """adopt は bind を **付け替える**: 新規 mint もせず、旧 token も残さない。
+
+    mint し直すと同一 agent_id に bind が 2 本並び、配送先解決と観測が曖昧化する。
+    かといって旧 token をそのまま使い回すと、旧プロセスと adopting プロセスが 1 つの
+    bind (= 1 つの ``session_id``) を共有し、双方の initialize が互いの session を
+    上書きして両方 ``[session_invalid]`` に落ちうる (decision note §4.5 の session
+    steal と同じ形)。鍵だけ差し替えることで「bind は 1 本のまま、旧プロセスの MCP
+    面は閉じる」を同時に満たす。
+    """
+    token, cred = _mint_channel_owner(admin_broker, "sec")
+    bind_before = admin_broker.get_bind(token)
+    res = _adopt(admin_broker, {"owner": "sec"})
+    servers = res["mcp_config"]["mcpServers"]
+    adopted = servers["org-broker"]["headers"]["Authorization"].removeprefix("Bearer ")
+    # full token は付け替わり、旧 token はもう解決しない (旧プロセスは締め出される)。
+    assert adopted != token
+    assert admin_broker.get_bind(token) is None
+    # bind オブジェクトは同一 (registered / cwd / role を引き継いでいる)。
+    assert admin_broker.get_bind(adopted) is bind_before
+    assert admin_broker.get_bind(adopted).session_id is None
+    # bind は 1 本のまま (mint していない)。delivery cred は使い回す。
+    assert len([b for b in admin_broker._binds.values()
+                if b.agent_id == "sec" and b.scope == "full"]) == 1
+    assert servers["org-broker-channel"]["env"]["ORG_BROKER_CHANNEL_CRED"] == cred
+
+
+def test_admin_adopt_delivery_keeps_observer_secret_out_of_mcp_config(admin_broker):
+    """observer 秘密は top-level のみに現れ、mcp_config には一切載らない。
+
+    mcp_config は fork/resume で replay される面である。そこへ秘密が混じると
+    replay した session が現職を詐称でき、「replay されない process env でだけ
+    正統性を見分ける」という lease の存在根拠がまるごと無効になる。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec"})
+    secret = res["observer_secret"]
+    assert secret and secret not in json.dumps(res["mcp_config"])
+
+
+@pytest.mark.parametrize("policy", ["requeue", "drop"])
+def test_admin_adopt_delivery_echoes_in_flight_policy(admin_broker, policy):
+    """要求した in-flight policy と適用件数が応答に残る。
+
+    policy が応答に残らないと、operator は「drop したつもりが requeue された」を
+    事後に確認できず、二重配達 / 取りこぼしの原因を辿れない。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec", "in_flight": policy})
+    assert res["in_flight_policy"] == policy
+    assert res["in_flight_rows"] == 0
+
+
+def test_admin_adopt_delivery_arming_default_follows_daemon_tunable(tmp_path):
+    """``arming_seconds`` 省略時の既定は Broker の tunable を反映する。
+
+    モジュール定数 (300s) を直接読む実装に戻ると ``Broker(adopt_arming_seconds=...)``
+    が黙って効かなくなり、期限まわりの検証が 300 秒待ちの vacuous pass に化ける。
+    """
+    b = Broker(state_dir=tmp_path / "broker", adapter=None, port=0,
+               admin_token="ADMIN-SECRET", adopt_arming_seconds=1234.0)
+    b.start()
+    try:
+        _mint_channel_owner(b, "sec")
+        res = _adopt(b, {"owner": "sec"})
+        assert res["arming_seconds"] == 1234.0
+    finally:
+        b.stop()
+
+
+def test_admin_adopt_delivery_honors_explicit_arming_seconds(admin_broker):
+    """明示された ``arming_seconds`` は float に正規化して受理される。
+
+    int を弾いたり無視したりすると、operator が短い期限を選んでも既定の長さで
+    armed のままになり、失敗した adopt の検知 (``delivery_adopt_expired``) が
+    意図した時刻に発火しない。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec", "arming_seconds": 42})
+    assert res["arming_seconds"] == 42.0
+
+
+@pytest.mark.parametrize("bad_token", [None, "WRONG"])
+def test_admin_adopt_delivery_requires_admin_token(admin_broker, bad_token):
+    """admin bearer 無し / 不一致の adopt は 401 で、**何も rotate しない**。
+
+    adopt は現職を無条件に fence する操作なので、認証に失敗した要求が副作用だけ
+    残すと、拒否されたはずの呼び出しが owner を無音にできてしまう (fence は
+    巻き戻らない — 旧 sidecar は二度と register し直さない)。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec"}, token=bad_token,
+                 expect_status=401)
+    assert "admin_unauthorized" in res["error"]
+    assert _fence_state(admin_broker, "sec") == ({}, 0)
+
+
+def test_admin_adopt_delivery_rejects_agent_and_delivery_credentials(admin_broker):
+    """agent の full token でも delivery credential でも adopt には到達できない。
+
+    adopt は observer lease より強い操作 (現職を無条件に fence できる) である。
+    lease より弱い主体 — とりわけ乗っ取り側 sidecar が持つ delivery cred — から
+    到達できると、fork した session が所有権を自分へ奪う経路になる。
+    """
+    token, cred = _mint_channel_owner(admin_broker, "sec")
+    for bearer in (token, cred):
+        res = _adopt(admin_broker, {"owner": "sec"}, token=bearer,
+                     expect_status=401)
+        assert "admin_unauthorized" in res["error"]
+    assert _fence_state(admin_broker, "sec") == ({}, 0)
+
+
+def test_adopt_is_absent_from_the_mcp_tool_surface(admin_broker):
+    """最上位 tier (secretary) の tools/list にも adopt 系ツールは現れない。
+
+    ツール面に出ると、エージェント自身が自分や他人の配達所有権を奪えることになる。
+    admin token (0600 の ``admin.token``) を持つ operator だけの操作である、という
+    認可境界を tier 最上位の実 tools/list で固定する。
+    """
+    res = _admin_post(admin_broker, {"method": "mint_token",
+                                     "params": {"role": "secretary"}},
+                      "ADMIN-SECRET")
+    c = MiniMcpClient(admin_broker.url, res["token"])
+    c.rpc("initialize", {"protocolVersion": "2025-06-18"})
+    c.notify("notifications/initialized")
+    names = {t["name"] for t in c.rpc("tools/list")["result"]["tools"]}
+    assert [n for n in names if "adopt" in n] == []
+    # catalogue 側 (tier フィルタの入力) にもそもそも存在しない。
+    assert [t["name"] for t in tools_for("secretary") if "adopt" in t["name"]] == []
+
+
+@pytest.mark.parametrize("params,code", [
+    ({}, "invalid_params"),                                  # owner 欠落
+    ({"owner": 7}, "invalid_params"),                         # 非文字列 owner
+    ({"owner": ""}, "invalid_params"),                        # 空 owner
+    ({"owner": "sec", "force": "true"}, "invalid_params"),    # truthy 文字列
+    ({"owner": "sec", "in_flight": 1}, "invalid_params"),     # 非文字列 policy
+    ({"owner": "sec", "in_flight": "nuke"}, "invalid_in_flight"),
+    ({"owner": "sec", "arming_seconds": "30"}, "invalid_params"),
+    ({"owner": "sec", "arming_seconds": True}, "invalid_params"),  # bool は数値でない
+    ({"owner": "sec", "arming_seconds": 0}, "invalid_arming_seconds"),
+])
+def test_admin_adopt_delivery_rejects_bad_params(admin_broker, params, code):
+    """壊れたパラメータは分類コード付き 400 で拒否され、**rotate は起きない**。
+
+    truthy 文字列を bool と見なすような緩い受理は、operator が意図しない force
+    supersede を踏む経路そのものになる。fence は巻き戻せないので、こうした要求は
+    副作用を出す前に入口で落とし切る必要がある。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, params, expect_status=400)
+    assert res["ok"] is False
+    assert res["error"].startswith(f"[{code}]")
+    assert _fence_state(admin_broker, "sec") == ({}, 0)
+
+
+def test_admin_adopt_delivery_unknown_owner_is_400(admin_broker):
+    """存在しない owner への adopt を成功にしない。
+
+    typo を成功にすると、operator は handover したつもりで、実際には誰も居ない
+    owner に lease を張って終わる (= 将来その名前で起動する session を
+    ``observer_pending`` で塞ぐ) — 失敗が沈黙する最悪の形になる。
+    """
+    res = _adopt(admin_broker, {"owner": "ghost"}, expect_status=400)
+    assert res["ok"] is False
+    assert res["error"].startswith("[unknown_owner]")
+    assert _fence_state(admin_broker, "ghost") == ({}, 0)
+
+
+def test_admin_adopt_delivery_without_delivery_credential_is_400(admin_broker):
+    """delivery credential を持たない owner の adopt は拒否される。
+
+    adopting session の channel sidecar はその cred で ``/claim-owner`` を叩く。
+    無いまま「成功」を返すと fence だけ済んで配達が二度と始まらない。
+    """
+    _admin_post(admin_broker, {"method": "mint_token",
+                               "params": {"role": "secretary", "name": "nochan"}},
+                "ADMIN-SECRET")
+    res = _adopt(admin_broker, {"owner": "nochan"}, expect_status=400)
+    assert res["ok"] is False
+    assert res["error"].startswith("[no_delivery_credential]")
+    assert _fence_state(admin_broker, "nochan") == ({}, 0)
+
+
+def test_admin_adopt_delivery_conflict_requires_force(admin_broker):
+    """期限内の未完了 adopt がある間、2 本目は force 無しでは拒否される。
+
+    rotate は last-rotate-wins なので、黙って許すと先行 CLI は「成功」を受け取った
+    後で **既に無効な秘密**を持つ session を起動し、その session は unobserved で
+    恒久に沈黙する。競合を暗黙の敗北ではなく明示の選択にする。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    first = _adopt(admin_broker, {"owner": "sec"})
+    clash = _adopt(admin_broker, {"owner": "sec"}, expect_status=400)
+    assert clash["ok"] is False
+    assert clash["error"].startswith("[adopt_in_flight]")
+    assert clash["adoption_id"] == first["adoption_id"]   # 現職の adopt を名指す
+    forced = _adopt(admin_broker, {"owner": "sec", "force": True})
+    assert forced["ok"] is True
+    assert forced["adoption_id"] != first["adoption_id"]
+    assert forced["observer_secret"] != first["observer_secret"]
+
+
+def test_admin_adopt_status_reports_pending_without_secret(admin_broker):
+    """adopt_status は進行中 adopt を報告するが、秘密は決して返さない。
+
+    ``org adopt`` は exec 直前の preflight にこれを使う。ここで秘密を返すと
+    「起動せずに現職の秘密を読む」経路になり、非 replay 秘密を 1 プロセスの env に
+    閉じ込める契約が崩れる。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    started = _adopt(admin_broker, {"owner": "sec", "in_flight": "drop"})
+    res = _adopt_status(admin_broker, {"owner": "sec"})
+    assert res["ok"] is True and res["owner"] == "sec"
+    assert res["generation"] == started["generation"]
+    assert res["instance_id"] is None                  # fence 済 (claimer 不在)
+    assert res["observer_state"] == store.OBSERVER_ARMED
+    pending = res["pending"]
+    assert pending["adoption_id"] == started["adoption_id"]
+    assert pending["in_flight_policy"] == "drop"
+    assert pending["in_flight_rows"] == 0
+    assert pending["fenced_generation"] == started["generation"]
+    # 残 arming は経過に依らず 0 以上・要求値以下 (時刻に依存しない不変量)。
+    assert 0.0 <= pending["armed_seconds_remaining"] <= started["arming_seconds"]
+    assert started["observer_secret"] not in json.dumps(res)
+
+
+def test_admin_adopt_status_pending_is_none_when_idle(admin_broker):
+    """進行中 adopt が無い owner では ``pending`` が None になる。
+
+    決着済み adoption の残骸を返し続けると、``org adopt`` の preflight がそれを
+    現職と誤認し、既に無効な秘密のまま session を起動してしまう。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt_status(admin_broker, {"owner": "sec"})
+    assert res["ok"] is True
+    assert res["pending"] is None
+    assert res["generation"] == 0 and res["instance_id"] is None
+    assert res["observer_state"] == store.OBSERVER_NONE
+
+
+@pytest.mark.parametrize("params", [{}, {"owner": 7}, {"owner": ""}])
+def test_admin_adopt_status_rejects_bad_owner(admin_broker, params):
+    """owner が欠落 / 非文字列 / 空の status 要求は 400 で拒否される。
+
+    非文字列 owner を素通しすると dict lookup が黙って miss し、「pending なし」を
+    正常応答として返す — preflight が空振りしていることに気付けなくなる。
+    """
+    res = _adopt_status(admin_broker, params, expect_status=400)
+    assert res["ok"] is False
+    assert "invalid_params" in res["error"]
+
+
+def test_admin_adopt_delivery_exception_is_rendered_as_400(admin_broker, monkeypatch):
+    """ハンドラ内の例外は 400 ``[adopt_failed]`` 本文になり、無言で接続を切らない。
+
+    ``/admin`` には catch-all が無い (tools/call の except は ``/mcp`` 専用) ため、
+    ここで例外が漏れると応答を書かないままソケットが閉じ、CLI からは「daemon 不到達」と
+    区別できない — adopt は現職を fence した **後** に落ちうる操作なので、その
+    取り違えは最悪の診断ミスになる。例外文は scrub_secrets を通す。
+    """
+    _mint_channel_owner(admin_broker, "sec")
+    live = _adopt(admin_broker, {"owner": "sec"})["observer_secret"]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(f"backend exploded with {live}")
+
+    monkeypatch.setattr(admin_broker, "adopt_delivery", _boom)
+    res = _adopt(admin_broker, {"owner": "sec", "force": True}, expect_status=400)
+    assert res["ok"] is False
+    assert res["error"].startswith("[adopt_failed] RuntimeError")
+    assert live not in res["error"]
+    assert "REDACTED_OBSERVER_SECRET" in res["error"]
+
+
+def test_admin_adopt_status_exception_is_rendered_as_400(admin_broker, monkeypatch):
+    """status 側の例外も 400 ``[adopt_status_failed]`` 本文で返る。
+
+    preflight が「例外で切断」と「daemon 不到達」を区別できないと、``org adopt`` は
+    起動を止めるべき場面 (自分の adoption が既に負けている) を通してしまう。
+    """
+    def _boom(*args, **kwargs):
+        raise RuntimeError("status exploded")
+
+    monkeypatch.setattr(admin_broker, "adopt_status", _boom)
+    res = _adopt_status(admin_broker, {"owner": "sec"}, expect_status=400)
+    assert res["ok"] is False
+    assert res["error"].startswith("[adopt_status_failed] RuntimeError")
+
+
+@pytest.mark.parametrize("method", ["adopt", "adopt_delivery_v2", "delivery_adopt"])
+def test_admin_near_adopt_method_names_are_unknown(admin_broker, method):
+    """adopt に似た未知メソッドは ``[unknown_admin_method]`` のまま 400 で落ちる。
+
+    新設の分岐が接頭辞一致のような緩い判定に化けると、綴り違いの要求が本物の
+    adopt 分岐に落ち、operator が意図しない owner の fence を踏む。
+    """
+    res = _admin_post(admin_broker, {"method": method}, "ADMIN-SECRET",
+                      expect_status=400)
+    assert "unknown_admin_method" in res["error"]
+
+
+def test_adopt_hidden_when_no_admin_token(broker):
+    """admin token 未設定の daemon では adopt 経路ごと 404 で隠れ、副作用も残らない。
+
+    ``/admin`` は 404 gate が先に立つ契約。新分岐がその手前で評価されるようになると、
+    admin 面を持たない daemon (内部起動 / テスト用) でも fence だけが実行される。
+    """
+    broker.issue_token("sec", "sec", "secretary")
+    broker.issue_delivery_cred("sec")
+    assert _adopt(broker, {"owner": "sec"}, token="anything",
+                  expect_status=404) is None
+    assert _fence_state(broker, "sec") == ({}, 0)
 
 
 # ============================================================= #74 SIGTERM

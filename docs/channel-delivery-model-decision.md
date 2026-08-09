@@ -1,9 +1,12 @@
 # Channel delivery model: owner-scoped exclusive claim vs broadcast + dedupe
 
-**Status:** Decided, after two reversals (§10.2).
+**Status:** Decided, after two reversals (§10.2). §6.5.3 / §7 / §8 refreshed 2026-08 against the shipped code.
 **Decision:** Keep the owner-scoped exclusive claim. Harden it with identity work (§8). Do not adopt broadcast.
-**Refs:** #162 (this decision), #125 (generation/instance fencing), #129 (observer lease, bg-hosted marker).
-**Scope:** This note contains a decision only. No behavior change ships with it.
+**Refs:** #162 (this decision), #125 (generation/instance fencing), #129 (observer lease, bg-hosted marker),
+#165 (§8 item 1), #170 (item 3), #171 (item 5), #166 (item 2, the adopt path).
+**Scope:** The decision itself shipped no behavior change. §7 and §8 are **living status** and are updated as
+each item lands - a stale item list here is worse than none, because these sections are read as the design
+rationale for the next change.
 
 ---
 
@@ -278,10 +281,21 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
 2. **The pull door narrows but does not close.** The full token is in the persisted config *by design*: HTTP
    MCP can only carry static headers (`tokens.py:192-205`), so there is no `${VAR}` indirection available.
    Item 4 can reduce the window; it cannot reach zero without changing how the token is transported.
-3. **Adoption is discipline-dependent.** A legitimate session started by hand (`claude --resume`) carries no
+3. **Adoption is discipline-dependent.** ~~A legitimate session started by hand (`claude --resume`) carries no
    observer secret, so it registers `unobserved`, sets `_stood_down`, and - because that latch has no
-   `clear()` (`channel_sidecar.py:86`) - **never receives push for the life of the process**. Extending the
-   lease without item 2 converts today's silent theft into a legitimate session that is silently mute.
+   `clear()` - **never receives push for the life of the process**.~~
+
+   **Superseded by #171 and #166 (updated 2026-08).** The refusal is now split by whether it can ever be
+   reversed (`store.py` `LATCHING_REFUSALS`). A session presenting *no* secret gets `observer_pending`, which
+   is **non-latching**: the sidecar keeps retrying at poll cadence and takes over the moment the incumbent's
+   lease is released. Only a session presenting a *stale* secret - one actually superseded by a rotate - gets
+   the latching `unobserved`. So a hand-started `claude --resume` is no longer permanently mute; it is queued
+   behind the incumbent.
+
+   What remains true is the shape of the concern: waiting behind an incumbent is not the same as taking over
+   from one, and the incumbent's lease does not expire on heartbeat loss (§7.5 note). **Item 2 (#166) is what
+   closes the gap**, by making the takeover an explicit operation rather than something the operator has to
+   provoke. See §8 item 2 for what shipped.
 
 ---
 
@@ -290,12 +304,21 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
 1. **Identity, not delivery, is the root** (§4.5). Session steal and DELETE collateral remain until item 4.
 2. **The pull path stays unfenced** until item 4 (§4.4).
 3. **Receiver-side dedupe still does not exist** (§4.2).
-4. **`_stood_down` is an unrecoverable latch** (`channel_sidecar.py:86`) - item 5.
-5. **`poll_claims` renews and activates an armed lease for whatever instance is current-generation**
-   (`store.py:485-487`) without checking it ever presented the secret.
-6. **There is no durability.** `_rows` is in-memory, the journal is never replayed (`store.py:325-332`). A
-   daemon restart drops every undelivered row silently. Neither model addresses this.
-7. **`duplicate_sidecar_detected` has no consumer** (`store.py:203-235`, `:466-468`) - item 3.
+4. ~~**`_stood_down` is an unrecoverable latch** - item 5.~~ **Fixed in #171.** The latch now applies only to
+   refusals that can never be reversed (`suppressed_bg_hosted`, `unobserved`); `observer_pending` is retried.
+   The sidecar keeps its own copy of that table and treats **unknown codes as non-latching**, so a version
+   skew fails toward retrying rather than toward silence.
+5. ~~**`poll_claims` renews and activates an armed lease for whatever instance is current-generation**
+   without checking it ever presented the secret.~~ **Fixed in #171.** `poll_claims` renews only a lease that
+   is already activated (`expires_at is not None`); activation stayed the exclusive privilege of a register
+   that presented the secret. Otherwise an instance that never held the secret could activate the lease and
+   silently void the arming deadline that §8 item 1 depends on.
+6. **There is no durability.** `_rows` is in-memory, the journal is never replayed. A daemon restart drops
+   every undelivered row silently. Neither model addresses this. **Still open.**
+7. ~~**`duplicate_sidecar_detected` has no consumer** - item 3.~~ **Fixed in #170**, and extended in #166:
+   the attention watcher now also consumes `delivery_register_superseded` and `delivery_adopt_expired`
+   (`attention/readers.py`, `attention/classifier.py`), so a session going mute and a failed handover both
+   reach the operator instead of only appearing in an admin-only dump.
 8. **Duplicate agent action is already reachable today** (§6.1): a row emitted but not yet confirmed is
    requeued when a new instance registers (`store.py:424-428`), so two sessions can be woken by the same
    message. This is inherent to emitting before confirming and is not fixed by keeping. If strict
@@ -304,25 +327,49 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
 
 ---
 
-## 8. Work items (not in this PR)
+## 8. Work items
 
-In the order ruled. Each filed separately.
+In the order ruled. Each filed separately. Status updated 2026-08.
 
-1. **Extend the observer lease to the `spawn_claude` path.** This closes §4.1, the default-silence path for
-   every spawned pane, and is the single highest-value item. `_adapter_spawn` already carries an env-injection
-   route, so this repeats for spawned panes what `launcher.py` already does for the secretary. Land item 2
-   with or before it (see §6.5.3).
-2. **An explicit adopt / handover path.** Rotate the lease and hand the secret to a new session's env, so a
-   deliberate takeover is expressible. Without this, item 1 turns a hand-started legitimate session into a
-   permanently mute one.
-3. **Give `duplicate_sidecar_detected` a consumer.** Detection already exists; only the notification is
-   missing. This is the cheapest observability win and directly attacks the "silence is undiagnosable"
-   property.
+1. **Extend the observer lease to the `spawn_claude` path.** - **Done (#165).** This closed §4.1, the
+   default-silence path for every spawned pane. `_adapter_spawn` already carried an env-injection route, so it
+   repeated for spawned panes what `launcher.py` does for the secretary. Because the secret's arrival is
+   backend-dependent, the lease is armed with a finite activation deadline: if nobody ever presents it, the
+   lease is dropped rather than muting the owner forever.
+2. **An explicit adopt / handover path.** - **Done (#166), and it is what this section's caveats were
+   waiting on.** Three decisions are worth recording, because each rules out an obvious-looking alternative:
+
+   *Adopt is a launcher, not a message to a running session.* The secret's whole power comes from riding in
+   process env, which fork/resume does not replay. A running process's env cannot be rewritten from outside,
+   so there is no way to hand a secret to a session that is already up. The alternative - an authenticated
+   dynamic handoff channel in the sidecar - was rejected because a forked sidecar could call it too: it would
+   delete the exact asymmetry the lease is built on. So `org adopt` rotates the lease and **starts a new
+   claude process** holding the new secret, with `--resume` / `--continue` carrying the conversation across.
+
+   *The handover boundary is the fence, not the RPC.* Rotating alone does not stop the incumbent: the old
+   `(generation, instance_id)` stays current and `poll_claims` never re-checks the secret, so the old session
+   would keep claiming until the new one registered. The adopt RPC therefore bumps the generation **and
+   clears the registered instance** in the same lock scope, which fences every caller (`poll_claims` compares
+   against a now-absent instance). Between that moment and the adopting sidecar's register, nobody delivers.
+
+   *Issuing the secret is not success.* Because adopt fences first, a failed launch would leave an owner with
+   no claimer at all - and a fenced sidecar never re-registers, so that state would be permanent. The adopt
+   therefore carries an adoption id and a finite arming deadline; if no adopting sidecar registers in time the
+   daemon **restores the previous generation and instance** (compare-and-restore) and journals
+   `delivery_adopt_expired`, which the attention watcher reports. A concurrent adopt is rejected rather than
+   silently winning, since last-rotate-wins would hand the earlier operator a success for a session that could
+   never deliver.
+
+   The in-flight question from §7.8 is answered by **not** answering it in the daemon: `--in-flight
+   requeue|drop` is an operator choice, defaulting to `requeue` to match the existing at-least-once posture,
+   with the count and the chosen policy recorded in both the response and the journal.
+3. **Give `duplicate_sidecar_detected` a consumer.** - **Done (#170)**, extended by #166 (§7.7).
 4. **Pull door and shared-bind identity** (§4.4, §4.5): session steal on `initialize`, DELETE collateral on a
    sibling's exit, and destructive `drain()` under a replayed token. Hardest, and separate - this is the root
-   cause, not a delivery concern.
-5. **Make `_stood_down` recoverable** (§6.5.3). Note the trap: a naive periodic re-register converts the
-   observer lease from a permanent fence into a TTL-delayed fork takeover, which is worse than the latch.
+   cause, not a delivery concern. **Still open.**
+5. **Make `_stood_down` recoverable** (§6.5.3). - **Done (#171).** The trap named here was real and was
+   avoided: recovery is *not* a periodic re-register (which would have converted the lease into a TTL-delayed
+   fork takeover). Instead the refusal was split, so only the never-reversible cases latch.
 
 A **live-incumbent guard** on the last-register-wins branch (`store.py:419-422`) was evaluated as an
 alternative to item 1. It is not in the ruled order because item 1 supersedes it where the lease is present,

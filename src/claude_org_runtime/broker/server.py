@@ -66,6 +66,7 @@ class Broker(TokenMixin, StoreMixin):
         lease_seconds: float = 30.0,
         observer_lease_seconds: float = 90.0,
         observer_arming_seconds: float = 600.0,
+        adopt_arming_seconds: float = store.DEFAULT_ADOPT_ARMING_SECONDS,
         reclaim_warn_threshold: int = 3,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
@@ -102,6 +103,16 @@ class Broker(TokenMixin, StoreMixin):
         # 組織全体の沈黙に気付くまで」より十分小さく。TTL (90s) の数倍以上離して、
         # 遅い起動が期限に触れないようにもする。10 分はこの間の広い谷にある。
         self.observer_arming_seconds = observer_arming_seconds
+        # 明示 adopt (#166) の **活性化期限**。adopt は旧 sidecar をその場で fence する
+        # ので、adopting session の起動が失敗すると誰も配達しない窓が残る。期限内に
+        # adopting register が来なければ adopt を失敗確定させ lease を落とし、
+        # ``delivery_adopt_expired`` で operator へ能動通知する。
+        #
+        # 桁の根拠: observer_arming_seconds (10 分 = 段1 folder-trust の人間承認待ちを
+        # 含む spawn 用) より **短く** 取る。adopt は operator が今まさに端末の前で
+        # 実行する操作で、resume は既存の会話を開くだけなので分オーダーで完了する。
+        # 一方 TTL (90s) の数倍は離し、遅い起動が期限に触れないようにする。
+        self.adopt_arming_seconds = adopt_arming_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存
@@ -129,6 +140,10 @@ class Broker(TokenMixin, StoreMixin):
         # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
         # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。
         self._observer_leases: dict[str, ObserverLease] = {}
+        # 明示 adopt (#166)。owner -> 進行中の adopt (高々 1 件)。adopt は rotate と
+        # 同時に generation を fence するため、ここに載っている間は当該 owner に claimer
+        # が 1 つも居ない = 完了 (adopting register) か失効かで必ず決着させる。_lock で守る。
+        self._pending_adoptions: dict[str, store.PendingAdoption] = {}
         # stand-down 観測面 (Issue #169)。owner -> 最後の register 拒否記録。sidecar 側の
         # stand-down は子プロセス内の Event で外から見えないため、daemon 側に残して
         # delivery_dump で晒す (「黙っている pane」を journal を読まずに発見できる)。
@@ -346,6 +361,63 @@ class Broker(TokenMixin, StoreMixin):
             "mcp_config": mcp_config,
             "observer_secret": observer_secret,
         }
+
+    def admin_adopt_delivery(self, params: dict) -> dict:
+        """配達所有権の明示 handover (#166、admin RPC の実体)。
+
+        :meth:`~claude_org_runtime.broker.store.StoreMixin.adopt_delivery` が rotate と
+        fence を原子的に行い、ここではその結果に **adopting session が使う
+        ``--mcp-config``** を畳んで返す。config は store が「owner 実在検証と同じ lock
+        スコープ」で返した既存 bind の資格情報から組む: adopt は新しい identity を作る
+        操作ではなく既存 owner の配達所有権を移す操作なので、token を mint し直さない
+        (mint すると同 agent_id の重複 bind になり配送解決が曖昧化する)。
+
+        **認可は admin token に限定する** (事前 Codex design review Major (e))。
+        adopt は observer lease より強い操作 (現職を無条件に fence できる) なので、
+        MCP ツール面にも delivery credential にも出さない — lease より弱い主体が
+        所有権を奪える経路を作らないため。``/admin`` は ``admin.token`` (0600) の
+        bearer のみ受理し、その検証は :meth:`_AdminHandler._handle_admin` が行う。
+        """
+        owner = params.get("owner")
+        if not isinstance(owner, str) or not owner:
+            return {"ok": False,
+                    "error": "[invalid_params] owner must be a non-empty string"}
+        in_flight = params.get("in_flight", store.ADOPT_INFLIGHT_REQUEUE)
+        if not isinstance(in_flight, str):
+            return {"ok": False, "error": "[invalid_params] in_flight must be a string"}
+        force = params.get("force", False)
+        if not isinstance(force, bool):
+            # bool を厳密に要求する (truthy 文字列で現職の fence が誤って上書きされない
+            # ように。channel / observer / bg_hosted と同じ検証方針)。
+            return {"ok": False, "error": "[invalid_params] force must be a boolean"}
+        arming_seconds = params.get("arming_seconds", self.adopt_arming_seconds)
+        if isinstance(arming_seconds, bool) or not isinstance(
+                arming_seconds, (int, float)):
+            return {"ok": False,
+                    "error": "[invalid_params] arming_seconds must be a number"}
+        result = self.adopt_delivery(
+            owner, in_flight=in_flight, force=force,
+            arming_seconds=float(arming_seconds),
+        )
+        # 内部フィールドは必ず落とす (ワイヤに出さない契約)。失敗経路には元々無い。
+        owner_token = result.pop("_owner_token", "")
+        delivery_cred = result.pop("_delivery_cred", "")
+        if not result.get("ok"):
+            return result
+        mcp_config = self.mcp_config_for(owner_token)
+        mcp_config["mcpServers"]["org-broker-channel"] = (
+            self.channel_server_config(delivery_cred, owner)
+        )
+        result["mcp_config"] = mcp_config
+        return result
+
+    def admin_adopt_status(self, params: dict) -> dict:
+        """owner の adopt 進行状況を返す (#166、admin RPC の実体)。**秘密は含めない**。"""
+        owner = params.get("owner")
+        if not isinstance(owner, str) or not owner:
+            return {"ok": False,
+                    "error": "[invalid_params] owner must be a non-empty string"}
+        return self.adopt_status(owner)
 
     @property
     def url(self) -> str:
@@ -642,6 +714,49 @@ class Broker(TokenMixin, StoreMixin):
         return _ok({"ok": True, "target": target})
 
     # ---------------------------------------------------- pane: 共通 cleanup / reap
+    def _detach_owner_panes_locked(self, owner: str) -> list[str]:
+        """adopt 済み owner の pane meta に「切り離し済み」印を付ける (#166)。
+
+        **_lock 保持中に呼ばれる** (:meth:`~claude_org_runtime.broker.store.
+        StoreMixin.adopt_delivery` の critical section から)。印を付けた pane id を返す。
+
+        adopt は配達所有権を **別プロセス** へ移す。移した後の旧 pane は所有権を持たない
+        抜け殻で、``org adopt`` は operator に「都合のよい時に閉じてよい」と案内する。
+        ところが pane の close / reap は :meth:`_cleanup_pane` を通り、そこは pane を
+        「その owner の唯一の実体」とみなして **token を revoke し、delivery cred を
+        revoke し、delivery state を reset し、未配達行を捨てる**。案内どおりに閉じた
+        瞬間に adopt 済み session が MCP も配達も失う (Codex review P1)。
+
+        pane meta を消さずに **印を付ける** のが要点: 消すと close_pane が pane を
+        見つけられなくなり、抜け殻を畳む手段まで失う。印は「この pane を閉じてよいが、
+        その owner の資格情報と queue は道連れにするな」を意味する。
+        """
+        detached: list[str] = []
+        for pane_id, meta in self._pane_meta.items():
+            if meta.get("agent_id") == owner and not meta.get("adopted_away"):
+                meta["adopted_away"] = True
+                detached.append(pane_id)
+        return detached
+
+    def _reattach_owner_panes_locked(self, owner: str) -> list[str]:
+        """切り離し印を外し、**まだ存在する** pane id を返す (#166 の巻き戻し)。
+
+        **_lock 保持中に呼ばれる** (:meth:`~claude_org_runtime.broker.store.
+        StoreMixin._sweep_adoptions_locked` の critical section から)。
+
+        adopt が失効したら所有権は旧 session に返る。返るなら pane も元の関係に戻す:
+        印を残したままだと、その pane を閉じても資格情報も未配達行も掃除されず、死んだ
+        owner の bind が居座って同名 respawn を塞ぐ。返り値が空 = 切り離した pane は
+        既に閉じられている、という判定材料でもある (呼び元はそれを見て「旧 instance を
+        復帰させてよいか」を決める)。
+        """
+        reattached: list[str] = []
+        for pane_id, meta in self._pane_meta.items():
+            if meta.get("agent_id") == owner and meta.get("adopted_away"):
+                meta.pop("adopted_away", None)
+                reattached.append(pane_id)
+        return reattached
+
     def _cleanup_pane(self, handle: "PaneId") -> tuple[str | None, bool]:
         """pane の bookkeeping を掃除する — close_pane と自己終了 reap の共通経路。
 
@@ -671,10 +786,18 @@ class Broker(TokenMixin, StoreMixin):
             meta = self._pane_meta.pop(str(handle), None)
             agent_id = meta.get("agent_id") if meta else None
             tok = meta.get("token") if meta else None
-            if tok and tok in self._binds:
+            # adopt (#166) で切り離された pane は **抜け殻**。配達所有権は別プロセスへ
+            # 移っており、この pane は既にその owner の実体ではない。meta は落として
+            # pane を畳めるようにするが、資格情報と queue には触らない: ここで従来どおり
+            # 掃除すると、adopt 済み session の token / delivery cred / 未配達行を、
+            # 旧 pane を閉じただけで巻き添えに殺す (:meth:`_detach_owner_panes_locked`)。
+            adopted_away = bool(meta.get("adopted_away")) if meta else False
+            if tok and tok in self._binds and not adopted_away:
                 b = self._binds[tok]
                 b.revoked = True
                 b.registered = False
+        if adopted_away:
+            return agent_id, meta is not None
         # delivery 掃除は **token-backed pane** に限る (tok が真の時のみ)。generic
         # spawn_pane は token=None で登録され、channel sidecar も delivery cred も queue
         # 行も持たない。その meta agent_id は bind-only の別 live agent (admin_mint_token
@@ -1753,6 +1876,26 @@ class _McpHandler(BaseHTTPRequestHandler):
             else:
                 result = broker.flip_mode(owner, mode)
                 self._send_json(200 if result.get("ok") else 400, result)
+        elif method in ("adopt_delivery", "adopt_status"):
+            # 配達所有権の明示 handover / その進行状況 (#166)。現職を無条件に fence
+            # できるため admin 面に限定する (上で admin.token bearer を定数時間比較済み)。
+            #
+            # **/admin には catch-all が無い** (do_POST は素で分岐し、tools/call の
+            # except Exception は /mcp 専用)。ここで漏らすと応答を書かないままソケットが
+            # 閉じ、CLI からは「daemon 不到達」と区別できない — adopt は現職を fence
+            # した後に落ちうる操作なので、その取り違えは最悪の診断ミスになる。
+            # 例外文は scrub_secrets を通す (observer 秘密の回り込みを断つ)。
+            code = ("adopt_failed" if method == "adopt_delivery"
+                    else "adopt_status_failed")
+            try:
+                if method == "adopt_delivery":
+                    result = broker.admin_adopt_delivery(params)
+                else:
+                    result = broker.admin_adopt_status(params)
+            except Exception as exc:
+                result = {"ok": False, "error": broker.scrub_secrets(
+                    f"[{code}] {type(exc).__name__}: {exc}")}
+            self._send_json(200 if result.get("ok") else 400, result)
         elif method == "delivery_dump":
             # 配送ライフサイクルの横断スナップショット (owner/state を晒すため admin)。
             self._send_json(200, {"ok": True, **broker.delivery_dump()})

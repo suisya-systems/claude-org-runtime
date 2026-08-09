@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An explicit **adopt / handover path for delivery ownership**: `org adopt`
+  plus the `adopt_delivery` / `adopt_status` admin RPCs (Issue #166).
+
+  Until now the only way an owner's delivery ownership moved was as a side
+  effect — a rotate on the next spawn, or a pane being closed. A session that
+  lost it could not get it back, and a session started by hand had no way to
+  claim it. Adopt makes the takeover a first-class operation:
+
+  ```
+  claude-org-runtime org adopt --owner worker-a --resume <session-id>
+  claude-org-runtime org adopt --owner worker-a --status   # query only
+  ```
+
+  **Adopt is a launcher, not a message to a running session.** The observer
+  secret is a non-replayable signal precisely because it rides in process env,
+  which fork/resume does not inherit — and a running process's env cannot be
+  rewritten from outside. Adding a dynamic handoff channel to the sidecar would
+  have let a forked sidecar call it too, dissolving the asymmetry the lease is
+  built on. So `org adopt` rotates the lease and starts a *new* claude process
+  holding the new secret, with `--resume` / `--continue` carrying the
+  conversation.
+
+  **The handover boundary is the fence, not the RPC.** Rotating the lease alone
+  does not stop the incumbent: the old `(generation, instance_id)` stays current
+  and `poll_claims` never re-checks the secret. `adopt_delivery` therefore bumps
+  the generation *and* clears the registered instance in one lock scope, which
+  fences every caller until the adopting sidecar registers. In that window
+  nobody delivers and no rows are lost.
+
+  **Issuing the secret is not treated as success.** Each adopt carries an
+  adoption id and a finite arming deadline. If no adopting sidecar registers in
+  time the daemon restores the previous generation and instance
+  (compare-and-restore) and journals `delivery_adopt_expired` — without that
+  restore a failed adopt would mute the owner permanently, because a fenced
+  sidecar never re-registers. A concurrent adopt is rejected with
+  `[adopt_in_flight]` rather than silently winning; `--force` makes superseding
+  an explicit choice and journals it.
+
+  **In-flight rows are the operator's call**, not the daemon's:
+  `--in-flight requeue|drop`. `requeue` (default) matches the existing
+  at-least-once posture and may show the adopting agent a message the previous
+  host already emitted; `drop` marks those rows delivered and accepts losing the
+  tail instead. The count and the chosen policy are recorded in both the RPC
+  response and the journal.
+
+  Authorization is **admin-token only**. Adopt can fence a live incumbent
+  unconditionally, so it is exposed neither on the MCP tool surface nor to a
+  delivery credential; the owner's existence and its delivery credential are
+  verified in the same lock scope as the rotate.
+
+  The owner's bind is **re-keyed** rather than reused or re-minted: the adopting
+  session gets a fresh bearer token for the same bind, and the token the previous
+  process holds stops resolving. Re-minting would leave two binds for one
+  `agent_id` and make delivery resolution ambiguous; reusing the token would
+  leave two live processes sharing one `session_id`, where each `initialize`
+  evicts the other's session. Because it is the same bind object, `registered`
+  and `cwd` carry across, so messages sent mid-handover still queue instead of
+  bouncing. Expiry rolls the re-key back along with the fence.
+
+  Closing the previous pane no longer collapses the handover: adopt marks that
+  pane detached, so its close/reap skips the credential and queue cleanup that
+  would otherwise revoke the adopted session's access. Expiry restores the
+  marking, and if the pane was already closed the expiry reports
+  `restored: false` rather than claiming it handed delivery back to a sidecar
+  that no longer exists.
+
+- The attention watcher gained operator-facing consumers for two more broker
+  journal signals: `delivery_register_superseded` (a session was superseded and
+  has stopped claiming for good) and `delivery_adopt_expired` (Issue #166). Both
+  default to `urgent` in `DEFAULT_NOTIFY` and both are one-shot, so they get
+  their own, much longer freshness window (`delivery_signal_window_sec`,
+  default 3600s) than the repeating `duplicate_sidecar_detected`. Previously the
+  only consumed journal line was `duplicate_sidecar_detected`, so a session
+  going mute reached nobody.
+
+- `Broker(adopt_arming_seconds=...)` tunable (default 300s).
+
+### Changed
+
+- **Potentially breaking**: `--resume` is now a *reserved* flag in the
+  interactive claude argv builder. It is newly accepted (it was previously
+  rejected as an unknown flag) but only through the structured
+  `build_claude_argv(resume=...)` field — passing it in free-form `args[]`
+  (`spawn_claude_pane`) or `--claude-arg` (`org up` / `org adopt`) raises
+  `ToolArgError`. Routing the session selector through one structured field is
+  what lets the builder enforce mutual exclusion with `--continue`; a free-form
+  hole would have allowed a second, conflicting selector to be appended after
+  the adopt's own.
+
+  `--continue` is deliberately **not** reserved, so existing callers that pass
+  it through `args[]` keep working; it is only rejected in combination with
+  `resume=`, and a duplicate is folded when both the structured field and
+  `args[]` supply it.
+
+- `docs/channel-delivery-model-decision.md` §6.5.3 / §7 / §8 refreshed against
+  the shipped code. Those sections still described `observer_pending` as a
+  permanent latch and `_stood_down` as unrecoverable, both of which stopped
+  being true in #171 — a stale rationale in that note is read as the basis for
+  the next change, so it is now maintained as living status.
+
 ## [0.1.41] - 2026-08-08
 
 ### Added

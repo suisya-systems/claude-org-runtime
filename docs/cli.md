@@ -379,7 +379,7 @@ than silently lose isolation. `sandbox doctor` is the non-breaking half
 of the answer: it makes the loss of isolation visible without changing
 what happens when a command cannot be sandboxed.
 
-## `org up` / `org down`
+## `org up` / `org adopt` / `org down`
 
 A thin session launcher over the broker control plane (the `daemon.json`
 sidecar + admin RPC). It does **not** re-implement any control-plane
@@ -387,6 +387,7 @@ logic; it orchestrates the existing primitives.
 
 ```sh
 claude-org-runtime org up               # reuse-or-start the daemon, launch secretary TUI
+claude-org-runtime org adopt --owner W  # hand W's delivery ownership to a new session
 claude-org-runtime org down             # stop the daemon (signal-free) and verify
 ```
 
@@ -460,6 +461,61 @@ daemon (rather than the daemon dying and timing out); use `--backend wezterm`
 on native Windows or run under WSL. To drive a remote `herdr` session from
 Windows, use the renga transport instead.
 
+## `org adopt` (Issue #166)
+
+Hands one owner's **delivery ownership** to a new session. Use it when the
+session that was receiving an owner's pushed messages is gone, was superseded,
+or was started by hand and so never held the observer secret.
+
+```sh
+claude-org-runtime org adopt --owner worker-a --resume 4f3c…   # take over, keep the conversation
+claude-org-runtime org adopt --owner worker-a --status         # report only; rotates nothing
+```
+
+Adopt is a **launcher**, not a message to a running session. The observer
+secret is non-replayable precisely because it rides in process env, which
+fork/resume does not inherit, and a running process's env cannot be rewritten
+from outside — so the only way to hand an owner to a session is to *start* that
+session with the secret. `--resume` / `--continue` carry the conversation
+across.
+
+What one `org adopt` does, in order:
+
+1. Resolves the running daemon from its sidecar. **It never starts one** — no
+   daemon means there is no delivery ownership to adopt, which is an error.
+2. Calls the admin RPC `adopt_delivery`. In a single lock scope the daemon
+   verifies the owner exists and holds a delivery credential, rotates the
+   observer lease (new secret, adoption id, finite arming deadline), **bumps
+   the generation and clears the registered instance**, and applies the
+   in-flight row policy. From this point the previous session is fenced and
+   nobody delivers until the adopting sidecar registers.
+3. Re-checks that its adoption is still the current one (a concurrent `--force`
+   adopt may have superseded it) and refuses to launch a session that could
+   never deliver.
+4. Launches `claude` with the new secret in its process env.
+
+If the adopting session never registers before the arming deadline, the daemon
+**restores the previous generation and instance** and journals
+`delivery_adopt_expired`, which the attention watcher reports as `urgent`.
+Issuing the secret is deliberately not treated as success: adopt fences first,
+and a fenced sidecar never re-registers, so an unreported failure would leave
+the owner permanently mute.
+
+### `org adopt` flags
+
+| Flag | Description |
+|------|-------------|
+| `--state-dir PATH` | Daemon state dir to discover the sidecar. Default: `.state/broker`. |
+| `--owner ID` | Agent id whose delivery ownership is being adopted. Default: `secretary`. |
+| `--resume SESSION_ID` | Resume this claude session in the adopting process. Mutually exclusive with `--continue`. |
+| `--continue` | Continue the most recent claude session. Mutually exclusive with `--resume`. |
+| `--in-flight {requeue,drop}` | What to do with rows the previous session claimed but never confirmed. `requeue` (default) re-delivers them — the previous host may already have emitted them, so the agent can see a duplicate. `drop` marks them delivered and accepts losing the tail instead. The count and policy land in the response and the journal. |
+| `--force` | Supersede an adoption already in flight for this owner. Without it a concurrent adopt is rejected with `[adopt_in_flight]` rather than silently invalidating the earlier one. |
+| `--status` | Report the owner's delivery/adoption state and exit. Rotates nothing, launches nothing. |
+| `--root-cwd PATH` | cwd for the adopting process. Default: the directory `org adopt` runs in. |
+| `--model` / `--permission-mode` | Passed through to the adopting TUI. |
+| `--claude-arg ARG` | Extra interactive claude flag (repeatable). `--resume` is **reserved** here — use the structured flag. |
+
 ### `org down` flags
 
 | Flag | Description |
@@ -472,9 +528,9 @@ Windows, use the renga transport instead.
 
 | Code | Meaning |
 |------|---------|
-| `0` | up: launched (or already up); down: `broker_stopped` verified (or no sidecar). |
+| `0` | up: launched (or already up); adopt: launched, or `--status` reported; down: `broker_stopped` verified (or no sidecar). |
 | `1` | down: shutdown requested but `broker_stopped` not observed / daemon unreachable. |
-| `2` | up: unknown backend, a backend unsupported on this platform (e.g. `herdr` on native Windows), backend conflict with a live daemon, or admin mint / MCP surface unhealthy. |
+| `2` | up: unknown backend, a backend unsupported on this platform (e.g. `herdr` on native Windows), backend conflict with a live daemon, or admin mint / MCP surface unhealthy. adopt: no daemon / no admin token, the daemon rejected the adopt, or the adoption was superseded before launch. |
 
 ## `broker send`
 

@@ -464,6 +464,10 @@ _CLAUDE_VALUE_FLAGS = {
     "--mcp-config", "--model", "--permission-mode", "--add-dir", "--settings",
     "--append-system-prompt", "--setting-sources", "--session-id",
     "--permission-prompt-tool", "--mcp-config-file",
+    # 明示 adopt (#166): 既存の会話を引き継いで起動するための session selector。
+    # 対話 TUI の flag なので allowlist に載せてよいが、**必ず構造化フィールド経由**
+    # にする (_CLAUDE_RESERVED_IN_ARGS も参照)。
+    "--resume",
     # push 一次配送 (§9.5): channel sidecar を load する dev-channel flag。値は
     # ``server:org-broker-channel``。renga と同形の対話 flag (renga も
     # ``--dangerously-load-development-channels server:renga-peers`` を使う)。
@@ -484,9 +488,18 @@ _CLAUDE_HEADLESS_BLACKLIST = {
 # reserved から外す。caller が冪等に args[] へ付与しても reject せず (builder が
 # 重複を畳む)、bare check_messages の ambient renga-peers への誤ルートを防ぐ strict
 # 隔離を弱めない。
+#
+# NOTE (#166): --resume は allowlist に**追加すると同時に**予約する。adopt を
+# 「秘密付きで新プロセスを起こす launcher」として定義した以上、resume は adopt の
+# 一級の入力であり、自由形式 extra_args に穴を開けて表現してはならない (事前 Codex
+# design review Major (c))。予約しないと caller が args[] 経由で第二の session
+# selector を持ち込め、構造化フィールドとの相互排他 (--resume と --continue) を
+# builder 側で保証できなくなる。--resume は本 PR で初めて allowlist に入る flag
+# なので、同時に予約しても既存 caller を壊さない (従来は unknown flag として拒否)。
 _CLAUDE_RESERVED_IN_ARGS = {
     "--mcp-config", "--model", "--permission-mode",
     "--mcp-config-file", "--dangerously-load-development-channels",
+    "--resume",
 }
 
 # --- Codex (interactive TUI) ---
@@ -525,6 +538,25 @@ def _drop_redundant_strict(args: list[str]) -> list[str]:
         out.append(tok)
         i += 1
     return out
+
+
+def _has_standalone_flag(args: list[str], flag: str) -> bool:
+    """``flag`` が **値位置ではない** token として args に現れるか。
+
+    ``_drop_redundant_strict`` と同じ arity 走査。素朴な ``flag in args`` だと
+    ``["--add-dir", "--continue"]`` のように値位置に来た同名文字列を flag と誤認する
+    (``--add-dir`` の値がたまたま ``--continue`` という名前のディレクトリ、等)。
+    """
+    i, n = 0, len(args)
+    while i < n:
+        tok = args[i]
+        if tok in _CLAUDE_VALUE_FLAGS and i + 1 < n:
+            i += 2       # 次は値: flag として解釈しない
+            continue
+        if tok == flag:
+            return True
+        i += 1
+    return False
 
 
 def _reject_reserved_claude_args(args: list[str]) -> None:
@@ -582,6 +614,8 @@ def build_claude_argv(
     permission_mode: str | None = None,
     extra_args: list[str] | None = None,
     channel_server: str | None = None,
+    resume: str | None = None,
+    continue_session: bool = False,
 ) -> list[str]:
     """spawn_claude_pane の対話 TUI argv を組む (renga の dev-channel 合成の代替)。
 
@@ -602,10 +636,36 @@ def build_claude_argv(
     が ambient renga-peers の同名ツールへ誤ルートして broker queue が silent drop
     する事象 (#76) を、NUDGE_TEXT の FQ 化とは独立に防ぐ防御多重。caller が
     extra_args に冪等で --strict-mcp-config を付けても重複は畳む。
+
+    ``resume`` / ``continue_session`` は明示 adopt (#166) の **session selector**。
+    adopt は「秘密付きで新しい claude プロセスを起こす」操作なので、引き継ぐ会話を
+    指定する手段が要る。これを自由形式 ``extra_args`` ではなく構造化フィールドで受け、
+    ``--resume`` は ``_CLAUDE_RESERVED_IN_ARGS`` で args[] からは持ち込めなくする
+    (事前 Codex design review Major (c))。両者は **相互排他**: 同時指定は矛盾した
+    session 指定で、claude 側の解決順に暗黙依存する argv を作ってしまう。
+    ``continue_session`` は既に allowlist にある ``--continue`` を出すだけなので、
+    caller が args[] に冪等で付けていれば重複を畳む (``--strict-mcp-config`` と同型)。
     """
     extra_args = list(extra_args or [])
     _reject_reserved_claude_args(extra_args)
+    has_extra_continue = _has_standalone_flag(extra_args, "--continue")
+    if resume is not None and (continue_session or has_extra_continue):
+        raise ToolArgError(
+            "resume and continue_session are mutually exclusive "
+            "(pass one session selector, not both)"
+        )
+    if resume is not None:
+        if not isinstance(resume, str) or not resume.strip():
+            raise ToolArgError("resume must be a non-empty session id")
+        if resume.startswith("-"):
+            # 先頭 '-' の値は guard の値位置検査を通っても claude 側で flag として
+            # 解釈されうる。builder の段で構造的に拒否する。
+            raise ToolArgError(f"resume session id must not start with '-': {resume!r}")
     argv = ["claude", "--mcp-config", mcp_config_json, "--strict-mcp-config"]
+    if resume is not None:
+        argv += ["--resume", resume]
+    if continue_session and not has_extra_continue:
+        argv.append("--continue")
     if permission_mode:
         argv += ["--permission-mode", permission_mode]
     if model:

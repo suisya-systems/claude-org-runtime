@@ -223,6 +223,7 @@ def write_secretary_mcp_config(state_dir: str, mcp_config: dict) -> Path:
 def build_up_argv(
     mcp_config: dict, *, model: str | None = None,
     permission_mode: str | None = None, extra: list[str] | None = None,
+    resume: str | None = None, continue_session: bool = False,
 ) -> list[str]:
     """secretary TUI の argv を **既存** の課金中立 builder で組む (二重実装禁止)。
 
@@ -238,6 +239,11 @@ def build_up_argv(
     付ける。flag は config の実体に**従属**させる (config に channel があるときだけ
     flag を出す) ことで、両者が必ず一致し drift しない (secretary mint が channel を
     載せれば root も push 一次配送 sidecar を load する)。
+
+    ``resume`` / ``continue_session`` は ``org adopt`` (#166) の session selector を
+    そのまま builder の構造化フィールドへ流す。ここで argv を組み直さない (docstring
+    冒頭の「二重実装禁止」がそのまま adopt にも効く: adopt の argv が別実装になると
+    default-deny guard の適用漏れが起きうる)。
     """
     channel_server = (
         "org-broker-channel"
@@ -248,6 +254,7 @@ def build_up_argv(
         mcp_config_json=json.dumps(mcp_config),
         model=model, permission_mode=permission_mode, extra_args=extra,
         channel_server=channel_server,
+        resume=resume, continue_session=continue_session,
     )
 
 
@@ -569,6 +576,163 @@ def org_up(
     # 子環境へ注入する (mcp-config には載せない非 replay 信号)。channel 非要求 mint や
     # 旧 daemon 応答では None で、その場合は従来の last-register-wins に委ねる。
     return launch(argv, state_dir, observer_secret=mint.get("observer_secret"),
+                  root_cwd=root_cwd)
+
+
+# ===========================================================================
+# org adopt (#166)
+# ===========================================================================
+
+def _resolve_running_daemon(state_dir: str) -> dict:
+    """走行中 daemon を **起動せずに** 解決する (``org adopt`` 用)。
+
+    ``{"kind": "ok"|"cold"|"token_missing", ...}``。org up の
+    :func:`_resolve_existing_daemon` を流用**しない**のが要点で、あちらは最後に
+    名前付き secretary を mint する = adopt の前提 (「その owner は既に居る」) と
+    真逆の副作用を持つ。adopt にとって daemon 不在は **エラー**であって新規起動の
+    理由ではない (daemon が居ないなら引き継ぐ配達所有権も存在しない)。
+    """
+    sc = sidecar.read_sidecar(state_dir)
+    if sc is None:
+        return {"kind": "cold"}
+    admin_token = _read_admin_token_with_grace(state_dir)
+    if admin_token is None:
+        return {"kind": "token_missing", "host": sc["host"]}
+    return {"kind": "ok", "host": sc["host"], "port": sc["port"],
+            "admin_token": admin_token}
+
+
+def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
+    """``org adopt`` 本体: 配達所有権を新しい session へ明示的に引き継ぐ。
+
+    ``launch`` はテスト用に注入可能 (org up と同じ seam)。
+
+    adopt が「秘密付きで新しい claude プロセスを起こす launcher」である理由:
+    observer 秘密は **process env** で運ぶ非 replay 信号であり、走行中プロセスの env は
+    外から書き換えられない。よって既存プロセスへ後から秘密を渡す経路は原理的に存在
+    せず、sidecar 側に動的 handoff を足す代案は「mcp-config は replay されるが process
+    env はされない」という lease の存在根拠そのものを壊す (fork した sidecar も同じ
+    handoff 経路を叩けてしまう)。引き継ぎたい会話は ``--resume`` / ``--continue`` で
+    開く。
+
+    **daemon 側が先に fence する**ので、この関数が返る/exec する前に旧 session の配達は
+    既に止まっている。逆に言えば起動に失敗すると誰も配達しない窓が残るため、完了条件は
+    daemon 側の arming deadline が持つ (POSIX では :func:`_launch_claude` が execvpe で
+    返らないので、CLI 側に「起動後の確認」を書く余地は構造的に無い)。
+    """
+    state_dir = sidecar.absolutize(args.state_dir)
+    root_cwd = (
+        sidecar.absolutize(args.root_cwd) if args.root_cwd is not None
+        else os.getcwd()
+    )
+    owner = args.owner
+    resolved = _resolve_running_daemon(state_dir)
+    if resolved["kind"] == "cold":
+        print(f"org adopt: no broker daemon sidecar under {state_dir}. "
+              "Nothing to adopt - start the org with 'org up' first.",
+              file=sys.stderr)
+        return 2
+    if resolved["kind"] == "token_missing":
+        print("org adopt: daemon.json is present but admin.token did not appear; "
+              "the daemon may be half-published or crashed. Not adopting.",
+              file=sys.stderr)
+        return 2
+    host, port = resolved["host"], resolved["port"]
+    admin_token = resolved["admin_token"]
+
+    if args.status:
+        # 問い合わせのみ (rotate も fence もしない)。
+        try:
+            res = _admin_rpc(host, port, admin_token, "adopt_status",
+                             {"owner": owner})
+        except urllib.error.URLError:
+            print("org adopt: daemon unreachable.", file=sys.stderr)
+            return 2
+        if not (res and res.get("ok")):
+            print(f"org adopt: adopt_status failed: "
+                  f"{(res or {}).get('error', 'no response')}", file=sys.stderr)
+            return 2
+        pending = res.get("pending")
+        print(f"org adopt: owner={owner} generation={res.get('generation')} "
+              f"instance={res.get('instance_id')} "
+              f"observer={res.get('observer_state')}")
+        if pending is None:
+            print("org adopt: no adoption in flight.")
+        else:
+            print(f"org adopt: adoption {pending['adoption_id']} armed for "
+                  f"{pending['armed_seconds_remaining']:.1f}s more "
+                  f"(in-flight {pending['in_flight_policy']}: "
+                  f"{pending['in_flight_rows']} rows)")
+        return 0
+
+    # **fence する前に** ローカル引数を検証する (Codex review P1)。adopt_delivery は
+    # 現職をその場で fence するので、その後で argv 組み立てが例外を投げると owner は
+    # claimer 不在のまま arming deadline まで放置される — しかも原因は operator の
+    # typo という、最も直しやすいはずのもの。spawn_claude が token 発行前に argv を
+    # pre-validate するのと同じ理由・同じ順序 (副作用の前に検証)。
+    claude_args = list(args.claude_arg or [])
+    try:
+        build_up_argv(
+            {"mcpServers": {}}, model=args.model,
+            permission_mode=args.permission_mode, extra=claude_args,
+            resume=args.resume, continue_session=args.continue_session,
+        )
+    except surface.ToolArgError as exc:
+        print(f"org adopt: invalid launch arguments: {exc}", file=sys.stderr)
+        print("org adopt: nothing was rotated.", file=sys.stderr)
+        return 2
+
+    try:
+        res = _admin_rpc(host, port, admin_token, "adopt_delivery", {
+            "owner": owner, "in_flight": args.in_flight, "force": args.force,
+        })
+    except urllib.error.URLError:
+        # **fence 前**に落ちたので配達所有権は動いていない。そう言い切る。
+        print("org adopt: daemon unreachable; nothing was rotated.",
+              file=sys.stderr)
+        return 2
+    if not (res and res.get("ok")):
+        print(f"org adopt: adopt_delivery failed: "
+              f"{(res or {}).get('error', 'no response')}", file=sys.stderr)
+        return 2
+
+    adoption_id = res["adoption_id"]
+    print(f"org adopt: rotated delivery ownership for owner={owner} "
+          f"(adoption {adoption_id}, generation {res['generation']})")
+    print(f"org adopt: in-flight policy={res['in_flight_policy']} "
+          f"rows={res['in_flight_rows']}")
+    detached = res.get("detached_panes") or []
+    if detached:
+        print(f"org adopt: detached the previous pane(s) {', '.join(detached)} from "
+              "this owner; closing them will not affect the adopting session.")
+    print("org adopt: the previous session is fenced now and will NOT deliver "
+          "again; close its pane when convenient.")
+    print(f"org adopt: this adoption must land within {res['arming_seconds']:.0f}s "
+          "or the daemon reverts the handover and reports it to the attention watcher.")
+
+    # exec 直前の preflight。並行 adopt (--force) に負けていたら起動しない: 負けた側の
+    # 秘密は既に無効で、起動しても sidecar が unobserved で恒久沈黙するだけになる。
+    # execvpe 後には何も走らせられない (POSIX) ので、確認できるのはここが最後。
+    try:
+        status = _admin_rpc(host, port, admin_token, "adopt_status", {"owner": owner})
+    except urllib.error.URLError:
+        status = None
+    if status and status.get("ok"):
+        pending = status.get("pending")
+        if pending is None or pending.get("adoption_id") != adoption_id:
+            print("org adopt: this adoption was already superseded by a concurrent "
+                  "adopt; not launching a session that could never deliver.",
+                  file=sys.stderr)
+            return 2
+
+    argv = build_up_argv(
+        res["mcp_config"], model=args.model,
+        permission_mode=args.permission_mode, extra=claude_args,
+        resume=args.resume, continue_session=args.continue_session,
+    )
+    print(f"org adopt: launching claude for owner={owner} "
+          f"({len(argv)} argv tokens)")
+    return launch(argv, state_dir, observer_secret=res["observer_secret"],
                   root_cwd=root_cwd)
 
 
@@ -939,6 +1103,83 @@ def _add_up_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_adopt_arguments(parser: argparse.ArgumentParser) -> None:
+    # NOTE: help strings here are strict ASCII on purpose (cp932 consoles choke on
+    # em-dashes; use '-' and '->'). Same rule as the up/down parsers.
+    parser.add_argument(
+        "--state-dir", default=DEFAULT_STATE_DIR,
+        help=f"daemon state dir to discover the sidecar. Default: {DEFAULT_STATE_DIR}.",
+    )
+    parser.add_argument(
+        "--owner", default=DEFAULT_ROOT_NAME,
+        help=(
+            "agent id whose delivery ownership is being adopted. Default: "
+            f"{DEFAULT_ROOT_NAME!r}."
+        ),
+    )
+    parser.add_argument(
+        "--resume", default=None, metavar="SESSION_ID",
+        help=(
+            "resume this claude session id in the adopting process "
+            "(mutually exclusive with --continue)."
+        ),
+    )
+    parser.add_argument(
+        "--continue", dest="continue_session", action="store_true", default=False,
+        help=(
+            "continue the most recent claude session in the adopting process "
+            "(mutually exclusive with --resume)."
+        ),
+    )
+    parser.add_argument(
+        "--in-flight", choices=("requeue", "drop"), default="requeue",
+        help=(
+            "what to do with rows the previous session had claimed but not yet "
+            "confirmed. 'requeue' (default) re-delivers them to the adopting "
+            "session - the previous host may already have emitted them, so the "
+            "agent can see a duplicate. 'drop' marks them delivered and accepts "
+            "losing the tail of the conversation instead."
+        ),
+    )
+    parser.add_argument(
+        "--force", action="store_true", default=False,
+        help=(
+            "supersede an adoption that is already in flight for this owner. "
+            "Without this, a concurrent adopt is rejected rather than silently "
+            "invalidating the earlier one."
+        ),
+    )
+    parser.add_argument(
+        "--status", action="store_true", default=False,
+        help=(
+            "report the owner's delivery/adoption state and exit. Rotates nothing "
+            "and launches nothing."
+        ),
+    )
+    parser.add_argument(
+        "--root-cwd", default=None,
+        help=(
+            "cwd for the adopting process (default: the directory org adopt runs in)."
+        ),
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="passed to the adopting TUI as --model <value>.",
+    )
+    parser.add_argument(
+        "--permission-mode", default=None,
+        help="passed to the adopting TUI as --permission-mode <value>.",
+    )
+    parser.add_argument(
+        "--claude-arg", action="append", default=None, metavar="ARG",
+        help=(
+            "extra interactive claude flag appended after the structured fields "
+            "(repeatable). Reserved/headless flags are rejected by the builder; "
+            "use --resume / --continue for the session selector."
+        ),
+    )
+
+
 def _add_down_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--state-dir", default=DEFAULT_STATE_DIR,
@@ -961,7 +1202,7 @@ def _add_down_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
-    """top-level CLI (``claude-org-runtime org ...``) に up / down を生やす。"""
+    """top-level CLI (``claude-org-runtime org ...``) に up / adopt / down を生やす。"""
     up_p = subparsers.add_parser(
         "up",
         help=(
@@ -972,6 +1213,18 @@ def add_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     _add_up_arguments(up_p)
     up_p.set_defaults(func=org_up)
+
+    adopt_p = subparsers.add_parser(
+        "adopt",
+        help=(
+            "Hand an owner's delivery ownership to a new session: rotate the "
+            "observer lease, fence the previous session at the daemon, and launch "
+            "a claude process holding the new secret (--resume/--continue to keep "
+            "the conversation)."
+        ),
+    )
+    _add_adopt_arguments(adopt_p)
+    adopt_p.set_defaults(func=org_adopt)
 
     down_p = subparsers.add_parser(
         "down",

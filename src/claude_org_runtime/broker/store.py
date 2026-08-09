@@ -86,6 +86,29 @@ REFUSE_OBSERVER_PENDING = "observer_pending"
 # war になるためしない)。
 REFUSE_STALE_SIDECAR = "stale_sidecar"
 
+# ------------------------------------------------- adopt の in-flight policy
+# 明示 adopt (#166) が旧 host の in-flight ``CLAIMED`` 行をどう扱うか。**既定を
+# 選ぶのではなく operator に選ばせる**のが要点 (事前 Codex design review Major):
+# 旧 host が既に emit 済なら requeue は重複 action になり、戻さなければ会話末尾が
+# 失われる。どちらが正しいかは message の冪等性次第で daemon には判定できない。
+#
+# - ``requeue``: ``UNDELIVERED`` へ戻す (**既定**)。register 時の既存挙動と同じで、
+#   「沈黙より重複」という本配送路の既存方針 (docs §7.8: 配達は at-least-once で
+#   duplicate-action 窓は元から開いている) と整合する。
+# - ``drop``: ``DELIVERED`` にして二度と配らない。at-most-once が要る運用向けで、
+#   会話末尾を失う代わりに重複 action を確実に断つ。
+#
+# どちらを選んでも件数と policy を adopt 応答と journal の両方に残す (選択の帰結を
+# 後から追えないまま「静かに片方に倒れていた」状態を作らない)。
+ADOPT_INFLIGHT_REQUEUE = "requeue"
+ADOPT_INFLIGHT_DROP = "drop"
+ADOPT_INFLIGHT_POLICIES = (ADOPT_INFLIGHT_REQUEUE, ADOPT_INFLIGHT_DROP)
+
+# adopt の既定 arming deadline (秒)。この間に adopting sidecar が新秘密を提示して
+# register しなければ adopt は **失敗** と判定し、lease を落として
+# ``delivery_adopt_expired`` を journal する (:meth:`StoreMixin.adopt_delivery`)。
+DEFAULT_ADOPT_ARMING_SECONDS = 300.0
+
 # ---------------------------------------------------- observer lease の状態
 # :meth:`StoreMixin._observer_state_locked` が返す状態 (:class:`ObserverLease` 参照)。
 # **fence するのは NONE / ARMING_EXPIRED 以外のすべて**。
@@ -168,8 +191,80 @@ class ObserverLease:
     secret: str
     # None = armed (未 activate)。float = activate 後の失効時刻 (過去なら stale)。
     expires_at: float | None
-    # armed 相の活性化期限 (None = 無期限)。spawn 経路だけが設定する。
+    # armed 相の活性化期限 (None = 無期限)。spawn 経路と adopt 経路が設定する。
     arming_until: float | None = None
+    # この lease を張った adopt 操作の ID (:class:`PendingAdoption`)。明示 adopt
+    # (#166) 以外の assert では None。register が秘密一致で通った時に、どの adopt が
+    # 完了したのかを **秘密を journal に出さずに** 特定するための紐付け。
+    adoption_id: str | None = None
+
+
+@dataclass
+class AdoptRollback:
+    """adopt が失効した時に戻す **原状一式** (#166)。
+
+    個別フィールドではなく 1 つのオブジェクトにまとめてあるのが要点。adopt は
+    ``force`` で先行 adopt を supersede でき、その時の復帰先は「今の状態」ではなく
+    **最初に fence する前の現職** でなければならない。フィールドごとに引き継ぎを書くと、
+    復帰状態を 1 つ足すたびに supersede 経路へ足し忘れる余地が生まれる (実際に
+    generation/instance を直した後、token と pane を足した時に同じ穴が再発した)。
+    一式で持てば引き継ぎは ``rollback = pending.rollback`` の 1 行になり、部分的に
+    忘れることが構造的にできなくなる。
+    """
+
+    # fence 前の delivery generation と現世代 instance。
+    generation: int
+    instance: str | None
+    # 旧プロセスへ渡してあった full token (付け替え前)。
+    token: str
+    # adopt が切り離した pane id。空でない場合、失効時に **その pane がまだ在るか** が
+    # 「instance を復帰してよいか」の判定材料になる。
+    detached_panes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PendingAdoption:
+    """進行中の明示 adopt 操作 (#166)。owner ごとに高々 1 件。
+
+    **「秘密の発行に成功した」を操作の成功にしない** ための記録 (事前 Codex design
+    review Major)。adopt RPC は observer lease を rotate すると同時に delivery
+    generation を bump し現世代 instance を消す = **旧 sidecar をその場で fence** する
+    ので、RPC が返った時点で当該 owner には claimer が 1 つも居ない。この窓を閉じる
+    のは「adopting session の sidecar が新秘密を提示して register を完了する」ことだけ
+    であり、それが起きるまでこのレコードが残る。
+
+    ``armed_until`` を過ぎても完了しなければ adopt は **失敗** で、
+    :meth:`StoreMixin._sweep_adoptions_locked` が lease ごと落として
+    ``delivery_adopt_expired`` を journal する (attention watcher が operator へ能動
+    通知する。失敗が沈黙しないことが adopt の設計要件そのもの)。
+    """
+
+    adoption_id: str
+    owner: str
+    # 発行した observer 秘密。**compare-and-clear 専用** で、応答以外のどこにも
+    # 出さない (journal / dump には載せない)。
+    secret: str
+    armed_until: float
+    in_flight_policy: str
+    in_flight_rows: int
+    # adopt が installed した generation (fence 後の現世代)。
+    fenced_generation: int
+    # 失効時に戻す **原状一式** (:class:`AdoptRollback`)。
+    #
+    # 復帰が要るのは、fence された旧 sidecar が二度と register し直さないため
+    # (``channel_sidecar.py``: ``stale_sidecar`` は latch しないが、再 register は
+    # ``_current_generation() is None`` の時だけで、一度成功した instance はそこを
+    # 通らない)。lease を落とすだけでは「adopt に失敗したので保護は外したが、
+    # 配達できる sidecar は 1 つも居ない」状態が恒久的に残り、**arming deadline が
+    # 防ぐはずだった恒久無音そのもの**になる。
+    #
+    # ``force`` で先行 adopt を supersede する時は、これを **丸ごと** 引き継ぐ
+    # (:class:`AdoptRollback` の docstring 参照)。
+    rollback: AdoptRollback
+    started_at: float
+    # adopting session へ渡した付け替え後の full token。失効時に
+    # ``rollback.token`` へ戻す対象を compare-and-restore で特定するために持つ。
+    adopted_token: str = ""
 
 
 @dataclass
@@ -215,6 +310,8 @@ class StoreMixin:
     _duplicate_emit_at: dict[tuple[str, str, str], float]  # (owner, iA, iB) -> last emit ts
     # observed-session binding (Issue #129 問題 A)。owner -> 現在の observer lease。
     _observer_leases: dict[str, ObserverLease]
+    # 明示 adopt (#166)。owner -> 進行中の adopt 操作 (高々 1 件)。
+    _pending_adoptions: dict[str, PendingAdoption]
     # stand-down 観測面 (Issue #169)。owner -> instance -> 記録
     # ({instance, reason, latched, since, last, count, journalled_at})。sidecar 側の
     # _stood_down は子プロセス内の Event で外から見えないため、daemon 側に「誰が・
@@ -223,6 +320,7 @@ class StoreMixin:
     state_dir: Path
     lease_seconds: float
     observer_lease_seconds: float
+    adopt_arming_seconds: float
     reclaim_warn_threshold: int
 
     def _journal(self, event: str, **fields) -> None:
@@ -296,17 +394,34 @@ class StoreMixin:
         なるため、一度も observed register が来なければ今日の last-register-wins へ
         戻す (:class:`ObserverLease` 参照)。
         """
-        secret = secrets.token_urlsafe(32)
         with self._lock:
-            # armed で置く (expires_at=None): 初回 observed register が TTL 計時を開始する
-            # まで失効させない (slow startup で保護が黙って外れるのを防ぐ — Codex P2)。
-            self._observer_leases[owner] = ObserverLease(
-                secret=secret, expires_at=None,
-                arming_until=None if arming_seconds is None
-                else time.time() + arming_seconds,
-            )
+            secret = self._rotate_observer_locked(owner, arming_seconds)
         self._journal("observer_lease_asserted", owner=owner,
                       arming_seconds=arming_seconds)
+        return secret
+
+    def _rotate_observer_locked(
+        self, owner: str, arming_seconds: float | None,
+        adoption_id: str | None = None,
+    ) -> str:
+        """observer lease を rotate して新しい秘密を返す。**_lock 保持中に呼ぶ**。
+
+        :meth:`assert_observer` の lock 内本体を切り出したもの。明示 adopt (#166) は
+        rotate と delivery generation の fence を **同一 lock スコープ**で行う必要が
+        あり (rotate だけでは旧 claimer は止まらない — 事前 Codex design review
+        Blocker)、自らロックを取る :meth:`assert_observer` を再入呼び出しできない
+        (``_lock`` は非再入)。journal は呼び元が lock 解放後に行う。
+
+        armed で置く (expires_at=None): 初回 observed register が TTL 計時を開始する
+        まで失効させない (slow startup で保護が黙って外れるのを防ぐ — Codex P2)。
+        """
+        secret = secrets.token_urlsafe(32)
+        self._observer_leases[owner] = ObserverLease(
+            secret=secret, expires_at=None,
+            arming_until=None if arming_seconds is None
+            else time.time() + arming_seconds,
+            adoption_id=adoption_id,
+        )
         return secret
 
     def clear_observer(self, owner: str, secret: str) -> bool:
@@ -331,6 +446,334 @@ class StoreMixin:
             del self._observer_leases[owner]
         self._journal("observer_lease_cleared", owner=owner)
         return True
+
+    # ------------------------------------------------------- adopt (#166)
+    def _adopt_owner_check_locked(
+        self, owner: str
+    ) -> tuple[str | None, str, str]:
+        """adopt 対象 owner の実在を検証する。**_lock 保持中に呼ぶ**。
+
+        返り値は ``(エラー文 or None, full token, delivery cred)``。token を **同じ
+        lock スコープで**返すのが要点: adopting session に渡す ``--mcp-config`` は
+        「今 検証したその bind」から組む必要があり、検証と別スコープで引き直すと、
+        その隙の revoke で「検証は通ったが渡した cred は死んでいる」adopt が成立する。
+
+        rotate / fence と **同一 lock スコープ**で行うのが要点 (事前 Codex design
+        review Major (e)): typo や存在しない owner への adopt を「成功」にすると、
+        operator は handover したつもりで、実際には誰も居ない owner の lease を張って
+        (= 将来その名前で起動する session を ``observer_pending`` で塞いで) 終わる。
+
+        検証は 2 点:
+
+        - **full bind が存在する** (revoked でない)。``registered`` は **問わない**:
+          adopt の主用途は「session が死んだ / 手起動で resume した」owner の引き継ぎ
+          であり、そこでは MCP initialize 済 (= ``registered``) ではありえない。
+          ``registered`` まで要求すると本来の用途がまるごと弾かれる。
+        - **delivery credential を保持している** (revoked でない)。adopting session の
+          channel sidecar はこの cred で ``/claim-owner`` を叩くので、無ければ adopt
+          しても配送は始まらない。
+        """
+        full_token = ""
+        delivery_cred = ""
+        for b in self._binds.values():
+            if b.revoked or b.agent_id != owner:
+                continue
+            if b.scope == "full" and not full_token:
+                full_token = b.token
+            elif b.scope == "delivery" and not delivery_cred:
+                delivery_cred = b.token
+        if not full_token:
+            return (f"[unknown_owner] no live agent bind for owner {owner!r}",
+                    "", "")
+        if not delivery_cred:
+            return (f"[no_delivery_credential] owner {owner!r} holds no delivery "
+                    "credential; nothing to adopt (mint or spawn it with channel "
+                    "first)", "", "")
+        return None, full_token, delivery_cred
+
+    def _sweep_adoptions_locked(self, now: float) -> list[tuple[str, dict]]:
+        """arming deadline を過ぎた未完了 adopt を失敗確定させる。**_lock 保持中に呼ぶ**。
+
+        journal すべき ``(event, fields)`` を return し、呼び元が lock 解放後に
+        :meth:`_journal` する (非再入 Lock の自己デッドロック回避。本 store の既存契約)。
+
+        **これが adopt の完了条件の後半**である (事前 Codex design review Major (d))。
+        adopt は旧 sidecar をその場で fence するので、adopting session が起動に失敗
+        すると当該 owner には claimer が 1 つも居ない状態が残る。期限内に register が
+        来なければ (a) 張った lease を落として今日の last-register-wins へ戻し、
+        (b) ``delivery_adopt_expired`` を journal する。(b) が要点で、attention watcher
+        がこれを operator へ能動通知する — **adopt の失敗が沈黙しない**ことが本機能の
+        設計要件そのものであり、「秘密の発行に成功した」を操作の成功にしない根拠になる。
+
+        なお本 daemon には周期タスクが無い (reaping も含め全て RPC 契機の lazy 実行)
+        ので、本 sweep も delivery 面の各入口から呼ぶ。fence された旧 sidecar が
+        poll cadence (~1s) で叩き続けるため、実運用では期限直後に発火する。
+        """
+        journal: list[tuple[str, dict]] = []
+        for owner, pending in list(self._pending_adoptions.items()):
+            if pending.armed_until > now:
+                continue
+            del self._pending_adoptions[owner]
+            # 自分が張った lease だけを落とす (compare-and-delete)。期限後に別経路
+            # (再 spawn の re-assert / 後続 adopt) が張り直した lease を巻き添えに
+            # しない — それは今まさに有効な保護なので消してはならない。
+            lease = self._observer_leases.get(owner)
+            dropped = False
+            if lease is not None and lease.secret == pending.secret:
+                del self._observer_leases[owner]
+                dropped = True
+            # **原状復帰** (compare-and-restore)。adopt が installed した fence
+            # (現世代 == fenced_generation かつ現世代 instance が空) がそのまま
+            # 残っている時だけ、fence 前の (generation, instance) へ戻す。誰かが
+            # 既に register していれば現世代は正統なので触らない。
+            #
+            # これが無いと、失敗した adopt は「lease は外れたが claimer は誰も
+            # 居ない」owner を残す。旧 sidecar は stale_sidecar を受け続けるだけで
+            # 再 register しないので、pane を閉じるまで push が戻らない。
+            # **queue は復帰させない**: ``in_flight="drop"`` で ``DELIVERED`` にした
+            # 行は戻さない (policy の帰結であって fence の副作用ではない)。戻すのは
+            # 配達経路であって配達済みの判断ではない。
+            #
+            # pane の印も戻す (Codex review P1)。戻さないと、失効して所有権が旧
+            # session に返っているのに、その pane を閉じても資格情報も未配達行も
+            # 掃除されない = 死んだ owner の bind が居座って同名 respawn を塞ぐ。
+            rollback = pending.rollback
+            reattached = self._reattach_owner_panes_locked(owner)
+            # **pane ごと消えていたら instance は戻さない**。切り離した pane が既に
+            # close/reap されているなら、復帰させる instance の sidecar はもう存在
+            # しない。それでも "restored" と報告すると、attention 通知が「旧 session に
+            # 戻した」と言い切る一方で実際には誰も claim せず、**失敗を知らせるための
+            # イベントが失敗を隠す**。pane を持たない owner (org up の secretary 等)
+            # は detached_panes が空なので、この判定の対象外。
+            pane_gone = bool(rollback.detached_panes) and not reattached
+            restored = False
+            if (self._generation_of(owner) == pending.fenced_generation
+                    and owner not in self._delivery_instances):
+                self._delivery_generations[owner] = rollback.generation
+                if rollback.instance is not None and not pane_gone:
+                    self._delivery_instances[owner] = rollback.instance
+                    restored = True
+            # full token も元へ戻す (compare-and-restore)。adopt は旧プロセスの token を
+            # 付け替えて MCP 面を切っているので、失効時に戻さないと「配達は旧 session に
+            # 返ったのに MCP は死んだまま」という半死状態が残る。付け替え後の token が
+            # 今も現役の時だけ戻す (別経路が触っていれば手を出さない)。
+            token_restored = False
+            if (pending.adopted_token and rollback.token
+                    and pending.adopted_token != rollback.token
+                    and pending.adopted_token in self._binds):
+                self._rekey_bind_locked(pending.adopted_token, rollback.token)
+                token_restored = True
+            journal.append(("delivery_adopt_expired", {
+                "owner": owner,
+                "adoption_id": pending.adoption_id,
+                "armed_seconds": round(pending.armed_until - pending.started_at, 3),
+                "lease_dropped": dropped,
+                "generation": pending.fenced_generation,
+                "restored": restored,
+                "restored_generation": rollback.generation if restored else None,
+                "pane_gone": pane_gone,
+                "token_restored": token_restored,
+            }))
+        return journal
+
+    def _sweep_adoptions(self) -> None:
+        """:meth:`_sweep_adoptions_locked` の自己ロック版 (lock を持たない入口用)。
+
+        ``enqueue`` / ``drain`` のように adopt と原子性を共有する必要がない入口から
+        呼ぶ。sidecar が 1 つも poll していない owner (= session ごと死んでいて adopt
+        したが起動に失敗した、まさに通知したいケース) でも、その owner 宛に message が
+        届いた時点で期限切れが検知される。
+        """
+        with self._lock:
+            journal = self._sweep_adoptions_locked(time.time())
+        for event_name, fields in journal:
+            self._journal(event_name, **fields)
+
+    def adopt_delivery(
+        self, owner: str, *,
+        in_flight: str = ADOPT_INFLIGHT_REQUEUE,
+        force: bool = False,
+        arming_seconds: float | None = None,
+    ) -> dict:
+        """配達所有権を新しい session へ明示的に引き継ぐ (#166 の本体)。
+
+        **rotate だけでは handover にならない** (事前 Codex design review Blocker):
+        :meth:`assert_observer` は秘密を差し替えるだけで、旧 ``(generation,
+        instance_id)`` はそのまま現世代に残り、:meth:`poll_claims` は observer 秘密を
+        再検証しないので、旧 session は新 sidecar が register するまで claim/confirm を
+        続けられる。そのため本メソッドは **同一 lock スコープ**で次を原子的に行う:
+
+        1. owner の実在検証 (:meth:`_adopt_owner_check_locked`)。
+        2. observer lease の rotate (新秘密 + 有限 arming deadline + adoption_id)。
+        3. **fence**: delivery generation を +1 し、現世代 instance を **消す**。
+           ``_delivery_instances`` に entry が無い owner は :meth:`poll_claims` の
+           ``instance_id != cur_instance`` 条件で **全 instance が弾かれる** ので、
+           この瞬間から adopting sidecar が register するまで **誰も配達できない**。
+           これが handover 境界であり、RPC の成功そのものではない。
+        4. in-flight ``CLAIMED`` 行に選択された policy を適用し、件数を記録する。
+
+        戻り値の ``observer_secret`` は呼び元 (``org adopt``) が **adopting claude
+        プロセスの env** へ載せる非 replay 秘密である。走行中プロセスの env は外から
+        書き換えられないため、adopt は必然的に「秘密付きで新しいプロセスを起こす
+        launcher」になる (sidecar 側に動的 handoff 経路を足す案は、mcp-config は replay
+        されるが process env はされない、という lease の存在根拠そのものを壊すので
+        採らない)。
+
+        ``force`` が False のとき、期限内の未完了 adopt が既にあれば
+        ``[adopt_in_flight]`` で **拒否** する。rotate は last-rotate-wins なので、
+        黙って許すと先行 CLI は「成功」を受け取った後で既に無効な秘密を持つ session を
+        起動し、それは ``unobserved`` で恒久沈黙する。競合を暗黙の敗北にせず、
+        ``force`` という明示の選択にする。
+        """
+        if in_flight not in ADOPT_INFLIGHT_POLICIES:
+            return {"ok": False, "error": (
+                f"[invalid_in_flight] in_flight must be one of "
+                f"{list(ADOPT_INFLIGHT_POLICIES)}, got {in_flight!r}")}
+        if arming_seconds is None:
+            # Broker の tunable を既定にする (**モジュール定数を直接読まない**):
+            # 読むと Broker(adopt_arming_seconds=...) が黙って効かなくなり、期限まわりの
+            # テストが 300 秒待ちの vacuous pass になる。
+            arming_seconds = self.adopt_arming_seconds
+        if not isinstance(arming_seconds, (int, float)) or arming_seconds <= 0:
+            return {"ok": False, "error": (
+                "[invalid_arming_seconds] arming_seconds must be a positive number")}
+        journal: list[tuple[str, dict]] = []
+        with self._lock:
+            now = time.time()
+            journal.extend(self._sweep_adoptions_locked(now))
+            err, full_token, delivery_cred = self._adopt_owner_check_locked(owner)
+            if err is not None:
+                result: dict = {"ok": False, "error": err}
+            else:
+                pending = self._pending_adoptions.get(owner)
+                if pending is not None and not force:
+                    result = {"ok": False, "error": (
+                        f"[adopt_in_flight] adoption {pending.adoption_id} for owner "
+                        f"{owner!r} is still armed for "
+                        f"{max(0.0, pending.armed_until - now):.1f}s; "
+                        "wait for it to land or expire, or pass force to supersede it"),
+                        "adoption_id": pending.adoption_id,
+                        "armed_seconds_remaining": max(0.0, pending.armed_until - now)}
+                else:
+                    # 旧 pane の bookkeeping から owner を切り離す (Codex review P1)。
+                    # adopt 後の旧 pane は配達所有権を持たない抜け殻で、operator には
+                    # 「都合のよい時に閉じてよい」と案内する。その close / reap は
+                    # _cleanup_pane を通り、owner の **token と delivery cred を revoke
+                    # し delivery state を reset し未配達行を捨てる** ので、切り離さないと
+                    # 案内どおりに閉じた瞬間に adopt 済み session が丸ごと死ぬ。
+                    detached = self._detach_owner_panes_locked(owner)
+                    if pending is None:
+                        # 失効時に戻す原状一式を、まだ何も触っていないこの時点で撮る。
+                        rollback = AdoptRollback(
+                            generation=self._generation_of(owner),
+                            instance=self._delivery_instances.get(owner),
+                            token=full_token,
+                            detached_panes=list(detached),
+                        )
+                    else:
+                        # force による明示 supersede。**先行 adopt が敗けたことを残す**
+                        # (先行 CLI が起動した session はこの後 unobserved で沈黙する
+                        # ので、その原因が journal から辿れないと診断不能になる)。
+                        journal.append(("delivery_adopt_superseded", {
+                            "owner": owner,
+                            "adoption_id": pending.adoption_id,
+                        }))
+                        # **現状ではなく先行 adopt の原状を丸ごと引き継ぐ**。今の状態は
+                        # 既に先行 adopt が fence / 付け替え / 切り離しをした **後** の
+                        # 中間状態なので、それを「原状」として復帰すると、generation は
+                        # 中間値、token は先行 adopt が発行した方、pane は切り離し済で
+                        # 空 — どれも元の現職ではない。復帰先は常に **最初に fence する
+                        # 前の現職** (Codex review P2 / round 3 P1)。一式を丸ごと写す
+                        # ことで、復帰状態を将来足しても引き継ぎ漏れが起きない。
+                        rollback = pending.rollback
+                    adoption_id = secrets.token_hex(8)
+                    secret = self._rotate_observer_locked(
+                        owner, arming_seconds, adoption_id=adoption_id)
+                    gen = self._generation_of(owner) + 1
+                    self._delivery_generations[owner] = gen
+                    # **現世代 instance を消す** = 旧 sidecar は次 poll で stale_sidecar。
+                    self._delivery_instances.pop(owner, None)
+                    moved = 0
+                    for row in self._rows.values():
+                        if row.state != CLAIMED or row.to_id != owner:
+                            continue
+                        moved += 1
+                        row.owner = None
+                        if in_flight == ADOPT_INFLIGHT_REQUEUE:
+                            row.state = UNDELIVERED
+                        else:
+                            row.state = DELIVERED
+                    armed_until = now + arming_seconds
+                    # 旧プロセスへ渡してあった full token を **付け替える** (Codex
+                    # review P1)。切り離した旧 pane は生きたまま残りうるので、bind を
+                    # 共有したままだと 2 プロセスが 1 つの ``session_id`` を奪い合い、
+                    # どちらも [session_invalid] に落ちうる。配達所有権だけ移して MCP 面を
+                    # 共有したままにしない。adopting session には付け替え後の token を
+                    # --mcp-config で渡す。
+                    adopted_token = self._rekey_bind_locked(full_token)
+                    self._pending_adoptions[owner] = PendingAdoption(
+                        adoption_id=adoption_id, owner=owner, secret=secret,
+                        armed_until=armed_until, in_flight_policy=in_flight,
+                        in_flight_rows=moved, fenced_generation=gen,
+                        rollback=rollback, started_at=now,
+                        adopted_token=adopted_token,
+                    )
+                    journal.append(("delivery_adopt_started", {
+                        "owner": owner, "adoption_id": adoption_id,
+                        "generation": gen, "in_flight_policy": in_flight,
+                        "in_flight_rows": moved, "arming_seconds": arming_seconds,
+                        "forced": force, "detached_panes": detached,
+                    }))
+                    result = {
+                        "ok": True, "owner": owner, "adoption_id": adoption_id,
+                        "observer_secret": secret, "generation": gen,
+                        "in_flight_policy": in_flight, "in_flight_rows": moved,
+                        "arming_seconds": arming_seconds, "armed_until": armed_until,
+                        # 切り離した旧 pane。operator に「これは閉じてよい」と
+                        # 具体的に言えるようにする (抜け殻を残す方が事故のもと)。
+                        "detached_panes": detached,
+                        # 検証と同一 lock スコープで取った owner の資格情報。呼び元
+                        # (server の admin ハンドラ) が --mcp-config へ畳んで **必ず
+                        # pop する** 内部フィールドで、ワイヤには出さない。full token は
+                        # **付け替え後**の値 (旧プロセスの token はこの時点で無効)。
+                        "_owner_token": adopted_token,
+                        "_delivery_cred": delivery_cred,
+                    }
+        for event_name, fields in journal:
+            self._journal(event_name, **fields)
+        return result
+
+    def adopt_status(self, owner: str) -> dict:
+        """owner の adopt 進行状況を返す (**秘密は含めない**)。
+
+        ``org adopt`` が exec 直前の preflight に使う: 自分の adoption_id がまだ現職で
+        あることを確認してから claude を起動する (並行 adopt に負けた CLI が、既に無効な
+        秘密を持つ session を黙って起動するのを防ぐ)。到達不能な残余レースは残るが、
+        その場合も adopting sidecar が ``unobserved`` を受けて latch し、
+        ``delivery_register_superseded`` が journal に残る。
+        """
+        journal: list[tuple[str, dict]] = []
+        with self._lock:
+            now = time.time()
+            journal.extend(self._sweep_adoptions_locked(now))
+            pending = self._pending_adoptions.get(owner)
+            _lease, state = self._observer_state_locked(owner, now)
+            result = {
+                "ok": True, "owner": owner,
+                "generation": self._generation_of(owner),
+                "instance_id": self._delivery_instances.get(owner),
+                "observer_state": state,
+                "pending": None if pending is None else {
+                    "adoption_id": pending.adoption_id,
+                    "armed_seconds_remaining": max(0.0, pending.armed_until - now),
+                    "in_flight_policy": pending.in_flight_policy,
+                    "in_flight_rows": pending.in_flight_rows,
+                    "fenced_generation": pending.fenced_generation,
+                },
+            }
+        for event_name, fields in journal:
+            self._journal(event_name, **fields)
+        return result
 
     def scrub_secrets(self, text: str) -> str:
         """診断文字列から live な observer 秘密を伏せる (Issue #165)。
@@ -358,6 +801,11 @@ class StoreMixin:
         text = _OBSERVER_ASSIGN_RE.sub(r"\1\2[REDACTED_OBSERVER_SECRET]", text)
         with self._lock:
             secrets_now = [l.secret for l in self._observer_leases.values()]
+            # 進行中 adopt の秘密も伏せる (#166): adopt が発行した秘密は lease と
+            # pending の両方に載る。lease が後続 rotate で差し替わっても、その秘密を
+            # env に載せて起動された session の失敗例外はまだ流れうるので、pending が
+            # 生きている間は値一致側でも捕まえる。
+            secrets_now.extend(p.secret for p in self._pending_adoptions.values())
         for secret in secrets_now:
             if secret and secret in text:
                 text = text.replace(secret, "[REDACTED_OBSERVER_SECRET]")
@@ -512,6 +960,7 @@ class StoreMixin:
         enqueue を並行時にも防ぐ既存契約)。I/O (_journal) と PTY 注入
         (_trigger_nudge) はロック外に出し非再入 Lock の自己デッドロックを避ける。
         """
+        self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         entry = {
             "from_id": from_bind.agent_id,
             "from_name": from_bind.name,
@@ -561,6 +1010,7 @@ class StoreMixin:
         の ``CLAIMED``) は返さない = push と二重配達しない。両 mode で同一挙動
         (single-drainer 性は行レベル claim 所有権が担保し、mode boolean に依らない)。
         """
+        self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         with self._lock:
             reaped = self._reap_locked()
             out: list[dict] = []
@@ -641,6 +1091,7 @@ class StoreMixin:
             if owner is None:
                 return {"ok": False, "error": "unauthorized"}
             now = time.time()
+            journal.extend(self._sweep_adoptions_locked(now))
             if bg_hosted:
                 # Phase 1: 明示 bg-hosted marker -> register/claim 抑止 (generation 不変)。
                 rec, emit = self._note_standdown_locked(
@@ -718,10 +1169,29 @@ class StoreMixin:
                         # observed sidecar の register で lease を activate (armed->TTL 計時
                         # 開始) / renew する。以後 poll heartbeat が renew し続ける。
                         lease.expires_at = now + self.observer_lease_seconds
+                    # 明示 adopt (#166) の **完了判定**。この register が adopt の張った
+                    # lease の秘密で通った時だけ adopt は成功する = 「秘密の発行に成功
+                    # した」ではなく「adopting instance が現世代の claimer として登録
+                    # された」が操作の完了条件 (事前 Codex design review Blocker/Major)。
+                    # compare-and-clear: lease に紐づく adoption_id が pending と一致
+                    # する時だけ落とす (期限切れ sweep 後に別 adopt が張った pending を
+                    # 巻き添えにしない)。
+                    pending = self._pending_adoptions.get(owner)
+                    adopted = (observed and pending is not None
+                               and lease.adoption_id == pending.adoption_id)
+                    if adopted:
+                        del self._pending_adoptions[owner]
+                        journal.append(("delivery_adopt_completed", {
+                            "owner": owner, "adoption_id": pending.adoption_id,
+                            "generation": gen, "instance": instance_id,
+                            "in_flight_policy": pending.in_flight_policy,
+                            "in_flight_rows": pending.in_flight_rows,
+                            "elapsed": round(now - pending.started_at, 3),
+                        }))
                     journal.append(("delivery_generation_registered",
                                     {"owner": owner, "generation": gen,
                                      "instance": instance_id,
-                                     "observed": observed}))
+                                     "observed": observed, "adopted": adopted}))
                     result = {"ok": True, "owner": owner, "generation": gen,
                               "instance_id": instance_id}
         for event_name, fields in journal:
@@ -751,9 +1221,14 @@ class StoreMixin:
             if owner is None:
                 return {"error": "unauthorized", "rows": []}
             now = time.time()
+            # adopt の arming deadline はここで刈る (#166)。本 daemon に周期タスクは
+            # 無いが、adopt で fence された旧 sidecar が poll cadence (~1s) で叩き
+            # 続けるため、失敗した adopt は期限直後に確実に検知される。**fence 判定
+            # より前**に置くのが要点で、fence された poll はこの下で早期 return する。
+            dup_journal = self._sweep_adoptions_locked(now)
             # 記録 + duplicate 検知は fence 判定より前に行う (stale 世代の poll でも
             # 「二重 sidecar が生きている」シグナルを残す — Major #5 / #10)。
-            dup_journal = self._note_poll_locked(owner, instance_id, now)
+            dup_journal.extend(self._note_poll_locked(owner, instance_id, now))
             cur_gen = self._generation_of(owner)
             cur_instance = self._delivery_instances.get(owner)
             if (cur_gen == 0 or generation != cur_gen
@@ -977,6 +1452,12 @@ class StoreMixin:
             # pane の close/reap は broker が実際に観測した死なので、TTL の代わりに
             # これが「外部が正統と言った」に相当する。
             self._observer_leases.pop(owner, None)
+            # 進行中の明示 adopt も落とす (#166)。pane 自体が消えた = adopting session の
+            # 到着先が無くなったので、この adopt はもう完了しえない。**残すと** 期限まで
+            # 後続 adopt が [adopt_in_flight] で塞がれ、期限後に「今はもう居ない owner の
+            # adopt が失敗した」という誤解を招く event が出る。cancel として journal に
+            # 残す (黙って消さない)。
+            cancelled = self._pending_adoptions.pop(owner, None)
             # stand-down 記録も落とす (Issue #169): 旧 session の「黙っている」記録が
             # 同名 respawn 後の観測面に残ると、新 pane が muted だと誤読される。
             self._delivery_standdowns.pop(owner, None)
@@ -986,6 +1467,9 @@ class StoreMixin:
                 if row.state == CLAIMED and row.to_id == owner:
                     row.state = UNDELIVERED
                     row.owner = None
+        if cancelled is not None:
+            self._journal("delivery_adopt_cancelled", owner=owner,
+                          adoption_id=cancelled.adoption_id, reason="delivery_reset")
 
     # --------------------------------------------------------------- dump
     def delivery_dump(self) -> dict:
@@ -994,6 +1478,7 @@ class StoreMixin:
         owner/state を晒すため admin scope に限定する想定 (§9.4 least-privilege:
         delivery-scoped cred からは到達不能)。
         """
+        self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         with self._lock:
             reaped = self._reap_locked()
             now = time.time()
@@ -1027,6 +1512,17 @@ class StoreMixin:
                 # 同一 owner に 2 件以上並ぶこと自体が二重 sidecar のシグナルになる。
                 "standdowns": {o: {i: dict(r) for i, r in per.items()}
                                for o, per in self._delivery_standdowns.items()},
+                # 進行中の明示 adopt (#166)。**秘密は載せない**。fence 済で claimer が
+                # 1 つも居ない窓 (adopt 発行〜adopting register) がここに現れるので、
+                # 「なぜ誰も配達していないのか」を dump 単独で説明できる。
+                "adoptions": {
+                    o: {"adoption_id": p.adoption_id,
+                        "armed_seconds_remaining": max(0.0, p.armed_until - now),
+                        "in_flight_policy": p.in_flight_policy,
+                        "in_flight_rows": p.in_flight_rows,
+                        "fenced_generation": p.fenced_generation}
+                    for o, p in self._pending_adoptions.items()
+                },
                 "rows": [
                     {"id": r.id, "to_id": r.to_id, "state": r.state,
                      "owner": r.owner, "reclaim": r.reclaim_count}
@@ -1038,3 +1534,12 @@ class StoreMixin:
 
     if TYPE_CHECKING:  # server が供給する配達トリガ (型チェッカ向け宣言)
         def _trigger_nudge(self, target: "AgentBind") -> None: ...
+
+        # server が供給する pane 切り離し / 復帰 (#166)。**_lock 保持中に呼ばれる**。
+        def _detach_owner_panes_locked(self, owner: str) -> list[str]: ...
+        def _reattach_owner_panes_locked(self, owner: str) -> list[str]: ...
+
+        # tokens.py (TokenMixin) が供給する bind の token 付け替え (#166)。
+        def _rekey_bind_locked(
+            self, old_token: str, new_token: str | None = None
+        ) -> str: ...
