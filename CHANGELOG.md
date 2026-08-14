@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-08-14
+
 ### Added
 
 - An explicit **adopt / handover path for delivery ownership**: `org adopt`
@@ -108,6 +110,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permanent latch and `_stood_down` as unrecoverable, both of which stopped
   being true in #171 — a stale rationale in that note is read as the basis for
   the next change, so it is now maintained as living status.
+
+### Removed
+
+- The three `Write(...)` entries in the bundled `role_configs_schema.json`'s
+  `roles.secretary.required_deny` (Issue #178):
+
+  ```
+  Write(*/workers/*/.claude/settings.local.json)
+  Write(*/workers/*/.worktrees/*/.claude/settings.local.json)
+  Write(*/.worktrees/*/.claude/settings.local.json)
+  ```
+
+  Claude Code's file permission check evaluates `Edit(path)` rules only, so a
+  `Write(path)` deny never matched and the session printed a warning per rule at
+  startup:
+
+  ```
+  Permission deny rule: Write(*/workers/*/.claude/settings.local.json) is not
+  matched by file permission checks -- only Edit(path) rules are.
+  Use Edit(*/workers/*/.claude/settings.local.json) instead
+  ```
+
+  **This is not a weakening of the deny surface.** The matching `Edit(...)` rule
+  for each of the three globs stays, and those are the rules that were doing the
+  enforcing all along. What is removed is inert text whose only observable
+  effect was a warning that operators read as "the settings-file guard is dead".
+
+  The three globs are byte-identical to the ones dropped on the ja side, which
+  is the requirement `tools/check_runtime_schema_drift.py` enforces:
+  `required_deny` is inside the byte-compared surface (only `$comment*` keys are
+  stripped before comparison), so this release and the paired ja change have to
+  land together — either half alone reports DRIFT. Consumers pinning this
+  version must take the ja-side removal in the same step.
 
 ## [0.1.41] - 2026-08-08
 
