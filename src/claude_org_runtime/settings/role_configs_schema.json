@@ -24,7 +24,8 @@
     "block-workers-delete.sh",
     "block-org-structure.sh",
     "check-worker-boundary.sh",
-    "block-dispatcher-out-of-scope.sh"
+    "block-dispatcher-out-of-scope.sh",
+    "block-relative-close-pane.sh"
   ],
   "$comment_roles_sandbox": "Phase 1 (Refs `claude-org-ja#378`): each entry under `roles.<role>` may now also include an optional `sandbox` object using the same shape and structured-anchor entry form documented under `worker_roles.$comment_sandbox` / `worker_roles.$comment_sandbox_anchor`. This lets secretary / dispatcher / curator declare Layer 3 sandbox intent alongside the existing Layer 2 `required_allow` / `required_deny` audit constraints. Roles without `sandbox` are treated as sandbox-disabled (backward compatible).",
   "roles": {
@@ -396,7 +397,9 @@
           "Read(.env.*)",
           "Read(**/credentials*)",
           "Read(**/*.pem)",
-          "Read(~/.config/gh/hosts.yml)"
+          "Read(~/.config/gh/hosts.yml)",
+          "mcp__renga-peers__close_pane",
+          "mcp__org-broker__close_pane"
         ]
       },
       "hooks": {
@@ -432,6 +435,15 @@
               {
                 "type": "command",
                 "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "mcp__.*__close_pane",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-relative-close-pane.sh\""
               }
             ]
           }
@@ -524,7 +536,9 @@
           "Read(.env.*)",
           "Read(**/credentials*)",
           "Read(**/*.pem)",
-          "Read(~/.config/gh/hosts.yml)"
+          "Read(~/.config/gh/hosts.yml)",
+          "mcp__renga-peers__close_pane",
+          "mcp__org-broker__close_pane"
         ]
       },
       "hooks": {
@@ -552,6 +566,15 @@
               {
                 "type": "command",
                 "command": "bash \"{claude_org_path}/.hooks/block-no-verify.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "mcp__.*__close_pane",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-relative-close-pane.sh\""
               }
             ]
           }
@@ -584,8 +607,9 @@
           "Bash(rm -r *)",
           "Edit",
           "Write",
-          "MultiEdit",
-          "NotebookEdit"
+          "NotebookEdit",
+          "mcp__renga-peers__close_pane",
+          "mcp__org-broker__close_pane"
         ]
       },
       "hooks": {
@@ -613,6 +637,15 @@
               {
                 "type": "command",
                 "command": "bash \"{claude_org_path}/.hooks/block-org-structure.sh\""
+              }
+            ]
+          },
+          {
+            "matcher": "mcp__.*__close_pane",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"{claude_org_path}/.hooks/block-relative-close-pane.sh\""
               }
             ]
           }
