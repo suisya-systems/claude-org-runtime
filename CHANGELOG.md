@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Worker role templates no longer get `close_pane`.** All three bundled
+  `worker_roles` templates (`default`, `claude-org-self-edit`, `doc-audit`)
+  now deny `mcp__renga-peers__close_pane` and `mcp__org-broker__close_pane`,
+  and register `.hooks/block-relative-close-pane.sh` under a
+  `mcp__.*__close_pane` PreToolUse matcher. `block-relative-close-pane.sh`
+  joins `required_hook_scripts` (Issue #183).
+
+  Destroying a pane is the dispatcher's job; a worker has no reason to call it.
+  On 2026-09-20 a worker called `close_pane(target="focused")` and closed the
+  secretary's pane -- `focused` is the pane the human is looking at, not the
+  caller's own. Two layers are needed because `permissions.deny` is a no-op for
+  roles running in `bypassPermissions` mode, while the hook does not know which
+  role it is guarding. claude-org-ja shipped the first layer (the hook itself,
+  plus its wiring for secretary / dispatcher / curator) in ja#1020; the worker
+  templates live here, so this is where the remaining gap closes.
+
+  The matching audit constraints under `roles.worker` (`required_deny` /
+  `required_hooks`) are deliberately **not** part of this change: adding them
+  now would fail every already-generated worker `settings.local.json`,
+  including live worktrees, under ja's
+  `check_role_configs --include-worker-settings`. They land in a separate PR
+  once this release has shipped and ja has synced the schema.
+
+### Removed
+
+- The stale `MultiEdit` entry from the `doc-audit` template's
+  `permissions.deny`. No tool by that name is registered in the current
+  harness (Claude Code 2.1.278 exposes `Edit`, `Write` and `NotebookEdit`),
+  so every worker launch logged `Permission deny rule "MultiEdit" matches no
+  known tool -- check for typos.` The remaining `MultiEdit` strings in the CLI
+  binary are legacy rule-normalization tables (`Write`/`NotebookEdit`/
+  `MultiEdit` -> `Edit`), not a tool registration, and `Edit` / `Write` /
+  `NotebookEdit` stay denied, so the read-only surface is unchanged.
+
 ## [0.1.42] - 2026-08-14
 
 ### Added
