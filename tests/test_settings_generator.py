@@ -39,6 +39,21 @@ def test_bundled_schema_loads() -> None:
     assert isinstance(schema["worker_roles"], dict)
 
 
+def test_bundled_schema_required_hook_scripts_are_referenced() -> None:
+    # Mirrors core_harness.validator.validate_schema_integrity, which ja's
+    # tools/check_role_configs.py runs on this schema. core_harness is not a
+    # dependency here, so the rule is restated: every required_hook_scripts
+    # entry must equal some roles[*].required_hooks[].command_contains.
+    schema = generator.load_schema()
+    referenced = {
+        hook.get("command_contains", "")
+        for role in schema.get("roles", {}).values()
+        for hook in role.get("required_hooks", [])
+    }
+    missing = set(schema.get("required_hook_scripts", [])) - referenced
+    assert not missing, f"required hook scripts not referenced by any role: {sorted(missing)}"
+
+
 def test_bundled_schema_is_valid_json_file() -> None:
     resource = files("claude_org_runtime.settings").joinpath(
         "role_configs_schema.json"
