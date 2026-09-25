@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workers can read `.env.example` again.** The `default` and
+  `claude-org-self-edit` worker templates deny `Read(.env)` / `Read(.env.*)`,
+  and `.env.*` also matched committed templates that hold no secrets, so a
+  worker could not open or edit `.env.example` with the Read tool (hit on
+  2026-09-25). Both templates now list `Read(!.env.example)`,
+  `Read(!.env.*.example)`, `Read(!**/.env.example)` and
+  `Read(!**/.env.*.example)` directly after `Read(.env.*)`.
+
+  A `!` deny pattern is a gitignore negation that carves its matches out of
+  the relative rules listed before it in the same settings file
+  (https://code.claude.com/docs/en/permissions, "Read and Edit"). An allow
+  rule cannot do this because deny is evaluated first. `.env`, `.env.local`,
+  `.env.production` and other non-template `.env.*` files stay denied at
+  every depth. Checked on Claude Code 2.1.282 with `claude -p`: templates
+  readable, secrets denied, and templates denied again once the `!` rules are
+  removed.
+
+  The four patterns are `settings.generator.ENV_TEMPLATE_PATTERNS`, the same
+  set claude-org-ja uses for Layer 3 `sandbox.filesystem.allowRead`, so the
+  two layers can be checked against one definition. The new
+  `tests/test_env_template_carve_out.py` pins the order and the
+  readable/denied outcome; its live `claude -p` case runs only with
+  `CLAUDE_ORG_RUNTIME_LIVE_CLAUDE=1`.
+
 ### Changed
 
 - **Worker role templates no longer get `close_pane`.** All three bundled
