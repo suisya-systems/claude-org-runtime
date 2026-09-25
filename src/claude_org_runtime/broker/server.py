@@ -99,7 +99,9 @@ class Broker(TokenMixin, StoreMixin):
         #
         # 桁の根拠 (値そのものより桁が本質): 下は「正常な起動」より十分大きく — pane の
         # 起動 + MCP handshake は通常 1 桁秒で、段2/3 の folder-trust は呼び出し元
-        # エージェントが send_keys で承認するため分オーダーに収まる。上は「人間が
+        # エージェントが inspect -> spawn-prompt-step -> send_keys で承認し (既定が
+        # "No, exit" なので素の Enter は送らない)、判定できなければ 120s で escalate
+        # するため分オーダーに収まる。上は「人間が
         # 組織全体の沈黙に気付くまで」より十分小さく。TTL (90s) の数倍以上離して、
         # 遅い起動が期限に触れないようにもする。10 分はこの間の広い谷にある。
         self.observer_arming_seconds = observer_arming_seconds

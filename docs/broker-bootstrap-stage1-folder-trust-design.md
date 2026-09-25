@@ -16,6 +16,19 @@ viable な自動承認があるか、無いならどう扱うかを**設計判�
 > (本件に blocked)。本ドキュメントは設計判断と一次裏取りを残し、実端末での
 > end-to-end 検証は #576 に委ねる。
 
+> **2026-09-25 訂正 (plan_version 2)**: 本書の「`send_keys(enter=true)` で
+> folder-trust を承認できる」は、既定選択が Yes だった Claude Code での実証
+> (ja#515) に基づく。現行版 (2.1.282 系) の folder-trust は **既定カーソルが
+> "No, exit"** で、素の Enter はワーカーを終了させる (2026-09-25 実害)。
+> 現在の段2/段3 の承認は、呼び出し元 agent が `inspect_pane` ->
+> `spawn-prompt-step` (判定、`claude_org_runtime.dispatcher.spawn_prompt`) ->
+> `send_keys` をループする delegate-plan の `approve_spawn_prompts` step で行う
+> (選択肢は文言で照合し、必要なら Down/Up で Yes へ移してから Enter。判定できな
+> ければ Enter を送らず escalate)。WezTerm broker adapter は Up/Down を送れない
+> ため、そこで folder-trust が出た場合は escalate になる。段1 が launcher では承認できないという本書の結論は変わらない
+> (human は Yes を選んでから確定する必要がある)。以下の本文は当時の
+> 記録として残し、「Enter = 承認」の前提はこの注記で読み替えること。
+
 ---
 
 ## 0. 結論 (TL;DR)
@@ -79,7 +92,8 @@ ja#575 / 窓口が最初に答えるべきとした問い:
 3. **「実プロンプトに anti-automation は無い」は ja#515 dogfood に依拠 (cross-repo /
    実端末、本 diff では再証明しない)**。同一の folder-trust プロンプトが段2/段3 で
    raw `send_keys(enter=true)` により実 clear できたことは ja#515 dogfood (実端末) で
-   実証済とされている。これと wire seam (#2) が揃うと、段2/段3 が機械承認できる
+   実証済とされている (2026-09-25 訂正: 既定が "No, exit" の現行版では raw Enter は
+   exit になる。冒頭注記参照)。これと wire seam (#2) が揃うと、段2/段3 が機械承認できる
    理由が説明される。crux (real-prompt-detect + exactly-once Enter on real TTY) の
    実端末検証は ja#576 が owner。
 4. **よって (a)**: 段1 のギャップは genuine-user 検出 (b) ではなく構造 (#1)。
@@ -118,7 +132,7 @@ ja#575 / 窓口が最初に答えるべきとした問い:
 |---|---|---|---|---|---|
 | 1 | secretary | `org up` (CLI, human) | **無し** (MCP token のみで登録) | — | **後から打鍵する別プロセスが無い** |
 | 2 | dispatcher | secretary agent | 有り (daemon が spawn) | secretary agent | `send_keys(enter=true)` |
-| 3 | worker | dispatcher agent | 有り (daemon が spawn) | dispatcher agent | `send_keys(enter=true)` |
+| 3 | worker | dispatcher agent | 有り (daemon が spawn) | dispatcher agent | `send_keys(enter=true)` (2026-09-25 訂正: plan_version 2 では `approve_spawn_prompts` (inspect -> `spawn-prompt-step` -> send_keys) に置換) |
 
 段2/段3 の pane は **daemon が spawn する**ため adapter handle (pane_id) が bind に
 付き、`resolve_target` で名前解決して `send_keys` できる。一方 secretary は
@@ -227,7 +241,7 @@ master 出力で folder-trust プロンプトを検出したら **CR を 1 回�
 ## 6. 採用する設計判断
 
 **段1 (secretary 自身) の folder-trust は、全プラットフォームで意図的に human 1-Enter
-とする (production path)。** これを本ドキュメントと `_launch_claude` の docstring で
+とする (production path)。** (2026-09-25 訂正: folder-trust の既定は "No, exit" のため、人間は Yes を選んでから Enter で確定する) これを本ドキュメントと `_launch_claude` の docstring で
 文書化し、将来の保守者が「naive な blind Enter を launcher に足す」regression を
 踏まないようにする (段2/段3 spawn 直後の blind auto-clear を禁ずる
 `test_broker_spawn_does_not_auto_clear_trust` と同じ防御意図)。

@@ -24,6 +24,12 @@ adapter 層の CR 等価 (tmux=`send-keys Enter` / wezterm=`send-text --no-paste
 は tests/terminal/test_tmux.py::test_send_enter /
 tests/terminal/test_wezterm.py::test_send_enter_is_raw_cr で別途固定済み。本ファイルは
 その上に立つ broker surface の spawn->machine-approve 契約を検証する。
+
+2026-09-25 訂正: 現行 Claude Code の folder-trust は既定カーソルが "No, exit" のため、
+素の Enter 1 回では承認にならず exit する。承認は呼び出し元 agent が inspect_pane ->
+spawn-prompt-step -> send_keys で行う (delegate-plan plan_version 2 の
+approve_spawn_prompts、判定は tests/test_spawn_prompt.py)。本ファイルが固定するのは
+その下の「名前で addressable な send_keys が対象 pane だけに届く」シームである。
 """
 
 from __future__ import annotations
@@ -81,7 +87,8 @@ def test_spawned_pane_is_machine_approvable_by_name_enter(tmp_path):
     """secretary が dispatcher を spawn し、安定名で folder-trust を Enter 承認する。
 
     これが ja org-start Block D-1 の機械承認シーム。runtime はこの spawn->approve を
-    成立させる責務を持つ (folder-trust 抑止 flag は存在しないため Enter が唯一手段)。
+    成立させる責務を持つ (folder-trust 抑止 flag は存在しないため send_keys が唯一手段。
+    実プロンプトでは Yes へ移してからの Enter になる: モジュール docstring 参照)。
     """
     b, adapter, secretary = _broker_with_caller(tmp_path, "secretary")
 

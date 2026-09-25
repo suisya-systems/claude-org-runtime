@@ -32,6 +32,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `check_role_configs --include-worker-settings`. They land in a separate PR
   once this release has shipped and ja has synced the schema.
 
+### Fixed
+
+- **`delegate-plan` no longer approves a new worker's startup prompts with a
+  blind Enter.** On 2026-09-25 a worker spawned into a fresh worktree exited
+  right after spawn: Claude Code showed the folder-trust dialog with the cursor
+  on "No, exit", and the plan's `after_spawn` `send_keys(enter=true)` confirmed
+  it. The Enter-approves premise came from ja#515, verified when the default
+  was Yes; a Claude Code update changed the default while `after_spawn` stayed
+  Enter-only.
+
+  The `send_keys` step is replaced by an `approve_spawn_prompts` step (same
+  position, same on the renga and broker transports). It carries an `inspect`
+  call, `decide_argv`, `deadline_ms` (120000), `poll_interval_ms` (1000), an
+  `escalate` message (`SPAWN_PROMPT_UNRESOLVED: ...`) and self-contained
+  `instructions`: the Dispatcher loops `inspect_pane` -> the new
+  `spawn-prompt-step` subcommand -> `send_keys` exactly as decided. The
+  decision core (`claude_org_runtime.dispatcher.spawn_prompt`) matches dialog
+  options by text, not position (the folder-trust option order differs across
+  Claude Code versions), moves the cursor with Down / Up before Enter, sends
+  any key only after two identical inspects taken after the last key, and past
+  the deadline escalates without sending Enter.
+  `WORKER_BIND_WINDOW_SECONDS` (the #158 capacity-reservation TTL) is now
+  derived from that deadline (120s + the ~30s peer-bind wait + 15s = 165s,
+  was 45s), because the reservation clock starts at plan time and a slow but
+  successful approval pass would otherwise outlive it.
+
+  `spawn-prompt-step` (`claude-org-runtime dispatcher spawn-prompt-step` or
+  `python -m claude_org_runtime.dispatcher.runner spawn-prompt-step`) reads
+  `{"screen", "previous_screen", "elapsed_ms"}` on stdin and prints ASCII
+  JSON. Exit codes: `0` decision emitted (`send_keys` / `wait` / `done`), `10`
+  escalate, `2` invalid input.
+
+  The plan gains a top-level `plan_version` field (now `2`), appended after
+  `on_spawn_error` so every existing key keeps its position. Consumers that
+  replay `after_spawn` must handle the new step; claude-org-ja needs matching
+  changes in `.dispatcher/CLAUDE.md` (the `after_spawn` line),
+  `.dispatcher/references/spawn-flow.md` 3-3b and the root `CLAUDE.md`
+  transport section.
+
+  There is no official way to pre-trust a directory for an interactive
+  session: no setting, environment variable or CLI flag
+  (<https://code.claude.com/docs/en/settings>,
+  <https://code.claude.com/docs/en/env-vars>,
+  <https://code.claude.com/docs/en/cli-reference>). Trust is only inherited: a
+  linked worktree uses the main checkout's trust
+  (<https://code.claude.com/docs/en/permissions#project-allow-rules-and-workspace-trust>),
+  so worktrees of a trusted repository skip the dialog. The dev-channel
+  dialog is shown on every launch
+  (<https://code.claude.com/docs/en/channels-reference>).
+
+  Known limit: the WezTerm broker adapter cannot send Up / Down, so a
+  folder-trust dialog there fails with `[key_unsupported]` and escalates
+  instead of being approved.
+
 ### Removed
 
 - The stale `MultiEdit` entry from the `doc-audit` template's

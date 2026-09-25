@@ -10,7 +10,10 @@ that Dispatcher Claude reads and executes via MCP tool calls.
 The helper does NOT call MCP tools directly. Dispatcher remains the actor
 that receives Secretary's DELEGATE, invokes this helper, reads the
 returned plan, and performs the ``spawn_claude_pane`` / ``send_keys`` /
-``send_message`` / etc. calls.
+``send_message`` / etc. calls. Startup prompts are the one place where the
+Dispatcher calls back into the helper: the ``approve_spawn_prompts`` step
+loops ``inspect_pane`` -> ``spawn-prompt-step`` -> ``send_keys`` (see
+:mod:`.spawn_prompt`).
 
 Behaviour parity with the original ``tools/dispatcher_runner.py`` is a
 hard requirement -- claude-org-ja consumers can replace their in-tree
@@ -74,6 +77,8 @@ from typing import Any, Iterable, Optional, Sequence, Union
 # Re-export for documentation / downstream importers (Step B + C symbols).
 from claude_org_runtime import prompts as _prompts  # noqa: F401
 from claude_org_runtime import schema as _schema  # noqa: F401
+
+from . import spawn_prompt as _spawn_prompt
 
 # Matches renga's name/role validation (see `set_pane_identity` docs).
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -302,7 +307,15 @@ DEFAULT_MAX_CONCURRENT_WORKERS = 8
 # are self-expiring rather than explicitly released because nothing in the
 # system reliably runs after a spawn fails -- a TTL needs no cleanup step and
 # cannot leak a slot permanently.
-WORKER_BIND_WINDOW_SECONDS = 45
+#
+# Since plan_version 2 the ``approve_spawn_prompts`` step runs before that
+# wait, and the clock starts at plan time (seed mtime). A pass is paced by the
+# Dispatcher's own turns, not the poll interval, so a slow pass can succeed
+# right before its deadline; the window therefore covers the whole approval
+# deadline + the ~30s peer-bind wait + 15s headroom.
+WORKER_BIND_WINDOW_SECONDS = (
+    _spawn_prompt.DEFAULT_APPROVAL_DEADLINE_MS // 1000 + 30 + 15
+)
 
 # Broker-path spawn coordinates. Under the broker transport the adapter does
 # not split a specific pane by geometry (it opens a fresh detached session), so
@@ -2213,6 +2226,10 @@ def validate_cwd(cwd_str: str) -> Optional[str]:
 # Action plan
 # ----------------------------------------------------------------------------
 
+# Bumped when a plan step's shape changes. 2 = the after_spawn
+# ``send_keys(enter)`` step was replaced by ``approve_spawn_prompts``.
+PLAN_VERSION = 2
+
 
 @dataclass
 class ActionPlan:
@@ -2239,7 +2256,8 @@ class ActionPlan:
     # ``layout`` becomes a diagnostics object, because that escalation is
     # exactly where a human needs to know how many columns the left panels
     # are eating. ``status``, the 0/1/2 exit codes, ``spawn``, ``after_spawn``,
-    # ``state_writes`` and ``capacity`` are unchanged everywhere.
+    # ``state_writes`` and ``capacity`` are unchanged everywhere. (#158 only;
+    # plan_version 2 later replaced one ``after_spawn`` step, see below.)
     #
     # ``population``  -- auditable worker census; set iff ``peers`` was passed.
     # ``layout``      -- renga-only measured pane area + tab diagnostics.
@@ -2248,6 +2266,8 @@ class ActionPlan:
     population: Optional[dict[str, Any]] = None
     layout: Optional[dict[str, Any]] = None
     on_spawn_error: Optional[dict[str, dict[str, Any]]] = None
+    # Appended last so the pre-existing key order is unchanged. See PLAN_VERSION.
+    plan_version: int = PLAN_VERSION
 
 
 def _population_report(
@@ -2447,6 +2467,65 @@ def _tab_limit_escalation(
         ),
     }
     return plan
+
+
+def approve_spawn_prompts_step(task_id: str, worker_name: str) -> dict[str, Any]:
+    """The after_spawn step that clears Claude Code's startup prompts.
+
+    Replaces the blind ``send_keys(enter=True)`` (2026-09-25 incident: the
+    folder-trust dialog now defaults to "No, exit", so a bare Enter exits the
+    worker). The decision lives in :mod:`.spawn_prompt`; the Dispatcher only
+    runs inspect -> ``spawn-prompt-step`` -> send_keys as ``instructions`` say.
+    Identical for the renga and broker transports.
+    """
+    deadline_ms = _spawn_prompt.DEFAULT_APPROVAL_DEADLINE_MS
+    poll_interval_ms = 1000
+    return {
+        "tool": "approve_spawn_prompts",
+        "target": worker_name,
+        "inspect": {"tool": "inspect_pane", "target": worker_name,
+                    "lines": 40, "format": "grid"},
+        "decide_argv": ["spawn-prompt-step", "--deadline-ms", str(deadline_ms)],
+        "deadline_ms": deadline_ms,
+        "poll_interval_ms": poll_interval_ms,
+        "escalate": {
+            "tool": "send_message",
+            "to_id": "secretary",
+            "message": (
+                f"SPAWN_PROMPT_UNRESOLVED: worker {worker_name!r} for task "
+                f"{task_id!r} is stuck on a Claude Code startup prompt that "
+                "could not be approved safely. No Enter was sent; human "
+                "judgment required -- look at the pane."
+            ),
+        },
+        "instructions": (
+            "Approve the worker's Claude Code startup prompts (folder-trust, "
+            "dev-channel) without guessing. Record the wall-clock time in "
+            "ms when this step starts (e.g. `date +%s%3N`). Loop: "
+            "(1) call the `inspect` tool call exactly as given, on the same "
+            "transport that spawned the worker. "
+            "(2) run the same runner entrypoint used for delegate-plan with "
+            "`decide_argv`, passing on stdin the JSON object "
+            '{"screen": <inspect result>, "previous_screen": <previous '
+            "inspect result, or null on the first iteration and right after "
+            'any send_keys>, "elapsed_ms": <integer ms: wall-clock now minus the '
+            "recorded start>}. "
+            "(3) exit 0 with action `send_keys`: call send_keys(target, "
+            "**send_keys) with the `send_keys` object exactly as given (never "
+            "add enter), then set previous to null and wait "
+            "`poll_interval_ms`. Exit 0 with action `wait`: set previous to "
+            "this inspect result and wait `poll_interval_ms`. Exit 0 with "
+            "action `done`: continue with the next after_spawn step. "
+            "(4) exit 10 (escalate), exit 2 (invalid input), any other exit "
+            "code, or any inspect / send_keys error such as [key_unsupported]: "
+            "send the `escalate` message and stop this delegation without "
+            "sending Enter. Never send a bare Enter on your own: the "
+            "folder-trust default is 'No, exit', so a blind Enter exits the "
+            "worker."
+        ),
+        "reason": ("approve Claude Code startup prompts (folder-trust, "
+                   "dev-channel) by inspecting the screen; never a blind Enter"),
+    }
 
 
 def build_plan(
@@ -2943,13 +3022,7 @@ def build_plan(
             "expect_name": worker_name,
             "deadline_ms": 3000,
         },
-        {
-            "tool": "send_keys",
-            "target": worker_name,
-            "enter": True,
-            "reason": ("approve the spawn-ritual prompt (renga: 'Load "
-                       "development channel?' Y/n / broker: folder-trust)"),
-        },
+        approve_spawn_prompts_step(task_id, worker_name),
         {
             "tool": "list_peers",
             "reason": (f"wait for {worker_name} to appear as a peer "
@@ -3459,6 +3532,8 @@ def add_subparsers(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -
         help="do not write worker seed / instruction files; just print the plan",
     )
     dp.set_defaults(func=cmd_delegate_plan)
+
+    _spawn_prompt.add_subparser(sub)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
