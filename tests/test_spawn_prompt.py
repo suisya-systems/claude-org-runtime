@@ -410,7 +410,10 @@ def test_cli_exit_10_on_escalate_and_deadline_flag(
         # unsortable row keys (TypeError) and pathological nesting (RecursionError)
         json.dumps({"screen": [{"text": "a", "row": "x"}, {"text": "b", "row": 1}],
                     "elapsed_ms": 0}),
-        "[" * 100000 + "]" * 100000,
+        # Explicit id: the default id embeds the 200k-char value into the node
+        # id, and pytest exports that as PYTEST_CURRENT_TEST, which exceeds
+        # Windows' 32767-char environment variable limit.
+        pytest.param("[" * 100000 + "]" * 100000, id="deep-nesting"),
     ],
 )
 def test_cli_exit_2_on_invalid_input(
