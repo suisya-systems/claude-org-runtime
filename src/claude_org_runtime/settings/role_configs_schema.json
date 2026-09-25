@@ -47,6 +47,11 @@
           "event": "PreToolUse",
           "matcher_contains": "Bash",
           "command_contains": "block-dangerous-git.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "close_pane",
+          "command_contains": "block-relative-close-pane.sh"
         }
       ],
       "disallow_allow_regex": []
@@ -199,6 +204,11 @@
           "event": "PreToolUse",
           "matcher_contains": "Bash",
           "command_contains": "block-no-verify.sh"
+        },
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "close_pane",
+          "command_contains": "block-relative-close-pane.sh"
         }
       ],
       "disallow_allow_regex": [
@@ -215,7 +225,13 @@
       "required_allow": [],
       "allowed_allow_regex": [],
       "required_deny": [],
-      "required_hooks": [],
+      "required_hooks": [
+        {
+          "event": "PreToolUse",
+          "matcher_contains": "close_pane",
+          "command_contains": "block-relative-close-pane.sh"
+        }
+      ],
       "disallow_allow_regex": [
         "^Bash\\(\\*\\)$",
         "^Bash$",

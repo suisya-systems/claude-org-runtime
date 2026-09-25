@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.44] - 2026-09-25
+
+### Fixed
+
+- **`block-relative-close-pane.sh` is now referenced by a role's
+  `required_hooks`.** 0.1.43 added it to `required_hook_scripts` without any
+  `roles[*].required_hooks` entry pointing at it, so ja's
+  `tools/check_role_configs.py` (via core_harness `validate_schema_integrity`)
+  failed on the synced schema with "required hook script
+  'block-relative-close-pane.sh' not referenced by any role". `repo_shared`,
+  `dispatcher` and `curator` now require a `PreToolUse` hook whose matcher
+  contains `close_pane` and whose command contains
+  `block-relative-close-pane.sh`, matching the wiring ja#1020 already ships
+  for those roles. `roles.worker` stays unchanged for the reason given under
+  0.1.43.
+
+  The script stays required. A new test,
+  `test_bundled_schema_required_hook_scripts_are_referenced`, restates the
+  integrity rule against the bundled schema so runtime CI catches this
+  before a release instead of ja catching it after.
+
 ## [0.1.43] - 2026-09-25
 
 ### Fixed
