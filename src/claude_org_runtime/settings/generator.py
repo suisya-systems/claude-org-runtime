@@ -484,6 +484,22 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
 # reach it leaves the sandbox-launch failure in place.
 _PERMISSION_PATH_TOOLS = ("Read", "Edit", "Write")
 
+# Committed ``.env`` templates that hold no secrets. The single definition of
+# the carve-out from the ``Read(.env)`` / ``Read(.env.*)`` credential denies:
+# the bundled worker templates list ``Read(!<pattern>)`` for each entry right
+# after ``Read(.env.*)`` (tests pin the two together), and claude-org-ja's
+# ``sandbox.filesystem.allowRead`` carries the same list for Layer 3.
+# Negation is documented at https://code.claude.com/docs/en/permissions
+# ("Read and Edit"): a ``!`` deny pattern carves its matches out of the
+# relative rules listed *before* it in the same settings file. An allow rule
+# cannot do this, since deny is evaluated first.
+ENV_TEMPLATE_PATTERNS = (
+    ".env.example",
+    ".env.*.example",
+    "**/.env.example",
+    "**/.env.*.example",
+)
+
 
 def _absolute_symlink_in_chain(
     path: str,
