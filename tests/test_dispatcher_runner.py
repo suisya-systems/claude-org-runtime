@@ -1679,6 +1679,8 @@ def _assert_approve_step(plan: ActionPlan) -> None:
     step = plan.after_spawn[1]
     assert step["target"] == plan.spawn["name"]
     assert step["inspect"]["target"] == plan.spawn["name"]
+    # Full screen: a bottom-N trim can cut a dialog off on a tall pane.
+    assert "lines" not in step["inspect"]
     assert step["decide_argv"][0] == "spawn-prompt-step"
     assert step["decide_argv"][-1] == str(DEFAULT_APPROVAL_DEADLINE_MS)
     assert step["deadline_ms"] == DEFAULT_APPROVAL_DEADLINE_MS

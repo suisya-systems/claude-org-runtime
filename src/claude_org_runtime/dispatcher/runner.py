@@ -2483,8 +2483,10 @@ def approve_spawn_prompts_step(task_id: str, worker_name: str) -> dict[str, Any]
     return {
         "tool": "approve_spawn_prompts",
         "target": worker_name,
+        # No ``lines``: both transports trim to the bottom N rows, and on a
+        # tall pane the dialog can sit above them with blank rows below.
         "inspect": {"tool": "inspect_pane", "target": worker_name,
-                    "lines": 40, "format": "grid"},
+                    "format": "grid"},
         "decide_argv": ["spawn-prompt-step", "--deadline-ms", str(deadline_ms)],
         "deadline_ms": deadline_ms,
         "poll_interval_ms": poll_interval_ms,
