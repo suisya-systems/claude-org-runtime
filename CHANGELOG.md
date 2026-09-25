@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.43] - 2026-09-25
+
 ### Fixed
 
 - **Workers can read `.env.example` again.** The `default` and
