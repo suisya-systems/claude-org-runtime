@@ -71,7 +71,8 @@ The ledger is the worker seed file the helper already writes on
    than the clock, and that rewrite is itself what refreshed the mtime, so
    without this rule a worker that just finished would block its own
    replacement for the whole window,
-3. it is younger than `WORKER_BIND_WINDOW_SECONDS` (45s) -- nothing ever
+3. it is younger than `WORKER_BIND_WINDOW_SECONDS` (165s: the 120s
+   spawn-prompt approval deadline + the ~30s peer-bind wait + 15s headroom) -- nothing ever
    deletes these files, so a spawn that died before anything could rewrite it
    frees its slot on the clock, with no cleanup step and no leaked slots.
 

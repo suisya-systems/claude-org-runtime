@@ -15,6 +15,18 @@ spawn された Claude pane が初回起動時に出す **folder-trust プロン
 > spawn -> approve -> deliver の e2e dogfood は本スコープ外 (別途人間調整の
 > dogfood run = 「実端末 e2e 検証手順」節の手順書として残す)。
 
+> **2026-09-25 訂正 (plan_version 2)**: 本書の「`send_keys(enter=true)` で
+> folder-trust を承認できる」は、既定選択が Yes だった Claude Code での実証
+> (ja#515) に基づく。現行版 (2.1.282 系) の folder-trust は **既定カーソルが
+> "No, exit"** で、素の Enter はワーカーを終了させる (2026-09-25 実害)。
+> 現在の段2/段3 の承認は、呼び出し元 agent が `inspect_pane` ->
+> `spawn-prompt-step` (判定、`claude_org_runtime.dispatcher.spawn_prompt`) ->
+> `send_keys` をループする delegate-plan の `approve_spawn_prompts` step で行う
+> (選択肢は文言で照合し、必要なら Down/Up で Yes へ移してから Enter。判定できな
+> ければ Enter を送らず escalate)。WezTerm broker adapter は Up/Down を送れない
+> ため、そこで folder-trust が出た場合は escalate になる。以下の本文は当時の
+> 記録として残し、「Enter = 承認」の前提はこの注記で読み替えること。
+
 ---
 
 ## 0. 結論 (TL;DR)
@@ -26,7 +38,8 @@ spawn された Claude pane が初回起動時に出す **folder-trust プロン
 - trust 受諾は `~/.claude.json` に per-directory で保存されるが、**home directory
   起動だと disk 非永続 = session 限り**になり spawn 毎に再発する
   (ja#566 の「`~/.claude.json` is not cached so it recurs per spawn」の正体)。
-- したがって機械承認の**唯一の手段は `send_keys(enter=true)`** (PTY に CR=0x0D を
+- したがって機械承認の**唯一の手段は `send_keys(enter=true)`** (2026-09-25 訂正:
+  現在は画面判定つきの `send_keys` ループ。冒頭注記参照) (PTY に CR=0x0D を
   送出。tmux / WezTerm 両 adapter で確認済)。
 - 3 つの bootstrap 段のうち **dispatcher / worker は既に agent 駆動で配線済**、
   **secretary 自身は launcher の構造上 send_keys 不能 = out-of-band 承認**が本質。
@@ -133,6 +146,7 @@ permission-modes) を確認した結果:
   (`src/claude_org_runtime/dispatcher/runner.py:677-706`)。順序は
   `poll_events(pane_started)` -> `send_keys(enter=True)` -> `list_peers`
   (peer 出現を ~30s retry) -> `send_message`。
+  (2026-09-25 訂正: plan_version 2 では `approve_spawn_prompts` (inspect -> `spawn-prompt-step` -> send_keys) に置換)
   - Enter は **単発** (再送 retry は Enter そのものでなく後続の `list_peers`
     peer-wait 側にある)。プロンプト未表示の段階で送ると no-op になりうる点は
     ja org-start Block D-1 と同じで、failure 時の Enter 再送は agent 判断に委ねる。
@@ -155,7 +169,7 @@ permission-modes) を確認した結果:
 |---|---|---|---|---|---|
 | 1 | secretary | `org up` (CLI) | human / 外部ドライバ (out-of-band) | Enter | launcher 構造上 runtime 不能 |
 | 2 | dispatcher | secretary agent | secretary agent | `send_keys(enter=true)` | agent: ja org-start Block D-1 |
-| 3 | worker | dispatcher agent | dispatcher agent | `send_keys(enter=true)` | runtime: `dispatcher.runner` after_spawn + agent: ja spawn-flow 3-3b |
+| 3 | worker | dispatcher agent | dispatcher agent | `send_keys(enter=true)` (2026-09-25 訂正: plan_version 2 では `approve_spawn_prompts` (inspect -> `spawn-prompt-step` -> send_keys) に置換) | runtime: `dispatcher.runner` after_spawn + agent: ja spawn-flow 3-3b |
 
 ---
 
@@ -248,6 +262,7 @@ fully-unattended の主張には実端末での spawn -> approve -> deliver 完�
   (a) プロンプト表示前で取りこぼす、(b) agent 側 Block D-1/3-3b と二重 Enter になり
   空 turn を暴発させる、リスクがある。承認は「画面を見て出てから 1 回」が正しく、
   これは agent 駆動 (Block D-1/3-3b の retry 付き待ち合わせ) が担う。
+  (2026-09-25 訂正: 段3 は plan_version 2 の `approve_spawn_prompts` が画面判定のうえ打鍵し、無条件の Enter は送らない)
 - **`dispatcher.runner` after_spawn の reason 文言ドリフト (本 PR で修正済)**:
   `src/claude_org_runtime/dispatcher/runner.py` の worker spawn 用 `send_keys`
   step は reason が renga 旧文言 (`"approve 'Load development channel?' Y/n
@@ -255,6 +270,7 @@ fully-unattended の主張には実端末での spawn -> approve -> deliver 完�
   (Enter 送出) は元から正しい cosmetic だが、両 transport を正確に表す文言に更新
   した (人間承認の上、本タスクスコープ内)。dispatcher は Enter を無条件発火し
   reason 文字列に依存しないため挙動への影響は無い。
+  (2026-09-25 訂正: この send_keys step は plan_version 2 で `approve_spawn_prompts` に置換され、Enter の無条件発火は廃止)
 - 抑止 flag が公式に入れば (anthropics/claude-code#29285) secretary 段も settings で
   解消できる。それまでは send_keys / out-of-band が唯一手段。
 

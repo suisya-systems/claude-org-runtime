@@ -305,11 +305,13 @@ def _launch_claude(
     出すが、本関数はそこへ Enter を**送らない**。exec/subprocess で launcher 自身が
     secretary プロセスになる/それにブロックされるため、その PTY に後から打鍵できる
     別プロセスが構造的に存在しない (= 残存ギャップは genuine-user 検出ではなく純構造)。
-    段2/段3 は daemon-spawned pane なので呼び出し元 agent が send_keys で承認できる
-    (wire seam は tests/broker/test_bootstrap_folder_trust.py が FakeAdapter で固定。
-    実プロンプトが CR を受理することは ja#515 dogfood = 実端末で実証済、本コードでは
-    再証明しない)。段1 は human が org up 実行直後に 1 回 Enter する production path と
-    し、blind Enter をここに足さない (表示前取りこぼし + 二重 Enter の空 turn 暴発を
+    段2/段3 は daemon-spawned pane なので呼び出し元 agent が inspect_pane ->
+    ``spawn-prompt-step`` (判定) -> send_keys で承認できる (plan_version 2 の
+    approve_spawn_prompts。wire seam は tests/broker/test_bootstrap_folder_trust.py が
+    FakeAdapter で固定)。2026-09-25 訂正: ja#515 dogfood の「Enter で承認」は既定選択が
+    Yes だった版の実証で、現行 Claude Code の folder-trust は既定が "No, exit" のため
+    素の Enter は exit する。段1 は human が org up 実行直後に Yes を選んで確定する
+    production path とし、blind Enter をここに足さない (表示前取りこぼし + 二重 Enter の空 turn 暴発を
     防ぐ。理由と将来の sanctioned mechanism = faithful POSIX PTY-wrapper は
     docs/broker-bootstrap-stage1-folder-trust-design.md)。
     """

@@ -1358,12 +1358,14 @@ def test_build_plan_renga_default_plan_adds_only_null_keys(
     tmp_path: Path,
 ) -> None:
     # The golden diff for every caller that passes nothing new: three extra
-    # keys, all null. Nothing else about the document may move.
+    # keys, all null, plus the later plan_version (appended last). Nothing
+    # else about the document may move.
     plan = build_plan(_task(tmp_path), _ok_panes(), tmp_path / ".state")
     d = dataclasses.asdict(plan)
     assert list(d) == _PRE_158_PLAN_KEYS + [
-        "population", "layout", "on_spawn_error",
+        "population", "layout", "on_spawn_error", "plan_version",
     ]
+    assert d["plan_version"] == 2
     assert d["population"] is None
     assert d["layout"] is None
     assert d["on_spawn_error"] is None
@@ -1610,9 +1612,10 @@ def test_cli_omitting_peers_json_matches_today(
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)
     # The emitted document differs from the pre-#158 one by exactly three null
-    # keys -- nothing else moved, including the spawn key ORDER.
+    # keys (plus the later plan_version, appended last) -- nothing else moved,
+    # including the spawn key ORDER.
     assert list(plan) == _PRE_158_PLAN_KEYS + [
-        "population", "layout", "on_spawn_error",
+        "population", "layout", "on_spawn_error", "plan_version",
     ]
     assert plan["population"] is None
     assert plan["layout"] is None

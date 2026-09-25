@@ -202,9 +202,22 @@ The helper returns one of three results, distinguishable by exit code:
   into the active transport's `spawn_claude_pane`
   (`mcp__org-broker__spawn_claude_pane` by default;
   `mcp__renga-peers__spawn_claude_pane` under renga), then run `after_spawn[]`
-  in order: `poll_events` → `send_keys(enter)` → wait on `list_peers` → final
-  `send_message`. The `send_message` body comes from reading the
-  `message_file` named in the action. Do not second-guess `spawn.target` /
+  in order: `poll_events` → `approve_spawn_prompts` → wait on `list_peers` →
+  final `send_message`. The `send_message` body comes from reading the
+  `message_file` named in the action.
+
+  `approve_spawn_prompts` is a loop, not one keystroke; follow its
+  `instructions` field exactly. Each iteration: run its `inspect` call, pipe
+  `{"screen", "previous_screen", "elapsed_ms"}` into the helper with
+  `decide_argv` (`spawn-prompt-step`), then act on the result — exit 0
+  `send_keys` → send exactly the given keys (then `previous_screen` = null),
+  `wait` → set `previous_screen` to this inspect result and poll again after
+  `poll_interval_ms`, `done` → next step; `elapsed_ms` is integer wall-clock
+  ms since the step started. Exit 10, exit 2, any other non-zero exit, or any
+  inspect / `send_keys` error (e.g. `[key_unsupported]`) → send the step's
+  `escalate` message and stop. **Never send a bare Enter on your own**: the
+  folder-trust dialog defaults to "No, exit", so a blind Enter exits the
+  worker. Do not second-guess `spawn.target` /
   `spawn.direction`: under broker they are stable fixed values the adapter
   resolves, not a geometry choice.
 
@@ -335,7 +348,8 @@ loop once every worker pane has closed.
 > - **Pane enumeration / closing** — `mcp__renga-peers__list_panes` /
 >   `close_pane`.
 > - **Raw key input** — `mcp__renga-peers__send_keys` (Shift+Tab, Enter,
->   Esc, etc.).
+>   Esc, etc.). Startup prompts of a new worker are keyed only as
+>   `approve_spawn_prompts` decides, never with a blind Enter.
 
 ### One monitoring cycle (every 1 minute)
 

@@ -1661,3 +1661,60 @@ def test_cli_bad_env_transport_returns_one(tmp_path: Path, capsys, monkeypatch) 
     rc = _run_cli(tmp_path, task_path, panes_path)
     assert rc == 1
     assert "transport" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
+# approve_spawn_prompts (plan_version 2)
+# ---------------------------------------------------------------------------
+
+
+def _assert_approve_step(plan: ActionPlan) -> None:
+    from claude_org_runtime.dispatcher.spawn_prompt import (
+        DEFAULT_APPROVAL_DEADLINE_MS,
+    )
+
+    assert [s["tool"] for s in plan.after_spawn] == [
+        "poll_events", "approve_spawn_prompts", "list_peers", "send_message",
+    ]
+    step = plan.after_spawn[1]
+    assert step["target"] == plan.spawn["name"]
+    assert step["inspect"]["target"] == plan.spawn["name"]
+    # Full screen: a bottom-N trim can cut a dialog off on a tall pane.
+    assert "lines" not in step["inspect"]
+    assert step["decide_argv"][0] == "spawn-prompt-step"
+    assert step["decide_argv"][-1] == str(DEFAULT_APPROVAL_DEADLINE_MS)
+    assert step["deadline_ms"] == DEFAULT_APPROVAL_DEADLINE_MS
+    assert step["escalate"]["message"].startswith("SPAWN_PROMPT_UNRESOLVED:")
+    assert "Never send a bare Enter" in step["instructions"]
+    assert "integer ms" in step["instructions"]
+
+
+def test_bind_window_covers_approval_deadline_plus_peer_wait() -> None:
+    # The #158 reservation clock starts at plan time; a slow approval pass
+    # that succeeds just before its deadline, then the ~30s peer-bind wait,
+    # must still land inside the window.
+    from claude_org_runtime.dispatcher.runner import WORKER_BIND_WINDOW_SECONDS
+    from claude_org_runtime.dispatcher.spawn_prompt import (
+        DEFAULT_APPROVAL_DEADLINE_MS,
+    )
+
+    assert WORKER_BIND_WINDOW_SECONDS > DEFAULT_APPROVAL_DEADLINE_MS / 1000 + 30
+
+
+def test_build_plan_after_spawn_approves_prompts_not_blind_enter(
+    tmp_path: Path,
+) -> None:
+    import dataclasses
+
+    task = {"task_id": "demo", "worker_dir": str(tmp_path), "instruction": "x"}
+    plan = build_plan(task, _ok_panes(), tmp_path / ".state")
+    _assert_approve_step(plan)
+    assert dataclasses.asdict(plan)["plan_version"] == 2
+
+
+def test_build_plan_broker_after_spawn_approves_prompts(tmp_path: Path) -> None:
+    plan = build_plan(
+        _broker_task(tmp_path), [], tmp_path / ".state", transport="broker",
+    )
+    assert plan.status == "ready_to_spawn"
+    _assert_approve_step(plan)
