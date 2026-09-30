@@ -488,3 +488,32 @@ def test_e2e_never_resolves_escalates_without_enter(
     code, sent = _drive(monkeypatch, capsys, [stuck], deadline_ms=5000)
     assert code == 10
     assert sent == []
+
+
+# --- renga grid output drops inter-word spaces -------------------------------
+
+def _squash(screen: list[str]) -> list[str]:
+    return [ln.replace(" ", "") if not ln.startswith(("❯", " ")) else
+            ln[:1] + ln[1:].replace(" ", "") for ln in screen]
+
+
+@pytest.mark.parametrize("screen,state", [
+    (DEV_CHANNEL, STATE_DEV_CHANNEL),
+    (FOLDER_TRUST_YES_SELECTED, STATE_FOLDER_TRUST),
+    (FOLDER_TRUST_OLD_ON_NO, STATE_FOLDER_TRUST),
+])
+def test_spaceless_screen_matches_spaced(screen: list[str], state: str) -> None:
+    sq = _squash(screen)
+    assert sq != screen
+    assert decide(sq, list(sq), 0) == decide(screen, list(screen), 0)
+    assert decide(sq, list(sq), 0)["state"] == state
+
+
+def test_spaceless_cursor_on_reject_moves_not_enters() -> None:
+    sq = _squash(DEV_CHANNEL_ON_EXIT)
+    assert decide(sq, list(sq), 0)["send_keys"] == {"keys": ["Up"]}
+
+
+def test_spaceless_unknown_dialog_footer_waits() -> None:
+    r = decide(["Somenewdialog", "❯1.Foo", "Entertoconfirm"], None, 0)
+    assert r["state"] == STATE_UNKNOWN
