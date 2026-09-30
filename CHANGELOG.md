@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.45] - 2026-09-30
+
+### Fixed
+
+- **Spawn prompt dialogs are matched regardless of inter-word spaces
+  (#189).** The dispatcher's spawn-prompt-step screen inspection no longer
+  misses a dialog when the terminal capture drops or collapses the spaces
+  between words.
+
 ## [0.1.44] - 2026-09-25
 
 ### Fixed
