@@ -76,7 +76,7 @@ DEFAULT_APPROVAL_DEADLINE_MS = 120000
 
 _CURSORS = ("❯", ">")
 # "esc to cancel" is deliberately absent: it is also a busy marker.
-_SELECTION_FOOTERS = ("enter to confirm", "enter to select", "↑/↓ to navigate")
+_SELECTION_FOOTERS = ("entertoconfirm", "entertoselect", "↑/↓tonavigate")  # spaceless
 _FENCE_CHARS = frozenset("─━-")
 _OPTION_NUMBER = re.compile(r"^\d+[.)]\s*")
 
@@ -143,12 +143,13 @@ def _find_dialog(norm: list[str], state: str) -> tuple[list[int], list[int]]:
     accepts: list[int] = []
     rejects: list[int] = []
     for i, ln in enumerate(norm):
-        label = _label(ln)
+        # Spaceless compare: renga's grid output can drop inter-word spaces.
+        label = _label(ln).replace(" ", "")
         if state == STATE_FOLDER_TRUST:
-            is_accept = "yes, i trust this folder" in label or "yes, proceed" in label
-            is_reject = "no, exit" in label
+            is_accept = "yes,itrustthisfolder" in label or "yes,proceed" in label
+            is_reject = "no,exit" in label
         else:
-            is_accept = "i am using this for local development" in label
+            is_accept = "iamusingthisforlocaldevelopment" in label
             is_reject = label == "exit"
         if is_accept:
             accepts.append(i)
@@ -208,7 +209,7 @@ def _decide(screen: list[str], previous_screen: list[str] | None) -> dict[str, A
                 "send_keys": {"keys": [key]},
                 "reason": f"cursor not on accept row; move {key}"}
 
-    if any(f in ln for ln in norm for f in _SELECTION_FOOTERS):
+    if any(f in ln.replace(" ", "") for ln in norm for f in _SELECTION_FOOTERS):
         return {"state": STATE_UNKNOWN, "action": ACTION_WAIT,
                 "reason": "unrecognized selection dialog is visible"}
     if _composer_visible(norm):
