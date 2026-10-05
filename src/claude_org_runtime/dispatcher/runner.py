@@ -255,6 +255,57 @@ _DISPATCHER_NARROW_PRIORITY = 0
 # feedback note.
 DEFAULT_WORKER_MODEL = "opus"
 
+# Worker-only sandbox overlay, passed as ``--settings`` on every worker spawn.
+# Claude Code honors ``network.strictAllowlist`` and ``sandbox.credentials``
+# file entries only from user / managed / ``--settings`` scopes, never from the
+# project ``.claude/settings*.json`` the worker body lives in
+# (https://code.claude.com/docs/en/sandboxing "Network isolation",
+# "Protect credentials", "Locks that apply without an admin-required
+# sandbox"). gh stays fully unusable inside the sandbox: the token file and
+# token env vars are denied, not masked -- mask + tlsTerminate cannot limit gh
+# to read-only (the proxy does no content filtering), so masking would hand
+# workers gh write access guarded only by hooks.
+# - ``allowedDomains`` is repeated here because a ``--settings``
+#   strictAllowlist makes Claude Code ignore the project's allowedDomains.
+#   Keep it in sync with the claude-org-ja worker_roles sandbox list.
+# - Do NOT add ``allowUnsandboxedCommands: false`` here: set via
+#   ``--settings`` it makes the sandbox admin-required, which drops the
+#   project's additionalDirectories (Pattern B .git write surface) and
+#   excludedCommands (docker). The project body already sets it.
+WORKER_SANDBOX_SETTINGS: dict[str, Any] = {
+    "sandbox": {
+        "network": {
+            "strictAllowlist": True,
+            "allowedDomains": [
+                "github.com",
+                "api.github.com",
+                "codeload.github.com",
+                "*.githubusercontent.com",
+                "pypi.org",
+                "files.pythonhosted.org",
+                "registry.npmjs.org",
+                "chatgpt.com",
+                "*.chatgpt.com",
+                "developers.openai.com",
+                "api.openai.com",
+                "*.oaiusercontent.com",
+            ],
+        },
+        "credentials": {
+            "files": [{"path": "~/.config/gh/hosts.yml", "mode": "deny"}],
+            "envVars": [
+                {"name": name, "mode": "deny"}
+                for name in (
+                    "GH_TOKEN",
+                    "GITHUB_TOKEN",
+                    "GH_ENTERPRISE_TOKEN",
+                    "GITHUB_ENTERPRISE_TOKEN",
+                )
+            ],
+        },
+    }
+}
+
 
 # ----------------------------------------------------------------------------
 # Backend-aware capacity policy (runtime Issue #99)
@@ -2634,6 +2685,20 @@ def build_plan(
         plan.status = "input_invalid"
         plan.errors.append(cwd_err)
         return plan
+    # The spawn appends WORKER_SANDBOX_SETTINGS as ``--settings``; Claude Code
+    # keeps only the last value of that flag, so a caller-supplied one would be
+    # silently dropped. Refuse instead of merging (a path value would have to
+    # be read and re-serialized here).
+    if any(
+        str(a) == "--settings" or str(a).startswith("--settings=")
+        for a in (task.get("args") or [])
+    ):
+        plan.status = "input_invalid"
+        plan.errors.append(
+            "task.args must not contain --settings: worker spawns already "
+            "carry the worker sandbox overlay as --settings"
+        )
+        return plan
 
     worker_name = f"worker-{task_id}"
     # Duplicate-name guard, WIDENED by #158 -- a UNION, never a replacement.
@@ -3012,8 +3077,11 @@ def build_plan(
     spawn["model"] = model
     if placement.selector is not None:
         spawn["tab"] = dict(placement.selector)
-    if extra_args:
-        spawn["args"] = list(extra_args)
+    spawn["args"] = [
+        *extra_args,
+        "--settings",
+        json.dumps(WORKER_SANDBOX_SETTINGS, separators=(",", ":")),
+    ]
     plan.spawn = spawn
 
     plan.after_spawn = [
