@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.46] - 2026-10-05
+
+### Added
+
+- **Worker spawns pass worker-only sandbox settings via `--settings`
+  (#191).** The dispatcher now attaches `--settings` with `strictAllowlist`,
+  `allowedDomains` and a `gh` credential deny to worker spawns. A `--settings`
+  in task args is rejected with `input_invalid`.
+
 ## [0.1.45] - 2026-09-30
 
 ### Fixed
