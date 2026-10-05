@@ -94,6 +94,7 @@ _PRE_158_PLAN_KEYS = [
 
 # The spawn dict key order as it stood before #158 (git HEAD runner.py:962-971).
 # Order is pinned, not just membership: consumers diff these plans by eye.
+# Every worker spawn now also ends with "args" (the --settings sandbox overlay).
 _PRE_158_SPAWN_KEYS = [
     "tool",
     "target",
@@ -1373,7 +1374,7 @@ def test_build_plan_renga_default_plan_adds_only_null_keys(
     assert d["status"] == "ready_to_spawn"
     # The spawn dict keeps its pre-#158 keys AND their order: no tab key, and
     # nothing reshuffled by the incremental assembly the tab:{new} shape needs.
-    assert list(d["spawn"]) == _PRE_158_SPAWN_KEYS
+    assert list(d["spawn"]) == _PRE_158_SPAWN_KEYS + ["args"]
     assert d["spawn"]["target"] == "dispatcher"
 
 
@@ -1621,7 +1622,7 @@ def test_cli_omitting_peers_json_matches_today(
     assert plan["layout"] is None
     assert plan["on_spawn_error"] is None
     assert plan["capacity"] is None
-    assert list(plan["spawn"]) == _PRE_158_SPAWN_KEYS
+    assert list(plan["spawn"]) == _PRE_158_SPAWN_KEYS + ["args"]
     assert plan["spawn"]["target"] == "dispatcher"
 
 

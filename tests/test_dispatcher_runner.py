@@ -725,6 +725,36 @@ def test_build_plan_ready_to_spawn(tmp_path: Path) -> None:
     assert plan.errors == []
 
 
+def test_build_plan_worker_spawn_carries_sandbox_settings(tmp_path: Path) -> None:
+    task = {
+        "task_id": "demo",
+        "worker_dir": str(tmp_path),
+        "instruction": "do the thing",
+        "args": ["--verbose"],
+    }
+    plan = build_plan(task, _ok_panes(), tmp_path / ".state")
+    args = plan.spawn["args"]
+    # caller args survive; the overlay is appended once
+    assert args[0] == "--verbose"
+    assert args.count("--settings") == 1
+    settings = json.loads(args[args.index("--settings") + 1])
+    sandbox = settings["sandbox"]
+    assert sandbox["network"]["strictAllowlist"] is True
+    # strictAllowlist via --settings drops the project allowedDomains, so the
+    # overlay must carry the hosts workers need itself
+    assert {"github.com", "pypi.org", "registry.npmjs.org", "chatgpt.com"} <= set(
+        sandbox["network"]["allowedDomains"]
+    )
+    assert {"path": "~/.config/gh/hosts.yml", "mode": "deny"} in sandbox[
+        "credentials"
+    ]["files"]
+    denied_env = {e["name"] for e in sandbox["credentials"]["envVars"]}
+    assert {"GH_TOKEN", "GITHUB_TOKEN"} <= denied_env
+    assert all(e["mode"] == "deny" for e in sandbox["credentials"]["envVars"])
+    # would make the sandbox admin-required and drop the project write surface
+    assert "allowUnsandboxedCommands" not in sandbox
+
+
 def test_build_plan_input_invalid_bad_task_id(tmp_path: Path) -> None:
     plan = build_plan(
         {"task_id": "", "worker_dir": str(tmp_path)},
