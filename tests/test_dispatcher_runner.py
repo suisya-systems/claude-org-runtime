@@ -755,6 +755,18 @@ def test_build_plan_worker_spawn_carries_sandbox_settings(tmp_path: Path) -> Non
     assert "allowUnsandboxedCommands" not in sandbox
 
 
+@pytest.mark.parametrize(
+    "args", [["--settings", "x.json"], ['--settings={"a":1}']]
+)
+def test_build_plan_rejects_caller_settings(tmp_path: Path, args: list) -> None:
+    # Claude Code keeps only the last --settings, so a caller one would be lost
+    task = {"task_id": "demo", "worker_dir": str(tmp_path), "args": args}
+    plan = build_plan(task, _ok_panes(), tmp_path / ".state")
+    assert plan.status == "input_invalid"
+    assert plan.spawn is None
+    assert "--settings" in plan.errors[0]
+
+
 def test_build_plan_input_invalid_bad_task_id(tmp_path: Path) -> None:
     plan = build_plan(
         {"task_id": "", "worker_dir": str(tmp_path)},

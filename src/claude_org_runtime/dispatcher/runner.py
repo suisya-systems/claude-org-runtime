@@ -2685,6 +2685,20 @@ def build_plan(
         plan.status = "input_invalid"
         plan.errors.append(cwd_err)
         return plan
+    # The spawn appends WORKER_SANDBOX_SETTINGS as ``--settings``; Claude Code
+    # keeps only the last value of that flag, so a caller-supplied one would be
+    # silently dropped. Refuse instead of merging (a path value would have to
+    # be read and re-serialized here).
+    if any(
+        str(a) == "--settings" or str(a).startswith("--settings=")
+        for a in (task.get("args") or [])
+    ):
+        plan.status = "input_invalid"
+        plan.errors.append(
+            "task.args must not contain --settings: worker spawns already "
+            "carry the worker sandbox overlay as --settings"
+        )
+        return plan
 
     worker_name = f"worker-{task_id}"
     # Duplicate-name guard, WIDENED by #158 -- a UNION, never a replacement.
