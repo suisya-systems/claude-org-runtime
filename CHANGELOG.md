@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`Bash(git stash:*)` dropped from the bundled org extension schema** (4
+  entries). Worker stash mutations are denied by the ja-side PreToolUse hook
+  anyway; this removes the contradictory allow. Needs a paired ja schema sync
+  (#175).
+
 ## [0.1.47] - 2026-10-08
 
 ### Fixed
