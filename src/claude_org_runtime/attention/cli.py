@@ -249,8 +249,9 @@ def _record_watch_stopped(db_path: Path, payload: dict) -> None:
     stderr only. Called on the way out, so it must never raise; the DB
     write goes first because stderr may already be dead.
     """
-    if db_path.exists():
-        try:
+    try:
+        # exists() inside the guard: an unreadable state dir raises too.
+        if db_path.exists():
             conn = sqlite3.connect(
                 f"file:{db_path.as_posix()}?mode=rw", uri=True, timeout=5,
             )
@@ -271,11 +272,11 @@ def _record_watch_stopped(db_path: Path, payload: dict) -> None:
                     )
             finally:
                 conn.close()
-        except Exception as exc:  # noqa: BLE001 - must not mask the exit
-            _warn(
-                f"warning: could not record attention_watch_stopped in "
-                f"{db_path}: {exc}"
-            )
+    except Exception as exc:  # noqa: BLE001 - must not mask the exit
+        _warn(
+            f"warning: could not record attention_watch_stopped in "
+            f"{db_path}: {exc}"
+        )
     _warn(
         f"attention watch stopped: {json.dumps(payload, ensure_ascii=False)}"
     )
