@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -217,6 +219,61 @@ def cmd_attention_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+class _StopSignal(BaseException):
+    """Raised from a SIGTERM / SIGHUP handler so the stop gets recorded."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _raise_stop(signum, _frame) -> None:
+    raise _StopSignal(signum)
+
+
+def _record_watch_stopped(db_path: Path, payload: dict) -> None:
+    """Append ``attention_watch_stopped`` to ``state.db`` ``events`` (Issue #182).
+
+    Pairs with the ``attention_watch_started`` row the launcher writes,
+    so a dead watcher leaves a readable reason instead of nothing. Best
+    effort: the schema is owned by claude-org-ja, so a missing DB or
+    ``events`` table is not created here, and any failure is reported on
+    stderr only. Called on the way out, so it must never raise.
+    """
+    print(
+        f"attention watch stopped: {json.dumps(payload, ensure_ascii=False)}",
+        file=sys.stderr,
+    )
+    if not db_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=rw", uri=True, timeout=5,
+        )
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO events (occurred_at, actor, kind, payload_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds")
+                        .replace("+00:00", "Z"),
+                        "attention_watch",
+                        "attention_watch_stopped",
+                        json.dumps(payload, ensure_ascii=False),
+                    ),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - recording must not mask the exit
+        print(
+            f"warning: could not record attention_watch_stopped in "
+            f"{db_path}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def cmd_attention_watch(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
     cfg = _load_cfg_or_exit(args.config)
@@ -226,6 +283,21 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
     interval = max(1, int(cfg.poll_interval_sec))
     max_iterations: Optional[int] = getattr(args, "max_iterations", None)
     count = 0
+    # SIGTERM / SIGHUP (pane closed) would otherwise kill the process
+    # without running any Python code, i.e. without a record.
+    stop_signals = [
+        sig for sig in (
+            getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None),
+        ) if sig is not None
+    ]
+    previous = {}
+    for sig in stop_signals:
+        try:
+            previous[sig] = signal.signal(sig, _raise_stop)
+        except ValueError:  # not the main thread (embedded use)
+            pass
+    payload: dict = {"reason": "max_iterations"}
+    rc = 0
     try:
         while True:
             _scan_once(
@@ -239,8 +311,24 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("attention watch interrupted", file=sys.stderr)
-    return 0
+        payload = {"reason": "interrupted"}
+    except _StopSignal as exc:
+        payload = {
+            "reason": "signal", "signal": signal.Signals(exc.signum).name,
+        }
+        rc = 128 + exc.signum
+    except BaseException as exc:
+        payload = {
+            "reason": "exception",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        payload["iterations"] = count
+        _record_watch_stopped(_state_paths(state_dir)[0], payload)
+    return rc
 
 
 def add_subparsers(

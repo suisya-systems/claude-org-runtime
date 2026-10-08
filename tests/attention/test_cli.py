@@ -8,6 +8,7 @@ criteria around ``--dry-run`` and dedup state recovery.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -224,6 +225,103 @@ def test_watch_exits_on_max_iterations(
     ])
     rc = args.func(args)
     assert rc == 0
+
+
+def _stopped_rows(state_dir: Path) -> list[dict]:
+    conn = sqlite3.connect(state_dir / "state.db")
+    try:
+        rows = conn.execute(
+            "SELECT actor, payload_json FROM events "
+            "WHERE kind = 'attention_watch_stopped'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert all(actor == "attention_watch" for actor, _ in rows)
+    return [json.loads(p) for _, p in rows]
+
+
+def _watch_args(state_dir: Path, *extra: str):
+    return build_top_parser().parse_args([
+        "attention", "watch", "--state-dir", str(state_dir), *extra,
+    ])
+
+
+def test_watch_records_stop_on_clean_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #182: an orderly return leaves ``attention_watch_stopped``."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    monkeypatch.setattr(attention_cli.time, "sleep", lambda _s: None)
+    args = _watch_args(state_dir, "--max-iterations", "2")
+    assert args.func(args) == 0
+    assert _stopped_rows(state_dir) == [
+        {"reason": "max_iterations", "iterations": 2},
+    ]
+
+
+def test_watch_records_stop_on_unhandled_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #182: a crash is recorded with its error, then re-raised."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("scan blew up")
+
+    monkeypatch.setattr(attention_cli, "_scan_once", _boom)
+    args = _watch_args(state_dir)
+    with pytest.raises(RuntimeError, match="scan blew up"):
+        args.func(args)
+    assert _stopped_rows(state_dir) == [{
+        "reason": "exception",
+        "error": "RuntimeError: scan blew up",
+        "iterations": 0,
+    }]
+
+
+@pytest.mark.skipif(
+    not hasattr(attention_cli.signal, "SIGTERM")
+    or not hasattr(attention_cli.signal, "SIGHUP"),
+    reason="POSIX stop signals only",
+)
+def test_watch_records_stop_on_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #182: SIGTERM is recorded and the handler is restored."""
+    import os
+    import signal
+
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(
+        attention_cli.time, "sleep",
+        lambda _s: os.kill(os.getpid(), signal.SIGTERM),
+    )
+    args = _watch_args(state_dir)
+    assert args.func(args) == 128 + signal.SIGTERM
+    assert _stopped_rows(state_dir) == [
+        {"reason": "signal", "signal": "SIGTERM", "iterations": 1},
+    ]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_watch_stop_without_state_db_goes_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """No ``state.db``: nothing is created, the stop still reaches stderr."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    monkeypatch.setattr(attention_cli.time, "sleep", lambda _s: None)
+    args = _watch_args(state_dir, "--max-iterations", "1")
+    assert args.func(args) == 0
+    assert not (state_dir / "state.db").exists()
+    assert "attention watch stopped" in capsys.readouterr().err
 
 
 def test_scan_with_template_config(tmp_path: Path, capsys) -> None:

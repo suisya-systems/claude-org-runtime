@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`attention watch` records its own exit (#182).** Every way out of the
+  watch loop now appends an `attention_watch_stopped` row (actor
+  `attention_watch`) to `.state/state.db` `events`, pairing with the
+  launcher's `attention_watch_started`, and prints the same payload to
+  stderr. `reason` is `exception` (with `error`, then re-raised),
+  `signal` (SIGTERM / SIGHUP, e.g. the pane closing), `interrupted`
+  (Ctrl-C) or `max_iterations`; `iterations` counts completed scans. A
+  missing `state.db` / `events` table is not created, and a failed write
+  only warns on stderr.
+
 ### Removed
 
 - **`Bash(git stash:*)` dropped from the bundled org extension schema** (4
