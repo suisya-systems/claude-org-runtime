@@ -346,6 +346,21 @@ def test_watch_stop_recorded_when_stderr_is_dead(
     ]
 
 
+def test_watch_records_stop_on_bad_config(tmp_path: Path) -> None:
+    """A startup failure (malformed --config) is recorded too."""
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    cfg_path = tmp_path / "attention.json"
+    cfg_path.write_text("{not json", encoding="utf-8")
+    args = _watch_args(state_dir, "--config", str(cfg_path))
+    with pytest.raises(SystemExit):
+        args.func(args)
+    assert _stopped_rows(state_dir) == [{
+        "reason": "exception", "error": "SystemExit: 2", "iterations": 0,
+    }]
+
+
 def test_scan_with_template_config(tmp_path: Path, capsys) -> None:
     """§6 integration: template override flows end-to-end."""
     state_dir = tmp_path / ".state"

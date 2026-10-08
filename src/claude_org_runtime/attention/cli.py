@@ -283,11 +283,6 @@ def _record_watch_stopped(db_path: Path, payload: dict) -> None:
 
 def cmd_attention_watch(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
-    cfg = _load_cfg_or_exit(args.config)
-    broker_state_dir = _resolve_broker_state_dir(
-        state_dir, getattr(args, "broker_state_dir", None),
-    )
-    interval = max(1, int(cfg.poll_interval_sec))
     max_iterations: Optional[int] = getattr(args, "max_iterations", None)
     count = 0
     # SIGTERM / SIGHUP (pane closed) would otherwise kill the process
@@ -306,6 +301,13 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
     payload: dict = {"reason": "max_iterations"}
     rc = 0
     try:
+        # Startup is inside the guard too: a bad --config must not leave
+        # the launcher's attention_watch_started unmatched.
+        cfg = _load_cfg_or_exit(args.config)
+        broker_state_dir = _resolve_broker_state_dir(
+            state_dir, getattr(args, "broker_state_dir", None),
+        )
+        interval = max(1, int(cfg.poll_interval_sec))
         while True:
             _scan_once(
                 state_dir, cfg,
