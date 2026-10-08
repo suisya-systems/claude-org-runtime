@@ -9,7 +9,7 @@ can consume. The classification table is the §5 design doc verbatim.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Literal, Mapping, Optional
 
@@ -462,6 +462,7 @@ def classify_all(
     pending_decision_drop: int = 10080,
     broker_duplicates: Iterable[Mapping[str, Any]] = (),
     broker_delivery_signals: Iterable[Mapping[str, Any]] = (),
+    event_window_sec: int = 0,
 ) -> list[AttentionEvent]:
     """Classify all inputs in order: DB events, pending, broker journal.
 
@@ -471,12 +472,30 @@ def classify_all(
     ``broker_duplicates`` (Issue #167) and ``broker_delivery_signals``
     (Issue #166) default to empty for the same reason — callers that do
     not read the broker journal are unchanged.
+
+    ``event_window_sec`` (Issue #181): a ``state.db`` event whose
+    ``occurred_at`` is older than this is marked ``suppressed``, so a
+    watcher starting on a months-old backlog lists it in ``scan --json``
+    without ringing. ``0`` disables the window. A missing or malformed
+    ``occurred_at`` is never suppressed: an unknown age must not hide a
+    signal.
     """
     out: list[AttentionEvent] = []
     for row in events:
         ev = classify_event(row, notify_map=notify_map)
-        if ev is not None:
-            out.append(ev)
+        if ev is None:
+            continue
+        if event_window_sec > 0:
+            occurred = (
+                _parse_iso(ev.created_at)
+                if isinstance(ev.created_at, str) else None
+            )
+            if (
+                occurred is not None
+                and (now - occurred).total_seconds() > event_window_sec
+            ):
+                ev = replace(ev, suppressed=True)
+        out.append(ev)
     for entry in pending:
         ev = classify_pending(
             entry, now, pending_decision_min, user_replied_min,

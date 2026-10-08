@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`attention watch` no longer replays the event backlog (#181).** A
+  `state.db` event row whose `occurred_at` is older than the new
+  `event_window_sec` attention config knob (default `3600`, `0` disables) is
+  marked `suppressed`: `attention scan --json` still lists it, but it is
+  never notified. Before, a watcher started without a matching
+  `attention_notified.json` rang urgent notifications for months-old rows.
+  Rows with a missing or malformed `occurred_at` still notify.
 - **`attention watch` records its own exit (#182).** Every way out of the
   watch loop now appends an `attention_watch_stopped` row (actor
   `attention_watch`) to `.state/state.db` `events`, pairing with the
