@@ -74,6 +74,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ..transport import descriptor as transport_descriptor
+from .deny_paths import (
+    PERMISSION_DENY_LAYER,
+    SANDBOX_DENY_KEYS,
+    resolve_deny_entry,
+)
 
 # Keys under worker_roles[<role>] / roles[<role>] that are *not* part of the
 # emitted settings.local.json content. ``sandbox_by_pattern`` (Phase 1
@@ -398,7 +403,7 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
     will surface any malformed entries directly).
     """
     if isinstance(entry, str):
-        if entry.startswith("/"):
+        if os.path.isabs(entry):
             return _NormalizedSandboxEntry(
                 anchor="absolute",
                 path=entry,
@@ -473,16 +478,6 @@ def _normalize_sandbox_entry(entry: Any) -> _NormalizedSandboxEntry | None:
 # weaken the Layer 2 tool-level block either -- Claude Code resolves symlinks
 # when matching ``Read`` / ``Edit`` deny rules, so the realpath form still
 # blocks reads issued through the original symlinked path.
-
-# Layer 2 tools whose argument is a filesystem path. ``Read`` / ``Edit`` are
-# the pair Claude Code's sandbox docs name as contributing to the deny set;
-# ``Write`` is included because this repo's own schema and docs treat it as a
-# Layer 2 filesystem deny (``role_configs_schema.json`` ships
-# ``Write(*/workers/*/...)`` entries). Canonicalizing a rule that turns out
-# not to reach bwrap is harmless -- the realpath form denies the same files,
-# since path matching resolves symlinks -- whereas omitting one that does
-# reach it leaves the sandbox-launch failure in place.
-_PERMISSION_PATH_TOOLS = ("Read", "Edit", "Write")
 
 # Committed ``.env`` templates that hold no secrets. The single definition of
 # the carve-out from the ``Read(.env)`` / ``Read(.env.*)`` credential denies:
@@ -577,47 +572,6 @@ def _absolute_symlink_in_chain(
     return None
 
 
-def _split_permission_rule(rule: Any) -> tuple[str, str] | None:
-    """Split ``'Read(~/.aws/*)'`` into ``('Read', '~/.aws/*')``.
-
-    Returns ``None`` for anything that is not a well-formed
-    ``Tool(argument)`` string so the caller passes it through untouched.
-    """
-    if not isinstance(rule, str) or not rule.endswith(")"):
-        return None
-    open_idx = rule.find("(")
-    if open_idx <= 0:
-        return None
-    return rule[:open_idx], rule[open_idx + 1 : -1]
-
-
-def _permission_rule_host_path(spec: str) -> str | None:
-    """Absolute host path a ``Read`` / ``Edit`` rule spec anchors at.
-
-    Per https://code.claude.com/docs/en/permissions the Read/Edit rule
-    syntax uses ``//path`` for an absolute path and ``~/`` for a
-    home-relative one; a bare or single-slash spec is project-relative.
-    Only the first two name a concrete host path that Claude Code can
-    expand into the bwrap deny set, so everything else returns ``None``
-    and is left alone. Unanchored globs such as ``**/credentials*`` land
-    here too, which matches the observed behavior: they never made bwrap
-    fail because they are not expanded into host paths.
-
-    Only the anchor is substituted; the remainder keeps the rule's own
-    ``/`` separators rather than being normalized to the platform's. On
-    Windows that yields a mixed spelling (``C:\\Users\\u/.aws/*``), which
-    is deliberate: the value is a permission-rule path, whose grammar
-    separates with ``/``, and every OS accepts ``/`` for the filesystem
-    probing this feeds. Normalizing would rewrite the glob tail into a
-    spelling the rule grammar does not use.
-    """
-    if spec.startswith("~/"):
-        return os.path.expanduser("~") + spec[1:]
-    if spec.startswith("//"):
-        return spec[1:]
-    return None
-
-
 def _canonicalize_escaping_path(
     absolute_path: str,
     *,
@@ -664,103 +618,56 @@ class SandboxPathRewrite:
     realpath: str
 
 
-def _canonicalize_permission_deny(
-    deny: list,
-    *,
-    realpath_fn: Callable[[str], str] = os.path.realpath,
-    symlink_probe_fn: Callable[[str], str | None] | None = None,
-) -> tuple[list, list[SandboxPathRewrite]]:
-    """Canonicalize Layer 2 ``permissions.deny`` ``Read`` / ``Edit`` rules.
-
-    Layer 2 is not merely a tool-level guard: Claude Code folds these
-    rules into the bwrap deny set, so a ``Read(~/.aws/*)`` mirror kept as
-    a *compensating control* for a suppressed Layer 3 entry is exactly
-    what re-injects the unbindable path and takes the whole sandbox down.
-    Rewriting to the realpath keeps both guarantees.
-    """
-    out: list = []
-    rewrites: list[SandboxPathRewrite] = []
-    for rule in deny:
-        parsed = _split_permission_rule(rule)
-        if parsed is None:
-            out.append(rule)
-            continue
-        tool, spec = parsed
-        if tool not in _PERMISSION_PATH_TOOLS:
-            out.append(rule)
-            continue
-        target = _permission_rule_host_path(spec)
-        if target is None:
-            out.append(rule)
-            continue
-        result = _canonicalize_escaping_path(
-            target, realpath_fn=realpath_fn, symlink_probe_fn=symlink_probe_fn
-        )
-        if result is None:
-            out.append(rule)
-            continue
-        rewritten_path, link, resolved = result
-        new_rule = f"{tool}(//{rewritten_path.lstrip('/')})"
-        out.append(new_rule)
-        rewrites.append(
-            SandboxPathRewrite(
-                layer="permissions.deny",
-                original=rule,
-                rewritten=new_rule,
-                symlink=link,
-                realpath=resolved,
-            )
-        )
-    return out, rewrites
-
-
-def _canonicalize_sandbox_deny(
+def _canonicalize_deny(
     entries: list,
     layer: str,
     *,
     realpath_fn: Callable[[str], str] = os.path.realpath,
     symlink_probe_fn: Callable[[str], str | None] | None = None,
 ) -> tuple[list, list[SandboxPathRewrite]]:
-    """Canonicalize *kept* Layer 3 deny entries.
+    """Rewrite deny entries of ``layer`` whose host path crosses an absolute symlink.
 
-    Escape suppression already drops entries that resolve outside the
-    sandbox read roots, but an entry can cross an absolute symlink and
-    still land inside them (e.g. a symlinked worker_dir). Those are kept
-    and would break bwrap just the same, so they are canonicalized here.
+    Which entries name a host path, and which path, is decided by
+    :func:`deny_paths.resolve_deny_entry` -- the same function
+    ``sandbox doctor`` uses, so the two cannot disagree on coverage.
 
-    ``~/``-anchored raw strings are expanded before the check. Claude
-    Code resolves that prefix against the home directory when building
-    the deny set (per its documented sandbox path prefixes), so
-    ``~/.aws/**`` reaches bwrap as an escaping absolute path even though
-    the *authored* string does not start with ``/``.
+    Layer 2 is not merely a tool-level guard: Claude Code folds
+    ``Read`` / ``Edit`` rules into the bwrap deny set, so a
+    ``Read(~/.aws/*)`` mirror kept as a *compensating control* for a
+    suppressed Layer 3 entry is exactly what re-injects the unbindable
+    path and takes the whole sandbox down. On Layer 3, escape suppression
+    already drops entries that resolve outside the sandbox read roots,
+    but an entry can cross an absolute symlink and still land inside
+    them (e.g. a symlinked worker_dir). Rewriting to the realpath keeps
+    the deny in both cases.
     """
     out: list = []
     rewrites: list[SandboxPathRewrite] = []
     for entry in entries:
-        if not isinstance(entry, str):
-            out.append(entry)
-            continue
-        probe = entry
-        if probe.startswith("~/"):
-            probe = os.path.expanduser("~") + probe[1:]
-        # isabs, not startswith("/"): a Windows entry begins with a drive
-        # letter, which the prefix test would pass over uncanonicalized.
-        if not os.path.isabs(probe):
-            out.append(entry)
-            continue
-        result = _canonicalize_escaping_path(
-            probe, realpath_fn=realpath_fn, symlink_probe_fn=symlink_probe_fn
+        target = resolve_deny_entry(entry, layer=layer)
+        result = (
+            None
+            if target is None
+            else _canonicalize_escaping_path(
+                target.path,
+                realpath_fn=realpath_fn,
+                symlink_probe_fn=symlink_probe_fn,
+            )
         )
         if result is None:
             out.append(entry)
             continue
         rewritten_path, link, resolved = result
-        out.append(rewritten_path)
+        if target.tool is None:
+            new_entry = rewritten_path
+        else:
+            new_entry = f"{target.tool}(//{rewritten_path.lstrip('/')})"
+        out.append(new_entry)
         rewrites.append(
             SandboxPathRewrite(
                 layer=layer,
                 original=entry,
-                rewritten=rewritten_path,
+                rewritten=new_entry,
                 symlink=link,
                 realpath=resolved,
             )
@@ -862,7 +769,7 @@ def _kept_entry_string(
     """
     if not isinstance(entry, dict):
         return entry
-    if substituted_path.startswith("/"):
+    if os.path.isabs(substituted_path):
         # Already absolute (anchor='absolute', or an absolute path under
         # any anchor): emit verbatim.
         return substituted_path
@@ -918,7 +825,7 @@ def _evaluate_sandbox_suppressions(
     # absent key should stay absent.
     if "additionalDirectories" in fs:
         new_fs["additionalDirectories"] = additional
-    for layer_key in ("denyRead", "denyWrite"):
+    for layer_key in SANDBOX_DENY_KEYS:
         entries = list(fs.get(layer_key) or [])
         kept: list[Any] = []
         for entry in entries:
@@ -931,7 +838,7 @@ def _evaluate_sandbox_suppressions(
             substituted_path = _substitute(normalized.path, mapping)
             anchor_base = _anchor_base_path(normalized.anchor, ctx)
             literal = _literal_path_prefix(substituted_path)
-            absolute_pattern = substituted_path.startswith("/")
+            absolute_pattern = os.path.isabs(substituted_path)
 
             anchored_relative_glob = False
             target_literal: str
@@ -1047,11 +954,11 @@ def _canonicalize_sandbox_filesystem(
         return sandbox, []
     rewrites: list[SandboxPathRewrite] = []
     new_fs = dict(fs)
-    for layer_key in ("denyRead", "denyWrite"):
+    for layer_key in SANDBOX_DENY_KEYS:
         entries = fs.get(layer_key)
         if not isinstance(entries, list):
             continue
-        canonical, layer_rewrites = _canonicalize_sandbox_deny(
+        canonical, layer_rewrites = _canonicalize_deny(
             entries,
             f"sandbox.filesystem.{layer_key}",
             realpath_fn=realpath_fn,
@@ -1391,8 +1298,9 @@ def render_role_with_metadata(
 
     permissions = rendered.get("permissions")
     if isinstance(permissions, dict) and isinstance(permissions.get("deny"), list):
-        canonical_deny, deny_rewrites = _canonicalize_permission_deny(
+        canonical_deny, deny_rewrites = _canonicalize_deny(
             permissions["deny"],
+            PERMISSION_DENY_LAYER,
             realpath_fn=realpath_fn,
             symlink_probe_fn=symlink_probe_fn,
         )

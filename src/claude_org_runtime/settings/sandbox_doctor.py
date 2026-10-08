@@ -46,13 +46,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .generator import (
-    _absolute_symlink_in_chain,
-    _literal_path_prefix,
-    _permission_rule_host_path,
-    _split_permission_rule,
-    _PERMISSION_PATH_TOOLS,
+from .deny_paths import (
+    PERMISSION_DENY_LAYER,
+    SANDBOX_DENY_KEYS,
+    resolve_deny_entry,
 )
+from .generator import _absolute_symlink_in_chain, _literal_path_prefix
 
 # Status values for a single deny target.
 STATUS_OK = "ok"
@@ -212,78 +211,47 @@ def collect_deny_targets(
     Only entries that name a *concrete host path* are collected;
     project-relative and unanchored-glob rules are skipped because Claude
     Code does not expand them into host paths for the deny set.
-    """
-    targets: list[DenyTarget] = []
 
+    Which entries those are, and the host path each names, comes from
+    :func:`deny_paths.resolve_deny_entry` -- the function the generator
+    canonicalizes with -- so the doctor audits exactly what the generator
+    rewrites.
+    """
+    layers: list[tuple[str, list]] = []
     permissions = settings.get("permissions")
     if isinstance(permissions, dict):
-        for rule in permissions.get("deny") or []:
-            if not isinstance(rule, str):
-                targets.append(
-                    DenyTarget(
-                        layer="permissions.deny",
-                        source=rule,
-                        path="",
-                        source_file=source_file,
-                    )
-                )
-                continue
-            parsed = _split_permission_rule(rule)
-            if parsed is None:
-                continue
-            tool, spec = parsed
-            if tool not in _PERMISSION_PATH_TOOLS:
-                continue
-            host_path = _permission_rule_host_path(spec)
-            if host_path is None:
-                continue
-            targets.append(
-                DenyTarget(
-                    layer="permissions.deny",
-                    source=rule,
-                    path=host_path,
-                    source_file=source_file,
-                )
-            )
-
+        layers.append((PERMISSION_DENY_LAYER, permissions.get("deny") or []))
     sandbox = settings.get("sandbox")
     if isinstance(sandbox, dict):
         fs = sandbox.get("filesystem")
         if isinstance(fs, dict):
-            for key in ("denyRead", "denyWrite"):
-                for entry in fs.get(key) or []:
-                    if not isinstance(entry, str):
-                        # The renderer emits kept entries as strings; a
-                        # structured dict surviving into a rendered file
-                        # means the entry was malformed, so surface it
-                        # rather than skipping to a clean result.
-                        targets.append(
-                            DenyTarget(
-                                layer=f"sandbox.filesystem.{key}",
-                                source=entry,
-                                path="",
-                                source_file=source_file,
-                            )
-                        )
-                        continue
-                    path = entry
-                    if path.startswith("~/"):
-                        path = os.path.expanduser("~") + path[1:]
-                    # isabs, not startswith("/"): on Windows an expanded
-                    # entry begins with a drive letter, so the prefix test
-                    # would drop every concrete Layer 3 target and leave
-                    # the report claiming there was nothing to check.
-                    if not os.path.isabs(path):
-                        continue
-                    targets.append(
-                        DenyTarget(
-                            layer=f"sandbox.filesystem.{key}",
-                            source=entry,
-                            path=path,
-                            source_file=source_file,
-                        )
-                    )
+            for key in SANDBOX_DENY_KEYS:
+                layers.append((f"sandbox.filesystem.{key}", fs.get(key) or []))
 
+    targets: list[DenyTarget] = []
+    for layer, entries in layers:
+        for entry in entries:
+            if not isinstance(entry, str):
+                # A rendered file carries only string entries; a non-string
+                # surviving here is malformed, so surface it rather than
+                # skipping to a clean result.
+                targets.append(
+                    DenyTarget(
+                        layer=layer, source=entry, path="", source_file=source_file
+                    )
+                )
+                continue
+            resolved = resolve_deny_entry(entry, layer=layer)
+            if resolved is None:
+                continue
+            targets.append(
+                DenyTarget(
+                    layer=layer,
+                    source=entry,
+                    path=resolved.path,
+                    source_file=source_file,
+                )
+            )
     return targets
 
 

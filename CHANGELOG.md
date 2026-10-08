@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Deny-entry resolution has one implementation (#157).** The settings
+  generator's symlink canonicalization and `sandbox doctor` now both resolve
+  `permissions.deny` / `sandbox.filesystem.deny{Read,Write}` entries to host
+  paths through `settings/deny_paths.py:resolve_deny_entry`, so they can no
+  longer disagree on which entries name a host path (`~/` expansion, `//`
+  stripping, Windows drive paths). Absolute-path checks in the generator use
+  `os.path.isabs` instead of `startswith("/")`. A test pins that both sides
+  resolve the same host-path set.
+
 ### Removed
 
 - **`Bash(git stash:*)` dropped from the bundled org extension schema** (4
