@@ -324,6 +324,28 @@ def test_watch_stop_without_state_db_goes_to_stderr(
     assert "attention watch stopped" in capsys.readouterr().err
 
 
+def test_watch_stop_recorded_when_stderr_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A closed pane makes stderr raise; the DB row must still land."""
+    import io
+
+    class _DeadStream(io.StringIO):
+        def write(self, _s):
+            raise OSError(5, "Input/output error")
+
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    monkeypatch.setattr(attention_cli.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(attention_cli.sys, "stderr", _DeadStream())
+    args = _watch_args(state_dir, "--max-iterations", "1")
+    assert args.func(args) == 0
+    assert _stopped_rows(state_dir) == [
+        {"reason": "max_iterations", "iterations": 1},
+    ]
+
+
 def test_scan_with_template_config(tmp_path: Path, capsys) -> None:
     """§6 integration: template override flows end-to-end."""
     state_dir = tmp_path / ".state"

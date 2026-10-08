@@ -231,6 +231,14 @@ def _raise_stop(signum, _frame) -> None:
     raise _StopSignal(signum)
 
 
+def _warn(message: str) -> None:
+    """stderr that cannot raise: the pane may already be gone (EIO / EPIPE)."""
+    try:
+        print(message, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _record_watch_stopped(db_path: Path, payload: dict) -> None:
     """Append ``attention_watch_stopped`` to ``state.db`` ``events`` (Issue #182).
 
@@ -238,40 +246,39 @@ def _record_watch_stopped(db_path: Path, payload: dict) -> None:
     so a dead watcher leaves a readable reason instead of nothing. Best
     effort: the schema is owned by claude-org-ja, so a missing DB or
     ``events`` table is not created here, and any failure is reported on
-    stderr only. Called on the way out, so it must never raise.
+    stderr only. Called on the way out, so it must never raise; the DB
+    write goes first because stderr may already be dead.
     """
-    print(
-        f"attention watch stopped: {json.dumps(payload, ensure_ascii=False)}",
-        file=sys.stderr,
-    )
-    if not db_path.exists():
-        return
-    try:
-        conn = sqlite3.connect(
-            f"file:{db_path.as_posix()}?mode=rw", uri=True, timeout=5,
-        )
+    if db_path.exists():
         try:
-            with conn:
-                conn.execute(
-                    "INSERT INTO events (occurred_at, actor, kind, payload_json) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        datetime.now(timezone.utc)
-                        .isoformat(timespec="milliseconds")
-                        .replace("+00:00", "Z"),
-                        "attention_watch",
-                        "attention_watch_stopped",
-                        json.dumps(payload, ensure_ascii=False),
-                    ),
-                )
-        finally:
-            conn.close()
-    except Exception as exc:  # noqa: BLE001 - recording must not mask the exit
-        print(
-            f"warning: could not record attention_watch_stopped in "
-            f"{db_path}: {exc}",
-            file=sys.stderr,
-        )
+            conn = sqlite3.connect(
+                f"file:{db_path.as_posix()}?mode=rw", uri=True, timeout=5,
+            )
+            try:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO events "
+                        "(occurred_at, actor, kind, payload_json) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            datetime.now(timezone.utc)
+                            .isoformat(timespec="milliseconds")
+                            .replace("+00:00", "Z"),
+                            "attention_watch",
+                            "attention_watch_stopped",
+                            json.dumps(payload, ensure_ascii=False),
+                        ),
+                    )
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - must not mask the exit
+            _warn(
+                f"warning: could not record attention_watch_stopped in "
+                f"{db_path}: {exc}"
+            )
+    _warn(
+        f"attention watch stopped: {json.dumps(payload, ensure_ascii=False)}"
+    )
 
 
 def cmd_attention_watch(args: argparse.Namespace) -> int:
