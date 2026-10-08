@@ -154,6 +154,7 @@ class Broker(TokenMixin, StoreMixin):
         # (Issue #169)。adapter I/O を 1Hz の再試行で叩き続けない。
         self._stale_lease_probe_at: float = 0.0
         self._nudge_threads: dict[str, threading.Thread] = {}
+        self._lease_watch_armed: set[str] = set()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 

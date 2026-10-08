@@ -121,3 +121,50 @@ def test_nudge_single_flight_under_concurrent_sends(tmp_path):
     with b._lock:
         assert len(b._nudge_threads) == 1
     assert adapter.sent == []
+
+
+def _wait_sent(adapter: FakeAdapter, n: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with adapter._lock:
+            if len(adapter.sent) >= n:
+                return True
+        time.sleep(0.01)
+    return False
+
+
+def _claim_and_die(tmp_path, *, confirm: bool):
+    """enqueue -> 初回 nudge -> sidecar claim。confirm しなければ sidecar 死亡を模す。"""
+    adapter = FakeAdapter(IDLE_SCREEN)
+    b = Broker(state_dir=tmp_path, adapter=adapter, lease_seconds=0.2,
+               nudge_defer_interval=0.01)
+    src = _registered(b, "src")
+    dst = _registered(b, "dst", pane_id="%9")
+    dc = b.issue_delivery_cred("dst")
+    gen = b.register_delivery_instance(dc, "i1")["generation"]
+    b.enqueue(src, "dst", "survive-me")
+    assert _wait_sent(adapter, 1)
+    res = b.poll_claims(dc, gen, "i1")
+    assert len(res["rows"]) == 1
+    # 受信側は初回 nudge で check_messages するが live claim は返らない (stall の起点)。
+    assert b.drain(dst) == []
+    if confirm:
+        assert b.confirm_delivered(
+            dc, res["rows"][0]["id"], res["epoch"], gen, "i1")["ok"] is True
+    return b, adapter, dst
+
+
+def test_claim_before_confirm_death_renudges_on_lease_expiry(tmp_path):
+    # Issue #78: claim 後 confirm 前に sidecar が死んでも、他の RPC 無しで lease
+    # 失効時に reap + 再 nudge され、check_messages で配達される (at-least-once)。
+    b, adapter, dst = _claim_and_die(tmp_path, confirm=False)
+    assert _wait_sent(adapter, 2)
+    assert [m["message"] for m in b.drain(dst)] == ["survive-me"]
+
+
+def test_confirmed_claim_does_not_renudge(tmp_path):
+    b, adapter, _dst = _claim_and_die(tmp_path, confirm=True)
+    time.sleep(0.5)  # lease (0.2s) 失効後も再 nudge しない
+    assert len(adapter.sent) == 1
+    with b._lock:
+        assert b._lease_watch_armed == set()

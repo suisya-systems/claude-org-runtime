@@ -56,6 +56,9 @@ UNDELIVERED = "UNDELIVERED"
 CLAIMED = "CLAIMED"
 DELIVERED = "DELIVERED"
 
+# lease watch timer を lease 期限より僅かに遅らせる余裕 (reap は ``lease_until < now``)。
+_LEASE_WATCH_MARGIN = 0.05
+
 # ----------------------------------------------------------- delivery modes
 PUSH = "PUSH"
 PULL = "PULL"
@@ -317,6 +320,8 @@ class StoreMixin:
     # _stood_down は子プロセス内の Event で外から見えないため、daemon 側に「誰が・
     # なぜ・いつから claim していないか」を残して delivery_dump で観測可能にする。
     _delivery_standdowns: dict[str, dict[str, dict]]
+    # lease watch timer を張済の owner (Issue #78)。owner ごと高々 1 本に保つ。
+    _lease_watch_armed: set[str]
     state_dir: Path
     lease_seconds: float
     observer_lease_seconds: float
@@ -951,6 +956,52 @@ class StoreMixin:
                 # 印字する (当該行は UNDELIVERED へ戻っており pull 経路で拾われる)。
                 self._journal("reclaim_threshold_exceeded", id=rid, reclaim=reclaim)
 
+    def _arm_lease_watch(self, owner: str, delay: float) -> None:
+        """owner の claim lease 失効時に reap + 再 nudge する timer を張る (Issue #78)。
+
+        reap は RPC 契機の lazy 実行で nudge も出さないため、claim 後 confirm 前に
+        sidecar が死ぬと行は誰にも reap されず、受信側は check_messages を叩く契機を
+        失って silent stall する。claim 発行時にここで lease 期限の timer を張り、
+        失効時に reap して ``UNDELIVERED`` が残れば受信側を再 nudge する。owner ごと
+        高々 1 本 (発火時に残存 claim の最早期限へ張り直す) で timer 数を有界にする。
+        """
+        with self._lock:
+            if owner in self._lease_watch_armed:
+                return
+            self._lease_watch_armed.add(owner)
+        t = threading.Timer(delay, self._lease_watch_fire, args=(owner,))
+        t.daemon = True
+        t.start()
+
+    def _lease_watch_fire(self, owner: str) -> None:
+        target: "AgentBind | None" = None
+        next_expiry: float | None = None
+        with self._lock:
+            self._lease_watch_armed.discard(owner)
+            reaped = self._reap_locked()
+            undelivered = False
+            for row in self._rows.values():
+                if row.to_id != owner:
+                    continue
+                if row.state == UNDELIVERED:
+                    undelivered = True
+                elif row.state == CLAIMED:
+                    if next_expiry is None or row.lease_until < next_expiry:
+                        next_expiry = row.lease_until
+            if undelivered:
+                for b in self._binds.values():
+                    if (b.agent_id == owner and b.scope == "full"
+                            and b.registered and not b.revoked):
+                        target = b
+                        break
+        self._journal_reaped(reaped)
+        if target is not None:
+            self._trigger_nudge(target)
+        if next_expiry is not None:
+            # まだ live な claim (後続 poll の claim / 早着火) はその期限で再監視する。
+            self._arm_lease_watch(
+                owner, max(0.0, next_expiry - time.time()) + _LEASE_WATCH_MARGIN)
+
     # --------------------------------------------------------------- enqueue
     def enqueue(self, from_bind: "AgentBind", to_id: str, message: str) -> dict:
         """queue store 投入 (UNDELIVERED 行を作る) + フォールバック nudge trigger。
@@ -1300,6 +1351,7 @@ class StoreMixin:
                 "claimed", owner=owner,
                 ids=[c["id"] for c in claimed], epoch=claimed_epoch,
             )
+            self._arm_lease_watch(owner, self.lease_seconds + _LEASE_WATCH_MARGIN)
         return result
 
     # ------------------------------------------------------- confirm-delivered

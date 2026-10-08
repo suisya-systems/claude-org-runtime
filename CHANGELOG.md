@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config` is recorded as `exception`; `iterations` counts completed scans. A
   missing `state.db` / `events` table is not created, and a failed write
   only warns on stderr.
+- **Broker re-nudges when a sidecar dies between claim and confirm (#78).**
+  Lease reap only ran lazily inside RPCs and never nudged, so a claimed row
+  whose sidecar died before `/confirm-delivered` stalled silently:
+  `check_messages` skips live claims and no further nudge was sent. A claim
+  now arms a per-owner lease-expiry timer that reaps the expired claim and
+  re-nudges the recipient so `check_messages` picks the message up.
 
 ## [0.1.47] - 2026-10-08
 
