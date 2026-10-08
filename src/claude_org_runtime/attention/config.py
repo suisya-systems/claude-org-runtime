@@ -127,6 +127,13 @@ class AttentionConfig:
     # will not fire again to catch a later scan. A short window would
     # quietly drop a still-unresolved mute.
     delivery_signal_window_sec: int = 3600
+    # Issue #181: how old a ``state.db`` event row may be and still
+    # notify. ``dedup`` only remembers rows it has notified, so a watcher
+    # started against a DB it never saw (fresh install, wiped
+    # ``attention_notified.json``) would otherwise ring for the whole
+    # backlog. Older rows are marked ``suppressed``: still listed by
+    # ``attention scan --json``, never notified. ``0`` disables it.
+    event_window_sec: int = 3600
     max_title_chars: int = 80
     max_body_chars: int = 240
     # Sparse map of *explicit user overrides* only (Issue #26 round-4
@@ -199,6 +206,7 @@ def load_config(path: Path | None) -> AttentionConfig:
         "user_replied_min",
         "duplicate_sidecar_window_sec",
         "delivery_signal_window_sec",
+        "event_window_sec",
         "max_title_chars", "max_body_chars",
     ):
         if key in raw:

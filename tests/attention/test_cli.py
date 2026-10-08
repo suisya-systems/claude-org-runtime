@@ -994,3 +994,38 @@ def test_watch_surfaces_duplicate_sidecar(tmp_path: Path) -> None:
     assert any(
         k.startswith("broker:duplicate_sidecar:") for k in dedup["pending"]
     )
+
+
+def test_watch_does_not_ring_for_old_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """Issue #181: a first watch over months-old rows stays quiet.
+
+    Only the fresh row is notified (dedup'd); the old one is still
+    listed by ``scan --json`` as suppressed.
+    """
+    state_dir = tmp_path / ".state"
+    make_state_db(state_dir / "state.db", [
+        {"kind": "ci_completed", "occurred_at": _stale_iso(60 * 24 * 90),
+         "payload": {"status": "failed", "task_id": "OLD"}},
+        {"kind": "ci_completed", "occurred_at": _stale_iso(1),
+         "payload": {"status": "failed", "task_id": "NEW"}},
+    ])
+    monkeypatch.setattr(attention_cli.time, "sleep", lambda _s: None)
+    args = _watch_args(state_dir, "--max-iterations", "1")
+    assert args.func(args) == 0
+    dedup = json.loads(
+        (state_dir / "attention_notified.json").read_text(encoding="utf-8"),
+    )
+    assert list(dedup["events"]) == ["event:2"]
+
+    capsys.readouterr()
+    args = build_top_parser().parse_args([
+        "attention", "scan", "--state-dir", str(state_dir),
+        "--json", "--dry-run",
+    ])
+    assert args.func(args) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["task_id"], r.get("suppressed", False)) for r in rows] == [
+        ("OLD", True),
+    ]

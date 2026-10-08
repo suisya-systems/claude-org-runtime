@@ -45,7 +45,9 @@ def make_state_db(
                 "INSERT INTO events (occurred_at, actor, kind, payload_json) "
                 "VALUES (?, ?, ?, ?)",
                 (
-                    ev.get("occurred_at", "2026-05-12T00:00:00Z"),
+                    # test_cli's frozen clock: older rows fall outside
+                    # ``event_window_sec`` and are suppressed (#181).
+                    ev.get("occurred_at", "2026-05-12T12:00:00Z"),
                     ev.get("actor"),
                     ev["kind"],
                     json.dumps(ev.get("payload", {})),

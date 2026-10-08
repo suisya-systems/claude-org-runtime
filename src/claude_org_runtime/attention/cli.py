@@ -112,6 +112,7 @@ def _scan_once(
         pending_decision_drop=cfg.pending_decision_drop,
         broker_duplicates=duplicates,
         broker_delivery_signals=delivery_signals,
+        event_window_sec=cfg.event_window_sec,
     )
     state: DedupState = load_state(dedup_path)
     notified: list[AttentionEvent] = []

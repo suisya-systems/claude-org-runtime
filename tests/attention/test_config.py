@@ -443,6 +443,17 @@ def test_delivery_signal_window_default_and_override(tmp_path: Path) -> None:
     assert load_config(p).delivery_signal_window_sec == 900
 
 
+def test_event_window_default_and_override(tmp_path: Path) -> None:
+    """Issue #181: backlog age window defaults to 1h, tunable, 0 allowed."""
+    assert AttentionConfig().event_window_sec == 3600
+    p = tmp_path / "attention.json"
+    p.write_text(json.dumps({"event_window_sec": 0}), encoding="utf-8")
+    assert load_config(p).event_window_sec == 0
+    p.write_text(json.dumps({"event_window_sec": "60"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_config(p)
+
+
 def test_delivery_signal_window_rejects_non_int(tmp_path: Path) -> None:
     """The new knob is validated like every other int key.
 

@@ -901,3 +901,27 @@ def test_classify_all_without_delivery_signals_is_unchanged() -> None:
         [], _NOW, pending_decision_min=15, user_replied_min=15,
     )
     assert [ev.kind for ev in out] == ["worker_completed"]
+
+
+def test_event_window_suppresses_old_rows_only() -> None:
+    """Issue #181: a backlog row older than the window is kept but muted.
+
+    A fresh row and a row with an unparseable ``occurred_at`` still
+    notify - an unknown age must not hide a signal.
+    """
+    rows = [
+        _row(id=1, kind="ci_completed", payload={"status": "failed"},
+             occurred_at="2026-01-01T00:00:00Z"),
+        _row(id=2, kind="ci_completed", payload={"status": "failed"},
+             occurred_at="2026-05-12T11:30:00Z"),
+        _row(id=3, kind="ci_completed", payload={"status": "failed"},
+             occurred_at="garbage"),
+    ]
+    out = classify_all(rows, [], _NOW, 15, 15, event_window_sec=3600)
+    assert [(ev.key, ev.suppressed) for ev in out] == [
+        ("event:1", True), ("event:2", False), ("event:3", False),
+    ]
+    # 0 disables the window (and is the classify_all default).
+    assert not any(
+        ev.suppressed for ev in classify_all(rows, [], _NOW, 15, 15)
+    )
