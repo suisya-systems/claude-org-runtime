@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Worker sandbox allows `auth.openai.com`.** `codex exec` inside workers
+  refreshes its OAuth token at `https://auth.openai.com/oauth/token`, which the
+  `strictAllowlist` overlay from #191 blocked.
+
 ## [0.1.46] - 2026-10-05
 
 ### Added
