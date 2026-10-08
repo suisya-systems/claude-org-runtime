@@ -331,10 +331,12 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
         }
         raise
     finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
         payload["iterations"] = count
         _record_watch_stopped(_state_paths(state_dir)[0], payload)
+        for sig, handler in previous.items():
+            # ``None`` = handler not set from Python; it cannot be restored.
+            if handler is not None:
+                signal.signal(sig, handler)
     return rc
 
 
