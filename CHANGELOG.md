@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Deny-entry resolution has one implementation (#157).** The settings
+  generator's symlink canonicalization and `sandbox doctor` now both resolve
+  `permissions.deny` / `sandbox.filesystem.deny{Read,Write}` entries to host
+  paths through `settings/deny_paths.py:resolve_deny_entry`, so they can no
+  longer disagree on which entries name a host path (`~/` expansion, `//`
+  stripping, Windows drive paths). Absolute-path checks in the generator use
+  `os.path.isabs` instead of `startswith("/")`. A test pins that both sides
+  resolve the same host-path set.
+
+### Removed
+
+- **`Bash(git stash:*)` dropped from the bundled org extension schema** (4
+  entries). Worker stash mutations are denied by the ja-side PreToolUse hook
+  anyway; this removes the contradictory allow. Needs a paired ja schema sync
+  (#175).
+
 ### Fixed
 
 - **`attention watch` records its own exit (#182).** Every way out of the
@@ -15,16 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher's `attention_watch_started`, and prints the same payload to
   stderr. `reason` is `exception` (with `error`, then re-raised),
   `signal` (SIGTERM / SIGHUP, e.g. the pane closing), `interrupted`
-  (Ctrl-C) or `max_iterations`; `iterations` counts completed scans. A
+  (Ctrl-C) or `max_iterations`; a startup failure such as a malformed
+  `--config` is recorded as `exception`; `iterations` counts completed scans. A
   missing `state.db` / `events` table is not created, and a failed write
   only warns on stderr.
-
-### Removed
-
-- **`Bash(git stash:*)` dropped from the bundled org extension schema** (4
-  entries). Worker stash mutations are denied by the ja-side PreToolUse hook
-  anyway; this removes the contradictory allow. Needs a paired ja schema sync
-  (#175).
 
 ## [0.1.47] - 2026-10-08
 

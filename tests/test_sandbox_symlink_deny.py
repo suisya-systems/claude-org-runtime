@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from claude_org_runtime import cli as runtime_cli
-from claude_org_runtime.settings import generator, sandbox_doctor
+from claude_org_runtime.settings import deny_paths, generator, sandbox_doctor
 
 
 def _can_symlink() -> bool:
@@ -417,8 +417,9 @@ def test_canonicalize_permission_deny_handles_write_rules(
     escaping_home: Path, tmp_path: Path
 ) -> None:
     """``Write(...)`` is a Layer 2 path deny in this repo's schema."""
-    out, rewrites = generator._canonicalize_permission_deny(
-        ["Write(~/.aws/*)", "Write(*/workers/*/settings.local.json)"]
+    out, rewrites = generator._canonicalize_deny(
+        ["Write(~/.aws/*)", "Write(*/workers/*/settings.local.json)"],
+        "permissions.deny",
     )
     external = tmp_path / "external" / ".aws"
     assert out == [
@@ -445,7 +446,7 @@ def test_canonicalize_permission_deny_handles_write_rules(
     ],
 )
 def test_split_permission_rule(rule: object, expected: object) -> None:
-    assert generator._split_permission_rule(rule) == expected
+    assert deny_paths.split_permission_rule(rule) == expected
 
 
 def test_permission_rule_host_path_anchored_forms(escaping_home: Path) -> None:
@@ -457,10 +458,10 @@ def test_permission_rule_host_path_anchored_forms(escaping_home: Path) -> None:
     as authored; joining via ``Path`` would assert a backslash on Windows
     and demand a normalization the rule grammar does not want.
     """
-    assert generator._permission_rule_host_path("~/.aws/*") == (
+    assert deny_paths.permission_rule_host_path("~/.aws/*") == (
         f"{escaping_home}/.aws/*"
     )
-    assert generator._permission_rule_host_path("//mnt/c/x") == "/mnt/c/x"
+    assert deny_paths.permission_rule_host_path("//mnt/c/x") == "/mnt/c/x"
 
 
 @pytest.mark.parametrize("spec", [".env", "**/credentials*", "/project/rel"])
@@ -471,7 +472,7 @@ def test_permission_rule_host_path_unanchored_is_none(spec: str) -> None:
     was ``Read(**/credentials*)`` started the sandbox fine, while
     ``Read(~/.aws/*)`` alone brought it down.
     """
-    assert generator._permission_rule_host_path(spec) is None
+    assert deny_paths.permission_rule_host_path(spec) is None
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +490,7 @@ def test_canonicalize_permission_deny_rewrites_escaping_rule(
         "Read(~/.ssh/*)",
         "Read(~/.aws/*)",
     ]
-    out, rewrites = generator._canonicalize_permission_deny(deny)
+    out, rewrites = generator._canonicalize_deny(deny, "permissions.deny")
 
     external = tmp_path / "external" / ".aws"
     assert out == [
@@ -509,7 +510,9 @@ def test_canonicalize_permission_deny_rewrites_escaping_rule(
 def test_canonicalize_permission_deny_preserves_glob_tail(
     escaping_home: Path, tmp_path: Path
 ) -> None:
-    out, _ = generator._canonicalize_permission_deny(["Read(~/.aws/**/*.pem)"])
+    out, _ = generator._canonicalize_deny(
+        ["Read(~/.aws/**/*.pem)"], "permissions.deny"
+    )
     external = tmp_path / "external" / ".aws"
     assert out == [f"Read(//{str(external).lstrip('/')}/**/*.pem)"]
 
@@ -518,7 +521,7 @@ def test_canonicalize_permission_deny_noop_without_symlink(
     escaping_home: Path,
 ) -> None:
     deny = ["Read(~/.ssh/*)", "Bash(rm -rf *)", "Read(**/*.pem)"]
-    out, rewrites = generator._canonicalize_permission_deny(deny)
+    out, rewrites = generator._canonicalize_deny(deny, "permissions.deny")
     assert out == deny
     assert rewrites == []
 
@@ -528,7 +531,7 @@ def test_canonicalize_permission_deny_ignores_non_path_tools(
 ) -> None:
     """Only Read/Edit contribute paths to the sandbox deny set."""
     deny = [f"Bash(cat {escaping_home}/.aws/config)"]
-    out, rewrites = generator._canonicalize_permission_deny(deny)
+    out, rewrites = generator._canonicalize_deny(deny, "permissions.deny")
     assert out == deny and rewrites == []
 
 
@@ -541,7 +544,7 @@ def test_canonicalize_sandbox_deny_rewrites_kept_entry(
     escaping_home: Path, tmp_path: Path
 ) -> None:
     entries = [str(escaping_home / ".aws" / "config"), "/plain/path"]
-    out, rewrites = generator._canonicalize_sandbox_deny(
+    out, rewrites = generator._canonicalize_deny(
         entries, "sandbox.filesystem.denyRead"
     )
     external = tmp_path / "external" / ".aws"
@@ -559,7 +562,7 @@ def test_canonicalize_sandbox_deny_expands_tilde_entries(
     resolves the prefix against the home directory when building the deny
     set, so a tilde entry over a symlinked directory is just as fatal.
     """
-    out, rewrites = generator._canonicalize_sandbox_deny(
+    out, rewrites = generator._canonicalize_deny(
         ["~/.aws/**", "~/.ssh/**"], "sandbox.filesystem.denyRead"
     )
     external = tmp_path / "external" / ".aws"
@@ -607,7 +610,7 @@ def test_canonicalize_sandbox_deny_leaves_structured_entries(
     escaping_home: Path,
 ) -> None:
     entries = [{"anchor": "home", "path": ".aws/**"}]
-    out, rewrites = generator._canonicalize_sandbox_deny(
+    out, rewrites = generator._canonicalize_deny(
         entries, "sandbox.filesystem.denyRead"
     )
     assert out == entries and rewrites == []
