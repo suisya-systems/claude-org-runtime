@@ -288,6 +288,7 @@ WORKER_SANDBOX_SETTINGS: dict[str, Any] = {
                 "*.chatgpt.com",
                 "developers.openai.com",
                 "api.openai.com",
+                "auth.openai.com",
                 "*.oaiusercontent.com",
             ],
         },

@@ -742,9 +742,14 @@ def test_build_plan_worker_spawn_carries_sandbox_settings(tmp_path: Path) -> Non
     assert sandbox["network"]["strictAllowlist"] is True
     # strictAllowlist via --settings drops the project allowedDomains, so the
     # overlay must carry the hosts workers need itself
-    assert {"github.com", "pypi.org", "registry.npmjs.org", "chatgpt.com"} <= set(
-        sandbox["network"]["allowedDomains"]
-    )
+    # auth.openai.com: codex refreshes its ChatGPT OAuth token there
+    assert {
+        "github.com",
+        "pypi.org",
+        "registry.npmjs.org",
+        "chatgpt.com",
+        "auth.openai.com",
+    } <= set(sandbox["network"]["allowedDomains"])
     assert {"path": "~/.config/gh/hosts.yml", "mode": "deny"} in sandbox[
         "credentials"
     ]["files"]
