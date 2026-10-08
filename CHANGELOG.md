@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.47] - 2026-10-08
+
 ### Fixed
 
 - **Worker sandbox allows `auth.openai.com`.** `codex exec` inside workers
