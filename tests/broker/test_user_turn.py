@@ -420,3 +420,21 @@ def test_wrapped_single_line_draft_is_own(tmp_path):
     a = Wrapping()
     b, src = make_broker(tmp_path, a)
     assert send(b, src, long)["status"] == "submitted"
+
+
+# ---------------------------------------------------------------- codex round 3
+def test_indented_rule_inside_draft_is_not_a_border():
+    screen = f"{RULE}\n❯ \n  {'─' * 10}\n  someone's text\n{RULE}\n"
+    assert assess_screen(screen) == DRAFT
+
+
+def test_foreign_continuation_row_withholds_enter(tmp_path):
+    class Appending(ComposerAdapter):
+        def get_text(self, pane_id, escapes=False):
+            if not self.draft:
+                return composer()
+            return f"{RULE}\n❯ {self.draft}\n  foreign instructions\n{RULE}\n"
+    a = Appending()
+    b, src = make_broker(tmp_path, a)
+    assert send(b, src, "/loop 5m check queue")["error"].startswith("[user_turn_stalled]")
+    assert ("enter",) not in a.writes

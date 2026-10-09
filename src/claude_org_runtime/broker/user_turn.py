@@ -52,7 +52,8 @@ NOT_READY = "not_ready"  # dialog / unrecognised screen
 
 
 def _is_fence(line: str) -> bool:
-    s = line.strip()
+    # Composer borders start at column 0; an indented rule is draft content.
+    s = line.rstrip()
     return len(s) >= 8 and set(s) <= _FENCE_CHARS
 
 
@@ -201,13 +202,13 @@ def _poll(broker: "Broker", adapter, pane_id, timeout: float):
 
 
 def _is_own_draft(draft: list[str], message: str) -> bool:
-    """For a single-line body, the draft's first row must be a prefix of it, so
-    text typed concurrently (e.g. a raw send_keys) is not submitted as ours.
-    Multi-line pastes may render as a placeholder, so they are not compared."""
+    """For a single-line body, the whole visible draft (wrapped rows joined,
+    whitespace ignored) must equal it, so text typed concurrently (e.g. a raw
+    send_keys) is not submitted as ours. Multi-line pastes may render as a
+    placeholder, so they are not compared."""
     if "\n" in message:
         return True
-    first = draft[0].strip() if draft else ""
-    return bool(first) and message.strip().startswith(first)
+    return "".join("".join(draft).split()) == "".join(message.split())
 
 
 def _wait_stable_draft(broker: "Broker", adapter, pane_id, message: str) -> bool:
