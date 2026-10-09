@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sqlite3
 import sys
@@ -300,6 +301,22 @@ def cmd_attention_watch(args: argparse.Namespace) -> int:
             previous[sig] = signal.signal(sig, _raise_stop)
         except ValueError:  # not the main thread (embedded use)
             pass
+    # Issue #41: a pane resize does not kill the watcher (SIGWINCH is
+    # ignored by default), but the multiplexer wipes the pane on resize
+    # and expects the program to redraw. The watcher is otherwise
+    # silent, so the pane stayed blank and looked dead. Redraw a status
+    # line on startup and on every SIGWINCH.
+    def _status(*_a) -> None:
+        _warn(f"attention watch running (pid {os.getpid()}, "
+              f"iterations {count})")
+
+    winch = getattr(signal, "SIGWINCH", None)
+    if winch is not None:
+        try:
+            previous[winch] = signal.signal(winch, _status)
+        except ValueError:  # not the main thread (embedded use)
+            pass
+    _status()
     payload: dict = {"reason": "max_iterations"}
     rc = 0
     try:

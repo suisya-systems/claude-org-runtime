@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default title/body template. Override via `notify` / `templates` as for any
   kind. Before, passed runs were dropped. Needs a paired ja template sync.
 
+### Fixed
+
+- **`attention watch` no longer looks dead after a pane resize (#41).** The
+  watcher was never killed by a resize (SIGWINCH is ignored by default; a pty
+  repro survives repeated 104 <-> 210 column resizes), but renga clears a
+  pane's screen on resize and expects the program to redraw. The watcher
+  printed nothing in steady state, so the pane stayed blank; `ps` from a
+  sandboxed agent cannot see processes outside its PID namespace, which made
+  it look like the process was gone. The watcher now prints a one-line status
+  (`attention watch running (pid N, iterations K)`) to stderr on startup and
+  on every SIGWINCH.
+
 ## [0.1.48] - 2026-10-09
 
 ### Changed
