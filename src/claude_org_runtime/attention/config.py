@@ -32,6 +32,9 @@ DEFAULT_NOTIFY: dict[str, Severity] = {
     "relay_gap_suspected": "normal",
     "silent_worker_output": "normal",
     "ci_failed": "urgent",
+    # Issue #139: passed terminal of ci_completed. Urgent by owner decision
+    # (the merge gate is waiting on a human); override to ``normal`` to quiet.
+    "ci_passed": "urgent",
     "pending_decision": "urgent",
     "user_reply_not_forwarded": "urgent",
     "pane_silent": "normal",

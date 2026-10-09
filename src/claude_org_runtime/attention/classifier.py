@@ -57,6 +57,12 @@ _CI_FAIL_STATUSES: frozenset[str] = frozenset(
     {"failed", "canceled", "incomplete"}
 )
 
+# Issue #139: CI run statuses that classify as a passed terminal. Both
+# spellings are seen in the wild; matching is case-insensitive.
+_CI_PASS_STATUSES: frozenset[str] = frozenset(
+    {"success", "succeeded", "passed"}
+)
+
 # Issue #167: dedup namespace for the broker-journal path. Anything that
 # is not ``state.db.events`` is cooldown-gated by :mod:`dedup` rather
 # than recorded once forever — which is what this signal wants, since a
@@ -121,7 +127,7 @@ def classify_event(
     """Map one ``events`` row to an :class:`AttentionEvent` or ``None``.
 
     Returns ``None`` for rows that should not produce a notification
-    (e.g. ``ci_completed status=success``, unrecognized
+    (e.g. ``ci_completed`` with a non-terminal status, unrecognized
     ``notify_sent.kind``). ``notify_map`` overrides the §5 default
     severity-per-kind table; missing keys fall back to the default.
     """
@@ -153,6 +159,18 @@ def classify_event(
 
     if kind == "ci_completed":
         status = str(payload.get("status") or "")
+        if status.strip().lower() in _CI_PASS_STATUSES:
+            title, body = _default_text(
+                "ci_passed", task_id=task_id, worker=worker, pr=pr,
+                status=status,
+            )
+            return AttentionEvent(
+                key=key, kind="ci_passed",
+                severity=_severity_for("ci_passed", notify_map),
+                title=title, body=body, source="state.db.events",
+                task_id=task_id, worker=worker, pr=pr, status=status,
+                created_at=occurred_at,
+            )
         if status not in _CI_FAIL_STATUSES:
             return None
         title, body = _default_text(
@@ -591,6 +609,10 @@ _DEFAULT_TEMPLATES: dict[str, tuple[str, str]] = {
     ),
     "ci_failed": (
         "CI failed",
+        "PR #{pr} finished with {status}.",
+    ),
+    "ci_passed": (
+        "CI passed",
         "PR #{pr} finished with {status}.",
     ),
     "worker_completed": (

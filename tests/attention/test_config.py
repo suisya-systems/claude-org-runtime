@@ -42,6 +42,7 @@ def test_default_notify_severity_part_b_rebalance() -> None:
     assert DEFAULT_NOTIFY["pending_decision"] == "urgent"
     assert DEFAULT_NOTIFY["user_reply_not_forwarded"] == "urgent"
     assert DEFAULT_NOTIFY["ci_failed"] == "urgent"
+    assert DEFAULT_NOTIFY["ci_passed"] == "urgent"
     assert DEFAULT_NOTIFY["pane_crashed"] == "urgent"
     # Demoted to normal in this PR.
     for demoted in (
