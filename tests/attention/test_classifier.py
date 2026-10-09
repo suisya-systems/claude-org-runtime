@@ -113,9 +113,31 @@ def test_ci_completed_failure_urgent(status: str) -> None:
     assert ev.status == status
 
 
-def test_ci_completed_success_ignored() -> None:
+@pytest.mark.parametrize(
+    "status", ["success", "passed", "succeeded", "Success"],
+)
+def test_ci_completed_passed_emits_ci_passed(status: str) -> None:
     ev = classify_event(_row(
-        kind="ci_completed", payload={"status": "success", "pr": 1},
+        kind="ci_completed", payload={"status": status, "pr": 1},
+    ))
+    assert ev is not None
+    assert ev.kind == "ci_passed"
+    assert ev.severity == "urgent"
+    assert ev.status == status
+    assert "#1" in ev.body
+
+
+def test_ci_passed_severity_overridable() -> None:
+    ev = classify_event(
+        _row(kind="ci_completed", payload={"status": "passed", "pr": 1}),
+        notify_map={"ci_passed": "normal"},
+    )
+    assert ev is not None and ev.severity == "normal"
+
+
+def test_ci_completed_running_ignored() -> None:
+    ev = classify_event(_row(
+        kind="ci_completed", payload={"status": "running", "pr": 1},
     ))
     assert ev is None
 
