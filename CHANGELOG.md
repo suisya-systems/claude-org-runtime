@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ci_passed` attention kind (#139).** A `ci_completed` event whose status
+  is `success` / `succeeded` / `passed` (case-insensitive) now yields an
+  `AttentionEvent` of kind `ci_passed`, default severity `urgent`, with a
+  default title/body template. Override via `notify` / `templates` as for any
+  kind. Before, passed runs were dropped. Needs a paired ja template sync.
+
 ### Fixed
 
 - **`attention watch` no longer looks dead after a pane resize (#41).** The
