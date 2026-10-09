@@ -311,6 +311,38 @@ def test_watch_records_stop_on_sigterm(
     assert signal.getsignal(signal.SIGTERM) is before
 
 
+@pytest.mark.skipif(
+    not hasattr(attention_cli.signal, "SIGWINCH"),
+    reason="POSIX resize signal only",
+)
+def test_watch_survives_resize_and_redraws_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Issue #41: SIGWINCH keeps the loop running and redraws a status line."""
+    import os
+    import signal
+
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    _populate_state(state_dir)
+    before = signal.getsignal(signal.SIGWINCH)
+    monkeypatch.setattr(
+        attention_cli.time, "sleep",
+        lambda _s: os.kill(os.getpid(), signal.SIGWINCH),
+    )
+    args = _watch_args(state_dir, "--max-iterations", "3")
+    assert args.func(args) == 0
+    assert _stopped_rows(state_dir) == [
+        {"reason": "max_iterations", "iterations": 3},
+    ]
+    err = capsys.readouterr().err
+    pid = os.getpid()
+    assert f"attention watch running (pid {pid}, iterations 0)" in err
+    assert f"attention watch running (pid {pid}, iterations 1)" in err
+    assert f"attention watch running (pid {pid}, iterations 2)" in err
+    assert signal.getsignal(signal.SIGWINCH) is before
+
+
 def test_watch_stop_without_state_db_goes_to_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
