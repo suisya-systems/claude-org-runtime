@@ -104,6 +104,9 @@ class TmuxAdapter:
     # broker の last-pane ガードが論理ペイン (窓口) を +1 計上してよい backend。
     # backend 固定の能力なので ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = True
+    # type_text は bracketed paste (複数行を 1 draft として置ける)。user_turn が
+    # 複数行本文を許すかの判定に使う (Issue #163)。
+    bracketed_paste: ClassVar[bool] = True
 
     # tmux は send-keys が一級プリミティブで、full raw-key vocabulary を emit できる。
     # 対応表 (_TMUX_KEY_MAP) の key = canonical 全集合 (テストで包含を固定)。
@@ -282,6 +285,12 @@ class TmuxAdapter:
             args.append("-e")
         proc = self._tmux(*args)
         return proc.stdout
+
+    def pane_in_mode(self, pane_id: str) -> bool:
+        """copy / view mode 中か (スクロールバック中は paste の bracket と Enter を
+        mode が奪う)。user_turn の readiness 判定用の任意メソッド (Issue #163)。"""
+        proc = self._tmux("display-message", "-p", "-t", str(pane_id), "#{pane_in_mode}")
+        return proc.stdout.strip() == "1"
 
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: str) -> None:

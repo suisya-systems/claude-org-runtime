@@ -45,7 +45,7 @@ from ..terminal import (
     venv_pane_env,
     venv_pane_prep,
 )
-from . import sidecar, store, surface
+from . import sidecar, store, surface, user_turn
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import AgentBind, TokenMixin
@@ -154,6 +154,15 @@ class Broker(TokenMixin, StoreMixin):
         # (Issue #169)。adapter I/O を 1Hz の再試行で叩き続けない。
         self._stale_lease_probe_at: float = 0.0
         self._nudge_threads: dict[str, threading.Thread] = {}
+        # pane への PTY 書き込み直列化 (Issue #163)。str(pane_id) -> Lock。nudge と
+        # user_turn が同一 composer に同時に書かないようにする。辞書自体は _lock で守る。
+        self._pane_write_locks: dict[str, threading.Lock] = {}
+        # user_turn 重複抑止: str(pane_id) -> (body, monotonic ts)。pane write lock 下で読み書き。
+        self._user_turn_last: dict[str, tuple[str, float]] = {}
+        self.user_turn_settle = 0.3          # 本文 write 後 Enter までの最小待ち (herdr 同値)
+        self.user_turn_settle_timeout = 1.0  # draft 安定待ちの上限
+        self.user_turn_submit_timeout = 3.0  # Enter 後の submit 観測の上限 (renga 同値)
+        self.user_turn_poll = 0.1
         self._lease_watch_armed: set[str] = set()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -486,7 +495,19 @@ class Broker(TokenMixin, StoreMixin):
                 )
                 return
             if state == "idle":
-                self.adapter.send_line(pane_id, NUDGE_TEXT)
+                # user_turn と同じ composer へ同時に書かない (Issue #163)。判定は
+                # lock 外の古い画面なので、lock 取得後に idle を取り直す。
+                try:
+                    with self._pane_write_lock(str(pane_id)):
+                        state = classify_pane_state(self.adapter.get_text(pane_id))
+                        if state == "idle":
+                            self.adapter.send_line(pane_id, NUDGE_TEXT)
+                except Exception as e:
+                    self._journal(
+                        "nudge_failed", agent_id=target.agent_id, error=str(e)
+                    )
+                    return
+            if state == "idle":
                 self._journal(
                     "nudge_sent",
                     agent_id=target.agent_id,
@@ -508,6 +529,26 @@ class Broker(TokenMixin, StoreMixin):
             pane_id=pane_id,
             error="defer retries exhausted",
         )
+
+    # ------------------------------------------------------------- user turn
+    def _pane_write_lock(self, key: str) -> threading.Lock:
+        with self._lock:
+            return self._pane_write_locks.setdefault(key, threading.Lock())
+
+    def _find_registered_target(self, to_id: str) -> AgentBind | None:
+        """enqueue と同じ宛先解決 (registered かつ未失効の full bind)。"""
+        with self._lock:
+            for b in self._binds.values():
+                if b.revoked or not b.registered:
+                    continue
+                if b.agent_id == to_id or b.name == to_id:
+                    return b
+        return None
+
+    def deliver_user_turn(self, from_bind: AgentBind, to_id: str, message: str) -> dict:
+        """``send_message(deliver="user_turn")`` (Issue #163)。queue を通さず
+        宛先 composer に本文を打って submit する。詳細は :mod:`.user_turn`。"""
+        return user_turn.deliver_user_turn(self, from_bind, to_id, message)
 
     # ------------------------------------------------------------- MCP tools
     def call_tool(self, bind: AgentBind, name: str, args: dict) -> dict:

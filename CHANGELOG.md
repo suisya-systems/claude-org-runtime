@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AttentionEvent` of kind `ci_passed`, default severity `urgent`, with a
   default title/body template. Override via `notify` / `templates` as for any
   kind. Before, passed runs were dropped. Needs a paired ja template sync.
+- **`send_message` gains `deliver="user_turn"` (#163).** Broker parity with
+  renga's `send_message(deliver=...)`: the body is typed into the recipient
+  Claude's composer and submitted with a separate Enter, so `/clear`, `/loop`
+  and other slash commands actually fire. It refuses with zero bytes written
+  unless an idle agent with an empty, rule-fenced composer and no selection
+  dialog is proven, using renga's codes: `[user_turn_busy]`,
+  `[user_turn_not_ready]` (dialog, draft, unrecognised screen, delivery in
+  flight), `[user_turn_unsupported_target]` (no managed pane, non-Claude
+  pane, unreadable pane), `[user_turn_invalid_body]` (empty, control
+  characters, over 4 KiB, multi-line on a backend without bracketed paste),
+  and `[user_turn_stalled]` when bytes may have been written but submission
+  was not observed (the draft never settled so Enter was withheld, Enter was
+  not consumed within 3s, or the backend failed mid-sequence). A tmux pane in
+  copy mode (scrolled back) is `[user_turn_not_ready]`. Success reports `status: "submitted"`; an identical
+  body to the same pane within 5s reports `status: "duplicate_suppressed"`.
+  `user_turn` is dispatcher / secretary only (it writes to a PTY, like
+  `send_keys`) and bypasses the queue. `deliver="channel"` (the default) and
+  `send_keys` are unchanged. The fallback nudge and `user_turn` now take a
+  per-pane write lock. New journal events `user_turn_submitted` /
+  `user_turn_stalled`. Known limits versus renga: Codex targets are refused,
+  the caret position is not checked, and a dialog drawn between the last
+  screen read and a write is not excluded (no parser lock in the broker).
 
 ### Fixed
 
