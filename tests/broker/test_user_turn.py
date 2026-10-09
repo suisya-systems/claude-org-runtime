@@ -365,3 +365,30 @@ def test_nudge_read_error_under_lock_is_journaled(tmp_path):
               (tmp_path / "broker" / "queue.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(e["event"] == "nudge_failed" and e.get("error") == "pane gone" for e in events)
     assert a.writes == []
+
+
+# ---------------------------------------------------------------- codex round 1
+@pytest.mark.parametrize("screen,want", [
+    # body starting with a blank line: ❯ row empty, content below it
+    (f"{RULE}\n❯ \n  Please review this\n{RULE}\n? for shortcuts\n", DRAFT),
+    # marker text inside the draft is the body, not UI state
+    (composer("Please explain esc to interrupt"), DRAFT),
+    (composer("press Enter to confirm"), DRAFT),
+    (f"{RULE}\n❯ a\n  ↑/↓ to navigate\n{RULE}\n", DRAFT),
+])
+def test_assess_screen_draft_content_is_not_ui(screen, want):
+    assert assess_screen(screen) == want
+
+
+@pytest.mark.parametrize("body", ["Please explain esc to interrupt", "\nleading blank line"])
+def test_body_with_marker_text_or_leading_blank_submits(tmp_path, body):
+    class Multiline(ComposerAdapter):
+        bracketed_paste = True
+
+        def get_text(self, pane_id, escapes=False):
+            rows = self.draft.split("\n") if self.draft else [""]
+            inner = "\n".join("  " + r for r in rows[1:])
+            return f"{RULE}\n❯ {rows[0]}\n{inner + chr(10) if inner else ''}{RULE}\n? for shortcuts\n"
+    a = Multiline()
+    b, src = make_broker(tmp_path, a)
+    assert send(b, src, body)["status"] == "submitted"

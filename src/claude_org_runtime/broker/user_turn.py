@@ -69,8 +69,18 @@ def assess_screen(screen: str) -> str:
     # pane): anchor the marker window to content, not to the physical bottom.
     while lines and not lines[-1]:
         lines.pop()
-    tail = lines[-20:]
-    low = "\n".join(tail).lower()
+    # Locate the lowest composer: a ❯ row with a rule directly above, up to the
+    # next rule below. Its rows are the draft (a body may contain marker text).
+    region = None
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i].strip().startswith("❯") and _is_fence(lines[i - 1]):
+            end = next((j for j in range(i + 1, len(lines)) if _is_fence(lines[j])), None)
+            if end is not None:
+                region = (i, end)
+                break
+    start, end = region if region else (len(lines), len(lines))
+    outside = lines[:max(start - 1, 0)] + lines[end + 1:]
+    low = "\n".join(outside[-20:]).lower()
     # Dialog first: a permission menu's "Esc to cancel" is also a busy marker,
     # but the caller needs to know a blocker (not a turn) is in the way.
     spaceless = unicodedata.normalize("NFKC", low).replace(" ", "")
@@ -78,20 +88,14 @@ def assess_screen(screen: str) -> str:
         return NOT_READY
     if any(m in low for m in _BUSY_MARKERS):
         return BUSY
-    for i in range(len(lines) - 1, 0, -1):
-        s = lines[i].strip()
-        if not s.startswith("❯"):
-            continue
-        # The lowest ❯ row decides: an unfenced one is a selector cursor, and an
-        # older composer frame above it must not count.
-        if not _is_fence(lines[i - 1]):
-            return NOT_READY
-        content = s[1:].strip()
-        if content:
-            return DRAFT
-        # Empty composer: the closing rule must sit directly below.
-        return EMPTY if i + 1 < len(lines) and _is_fence(lines[i + 1]) else NOT_READY
-    return NOT_READY
+    if region is None:
+        return NOT_READY
+    # A cursor row below the composer is a selector (the lowest ❯ decides; an
+    # older composer frame above it must not count).
+    if any(ln.strip().startswith("❯") for ln in lines[end + 1:]):
+        return NOT_READY
+    draft = [lines[start].strip()[1:]] + lines[start + 1:end]
+    return DRAFT if any(ln.strip() for ln in draft) else EMPTY
 
 
 def body_error(message: str, multiline_ok: bool) -> str | None:
