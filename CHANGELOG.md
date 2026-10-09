@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `user_turn_stalled`. Known limits versus renga: Codex targets are refused,
   the caret position is not checked, and a dialog drawn between the last
   screen read and a write is not excluded (no parser lock in the broker).
+  `send_keys` stays unserialized (raw keys must not wait behind a turn); a
+  single-line `user_turn` withholds Enter unless the draft is its own body.
 
 ### Fixed
 

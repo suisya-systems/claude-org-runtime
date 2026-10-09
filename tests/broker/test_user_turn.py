@@ -392,3 +392,31 @@ def test_body_with_marker_text_or_leading_blank_submits(tmp_path, body):
     a = Multiline()
     b, src = make_broker(tmp_path, a)
     assert send(b, src, body)["status"] == "submitted"
+
+
+# ---------------------------------------------------------------- codex round 2
+def test_foreign_text_in_draft_withholds_enter(tmp_path):
+    # e.g. a concurrent raw send_keys typed into the composer during the settle
+    a = ComposerAdapter()
+    real = a.type_text
+
+    def clobbered(pane_id, text):
+        real(pane_id, text)
+        a.draft = "y" + a.draft
+    a.type_text = clobbered
+    b, src = make_broker(tmp_path, a)
+    assert send(b, src, "/clear")["error"].startswith("[user_turn_stalled]")
+    assert ("enter",) not in a.writes
+
+
+def test_wrapped_single_line_draft_is_own(tmp_path):
+    long = "/loop 5m " + "check the queue " * 10
+
+    class Wrapping(ComposerAdapter):
+        def get_text(self, pane_id, escapes=False):
+            if not self.draft:
+                return composer()
+            return f"{RULE}\n❯ {self.draft[:40]}\n  {self.draft[40:]}\n{RULE}\n"
+    a = Wrapping()
+    b, src = make_broker(tmp_path, a)
+    assert send(b, src, long)["status"] == "submitted"

@@ -57,6 +57,10 @@ def _is_fence(line: str) -> bool:
 
 
 def assess_screen(screen: str) -> str:
+    return _parse(screen)[0]
+
+
+def _parse(screen: str) -> tuple[str, list[str]]:
     """Classify a visible screen for user-turn delivery.
 
     Stricter than :func:`~claude_org_runtime.terminal.base.classify_pane_state`:
@@ -85,17 +89,17 @@ def assess_screen(screen: str) -> str:
     # but the caller needs to know a blocker (not a turn) is in the way.
     spaceless = unicodedata.normalize("NFKC", low).replace(" ", "")
     if any(f in spaceless for f in _DIALOG_FOOTERS):
-        return NOT_READY
+        return NOT_READY, []
     if any(m in low for m in _BUSY_MARKERS):
-        return BUSY
+        return BUSY, []
     if region is None:
-        return NOT_READY
+        return NOT_READY, []
     # A cursor row below the composer is a selector (the lowest ❯ decides; an
     # older composer frame above it must not count).
     if any(ln.strip().startswith("❯") for ln in lines[end + 1:]):
-        return NOT_READY
+        return NOT_READY, []
     draft = [lines[start].strip()[1:]] + lines[start + 1:end]
-    return DRAFT if any(ln.strip() for ln in draft) else EMPTY
+    return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
 
 
 def body_error(message: str, multiline_ok: bool) -> str | None:
@@ -171,7 +175,7 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
             adapter.type_text(pane_id, message)
             broker._user_turn_last[key] = (message, now)
             time.sleep(broker.user_turn_settle)
-            if not _wait_stable_draft(broker, adapter, pane_id):
+            if not _wait_stable_draft(broker, adapter, pane_id, message):
                 return _stalled(broker, from_bind, target, message,
                                 "typed body did not settle into the composer; Enter not sent")
             adapter.send_enter(pane_id)
@@ -196,11 +200,22 @@ def _poll(broker: "Broker", adapter, pane_id, timeout: float):
         time.sleep(broker.user_turn_poll)
 
 
-def _wait_stable_draft(broker: "Broker", adapter, pane_id) -> bool:
-    """Draft visible in the composer, no busy/dialog, two identical frames."""
+def _is_own_draft(draft: list[str], message: str) -> bool:
+    """For a single-line body, the draft's first row must be a prefix of it, so
+    text typed concurrently (e.g. a raw send_keys) is not submitted as ours.
+    Multi-line pastes may render as a placeholder, so they are not compared."""
+    if "\n" in message:
+        return True
+    first = draft[0].strip() if draft else ""
+    return bool(first) and message.strip().startswith(first)
+
+
+def _wait_stable_draft(broker: "Broker", adapter, pane_id, message: str) -> bool:
+    """Our draft visible in the composer, no busy/dialog, two identical frames."""
     prev = None
     for screen in _poll(broker, adapter, pane_id, broker.user_turn_settle_timeout):
-        if assess_screen(screen) != DRAFT:
+        state, draft = _parse(screen)
+        if state != DRAFT or not _is_own_draft(draft, message):
             prev = None
             continue
         if screen == prev:
