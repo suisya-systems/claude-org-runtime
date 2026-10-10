@@ -347,6 +347,23 @@ def test_nudge_waits_for_user_turn_and_rechecks_screen(tmp_path):
     assert "nudge_deferred" in events and "nudge_sent" not in events
 
 
+def test_nudge_does_not_submit_stalled_multiline_draft(tmp_path):
+    # Issue #207: the ❯ row is empty but a stalled multi-line draft sits on the
+    # continuation row. classify_pane_state alone calls this idle.
+    stalled = f"some transcript\n\n{RULE}\n❯ \n  second line of the body\n{RULE}\n  ? for shortcuts\n"
+    a = ComposerAdapter(screen=stalled)
+    b, src = make_broker(tmp_path, a)
+    b.nudge_defer_interval = 0.001
+    b.nudge_defer_max_tries = 2
+    send(b, src, "hi", deliver="channel")
+    b._nudge_threads["dst"].join(2)
+    assert a.writes == []
+    events = [json.loads(ln) for ln in
+              (tmp_path / "broker" / "queue.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(e["event"] == "nudge_deferred" and e.get("state") == "input_pending" for e in events)
+    assert not any(e["event"] == "nudge_sent" for e in events)
+
+
 def test_nudge_read_error_under_lock_is_journaled(tmp_path):
     a = ComposerAdapter()
     b, src = make_broker(tmp_path, a)
