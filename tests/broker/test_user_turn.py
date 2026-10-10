@@ -506,6 +506,8 @@ _UPDATE = (f"\n\x1b[36;1m  ✨ \x1b[39mUpdate available!\n\n\x1b[36;22;24m› 1.
     (codex(foot="  someone's second line\n\n" + _CODEX_FOOT), DRAFT),  # continuation
     (codex(foot=_CODEX_FOOT + "  extra row\n"), NOT_READY),     # unknown layout below
     (codex("1. Explain the failure"), DRAFT),
+    (f"{_B}›{_R} \n\n$ ", NOT_READY),                           # not a Codex footer
+    (f"{_B}›{_R} {_D}Ask Codex to do anything", NOT_READY),      # no footer at all
     # live codex 0.153.4: popup after the spacer row is not draft content
     (codex("/rev", foot="\n  \x1b[1m/review  review my current changes\n\x1b[22m  /revert  \x1b[2mx\n"),
      DRAFT),                    # numbered body, not a menu

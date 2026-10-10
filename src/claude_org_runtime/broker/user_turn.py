@@ -187,7 +187,8 @@ def _parse_codex(screen: str) -> tuple[str, list[str]]:
     while end < len(lines) and lines[end].strip():
         end += 1
     rest = [ln for ln in lines[end:] if ln.strip()]
-    if len(rest) > 1 and not all(ln.startswith("  /") for ln in rest):
+    footer = [ln for ln in rest if re.match(r"  \S", ln)]
+    if not rest or footer != rest or (len(rest) > 1 and not all(ln.startswith("  /") for ln in rest)):
         return NOT_READY, []
     # Only the glyph row carries the dim placeholder; rows below always count.
     draft = [lit[prompt][1:]] + lines[prompt + 1:end]
