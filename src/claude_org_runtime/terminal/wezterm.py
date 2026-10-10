@@ -183,6 +183,11 @@ class WezTermAdapter:
     def pane_exists(self, pane_id: int) -> bool:
         return any(p["pane_id"] == pane_id for p in self.list_panes())
 
+    def pane_width(self, pane_id: int) -> int | None:
+        """pane の桁数 (list の size.cols)。Codex への user_turn 用 (Issue #208)。"""
+        return next((p.get("size", {}).get("cols") for p in self.list_panes()
+                     if p["pane_id"] == pane_id), None)
+
     def _window_alive(self, window_id: PaneId) -> bool:
         """window_id を持つ pane が 1 つでも生存しているか (アンカー生存確認)。"""
         return any(p["window_id"] == window_id for p in self.list_panes())

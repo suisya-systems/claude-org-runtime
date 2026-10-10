@@ -292,6 +292,11 @@ class TmuxAdapter:
         proc = self._tmux("display-message", "-p", "-t", str(pane_id), "#{pane_in_mode}")
         return proc.stdout.strip() == "1"
 
+    def pane_width(self, pane_id: str) -> int:
+        """pane の桁数。Codex への user_turn が 1 行に収まるかの判定用 (Issue #208)。"""
+        proc = self._tmux("display-message", "-p", "-t", str(pane_id), "#{pane_width}")
+        return int(proc.stdout.strip())
+
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: str) -> None:
         """spawn した検証 pane の後始末 (kill-pane)。単一 pane の session なら

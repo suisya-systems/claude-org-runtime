@@ -16,6 +16,17 @@ again, or the agent busy). Otherwise ``[user_turn_stalled]``.
 Refusal codes and the success ``status`` values match renga's contract so the
 two transports stay interchangeable for callers.
 
+Codex panes (Issue #208) use their own model (:func:`_parse_codex`): the
+lowest ``›`` row at column 0 is the composer, and it is proven empty only
+when everything after the glyph is blank or dim (Codex paints its rotating
+placeholder dim; typed text never is), so Codex screens are read with
+escapes. Draft rows continue directly below the glyph row; after a spacer
+only the footer or the slash-command popup may follow (calibrated live on
+codex 0.153.4), so a typed draft is compared in full. Busy = a ``•`` status line with an interrupt hint just above the
+composer. A Codex body must be one line that fits on the composer row:
+renga has no verified model of a wrapped Codex composer either, so the
+backend must report the pane width (``pane_width``) or the turn is refused.
+
 Known weaker guarantees than renga (no parser lock / cursor proof here):
 the screen is re-read right before each write, but a dialog drawn in the
 gap between that read and the write is not excluded; the caret position is
@@ -24,6 +35,7 @@ not checked (backends do not report it uniformly).
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from typing import TYPE_CHECKING
@@ -103,6 +115,91 @@ def _parse(screen: str) -> tuple[str, list[str]]:
     return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
 
 
+# --- Codex (calibrated on renga's codex v0.153.4 fixtures) ------------------
+_CODEX_GLYPH = "\u203a"  # ›
+_CODEX_FOOTERS = _DIALOG_FOOTERS + ("entertocontinue",)  # update / trust prompts
+# "› 1. Yes, proceed" over "  2. ...": a menu (a body may start with "1. ").
+_CODEX_MENU = re.compile("\u203a\\s*1\\.\\s.*\n\\s+2\\.\\s")
+_ESC_SEQ = re.compile(r"\x1b(?:\[([0-?]*)[ -/]*([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+
+
+def _sgr_dim(params: str, dim: bool) -> bool:
+    codes = params.split(";")
+    i = 0
+    while i < len(codes):
+        c = codes[i]
+        if c in ("", "0", "22"):
+            dim = False
+        elif c == "2":
+            dim = True
+        elif c in ("38", "48", "58") and i + 1 < len(codes):
+            # ";"-form colour args (5;n / 2;r;g;b) are not attributes; the
+            # ":"-form ("38:2::r:g:b") is one param and never matches here.
+            i += {"5": 2, "2": 4}.get(codes[i + 1], 0)
+        i += 1
+    return dim
+
+
+def _undim(screen: str) -> tuple[list[str], list[str]]:
+    """Strip escapes; return (rows, rows with dim text blanked). SGR state
+    carries across rows (tmux ``capture-pane -e`` only emits changes)."""
+    full, lit, dim, pos = [], [], False, 0
+    for m in [*_ESC_SEQ.finditer(screen), None]:
+        seg = screen[pos:m.start() if m else len(screen)]
+        full.append(seg)
+        lit.append(re.sub(r"[^\n]", " ", seg) if dim else seg)
+        if m is None:
+            break
+        if m.group(2) == "m":
+            dim = _sgr_dim(m.group(1), dim)
+        pos = m.end()
+    rows = [ln.rstrip() for ln in "".join(full).split("\n")]
+    return rows, [ln.rstrip() for ln in "".join(lit).split("\n")]
+
+
+def _parse_codex(screen: str) -> tuple[str, list[str]]:
+    """Classify a Codex screen (read with escapes). Draft = the composer row's
+    non-dim text after the glyph."""
+    lines, lit = _undim(screen)
+    while lines and not lines[-1]:
+        lines.pop()
+    prompt = next((i for i in range(len(lines) - 1, -1, -1)
+                   if lines[i].startswith(_CODEX_GLYPH)), None)
+    outside = [ln for i, ln in enumerate(lines) if i != prompt]
+    spaceless = unicodedata.normalize("NFKC", "\n".join(outside[-20:]).lower()).replace(" ", "")
+    if any(f in spaceless for f in _CODEX_FOOTERS):
+        return NOT_READY, []
+    # The live glyph is bold; transcript echoes of past turns paint it dim.
+    if prompt is None or not lit[prompt].startswith(_CODEX_GLYPH) \
+            or _CODEX_MENU.match("\n".join(lines[prompt:prompt + 2])):
+        return NOT_READY, []
+    # Status line ("• Working (2s • esc to interrupt)") sits a spacer row or
+    # two above the composer; bounded so transcript text cannot pin busy.
+    above = [ln.lower() for ln in lines[max(prompt - 4, 0):prompt]]
+    near = "\n".join(above[-1:] + [ln.lower() for ln in lines[prompt + 1:]])
+    if any(m in near for m in _BUSY_MARKERS) or any(
+            ln.lstrip().startswith("•") and any(m in ln for m in _BUSY_MARKERS) for ln in above):
+        return BUSY, []
+    # Draft rows run on (no blank) below the glyph row; then a spacer and
+    # either the one-row footer or the slash-command popup ("  /review  ...").
+    # Any other layout may hide part of a draft: refuse it.
+    end = prompt + 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    rest = [ln for ln in lines[end:] if ln.strip()]
+    footer = [ln for ln in rest if re.match(r"  \S", ln)]
+    if not rest or footer != rest or (len(rest) > 1 and not all(ln.startswith("  /") for ln in rest)):
+        return NOT_READY, []
+    # Only the glyph row carries the dim placeholder; rows below always count.
+    draft = [lit[prompt][1:]] + lines[prompt + 1:end]
+    return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
+
+
+def _cells(text: str) -> int:
+    return sum(0 if unicodedata.combining(ch) else
+               2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
 def body_error(message: str, multiline_ok: bool) -> str | None:
     """Return why ``message`` cannot be a user turn, or None if it can."""
     if not message.strip():
@@ -138,15 +235,37 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
         # typing there would not reach the current recipient.
         return _refuse("user_turn_unsupported_target",
                        f"agent '{to_id}' was adopted by another session; its old pane is detached")
-    if target.kind != "claude":
-        # Codex composer rendering has no verified model here; fail closed.
+    pane_id = target.pane_id
+    codex = target.kind == "codex"
+    if not codex and target.kind != "claude":
         return _refuse("user_turn_unsupported_target",
-                       f"agent '{to_id}' is not a Claude pane (kind={target.kind!r})")
+                       f"agent '{to_id}' is not a Claude or Codex pane (kind={target.kind!r})")
+    if codex and "\n" in message:
+        # Only the single composer row is modelled for Codex (decided, #208).
+        return _refuse("user_turn_unsupported_target",
+                       "multi-line user_turn to a Codex pane is not supported; use deliver='channel'")
     err = body_error(message, bool(getattr(adapter, "bracketed_paste", False)))
     if err:
         return _refuse("user_turn_invalid_body", err)
+    if codex:
+        width = getattr(adapter, "pane_width", None)
+        try:
+            cols = width(pane_id) if width else None
+        except Exception as e:
+            return _refuse("user_turn_unsupported_target", f"cannot read pane width: {e}")
+        if not cols:
+            return _refuse("user_turn_unsupported_target",
+                           "terminal backend cannot report the pane width a Codex body must fit")
+        # Glyph + space, and a cell left for the caret (renga parity).
+        if _cells(message) > cols - 3:
+            return _refuse("user_turn_invalid_body",
+                           "body does not fit on one row of the Codex composer; "
+                           "send a shorter single line or use deliver='channel'")
+    parse = _parse_codex if codex else _parse
 
-    pane_id = target.pane_id
+    def read() -> str:
+        return adapter.get_text(pane_id, escapes=True) if codex else adapter.get_text(pane_id)
+
     key = str(pane_id)
     result = {"ok": True, "delivered_to": target.agent_id, "deliver": "user_turn"}
     lock = broker._pane_write_lock(key)
@@ -158,7 +277,7 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
         if last and last[0] == message and now - last[1] < DUPLICATE_WINDOW:
             return {**result, "status": "duplicate_suppressed"}
         try:
-            state = assess_screen(adapter.get_text(pane_id))
+            state = parse(read())[0]
         except Exception as e:  # pane gone / backend down
             return _refuse("user_turn_unsupported_target", f"cannot read pane: {e}")
         if state == BUSY:
@@ -181,11 +300,11 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
             adapter.type_text(pane_id, message)
             broker._user_turn_last[key] = (message, now)
             time.sleep(broker.user_turn_settle)
-            if not _wait_stable_draft(broker, adapter, pane_id, message):
+            if not _wait_stable_draft(broker, read, parse, message):
                 return _stalled(broker, from_bind, target, message,
                                 "typed body did not settle into the composer; Enter not sent")
             adapter.send_enter(pane_id)
-            if not _wait_submitted(broker, adapter, pane_id):
+            if not _wait_submitted(broker, read, parse):
                 return _stalled(broker, from_bind, target, message,
                                 "Enter sent but the draft was not observed to be consumed")
         except Exception as e:  # backend failed mid-sequence: bytes may be on screen
@@ -197,10 +316,10 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
     return {**result, "status": "submitted"}
 
 
-def _poll(broker: "Broker", adapter, pane_id, timeout: float):
+def _poll(broker: "Broker", read, timeout: float):
     deadline = time.monotonic() + timeout
     while True:
-        yield adapter.get_text(pane_id)
+        yield read()
         if time.monotonic() >= deadline:
             return
         time.sleep(broker.user_turn_poll)
@@ -216,11 +335,11 @@ def _is_own_draft(draft: list[str], message: str) -> bool:
     return "".join("".join(draft).split()) == "".join(message.split())
 
 
-def _wait_stable_draft(broker: "Broker", adapter, pane_id, message: str) -> bool:
+def _wait_stable_draft(broker: "Broker", read, parse, message: str) -> bool:
     """Our draft visible in the composer, no busy/dialog, two identical frames."""
     prev = None
-    for screen in _poll(broker, adapter, pane_id, broker.user_turn_settle_timeout):
-        state, draft = _parse(screen)
+    for screen in _poll(broker, read, broker.user_turn_settle_timeout):
+        state, draft = parse(screen)
         if state != DRAFT or not _is_own_draft(draft, message):
             prev = None
             continue
@@ -230,9 +349,9 @@ def _wait_stable_draft(broker: "Broker", adapter, pane_id, message: str) -> bool
     return False
 
 
-def _wait_submitted(broker: "Broker", adapter, pane_id) -> bool:
-    for screen in _poll(broker, adapter, pane_id, broker.user_turn_submit_timeout):
-        if assess_screen(screen) in (BUSY, EMPTY):
+def _wait_submitted(broker: "Broker", read, parse) -> bool:
+    for screen in _poll(broker, read, broker.user_turn_submit_timeout):
+        if parse(screen)[0] in (BUSY, EMPTY):
             return True
     return False
 

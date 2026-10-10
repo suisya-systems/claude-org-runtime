@@ -162,13 +162,14 @@ TOOLS = [
                     "description": (
                         "`channel` (default) queues the body for channel/check_messages "
                         "delivery without taking the recipient's turn. `user_turn` types "
-                        "the body into an idle Claude recipient's empty composer and "
+                        "the body into an idle Claude or Codex recipient's empty composer and "
                         "submits it as a real user turn (slash commands such as /clear "
                         "or /loop only fire this way); it refuses with zero bytes written "
                         "unless readiness is proven ([user_turn_busy] / "
                         "[user_turn_not_ready] / [user_turn_unsupported_target] / "
                         "[user_turn_invalid_body]) and reports [user_turn_stalled] when "
-                        "the body was typed but submission was not observed. "
+                        "the body was typed but submission was not observed. Codex "
+                        "targets take a single line that fits the composer row. "
                         "dispatcher / secretary only."
                     ),
                 },

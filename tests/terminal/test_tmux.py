@@ -127,6 +127,13 @@ def test_pane_in_mode(adapter: TmuxAdapter, out: str, want: bool) -> None:
         "display-message", "-p", "-t", "%1", "#{pane_in_mode}"]
 
 
+def test_pane_width(adapter: TmuxAdapter) -> None:
+    adapter._fake.queue((0, "120\n", ""))
+    assert adapter.pane_width("%1") == 120
+    assert _args(adapter._fake.last) == [
+        "display-message", "-p", "-t", "%1", "#{pane_width}"]
+
+
 # --------------------------------------------------------------------------
 # spawn
 # --------------------------------------------------------------------------

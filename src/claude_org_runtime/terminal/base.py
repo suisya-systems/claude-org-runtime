@@ -167,6 +167,9 @@ class TerminalAdapter(Protocol):
     ``getattr(adapter, "bracketed_paste", False)`` で読む (注釈しない)。
     同じく任意メソッド ``pane_in_mode(pane_id) -> bool`` (tmux のみ実装) が True を
     返す pane (copy / view mode でスクロールバック中) へは user_turn を書かない。
+    任意メソッド ``pane_width(pane_id) -> int | None`` (tmux / wezterm 実装, Issue #208)
+    が桁数を返さない backend では Codex pane への user_turn を拒否する (本文が
+    composer の 1 行に収まることを確認できないため)。
 
     opportunistic reap の tuning (任意 ClassVar、backend-aware):
     broker の入口 reap (自己終了した managed pane の bookkeeping 掃除) は既定で
