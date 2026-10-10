@@ -19,8 +19,9 @@ two transports stay interchangeable for callers.
 Codex panes (Issue #208) use their own model (:func:`_parse_codex`): the
 lowest ``›`` row at column 0 is the composer, and it is proven empty only
 when everything after the glyph is blank or dim (Codex paints its rotating
-placeholder dim; typed text never is), so Codex screens are read with
-escapes. Busy = a ``•`` status line with an interrupt hint just above the
+placeholder dim; typed text never is) and only a spacer and the footer sit
+below it, so Codex screens are read with escapes. After typing only the
+composer row is compared (a slash-command popup may be drawn below it). Busy = a ``•`` status line with an interrupt hint just above the
 composer. A Codex body must be one line that fits on the composer row:
 renga has no verified model of a wrapped Codex composer either, so the
 backend must report the pane width (``pane_width``) or the turn is refused.
@@ -116,7 +117,8 @@ def _parse(screen: str) -> tuple[str, list[str]]:
 # --- Codex (calibrated on renga's codex v0.153.4 fixtures) ------------------
 _CODEX_GLYPH = "\u203a"  # ›
 _CODEX_FOOTERS = _DIALOG_FOOTERS + ("entertocontinue",)  # update / trust prompts
-_CODEX_MENU_ROW = re.compile("\u203a\\s*\\d+\\.\\s")      # "› 1. Yes, proceed"
+# "› 1. Yes, proceed" over "  2. ...": a menu (a body may start with "1. ").
+_CODEX_MENU = re.compile("\u203a\\s*1\\.\\s.*\n\\s+2\\.\\s")
 _ESC_SEQ = re.compile(r"\x1b(?:\[([0-?]*)[ -/]*([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 
 
@@ -166,7 +168,9 @@ def _parse_codex(screen: str) -> tuple[str, list[str]]:
     spaceless = unicodedata.normalize("NFKC", "\n".join(outside[-20:]).lower()).replace(" ", "")
     if any(f in spaceless for f in _CODEX_FOOTERS):
         return NOT_READY, []
-    if prompt is None or _CODEX_MENU_ROW.match(lines[prompt]):
+    # The live glyph is bold; transcript echoes of past turns paint it dim.
+    if prompt is None or not lit[prompt].startswith(_CODEX_GLYPH) \
+            or _CODEX_MENU.match("\n".join(lines[prompt:prompt + 2])):
         return NOT_READY, []
     # Status line ("• Working (2s • esc to interrupt)") sits a spacer row or
     # two above the composer; bounded so transcript text cannot pin busy.
@@ -176,7 +180,14 @@ def _parse_codex(screen: str) -> tuple[str, list[str]]:
             ln.lstrip().startswith("•") and any(m in ln for m in _BUSY_MARKERS) for ln in above):
         return BUSY, []
     draft = [lit[prompt][1:]]
-    return (DRAFT if draft[0].strip() else EMPTY), draft
+    if draft[0].strip():
+        return DRAFT, draft
+    # Empty only in the calibrated layout: a spacer row, then at most the
+    # footer. Anything else may be the continuation rows of someone's draft.
+    below = lines[prompt + 1:]
+    if below and (below[0].strip() or sum(1 for ln in below if ln.strip()) > 1):
+        return NOT_READY, []
+    return EMPTY, draft
 
 
 def _cells(text: str) -> int:

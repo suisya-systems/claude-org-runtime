@@ -503,6 +503,10 @@ _UPDATE = (f"\n\x1b[36;1m  ✨ \x1b[39mUpdate available!\n\n\x1b[36;22;24m› 1.
     (_UPDATE, NOT_READY),
     (codex().replace("\x1b[2m", "").replace("\x1b[0m", ""), DRAFT),  # no escapes: unproven
     (codex().replace(f"{_B}›", f" {_B}›"), NOT_READY),           # glyph not at column 0
+    (codex(foot="  someone's second line\n\n" + _CODEX_FOOT), NOT_READY),  # continuation
+    (codex(foot=_CODEX_FOOT + "  extra row\n"), NOT_READY),     # unknown layout below
+    (codex("1. Explain the failure"), DRAFT),                    # numbered body, not a menu
+    (codex().replace(f"{_B}›", f"{_D}›"), NOT_READY),            # dim glyph: transcript echo
     ("$ ls\n", NOT_READY),
     ("", NOT_READY),
 ])
@@ -543,12 +547,13 @@ class CodexAdapter:
 
 
 @pytest.mark.parametrize("busy_after_enter", [False, True])
-def test_codex_user_turn_submits(tmp_path, busy_after_enter):
+@pytest.mark.parametrize("body", ["/review", "1. Explain the failure"])
+def test_codex_user_turn_submits(tmp_path, busy_after_enter, body):
     a = CodexAdapter(busy_after_enter=busy_after_enter)
     b, src = make_broker(tmp_path, a, kind="codex")
-    res = send(b, src, "/review")
+    res = send(b, src, body)
     assert res["status"] == "submitted", res
-    assert a.writes == [("type", "/review"), ("enter",)]
+    assert a.writes == [("type", body), ("enter",)]
     assert all(a.escapes_seen)  # placeholder vs draft needs the dim attribute
 
 
@@ -564,6 +569,7 @@ def test_codex_body_filling_the_row_submits(tmp_path):
     ("draft", "user_turn_not_ready"),
     ("approval", "user_turn_not_ready"),
     ("update", "user_turn_not_ready"),
+    ("continuation", "user_turn_not_ready"),
     ("multiline", "user_turn_unsupported_target"),
     ("no_width", "user_turn_unsupported_target"),
     ("width_error", "user_turn_unsupported_target"),
@@ -584,6 +590,8 @@ def test_codex_refusal_writes_zero_bytes(tmp_path, case, code):
         a.fixed_screen = _APPROVAL
     elif case == "update":
         a.fixed_screen = _UPDATE
+    elif case == "continuation":
+        a.fixed_screen = codex(foot="  someone's second line\n\n" + _CODEX_FOOT)
     elif case == "multiline":
         body = "a\nb"
     elif case == "no_width":
