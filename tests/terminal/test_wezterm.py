@@ -473,3 +473,10 @@ def test_wezterm_is_not_isolated_session() -> None:
     # wezterm cli list は global mux を見せる (dedicated socket 分離なし) ため
     # isolated_session=False。broker は論理ペイン (窓口) を last-pane 計上しない。
     assert WezTermAdapter.isolated_session is False
+
+
+def test_pane_width_reads_list_size(adapter: WezTermAdapter) -> None:
+    adapter._fake.queue((0, '[{"pane_id": 5, "size": {"cols": 132, "rows": 40}}]', ""))
+    assert adapter.pane_width(5) == 132
+    adapter._fake.queue((0, "[]", ""))
+    assert adapter.pane_width(5) is None

@@ -12,7 +12,7 @@ from claude_org_runtime.broker import surface
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.surface import ToolArgError, dispatch_tool
 from claude_org_runtime.broker.user_turn import (
-    BUSY, DRAFT, EMPTY, MAX_BODY_BYTES, NOT_READY, assess_screen,
+    BUSY, DRAFT, EMPTY, MAX_BODY_BYTES, NOT_READY, _parse_codex, assess_screen,
 )
 from claude_org_runtime.schema import broker_queue_event_schema
 
@@ -144,7 +144,7 @@ _BUSY = composer(footer="✻ Working… (esc to interrupt)")
     ("dialog", "user_turn_not_ready"),
     ("unknown_screen", "user_turn_not_ready"),
     ("in_flight", "user_turn_not_ready"),
-    ("codex", "user_turn_unsupported_target"),
+    ("codex_no_width", "user_turn_unsupported_target"),
     ("no_pane", "user_turn_unsupported_target"),
     ("no_adapter", "user_turn_unsupported_target"),
     ("read_error", "user_turn_unsupported_target"),
@@ -168,7 +168,7 @@ def test_refusal_writes_zero_bytes(tmp_path, case, code):
         a.fixed_screen = composer() + "\nEnter to confirm · Esc to exit\n"
     elif case == "unknown_screen":
         a.fixed_screen = "$ "
-    elif case == "codex":
+    elif case == "codex_no_width":
         kw["kind"] = "codex"
     elif case == "no_pane":
         kw["pane_id"] = None
@@ -467,3 +467,158 @@ def test_adopted_away_pane_is_refused_with_zero_bytes(tmp_path):
     assert a.writes == []
     b._pane_meta["7"].pop("adopted_away")  # reattached (#166 rollback): deliverable again
     assert send(b, src, "/clear")["status"] == "submitted"
+
+
+# ---------------------------------------------------------------- Codex (#208)
+# `capture-pane -e` shapes of renga's codex v0.153.4 fixtures. SGR state carries
+# across rows, as tmux only emits attribute changes.
+_D, _B, _R = "\x1b[2m", "\x1b[1m", "\x1b[0m"
+_CODEX_HEAD = (f"{_D}╭────────╮\n│ >_ {_B}OpenAI Codex{_D} (v0.153.4) │\n╰────────╯\n"
+               f"{_R}  {_B}Tip:{_R} Use /fast\n\n")
+_CODEX_FOOT = f"{_R}\n  \x1b[38;2;246;226;183mgpt-6-astra medium\x1b[39;2m · ~/work\n"
+_WORKING = f"• {_D}Working{_R} {_D}(2s • esc to interrupt)\n{_R}\n"
+
+
+def codex(content: str = "", above: str = "", foot: str = _CODEX_FOOT) -> str:
+    row = f"{_B}›{_R} {content}" if content else f"{_B}›{_R} {_D}Ask Codex to do anything"
+    return _CODEX_HEAD + above + row + "\n" + foot
+
+
+_APPROVAL = (_CODEX_HEAD + f"• {_B}Running{_R} printf hi\n\n  Would you like to run it?\n\n"
+             f"\x1b[36;1m› 1. Yes, proceed (y)\n{_R}  2. No (esc)\n"
+             f"  {_D}Press enter to confirm or esc to cancel{_R}\n")
+_UPDATE = (f"\n\x1b[36;1m  ✨ \x1b[39mUpdate available!\n\n\x1b[36;22;24m› 1. Update now\n"
+           f"  {_R}2. Skip\n\n  {_D}Press enter to continue{_R}\n")
+
+
+@pytest.mark.parametrize("screen,want", [
+    (codex(), EMPTY),
+    (codex() + "\n\n\n", EMPTY),                                 # blank rows below
+    (codex().replace("Ask Codex to do anything", "Explain this codebase"), EMPTY),
+    ("some answer quoting esc to interrupt\n\n\n\n\n" + codex(), EMPTY),  # transcript
+    (codex("hello draft"), DRAFT),
+    (codex(above=_WORKING), BUSY),
+    (codex("follow up", above=_WORKING, foot=f"\n  {_D}tab to queue message{_R}\n"), BUSY),
+    (_APPROVAL, NOT_READY),
+    (_UPDATE, NOT_READY),
+    (codex().replace("\x1b[2m", "").replace("\x1b[0m", ""), DRAFT),  # no escapes: unproven
+    (codex().replace(f"{_B}›", f" {_B}›"), NOT_READY),           # glyph not at column 0
+    ("$ ls\n", NOT_READY),
+    ("", NOT_READY),
+])
+def test_parse_codex(screen, want):
+    assert _parse_codex(screen)[0] == want
+
+
+class CodexAdapter:
+    """Models a Codex composer (dim placeholder when empty)."""
+
+    bracketed_paste = True
+
+    def __init__(self, width=100, fixed_screen=None, busy_after_enter=False):
+        self.width, self.fixed_screen = width, fixed_screen
+        self.busy_after_enter = busy_after_enter
+        self.draft, self.busy = "", False
+        self.writes: list[tuple] = []
+        self.escapes_seen: list[bool] = []
+
+    def pane_width(self, pane_id):
+        if isinstance(self.width, Exception):
+            raise self.width
+        return self.width
+
+    def get_text(self, pane_id, escapes=False) -> str:
+        self.escapes_seen.append(escapes)
+        if self.fixed_screen is not None:
+            return self.fixed_screen
+        return codex(self.draft, above=_WORKING if self.busy else "")
+
+    def type_text(self, pane_id, text) -> None:
+        self.writes.append(("type", text))
+        self.draft += text
+
+    def send_enter(self, pane_id) -> None:
+        self.writes.append(("enter",))
+        self.draft, self.busy = "", self.busy_after_enter
+
+
+@pytest.mark.parametrize("busy_after_enter", [False, True])
+def test_codex_user_turn_submits(tmp_path, busy_after_enter):
+    a = CodexAdapter(busy_after_enter=busy_after_enter)
+    b, src = make_broker(tmp_path, a, kind="codex")
+    res = send(b, src, "/review")
+    assert res["status"] == "submitted", res
+    assert a.writes == [("type", "/review"), ("enter",)]
+    assert all(a.escapes_seen)  # placeholder vs draft needs the dim attribute
+
+
+def test_codex_body_filling_the_row_submits(tmp_path):
+    a = CodexAdapter(width=20)
+    b, src = make_broker(tmp_path, a, kind="codex")
+    assert send(b, src, "x" * 17)["status"] == "submitted"
+
+
+@pytest.mark.parametrize("case,code", [
+    ("busy", "user_turn_busy"),
+    ("queued_draft", "user_turn_busy"),
+    ("draft", "user_turn_not_ready"),
+    ("approval", "user_turn_not_ready"),
+    ("update", "user_turn_not_ready"),
+    ("multiline", "user_turn_unsupported_target"),
+    ("no_width", "user_turn_unsupported_target"),
+    ("width_error", "user_turn_unsupported_target"),
+    ("too_wide", "user_turn_invalid_body"),
+    ("too_wide_cjk", "user_turn_invalid_body"),
+    ("tab", "user_turn_invalid_body"),
+])
+def test_codex_refusal_writes_zero_bytes(tmp_path, case, code):
+    a = CodexAdapter(width=20)
+    body = "/review"
+    if case == "busy":
+        a.fixed_screen = codex(above=_WORKING)
+    elif case == "queued_draft":
+        a.fixed_screen = codex("follow up", above=_WORKING)
+    elif case == "draft":
+        a.fixed_screen = codex("someone's draft")
+    elif case == "approval":
+        a.fixed_screen = _APPROVAL
+    elif case == "update":
+        a.fixed_screen = _UPDATE
+    elif case == "multiline":
+        body = "a\nb"
+    elif case == "no_width":
+        a.width = None
+    elif case == "width_error":
+        a.width = RuntimeError("pane gone")
+    elif case == "too_wide":
+        body = "x" * 18
+    elif case == "too_wide_cjk":
+        body = "あ" * 9
+    elif case == "tab":
+        body = "a\tb"
+    b, src = make_broker(tmp_path, a, kind="codex")
+    res = send(b, src, body)
+    assert res["ok"] is False
+    assert res["error"].startswith(f"[{code}]"), res
+    assert a.writes == []
+
+
+def test_codex_draft_that_is_not_ours_withholds_enter(tmp_path):
+    a = CodexAdapter()
+    b, src = make_broker(tmp_path, a, kind="codex")
+    a.draft = ""
+    orig = a.type_text
+    a.type_text = lambda pid, text: (orig(pid, text), setattr(a, "draft", "x" + a.draft))
+    res = send(b, src, "/review")
+    assert res["error"].startswith("[user_turn_stalled]")
+    assert ("enter",) not in a.writes
+
+
+def test_codex_dialog_after_typing_withholds_enter(tmp_path):
+    a = CodexAdapter()
+    b, src = make_broker(tmp_path, a, kind="codex")
+    orig = a.type_text
+    a.type_text = lambda pid, text: (orig(pid, text), setattr(a, "fixed_screen", _APPROVAL))
+    res = send(b, src, "1. Yes, proceed (y)")
+    assert res["error"].startswith("[user_turn_stalled]")
+    assert ("enter",) not in a.writes

@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AttentionEvent` of kind `ci_passed`, default severity `urgent`, with a
   default title/body template. Override via `notify` / `templates` as for any
   kind. Before, passed runs were dropped. Needs a paired ja template sync.
+- **`deliver="user_turn"` reaches Codex panes (#208).** The broker now proves
+  an idle, empty Codex composer (lowest `›` row with only Codex's dim
+  placeholder after it, read with escapes; no `• Working (… esc to
+  interrupt)` status line just above it; no selection dialog footer) before
+  typing, and observes the submit the same way. A Codex body must be a single
+  line that fits on the composer row, measured against the pane width the
+  backend reports (`pane_width`, new on tmux and WezTerm): an over-long line
+  is `[user_turn_invalid_body]`, a multi-line body or a backend that cannot
+  report the width is `[user_turn_unsupported_target]`. Unclassifiable
+  screens stay `[user_turn_not_ready]`.
 - **`send_message` gains `deliver="user_turn"` (#163).** Broker parity with
   renga's `send_message(deliver=...)`: the body is typed into the recipient
   Claude's composer and submitted with a separate Enter, so `/clear`, `/loop`
@@ -33,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `send_keys`) and bypasses the queue. `deliver="channel"` (the default) and
   `send_keys` are unchanged. The fallback nudge and `user_turn` now take a
   per-pane write lock. New journal events `user_turn_submitted` /
-  `user_turn_stalled`. Known limits versus renga: Codex targets are refused,
+  `user_turn_stalled`. Known limits versus renga:
   the caret position is not checked, and a dialog drawn between the last
   screen read and a write is not excluded (no parser lock in the broker).
   `send_keys` stays unserialized (raw keys must not wait behind a turn); a
