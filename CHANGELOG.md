@@ -16,11 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind. Before, passed runs were dropped. Needs a paired ja template sync.
 - **`deliver="user_turn"` reaches Codex panes (#208).** The broker now proves
   an idle, empty Codex composer (lowest `›` row, glyph not dim, with only
-  Codex's dim placeholder after it, read with escapes, and nothing below it
-  but a spacer and the footer; no `• Working (… esc to interrupt)` status
-  line just above it; no selection menu or dialog footer) before typing, and
-  observes the submit the same way. Once typed, only the composer row is
-  compared against the body (rows below may be Codex's slash-command popup). A Codex body must be a single
+  Codex's dim placeholder after it, read with escapes, no continuation rows,
+  and only the footer or the slash-command popup after the spacer; no
+  `• Working (… esc to interrupt)` status line just above it; no selection
+  menu or dialog footer) before typing, and observes the submit the same
+  way. Enter is withheld unless the whole typed draft is the body. A Codex body must be a single
   line that fits on the composer row, measured against the pane width the
   backend reports (`pane_width`, new on tmux and WezTerm): an over-long line
   is `[user_turn_invalid_body]`, a multi-line body or a backend that cannot

@@ -503,9 +503,12 @@ _UPDATE = (f"\n\x1b[36;1m  ✨ \x1b[39mUpdate available!\n\n\x1b[36;22;24m› 1.
     (_UPDATE, NOT_READY),
     (codex().replace("\x1b[2m", "").replace("\x1b[0m", ""), DRAFT),  # no escapes: unproven
     (codex().replace(f"{_B}›", f" {_B}›"), NOT_READY),           # glyph not at column 0
-    (codex(foot="  someone's second line\n\n" + _CODEX_FOOT), NOT_READY),  # continuation
+    (codex(foot="  someone's second line\n\n" + _CODEX_FOOT), DRAFT),  # continuation
     (codex(foot=_CODEX_FOOT + "  extra row\n"), NOT_READY),     # unknown layout below
-    (codex("1. Explain the failure"), DRAFT),                    # numbered body, not a menu
+    (codex("1. Explain the failure"), DRAFT),
+    # live codex 0.153.4: popup after the spacer row is not draft content
+    (codex("/rev", foot="\n  \x1b[1m/review  review my current changes\n\x1b[22m  /revert  \x1b[2mx\n"),
+     DRAFT),                    # numbered body, not a menu
     (codex().replace(f"{_B}›", f"{_D}›"), NOT_READY),            # dim glyph: transcript echo
     ("$ ls\n", NOT_READY),
     ("", NOT_READY),
@@ -630,3 +633,30 @@ def test_codex_dialog_after_typing_withholds_enter(tmp_path):
     res = send(b, src, "1. Yes, proceed (y)")
     assert res["error"].startswith("[user_turn_stalled]")
     assert ("enter",) not in a.writes
+
+
+def test_parse_codex_draft_spans_continuation_rows_not_popup():
+    popup = "\n  /review  review my current changes and find issues\n"
+    assert _parse_codex(codex("/review", foot=popup))[1] == [" /review"]
+    cont = codex("/review", foot="  second line\n" + _CODEX_FOOT)
+    assert _parse_codex(cont) == (DRAFT, [" /review", "  second line"])
+
+
+def test_codex_continuation_added_after_typing_withholds_enter(tmp_path):
+    a = CodexAdapter()
+    b, src = make_broker(tmp_path, a, kind="codex")
+    orig = a.type_text
+    a.type_text = lambda pid, text: (orig(pid, text), setattr(
+        a, "fixed_screen", codex(text, foot="  another request\n" + _CODEX_FOOT)))
+    res = send(b, src, "/review")
+    assert res["error"].startswith("[user_turn_stalled]")
+    assert ("enter",) not in a.writes
+
+
+def test_codex_slash_popup_after_typing_still_submits(tmp_path):
+    a = CodexAdapter()
+    b, src = make_broker(tmp_path, a, kind="codex")
+    popup = "\n  /review  review my current changes and find issues\n"
+    a.get_text = lambda pid, escapes=False: codex(a.draft, foot=popup if a.draft else _CODEX_FOOT)
+    assert send(b, src, "/review")["status"] == "submitted"
+    assert a.writes == [("type", "/review"), ("enter",)]

@@ -19,9 +19,10 @@ two transports stay interchangeable for callers.
 Codex panes (Issue #208) use their own model (:func:`_parse_codex`): the
 lowest ``›`` row at column 0 is the composer, and it is proven empty only
 when everything after the glyph is blank or dim (Codex paints its rotating
-placeholder dim; typed text never is) and only a spacer and the footer sit
-below it, so Codex screens are read with escapes. After typing only the
-composer row is compared (a slash-command popup may be drawn below it). Busy = a ``•`` status line with an interrupt hint just above the
+placeholder dim; typed text never is), so Codex screens are read with
+escapes. Draft rows continue directly below the glyph row; after a spacer
+only the footer or the slash-command popup may follow (calibrated live on
+codex 0.153.4), so a typed draft is compared in full. Busy = a ``•`` status line with an interrupt hint just above the
 composer. A Codex body must be one line that fits on the composer row:
 renga has no verified model of a wrapped Codex composer either, so the
 backend must report the pane width (``pane_width``) or the turn is refused.
@@ -179,15 +180,18 @@ def _parse_codex(screen: str) -> tuple[str, list[str]]:
     if any(m in near for m in _BUSY_MARKERS) or any(
             ln.lstrip().startswith("•") and any(m in ln for m in _BUSY_MARKERS) for ln in above):
         return BUSY, []
-    draft = [lit[prompt][1:]]
-    if draft[0].strip():
-        return DRAFT, draft
-    # Empty only in the calibrated layout: a spacer row, then at most the
-    # footer. Anything else may be the continuation rows of someone's draft.
-    below = lines[prompt + 1:]
-    if below and (below[0].strip() or sum(1 for ln in below if ln.strip()) > 1):
+    # Draft rows run on (no blank) below the glyph row; then a spacer and
+    # either the one-row footer or the slash-command popup ("  /review  ...").
+    # Any other layout may hide part of a draft: refuse it.
+    end = prompt + 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    rest = [ln for ln in lines[end:] if ln.strip()]
+    if len(rest) > 1 and not all(ln.startswith("  /") for ln in rest):
         return NOT_READY, []
-    return EMPTY, draft
+    # Only the glyph row carries the dim placeholder; rows below always count.
+    draft = [lit[prompt][1:]] + lines[prompt + 1:end]
+    return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
 
 
 def _cells(text: str) -> int:
