@@ -159,6 +159,15 @@ class TerminalAdapter(Protocol):
     ``isolated_session`` と同じ理由で **注釈しない** ClassVar とし、broker は
     ``getattr(adapter, "supported_named_keys", frozenset())`` で読む。
 
+    能力フラグ ``bracketed_paste`` (bool, ClassVar, Issue #163): :meth:`type_text`
+    が bracketed paste で送られ、複数行を改行で submit させずに 1 つの draft として
+    置けるか。tmux / wezterm は True。宣言しない backend (Herdr の ``pane.send_text``
+    は未検証) では broker の ``send_message(deliver="user_turn")`` が複数行本文を
+    ``[user_turn_invalid_body]`` で拒否する。broker は
+    ``getattr(adapter, "bracketed_paste", False)`` で読む (注釈しない)。
+    同じく任意メソッド ``pane_in_mode(pane_id) -> bool`` (tmux のみ実装) が True を
+    返す pane (copy / view mode でスクロールバック中) へは user_turn を書かない。
+
     opportunistic reap の tuning (任意 ClassVar、backend-aware):
     broker の入口 reap (自己終了した managed pane の bookkeeping 掃除) は既定で
     「snapshot に現れない = 即 reap」だが、``list_panes`` が **eventually consistent**
@@ -301,6 +310,10 @@ def classify_pane_state(screen: str) -> str:
     ここからは観測できない。よって IME 変換中の判定は自動化対象外。
     """
     lines = [ln.rstrip() for ln in screen.splitlines()]
+    # capture は短い UI の下の空行も含む (起動直後 / clear 直後の縦長 pane)。
+    # busy 判定窓を物理的な最下行でなく内容の末尾に合わせる。
+    while lines and not lines[-1]:
+        lines.pop()
     # 1) busy: 応答生成中ヒントが画面下部にある
     tail = "\n".join(lines[-20:]).lower()
     if any(m in tail for m in _BUSY_MARKERS):

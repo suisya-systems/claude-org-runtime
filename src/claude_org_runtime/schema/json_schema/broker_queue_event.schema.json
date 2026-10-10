@@ -23,7 +23,9 @@
         "nudge_sent",
         "nudge_deferred",
         "nudge_failed",
-        "logical_pane_registered"
+        "logical_pane_registered",
+        "user_turn_submitted",
+        "user_turn_stalled"
       ]
     },
     "host": { "type": ["string", "null"] },

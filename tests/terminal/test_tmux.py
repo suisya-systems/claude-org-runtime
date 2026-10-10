@@ -119,6 +119,14 @@ def test_get_text_with_escapes(adapter: TmuxAdapter) -> None:
     assert _args(adapter._fake.last) == ["capture-pane", "-t", "%1", "-p", "-e"]
 
 
+@pytest.mark.parametrize("out,want", [("1\n", True), ("0\n", False)])
+def test_pane_in_mode(adapter: TmuxAdapter, out: str, want: bool) -> None:
+    adapter._fake.queue((0, out, ""))
+    assert adapter.pane_in_mode("%1") is want
+    assert _args(adapter._fake.last) == [
+        "display-message", "-p", "-t", "%1", "#{pane_in_mode}"]
+
+
 # --------------------------------------------------------------------------
 # spawn
 # --------------------------------------------------------------------------

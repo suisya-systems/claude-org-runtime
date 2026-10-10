@@ -119,6 +119,9 @@ class WezTermAdapter:
     # として数えられる/不在なら +1 は stale なため)。backend 固定の能力なので
     # ClassVar (dataclass field にしない)。
     isolated_session: ClassVar[bool] = False
+    # type_text は bracketed paste (複数行を 1 draft として置ける)。user_turn が
+    # 複数行本文を許すかの判定に使う (Issue #163)。
+    bracketed_paste: ClassVar[bool] = True
 
     # raw-key vocabulary (Issue #108): WezTerm adapter は full gap ではなく
     # **既存実装で送れる subset** を宣言する (design review 確定事項 (5))。Enter は

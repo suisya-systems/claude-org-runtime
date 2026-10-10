@@ -156,6 +156,22 @@ TOOLS = [
             "properties": {
                 "to_id": {"type": "string", "description": "Recipient agent id or name."},
                 "message": {"type": "string", "description": "Text to deliver."},
+                "deliver": {
+                    "type": "string",
+                    "enum": ["channel", "user_turn"],
+                    "description": (
+                        "`channel` (default) queues the body for channel/check_messages "
+                        "delivery without taking the recipient's turn. `user_turn` types "
+                        "the body into an idle Claude recipient's empty composer and "
+                        "submits it as a real user turn (slash commands such as /clear "
+                        "or /loop only fire this way); it refuses with zero bytes written "
+                        "unless readiness is proven ([user_turn_busy] / "
+                        "[user_turn_not_ready] / [user_turn_unsupported_target] / "
+                        "[user_turn_invalid_body]) and reports [user_turn_stalled] when "
+                        "the body was typed but submission was not observed. "
+                        "dispatcher / secretary only."
+                    ),
+                },
             },
             "required": ["to_id", "message"],
         },
@@ -819,7 +835,19 @@ def dispatch_tool(broker: "Broker", bind: "AgentBind", name: str, args: dict) ->
         to_id, message = args.get("to_id"), args.get("message")
         if not isinstance(to_id, str) or not isinstance(message, str):
             raise ToolArgError("send_message requires string to_id and message")
-        return _ok(broker.enqueue(bind, to_id, message))
+        deliver = args.get("deliver", "channel")
+        if deliver == "channel":
+            return _ok(broker.enqueue(bind, to_id, message))
+        if deliver != "user_turn":
+            raise ToolArgError("send_message deliver must be 'channel' or 'user_turn'")
+        # user_turn は宛先 PTY へ書く = send_keys と同じ面。worker から secretary の
+        # pane へ打鍵できない tier 契約 (§4.2) を deliver 経由で迂回させない。
+        if bind.auth_role not in _OPS_TIERS:
+            return _err(
+                f"[tool_not_authorized] send_message deliver='user_turn' is not "
+                f"available to role {bind.auth_role!r}"
+            )
+        return _ok(broker.deliver_user_turn(bind, to_id, message))
 
     if name == "check_messages":
         return _ok({"messages": broker.drain(bind)})
