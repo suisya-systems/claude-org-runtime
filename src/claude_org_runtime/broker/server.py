@@ -545,6 +545,12 @@ class Broker(TokenMixin, StoreMixin):
                     return b
         return None
 
+    def _pane_adopted_away(self, pane_id: "PaneId") -> bool:
+        """adopt (#166) で配達所有権が別 session へ移った抜け殻 pane か。"""
+        with self._lock:
+            meta = self._pane_meta.get(str(pane_id))
+            return bool(meta and meta.get("adopted_away"))
+
     def deliver_user_turn(self, from_bind: AgentBind, to_id: str, message: str) -> dict:
         """``send_message(deliver="user_turn")`` (Issue #163)。queue を通さず
         宛先 composer に本文を打って submit する。詳細は :mod:`.user_turn`。"""

@@ -133,6 +133,11 @@ def deliver_user_turn(broker: "Broker", from_bind: "AgentBind", to_id: str, mess
     if adapter is None or target.pane_id is None:
         return _refuse("user_turn_unsupported_target",
                        f"agent '{to_id}' has no broker-managed pane to type into")
+    if broker._pane_adopted_away(target.pane_id):
+        # Ownership moved to another session (#166): the old pane is a husk and
+        # typing there would not reach the current recipient.
+        return _refuse("user_turn_unsupported_target",
+                       f"agent '{to_id}' was adopted by another session; its old pane is detached")
     if target.kind != "claude":
         # Codex composer rendering has no verified model here; fail closed.
         return _refuse("user_turn_unsupported_target",

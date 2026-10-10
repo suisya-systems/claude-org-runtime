@@ -438,3 +438,15 @@ def test_foreign_continuation_row_withholds_enter(tmp_path):
     b, src = make_broker(tmp_path, a)
     assert send(b, src, "/loop 5m check queue")["error"].startswith("[user_turn_stalled]")
     assert ("enter",) not in a.writes
+
+
+# ---------------------------------------------------------------- codex round 4
+def test_adopted_away_pane_is_refused_with_zero_bytes(tmp_path):
+    a = ComposerAdapter()
+    b, src = make_broker(tmp_path, a)
+    b._pane_meta["7"] = {"agent_id": "dst", "handle": 7, "adopted_away": True}
+    res = send(b, src, "/clear")
+    assert res["error"].startswith("[user_turn_unsupported_target]")
+    assert a.writes == []
+    b._pane_meta["7"].pop("adopted_away")  # reattached (#166 rollback): deliverable again
+    assert send(b, src, "/clear")["status"] == "submitted"
