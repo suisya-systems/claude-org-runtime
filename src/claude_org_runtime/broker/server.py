@@ -499,7 +499,13 @@ class Broker(TokenMixin, StoreMixin):
                 # lock 外の古い画面なので、lock 取得後に idle を取り直す。
                 try:
                     with self._pane_write_lock(str(pane_id)):
-                        state = classify_pane_state(self.adapter.get_text(pane_id))
+                        screen = self.adapter.get_text(pane_id)
+                        state = classify_pane_state(screen)
+                        # classify_pane_state は ❯ 行しか見ないので、継続行に残った
+                        # 複数行 draft (stalled user_turn 等) を idle と誤認する。
+                        # user_turn と同じ composer 全体判定で draft があれば止める (#207)。
+                        if state == "idle" and user_turn.assess_screen(screen) == user_turn.DRAFT:
+                            state = "input_pending"
                         if state == "idle":
                             self.adapter.send_line(pane_id, NUDGE_TEXT)
                 except Exception as e:
