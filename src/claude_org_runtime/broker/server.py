@@ -1840,6 +1840,10 @@ def _tool_error_message(
     return scrub(msg) if scrub is not None else msg
 
 
+# 早期拒否で読み捨てる request body の上限 (Issue #201)。
+_DRAIN_LIMIT = 1 << 20
+
+
 class _McpHandler(BaseHTTPRequestHandler):
     """MCP streamable-HTTP (JSON-RPC over POST, application/json 応答)。"""
 
@@ -1877,7 +1881,42 @@ class _McpHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001 - 診断のための best-effort
             pass
 
+    def parse_request(self) -> bool:
+        # handler は keep-alive 接続ごとに 1 個。消費フラグは request ごとに戻す。
+        self._body_read = False
+        return super().parse_request()
+
+    def _read_body(self, length: int) -> bytes:
+        self._body_read = True
+        return self.rfile.read(length)
+
+    def _drain_body(self) -> None:
+        """未読の request body を読み捨てる (Issue #201)。
+
+        早期拒否 (401/403/404) は body を読まずに応答する。未読 byte を残したまま
+        close すると Windows は RST を送り、クライアントが応答を読み切る前に
+        ``ConnectionAbortedError`` [WinError 10053] で落ちる。keep-alive 時は残りが
+        次の request として parse され接続が壊れる。応答前に必ず消費する。
+        """
+        if self._body_read:
+            return
+        self._body_read = True
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            remaining = 0
+        # 上限超の body は読み切らず接続を閉じる (その場合の RST は許容する)。
+        if remaining > _DRAIN_LIMIT:
+            self.close_connection = True
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _send_json(self, status: int, payload: dict | None, session_id: str | None = None):
+        self._drain_body()
         body = b"" if payload is None else json.dumps(payload).encode("utf-8")
         self.send_response(status)
         if body:
@@ -1947,7 +1986,7 @@ class _McpHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", 0))
         try:
-            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            req = json.loads(self._read_body(length).decode("utf-8")) if length else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json(400, {"ok": False, "error": "[parse_error] invalid json body"})
             return
@@ -2032,7 +2071,7 @@ class _McpHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", 0))
         try:
-            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            req = json.loads(self._read_body(length).decode("utf-8")) if length else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json(400, {"error": "[parse_error] invalid json body"})
             return
@@ -2130,7 +2169,7 @@ class _McpHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         try:
-            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            req = json.loads(self._read_body(length).decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json(
                 400,

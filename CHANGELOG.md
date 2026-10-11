@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
+### Fixed
+
+- **Broker reads the request body before an early reject (#201).** A 401 /
+  403 / 404 answered before the body was read left unread bytes on the
+  socket; closing it made Windows send a RST that aborted the client's read
+  of the response (`ConnectionAbortedError` [WinError 10053]), and on a
+  keep-alive connection the leftover body was parsed as the next request.
+  The handler now drains the body (up to 1 MiB) before every response.
+
 ## [0.1.49] - 2026-10-11
 
 ### Added
