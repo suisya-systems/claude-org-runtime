@@ -19,6 +19,7 @@ daemon バックグラウンド起動 (subprocess.Popen) は注入差し替え�
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shlex
@@ -823,6 +824,29 @@ def test_launch_claude_posix_exec_injects_broker_transport(monkeypatch):
     launcher._launch_claude(["claude", "--mcp-config", "{}"])
     assert captured["file"] == "claude"
     assert captured["env"].get("ORG_TRANSPORT") == "broker"
+
+
+def test_launch_claude_posix_flushes_stdio_before_exec(monkeypatch):
+    """exec は stdio バッファを捨てるので、exec 前に flush されていること (#177 Defect 4)。
+
+    stdout が TTY でないと org up / org adopt の状況表示が block buffer に残ったまま
+    プロセスが置換され、ログが空になる。
+    """
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    out, err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(launcher.sys, "stdout", out)
+    monkeypatch.setattr(launcher.sys, "stderr", err)
+    flushed_at_exec = {}
+
+    def fake_execvpe(file, argv, env):
+        flushed_at_exec["ok"] = out.flushed and err.flushed
+
+    for stream in (out, err):
+        stream.flushed = False
+        stream.flush = lambda s=stream: setattr(s, "flushed", True)
+    monkeypatch.setattr(launcher.os, "execvpe", fake_execvpe)
+    launcher._launch_claude(["claude", "--mcp-config", "{}"])
+    assert flushed_at_exec == {"ok": True}
 
 
 def test_launch_claude_windows_subprocess_injects_broker_transport(monkeypatch):
