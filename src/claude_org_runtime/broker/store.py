@@ -725,8 +725,8 @@ class StoreMixin:
                     armed_until = now + arming_seconds
                     # 旧プロセスへ渡してあった full token を **付け替える** (Codex
                     # review P1)。切り離した旧 pane は生きたまま残りうるので、bind を
-                    # 共有したままだと 2 プロセスが 1 つの ``session_id`` を奪い合い、
-                    # どちらも [session_invalid] に落ちうる。配達所有権だけ移して MCP 面を
+                    # 共有したままだと旧プロセスが同じ token で MCP 面 (check_messages
+                    # の drain 等) を使い続けられる。配達所有権だけ移して MCP 面を
                     # 共有したままにしない。adopting session には付け替え後の token を
                     # --mcp-config で渡す。
                     adopted_token = self._rekey_bind_locked(full_token)

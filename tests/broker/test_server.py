@@ -228,6 +228,51 @@ def test_delete_drops_registration_for_delivery(broker, client_factory):
     assert "peer_not_found" in res["error"]
 
 
+def _shared_token_pair(broker, agent_id):
+    """同じ token を再生する 2 session (元 session と fork / resume)。"""
+    token = broker.issue_token(agent_id, agent_id, "worker")
+    orig, fork = MiniMcpClient(broker.url, token), MiniMcpClient(broker.url, token)
+    orig.rpc("initialize", {"protocolVersion": "2025-06-18"})
+    fork.rpc("initialize", {"protocolVersion": "2025-06-18"})
+    return orig, fork
+
+
+def test_fork_initialize_does_not_evict_original_session(broker):
+    # #168 session steal: fork の initialize が共有 bind の session を上書きしない。
+    orig, fork = _shared_token_pair(broker, "agent-o")
+    assert orig.session_id != fork.session_id
+    assert "result" in orig.rpc("tools/list")
+    assert "result" in fork.rpc("tools/list")
+
+
+def test_fork_delete_keeps_original_registered(broker, client_factory):
+    # #168 DELETE collateral: 兄弟の正常終了で生きている agent が配送先から消えない。
+    a = client_factory("agent-a")
+    orig, fork = _shared_token_pair(broker, "agent-o")
+    fork.delete(expect_status=200)
+    assert "result" in orig.rpc("tools/list")
+    res = a.call_tool("send_message", {"to_id": "agent-o", "message": "still here"})
+    assert res["ok"] is True
+    # 閉じた session は再利用できない。
+    assert "session_invalid" in fork.rpc("tools/list", expect_status=404)["error"]["message"]
+    # 最後の session が閉じたら従来どおり de-register。
+    orig.delete(expect_status=200)
+    res = a.call_tool("send_message", {"to_id": "agent-o", "message": "gone"})
+    assert "peer_not_found" in res["error"]
+
+
+def test_bind_sessions_are_capped_oldest_first(broker):
+    from claude_org_runtime.broker.tokens import MAX_SESSIONS_PER_BIND
+
+    token = broker.issue_token("agent-x", "agent-x", "worker")
+    clients = [MiniMcpClient(broker.url, token) for _ in range(MAX_SESSIONS_PER_BIND + 1)]
+    for c in clients:
+        c.rpc("initialize", {"protocolVersion": "2025-06-18"})
+    assert len(broker.get_bind(token).sessions) == MAX_SESSIONS_PER_BIND
+    assert "session_invalid" in clients[0].rpc("tools/list", expect_status=404)["error"]["message"]
+    assert "result" in clients[-1].rpc("tools/list")
+
+
 # --------------------------------------------------------------------- journal
 def test_queue_journal_written_to_state_dir(broker, client_factory):
     a = client_factory("agent-a")

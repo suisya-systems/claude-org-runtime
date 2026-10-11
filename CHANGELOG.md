@@ -67,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Sessions sharing an agent token no longer evict each other (#168).** A
+  fork or `--resume` replays the mcp-config, so two processes can hold the same
+  token. Before, the second `initialize` overwrote the bind's only session
+  (the first process then got `[session_invalid]`), and either one's DELETE
+  cleared `registered`, so `send_message` to the still-live one returned
+  `[peer_not_found]`. A bind now keeps a set of sessions (capped at 16, oldest
+  dropped); DELETE removes only its own and de-registers only when none are
+  left. Also tested the "headers must be literal" premise: Claude Code expands
+  `${VAR}` in `--mcp-config` headers, so moving the token to process env could
+  close the replayed-token pull path. That change is not made here; see
+  `docs/channel-delivery-model-decision.md` §4.4.
+
 - **Workers can no longer push images with the host's docker credentials
   (#149).** Worker templates allow `docker build` / `docker buildx build` and
   run them outside the sandbox, so `--push` or `--output type=registry` wrote

@@ -48,7 +48,7 @@ from ..terminal import (
 from . import sidecar, store, surface, user_turn
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
-from .tokens import AgentBind, TokenMixin
+from .tokens import MAX_SESSIONS_PER_BIND, AgentBind, TokenMixin
 
 
 class Broker(TokenMixin, StoreMixin):
@@ -1883,11 +1883,14 @@ class _McpHandler(BaseHTTPRequestHandler):
         sid = self.headers.get("Mcp-Session-Id")
         closed = False
         with self.broker._lock:
-            if bind.session_id is not None and sid == bind.session_id:
-                bind.session_id = None
-                # 登録も落とす: 切断済み client を list_peers / 配送先に
-                # 残さない (codex review round 3 Major 対応)
-                bind.registered = False
+            if sid is not None and sid in bind.sessions:
+                del bind.sessions[sid]
+                # 最後の session が閉じたら登録も落とす: 切断済み client を
+                # list_peers / 配送先に残さない (codex review round 3 Major 対応)。
+                # 同じ token の別 session (fork / resume) が生きている間は落とさない
+                # — 兄弟の正常終了で生きている agent が [peer_not_found] になる (#168)。
+                if not bind.sessions:
+                    bind.registered = False
                 closed = True
         if not closed:
             self._send_json(404, None)
@@ -2124,8 +2127,8 @@ class _McpHandler(BaseHTTPRequestHandler):
         if method != "initialize":
             sid = self.headers.get("Mcp-Session-Id")
             with self.broker._lock:
-                expected = bind.session_id
-            if expected is None or sid != expected:
+                known = sid is not None and sid in bind.sessions
+            if not known:
                 self._send_json(
                     404,
                     {
@@ -2153,7 +2156,11 @@ class _McpHandler(BaseHTTPRequestHandler):
             with self.broker._lock:
                 bind.registered = True
                 bind.registered_at = time.time()
-                bind.session_id = session_id
+                # 既存 session は上書きしない (#168): 同じ token を再生した fork が
+                # initialize しても元の session は有効なまま。
+                bind.sessions[session_id] = None
+                while len(bind.sessions) > MAX_SESSIONS_PER_BIND:
+                    del bind.sessions[next(iter(bind.sessions))]
             self.broker._journal(
                 "agent_registered", agent_id=bind.agent_id, role=bind.role
             )

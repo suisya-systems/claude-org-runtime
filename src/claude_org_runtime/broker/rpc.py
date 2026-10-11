@@ -134,8 +134,8 @@ class _McpClient:
     def close(self) -> None:
         """MCP セッションを DELETE で閉じる (best-effort)。
 
-        bind の ``session_id`` を落とし ``registered=False`` にする (server の
-        do_DELETE)。使い捨て token を list_peers / 配送先から de-register し、走行中
+        当該 session を bind から外し、最後の session なら ``registered=False`` に
+        する (server の do_DELETE)。使い捨て token を list_peers / 配送先から de-register し、走行中
         daemon に idle な登録を残さないための後始末。初期化前 / 既に閉じている等は
         無視する。
         """

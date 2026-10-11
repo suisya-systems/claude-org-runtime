@@ -17,13 +17,19 @@ import secrets
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..terminal import PaneId
 
 if TYPE_CHECKING:  # mixin が前提とする Broker の共有状態 (型のみ)
     pass
+
+# 1 bind が同時に保持できる MCP session 数の上限。超えたら最古を落とす。
+# ponytail: 固定上限。DELETE せず落ちた client の session が溜まり続けないための
+# 歯止めで、token を持つ fork がこの数だけ initialize すれば最古 (元 session) を
+# 追い出せる。token 保持者は drain も呼べるので新しい露出ではない (#168)。
+MAX_SESSIONS_PER_BIND = 16
 
 
 @dataclass
@@ -49,7 +55,13 @@ class AgentBind:
     kind: str | None = None           # peer client 種別 ("claude" / "codex" / None)
     registered: bool = False          # MCP initialize 到達で True (AC-2-3 の検知点)
     registered_at: float | None = None
-    session_id: str | None = None
+    # live MCP session の集合 (挿入順 = 古い順)。fork / resume は mcp-config の
+    # token を再生するので 1 token を複数プロセスが共有しうる。session を 1 つしか
+    # 持たないと、後から initialize した側が先の側を ``[session_invalid]`` に
+    # 追い出し、片方の DELETE が共有 bind の ``registered`` を落として生きている
+    # 側を配送先から消す (decision note §4.5 / #168)。session ごとに持てば、
+    # 互いの session と配送登録を無効化できない。
+    sessions: dict[str, None] = field(default_factory=dict)
     summary: str = ""
     revoked: bool = False
     # credential scope (§9.4 delivery-scoped token)。
@@ -128,16 +140,16 @@ class TokenMixin:
 
         明示 adopt (#166) 用。adopt は同じ agent の配達所有権を別プロセスへ移すが、
         bind をそのまま使い回すと **2 つの live プロセスが 1 つの bind を共有** する。
-        bind は ``session_id`` を 1 つしか持たないので、双方の ``initialize`` が互いの
-        session を上書きし、以後どちらも ``[session_invalid]`` に落ちうる (decision note
-        §4.5 の session steal と同じ形)。旧プロセスへ渡した token を無効化することで、
-        「配達所有権を移した」が「MCP 面も移った」を伴うようにする。
+        session は bind ごとに複数持てる (#168) ので互いを追い出しはしないが、旧
+        プロセスが同じ token で MCP 面 (check_messages の drain 等) を使い続けられて
+        しまう。旧プロセスへ渡した token を無効化することで、「配達所有権を移した」が
+        「MCP 面も移った」を伴うようにする。
 
         **bind オブジェクトは作り直さない**: 表の鍵だけ差し替える。registered / cwd /
         role / auth_role / pane_id をそのまま引き継ぐので、handover の最中に owner が
         「登録されていない agent」になって送信元から見えなくなることがない (その窓に
         届いた message は queue に残るべきで、``[peer_not_found]`` で弾かれてはいけない)。
-        ``session_id`` だけは落とす — それは旧プロセスの MCP session の識別子であり、
+        ``sessions`` だけは空にする — それは旧プロセスの MCP session の識別子であり、
         引き継ぐ相手が居ない。
 
         ``new_token`` を明示するのは **失効時の巻き戻し** 経路だけ (元の token へ戻す)。
@@ -145,7 +157,7 @@ class TokenMixin:
         bind = self._binds.pop(old_token)
         token = new_token or secrets.token_urlsafe(32)
         bind.token = token
-        bind.session_id = None
+        bind.sessions.clear()
         self._binds[token] = bind
         return token
 
@@ -189,8 +201,8 @@ class TokenMixin:
 
         channel sidecar (:mod:`claude_org_runtime.broker.channel_sidecar`) を stdio
         MCP サーバーとして子 claude に load させる。token は env に**リテラルで**載せる
-        (``${VAR}`` 参照は config parse 時の失敗リスクのため使わない。既存の
-        :meth:`mcp_config_for` と同方針)。daemon URL は base (``/mcp`` 無し) で渡し、
+        (:meth:`mcp_config_for` と同方針。``${VAR}`` 展開自体は動くことを確認済み —
+        decision note §4.4)。daemon URL は base (``/mcp`` 無し) で渡し、
         sidecar が ``/poll-claims`` / ``/confirm-delivered`` を叩く。
         """
         return {
@@ -218,7 +230,10 @@ class TokenMixin:
     def mcp_config_for(self, token: str, server_name: str = "org-broker") -> dict:
         """--mcp-config に渡す JSON。token は static headers に埋める (確定事項 (2))。
 
-        env 参照 (${VAR}) は config parse 時の失敗リスクがあるため使わない。
+        ``${VAR}`` 参照は **Claude Code 2.1.296 で headers 内も展開される** (未設定時は
+        parse 失敗せずリテラルのまま送られる) ことを確認済み (#168, decision note §4.4)。
+        token を env 経由に移せば fork による pull path の再生を閉じられるが、起動
+        契約の変更なので未採用。
         """
         return {
             "mcpServers": {
