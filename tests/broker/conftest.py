@@ -57,11 +57,14 @@ class FakeAdapter:
         supports_space_layout: bool = False,
         supports_agent_kind: bool = False,
         venv_path_via_pane_env: bool = False,
+        supports_display_name: bool = False,
     ) -> None:
         # Issue #151: broker が getattr で読む能力フラグ。既定 False = 従来挙動
         # (kind を渡さない / venv は argv wrapper 方式)。
         self.supports_agent_kind = supports_agent_kind
         self.venv_path_via_pane_env = venv_path_via_pane_env
+        # Issue #123: True の時だけ broker が spawn(display_name=) を渡す。
+        self.supports_display_name = supports_display_name
         # 既定 True (tmux-style: adapter は自分が spawn した pane のみ見せる)。
         # global-mux backend (wezterm) を模すテストは False を渡す。
         self.isolated_session = isolated_session
@@ -126,12 +129,13 @@ class FakeAdapter:
     # TerminalAdapter Protocol --------------------------------------------
     def spawn(
         self, argv, cwd=None, new_window=True, space=None, env=None,
-        kind=_UNSET,
+        kind=_UNSET, display_name=_UNSET,
     ) -> PaneRef:
         handle = self.add_pane()
         self.spawned.append(
             {"argv": list(argv), "cwd": cwd, "handle": handle, "space": space,
-             "env": dict(env) if env else None, "kind": kind}
+             "env": dict(env) if env else None, "kind": kind,
+             "display_name": display_name}
         )
         tid = f"term_{handle}" if self._provides_terminal_id else None
         if tid is not None:
