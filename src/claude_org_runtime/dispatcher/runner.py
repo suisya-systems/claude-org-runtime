@@ -272,7 +272,28 @@ DEFAULT_WORKER_MODEL = "opus"
 #   ``--settings`` it makes the sandbox admin-required, which drops the
 #   project's additionalDirectories (Pattern B .git write surface) and
 #   excludedCommands (docker). The project body already sets it.
+# - ``permissions.deny`` blocks docker forms that write to a registry (#149).
+#   Worker templates allow ``docker build`` / ``docker buildx build`` and run
+#   them outside the sandbox (excludedCommands), so ``--push`` /
+#   ``--output type=registry`` would push with the host's ~/.docker
+#   credentials. Deny rules win over allow rules and are merged across
+#   settings scopes, and this overlay is the one surface every worker gets
+#   (claude-org-ja renders worker settings from its own schema). Hiding
+#   ~/.docker/config.json instead is no fix: docker reads it outside the
+#   sandbox, and without it pulls from a private registry go anonymous.
+#   ``*`` matches any characters, spaces included
+#   (https://code.claude.com/docs/en/permissions "Wildcard patterns").
+WORKER_DOCKER_PUSH_DENY: tuple[str, ...] = (
+    "Bash(docker push *)",  # docker push
+    "Bash(docker * push)",  # docker compose push (all services)
+    "Bash(docker * push *)",  # docker image|manifest|compose push, docker --config x push
+    "Bash(docker *--push*)",  # build|buildx build|bake --push
+    "Bash(docker *push=*)",  # --output type=image,push=true
+    "Bash(docker *type=registry*)",  # --output / -o / --cache-to type=registry
+    "Bash(docker *imagetools create*)",  # buildx imagetools create
+)
 WORKER_SANDBOX_SETTINGS: dict[str, Any] = {
+    "permissions": {"deny": list(WORKER_DOCKER_PUSH_DENY)},
     "sandbox": {
         "network": {
             "strictAllowlist": True,
