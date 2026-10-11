@@ -20,6 +20,9 @@ channel-only idle-wake が実機 PASS) の三状態モデルを、既存の brok
 **配達保証 = at-least-once + 冪等表示** (§9.3): ``DELIVERED`` は再配達しない
 (confirmed 上は at-most-once)。lease reap された ``CLAIMED`` 行は再 eligible 化
 (全体では at-least-once)。喪失より重複に倒す idle-wake 用途の正準選択。
+ただし confirm は emit の stdout flush であって host の受理ではない。host 受理信号が
+無い間の暫定として、受領の兆候が無い ``DELIVERED`` 行は pull 専用で再通知する
+(:meth:`StoreMixin._renotify_due_locked`、#131)。
 
 **pull フォールバック (§9.3 / §9.6)**: :meth:`drain` (= ``check_messages``) は
 **claim-respecting view** をドレインする — ``UNDELIVERED``-and-unclaimed (lease 失効で
@@ -289,6 +292,12 @@ class QueueRow:
     claim_generation: int = -1       # claim 時の delivery generation (session fencing 用)
     reclaim_count: int = 0           # lease reap で UNDELIVERED へ戻った回数
     enqueued_at: float = 0.0
+    # 受領待ち (#131 暫定): push confirm 時刻。0 = 待っていない。受領の兆候 (宛先から
+    # 送信元への返信) で 0 に戻り、兆候なく renotify_seconds を過ぎると再通知に回る。
+    awaiting_receipt_since: float = 0.0
+    # 再通知済 = pull 専用。push では再 claim しない (一度 host が落とした push 経路へ
+    # 同じ行を流し直しても同じく落ちうるため)。check_messages だけが拾う。
+    renotified: bool = False
 
 
 class StoreMixin:
@@ -327,6 +336,7 @@ class StoreMixin:
     observer_lease_seconds: float
     adopt_arming_seconds: float
     reclaim_warn_threshold: int
+    renotify_seconds: float | None
 
     def _journal(self, event: str, **fields) -> None:
         rec = {"ts": time.time(), "event": event, **fields}
@@ -956,6 +966,50 @@ class StoreMixin:
                 # 印字する (当該行は UNDELIVERED へ戻っており pull 経路で拾われる)。
                 self._journal("reclaim_threshold_exceeded", id=rid, reclaim=reclaim)
 
+    def _full_bind_locked(self, owner: str) -> "AgentBind | None":
+        """owner の registered な full bind (nudge 宛先)。**caller が _lock 保持中**。"""
+        for b in self._binds.values():
+            if (b.agent_id == owner and b.scope == "full"
+                    and b.registered and not b.revoked):
+                return b
+        return None
+
+    def _renotify_due_locked(self, now: float) -> list[tuple[str, str, "AgentBind | None"]]:
+        """push confirm 後、受領の兆候なく期限を過ぎた行を pull 専用で再通知に回す (#131)。
+
+        **暫定フォールバック**: ``/confirm-delivered`` は emit の stdout flush しか意味
+        しない (host が本文をセッションへ注入したかは分からない)。host 側の受理信号が
+        Claude Code に無い間、既存の観測点で代用する。受領の兆候は (a) 宛先から送信元
+        への ``send_message`` (返信、:meth:`enqueue` が観測) と (b) 再通知後の
+        ``check_messages`` での消化。兆候が無ければ行を ``UNDELIVERED`` + ``renotified``
+        に戻し、check_messages で同じ id (``msg_id``) のまま再配達する。重複配送に
+        なりうるが黙って捨てない (受信側は msg_id で冪等に扱える)。
+
+        **caller が _lock 保持中に呼ぶ** (lock 内 no-I/O)。``(id, to_id, nudge 宛先)``
+        を返し、呼び元が lock 解放後に :meth:`_finish_renotify` する。
+        """
+        if not self.renotify_seconds:
+            return []
+        due: list[tuple[str, str, "AgentBind | None"]] = []
+        for row in self._rows.values():
+            if (row.awaiting_receipt_since
+                    and now - row.awaiting_receipt_since >= self.renotify_seconds):
+                row.awaiting_receipt_since = 0.0
+                row.state = UNDELIVERED
+                row.owner = None
+                row.renotified = True
+                due.append((row.id, row.to_id, self._full_bind_locked(row.to_id)))
+        return due
+
+    def _finish_renotify(self, due: list[tuple[str, str, "AgentBind | None"]]) -> None:
+        """再通知の journal + 再ナッジ (lock 外)。nudge は宛先ごと冪等。"""
+        nudged: set[str] = set()
+        for rid, to_id, target in due:
+            self._journal("renotify_no_receipt", id=rid, to_id=to_id)
+            if target is not None and to_id not in nudged:
+                nudged.add(to_id)
+                self._trigger_nudge(target)
+
     def _arm_lease_watch(self, owner: str, delay: float) -> None:
         """owner の claim lease 失効時に reap + 再 nudge する timer を張る (Issue #78)。
 
@@ -989,11 +1043,7 @@ class StoreMixin:
                     if next_expiry is None or row.lease_until < next_expiry:
                         next_expiry = row.lease_until
             if undelivered:
-                for b in self._binds.values():
-                    if (b.agent_id == owner and b.scope == "full"
-                            and b.registered and not b.revoked):
-                        target = b
-                        break
+                target = self._full_bind_locked(owner)
         self._journal_reaped(reaped)
         if target is not None:
             self._trigger_nudge(target)
@@ -1030,6 +1080,12 @@ class StoreMixin:
                     break
             if target is None:
                 return {"ok": False, "error": f"[peer_not_found] no agent '{to_id}'"}
+            # 受領の兆候 (#131 暫定): 宛先が push 確定済の行の送信元へ返信した。
+            for row in self._rows.values():
+                if (row.awaiting_receipt_since
+                        and row.to_id == from_bind.agent_id
+                        and row.entry.get("from_id") == target.agent_id):
+                    row.awaiting_receipt_since = 0.0
             rid = secrets.token_hex(8)
             self._rows[rid] = QueueRow(
                 id=rid, to_id=target.agent_id, entry=entry,
@@ -1064,12 +1120,16 @@ class StoreMixin:
         self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         with self._lock:
             reaped = self._reap_locked()
+            due = self._renotify_due_locked(time.time())
             out: list[dict] = []
             for row in self._rows.values():
                 if row.state == UNDELIVERED and row.to_id == bind.agent_id:
                     row.state = DELIVERED
-                    out.append(row.entry)
+                    # msg_id = channel meta と同じ行 id。再通知 (#131) の重複を受信側が
+                    # 冪等に扱うための dedup key。
+                    out.append({**row.entry, "msg_id": row.id})
         self._journal_reaped(reaped)
+        self._finish_renotify(due)
         if out:
             self._journal("queue_drained", agent_id=bind.agent_id, count=len(out))
         return out
@@ -1267,11 +1327,16 @@ class StoreMixin:
         claimed: list[dict] = []
         claimed_epoch = 0
         owner: str | None = None
+        due: list[tuple[str, str, "AgentBind | None"]] = []
         with self._lock:
             owner = self._delivery_owner_locked(token)
             if owner is None:
                 return {"error": "unauthorized", "rows": []}
             now = time.time()
+            # ponytail: 再通知の期限判定は周期タスクを持たず、生きている sidecar の
+            # ~1s poll (全 owner 分) と check_messages を tick にする。sidecar が 1 本も
+            # 生きていない間は判定が遅れる (行は DELIVERED のまま)。要るなら timer 化。
+            due = self._renotify_due_locked(now)
             # adopt の arming deadline はここで刈る (#166)。本 daemon に周期タスクは
             # 無いが、adopt で fence された旧 sidecar が poll cadence (~1s) で叩き
             # 続けるため、失敗した adopt は期限直後に確実に検知される。**fence 判定
@@ -1332,7 +1397,8 @@ class StoreMixin:
                 else:
                     reaped = self._reap_locked()
                     for row in self._rows.values():
-                        if row.state == UNDELIVERED and row.to_id == owner:
+                        if (row.state == UNDELIVERED and row.to_id == owner
+                                and not row.renotified):
                             row.state = CLAIMED
                             row.lease_until = now + self.lease_seconds
                             row.owner = owner
@@ -1344,6 +1410,7 @@ class StoreMixin:
                     claimed_epoch = epoch
                     result = {"rows": claimed, "epoch": epoch}
         self._journal_reaped(reaped)
+        self._finish_renotify(due)
         for ev, fields in dup_journal:
             self._journal(ev, **fields)
         if claimed:
@@ -1423,6 +1490,7 @@ class StoreMixin:
                           "state": row.state, "owner": row.owner}
             else:
                 row.state = DELIVERED
+                row.awaiting_receipt_since = time.time()   # #131: 受領の兆候待ち
                 journal = ("delivered", {"id": rid, "owner": owner})
                 result = {"ok": True}
         self._journal_reaped(reaped)

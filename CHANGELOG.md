@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Interim re-notify for push-confirmed messages with no sign of receipt
+  (#131, partial).** `/confirm-delivered` only means the sidecar flushed the
+  channel frame to stdout; Claude Code exposes no host-accept signal, so a
+  host that drops the frame still loses the message. Until that signal exists
+  (Issue #81 family), a push-confirmed row can wait `renotify_seconds` (Broker
+  arg, **opt-in: default `None` = off**) for the recipient to message the
+  original sender. Without that, the row goes back to `UNDELIVERED` as
+  pull-only (never re-pushed), the recipient is nudged, and `check_messages`
+  returns it once more with the same `msg_id` (journal: `renotify_no_receipt`).
+  `check_messages` entries now carry `msg_id` so receivers can dedupe against
+  the channel meta. When enabled, messages that need no reply are delivered
+  twice, so enable it only once receivers dedupe by `msg_id` (300s suggested).
+  Host-accept gating itself is not built. See
+  `docs/channel-delivery-model-decision.md` §7.9.
 - **`ci_passed` attention kind (#139).** A `ci_completed` event whose status
   is `success` / `succeeded` / `passed` (case-insensitive) now yields an
   `AttentionEvent` of kind `ci_passed`, default severity `urgent`, with a
