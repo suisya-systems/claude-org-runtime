@@ -437,9 +437,8 @@ def test_admin_adopt_delivery_rekeys_the_bind_instead_of_minting_a_second(
 
     mint し直すと同一 agent_id に bind が 2 本並び、配送先解決と観測が曖昧化する。
     かといって旧 token をそのまま使い回すと、旧プロセスと adopting プロセスが 1 つの
-    bind (= 1 つの ``session_id``) を共有し、双方の initialize が互いの session を
-    上書きして両方 ``[session_invalid]`` に落ちうる (decision note §4.5 の session
-    steal と同じ形)。鍵だけ差し替えることで「bind は 1 本のまま、旧プロセスの MCP
+    bind を共有し、旧プロセスが同じ token で MCP 面 (check_messages の drain 等) を
+    使い続けられる。鍵だけ差し替えることで「bind は 1 本のまま、旧プロセスの MCP
     面は閉じる」を同時に満たす。
     """
     token, cred = _mint_channel_owner(admin_broker, "sec")
@@ -452,7 +451,7 @@ def test_admin_adopt_delivery_rekeys_the_bind_instead_of_minting_a_second(
     assert admin_broker.get_bind(token) is None
     # bind オブジェクトは同一 (registered / cwd / role を引き継いでいる)。
     assert admin_broker.get_bind(adopted) is bind_before
-    assert admin_broker.get_bind(adopted).session_id is None
+    assert admin_broker.get_bind(adopted).sessions == {}
     # bind は 1 本のまま (mint していない)。delivery cred は使い回す。
     assert len([b for b in admin_broker._binds.values()
                 if b.agent_id == "sec" and b.scope == "full"]) == 1

@@ -122,6 +122,22 @@ and a fork replays the **full agent token**, since `mcp_config_for` embeds it in
 (`tokens.py:192-205`). A forked session's `check_messages` destructively consumes the operator's rows with
 zero fencing. This is the #162 failure with no sidecar involved, and it is independent of delivery model.
 
+**The "static headers only" premise was tested (#168, 2026-10) and does not hold.** With Claude Code 2.1.296,
+`claude -p --mcp-config <file> --strict-mcp-config` against a probe HTTP server: a header
+`"Authorization": "Bearer ${ORG_PROBE_TOKEN}"` arrived as `Bearer <value from process env>`, and
+`${UNSET:-dflt}` arrived as `dflt`. With the variable unset there was **no parse failure**: the literal
+`Bearer ${ORG_PROBE_TOKEN}` was sent, which the broker rejects with `[token_invalid]`. So the full token
+*can* travel out-of-band in process env, like the observer secret, and a fork that replays the config
+without that env would be refused at the door. Not verified: interactive (non `-p`) mode, and whether a
+fork / `--resume` inherits the env (the same bet as §6.5.1). Moving the token is a launch-contract change
+(spawn, `launcher.py`, adopt, and anyone who builds a config from `mcp_config_for`) and is left as a
+separate decision; until it ships, the residual below stands.
+
+**Residual, and when it fires.** Any process holding the persisted mcp-config can call `check_messages`
+and destructively drain the owner's queue. It fires only on an **active tool call** by that process - pull
+has no passive wake-up (the nudge types into the owner's pane, not the fork's), so this is already
+narrower than the push path the lease guards. Rows drained this way go to DELIVERED and are not redelivered.
+
 ### 4.5 The identity holes reach past delivery into bind and session ownership
 
 Bind identity is keyed on **token**, not session, and a fork replays the token. Two consequences, both
@@ -135,6 +151,10 @@ verified, neither touched by any delivery model:
   (`server.py:1560`, `:1563`). `enqueue` only resolves to `registered` binds (`store.py:311-317`), so
   `send_message` addressed to a **still-live** original returns `[peer_not_found]`. A sibling's orderly exit
   silently un-addresses a running agent.
+
+**Both fixed in #168** (§8 item 4): a bind holds a set of sessions, so a fork's `initialize` adds rather
+than overwrites, and its DELETE de-registers the bind only if no other session is left. The line numbers
+above describe the code before that change.
 
 These support the central thesis more strongly than the delivery analysis does: **the problem is identity, and
 no choice of delivery model reaches it.**
@@ -278,9 +298,10 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
    the fence **dissolves silently** - a design chosen to defeat silence would fail in exactly that shape. The
    mitigating point: the current observer lease already depends on this, so §8 adds no new exposure, only
    more reliance on an existing bet.
-2. **The pull door narrows but does not close.** The full token is in the persisted config *by design*: HTTP
-   MCP can only carry static headers (`tokens.py:192-205`), so there is no `${VAR}` indirection available.
-   Item 4 can reduce the window; it cannot reach zero without changing how the token is transported.
+2. **The pull door narrows but does not close.** The full token is in the persisted config *by design*.
+   The premise that HTTP MCP can only carry static headers turned out false (§4.4, tested in #168):
+   `${VAR}` indirection works, so the door *can* close by changing how the token is transported. Until
+   that launch-contract change is made, the residual in §4.4 stands.
 3. **Adoption is discipline-dependent.** ~~A legitimate session started by hand (`claude --resume`) carries no
    observer secret, so it registers `unobserved`, sets `_stood_down`, and - because that latch has no
    `clear()` - **never receives push for the life of the process**.~~
@@ -395,7 +416,13 @@ In the order ruled. Each filed separately. Status updated 2026-08.
 3. **Give `duplicate_sidecar_detected` a consumer.** - **Done (#170)**, extended by #166 (§7.7).
 4. **Pull door and shared-bind identity** (§4.4, §4.5): session steal on `initialize`, DELETE collateral on a
    sibling's exit, and destructive `drain()` under a replayed token. Hardest, and separate - this is the root
-   cause, not a delivery concern. **Still open.**
+   cause, not a delivery concern. **Partly done (#168).** A bind now holds a set of MCP sessions instead of
+   one: `initialize` adds a session rather than overwriting, and DELETE removes only its own session,
+   dropping `registered` only when the last one closes. Two sessions sharing a token can no longer evict
+   each other or un-address each other. The set is capped (`MAX_SESSIONS_PER_BIND`, oldest dropped), so a
+   token holder that initializes that many times can still push the original out - no new exposure, since
+   that holder can already drain. The `${VAR}` premise was tested and is false (§4.4); moving the token to
+   process env is the open remainder, and the drain residual is documented in §4.4.
 5. **Make `_stood_down` recoverable** (§6.5.3). - **Done (#171).** The trap named here was real and was
    avoided: recovery is *not* a periodic re-register (which would have converted the lease into a TTL-delayed
    fork takeover). Instead the refusal was split, so only the never-reversible cases latch.

@@ -1981,10 +1981,9 @@ def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
 def test_adopt_does_not_leave_two_live_processes_sharing_one_bind(tmp_path):
     """**回帰**: adopt は旧プロセスの full token を無効化する (bind を共有させない)。
 
-    切り離した旧 pane は生きたまま残りうる。bind は ``session_id`` を 1 つしか持たない
-    ので、旧プロセスと adopting プロセスが同じ token を使うと双方の ``initialize`` が
-    互いの session を上書きし、以後どちらも ``[session_invalid]`` に落ちうる (旧プロセスの
-    MCP 再接続が新 session を蹴り出す形でも起きる)。所有権を移すなら MCP 面も移す。
+    切り離した旧 pane は生きたまま残りうる。旧プロセスと adopting プロセスが同じ token を
+    使うと、旧プロセスが MCP 面 (check_messages の drain 等) を使い続けられる。所有権を
+    移すなら MCP 面も移す。
     """
     b = Broker(state_dir=tmp_path, adapter=None)
     _registered(b, "dst")
@@ -1997,7 +1996,7 @@ def test_adopt_does_not_leave_two_live_processes_sharing_one_bind(tmp_path):
     assert adopted != old_token
     assert b.get_bind(old_token) is None          # 旧プロセスは締め出される
     assert b.get_bind(adopted).agent_id == "dst"
-    assert b.get_bind(adopted).session_id is None  # 引き継ぐ session は無い
+    assert b.get_bind(adopted).sessions == {}  # 引き継ぐ session は無い
     assert b.get_bind(adopted).registered is True  # 送信先としては生きたまま
     # bind は増えていない (mint し直していない)。
     assert len([bd for bd in b._binds.values()
