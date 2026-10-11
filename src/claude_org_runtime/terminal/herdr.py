@@ -570,6 +570,11 @@ class HerdrAdapter:
     # 復元できない。legacy 経路では受け取るだけで使わない (無害)。
     supports_agent_kind: ClassVar[bool] = True
 
+    # spawn(env=) を herdr API の param (pane.split / agent.start の ``env``) で渡し、
+    # コマンドラインにもペインの画面にも出さない。broker はこれを読み、broker token を
+    # mcp-config に直書きせず pane env (``ORG_BROKER_TOKEN``) で渡す (#218)。
+    token_via_pane_env: ClassVar[bool] = True
+
 
     # Herdr pane.send_keys が emit 可能な canonical 部分集合 (= _HERDR_KEY_MAP の key)。
     supported_named_keys: ClassVar[frozenset[str]] = frozenset(_HERDR_KEY_MAP)

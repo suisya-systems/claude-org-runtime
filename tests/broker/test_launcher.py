@@ -96,10 +96,11 @@ def test_org_up_reuses_live_healthy_daemon(live_daemon):
         spawn_calls.append((a, k))
         raise AssertionError("spawn_daemon must not run when reusing a live daemon")
 
-    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None):
         captured["argv"] = argv
         captured["state_dir"] = state_dir
         captured["observer_secret"] = observer_secret
+        captured["broker_token"] = broker_token
         return 0
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
@@ -112,8 +113,13 @@ def test_org_up_reuses_live_healthy_daemon(live_daemon):
     # secretary token が mint され、mcp-config が書かれ、argv が組まれた。
     cfg_path = os.path.join(state_dir, "secretary-mcp.json")
     cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    # token は env で渡り、config (0600 file と argv の inline JSON) には env 参照
+    # だけが残る (#218)。
     hdr = cfg["mcpServers"]["org-broker"]["headers"]["Authorization"]
-    minted_token = hdr.removeprefix("Bearer ")
+    assert hdr == "Bearer ${ORG_BROKER_TOKEN}"
+    minted_token = captured["broker_token"]
+    assert minted_token not in json.dumps(cfg)
+    assert minted_token not in json.dumps(captured["argv"])
     assert b.get_bind(minted_token) is not None
     assert b.get_bind(minted_token).auth_role == "secretary"
     # launch に渡った argv が claude 対話 TUI。
@@ -125,7 +131,7 @@ def test_org_up_reused_secretary_named_secretary(live_daemon):
     b, state_dir = live_daemon
     launcher.org_up(_up_args(state_dir, name="secretary"),
                     spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-                    launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0)
+                    launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0)
     # mint された bind の agent_id は 'secretary' (root name 契約)。
     assert any(bnd.agent_id == "secretary" and bnd.auth_role == "secretary"
                for bnd in b._binds.values())
@@ -141,7 +147,7 @@ def test_org_up_noop_when_secretary_already_registered(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, name="secretary"),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0,
     )
     assert rc == 0
     assert launched == []                          # 二人目の secretary を起動しない
@@ -157,7 +163,7 @@ def test_org_up_errors_on_live_backend_conflict(live_daemon):
     rc = launcher.org_up(
         _up_args(state_dir, backend=other),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0,
     )
     assert rc == 2                                 # 競合エラー
     assert launched == []                          # 起動しない
@@ -180,7 +186,7 @@ def test_org_up_fails_fast_on_herdr_native_windows(tmp_path, monkeypatch, capsys
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unsupported backend")
         ),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []                          # secretary TUI not launched
@@ -203,7 +209,7 @@ def test_org_up_errors_on_unknown_backend(tmp_path, capsys):
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("spawn_daemon must not run for an unknown backend")
         ),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -228,8 +234,9 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
 
     captured = {}
 
-    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None):
         captured["argv"] = argv
+        captured["broker_token"] = broker_token
         return 0
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
@@ -241,8 +248,9 @@ def test_org_up_starts_fresh_when_no_daemon(tmp_path):
         # mint された secretary token が新 daemon に bind され、TUI argv が組まれた。
         cfg_path = os.path.join(state_dir, "secretary-mcp.json")
         cfg = json.loads(open(cfg_path, encoding="utf-8").read())
-        tok = cfg["mcpServers"]["org-broker"]["headers"]["Authorization"].removeprefix("Bearer ")
-        assert b.get_bind(tok).auth_role == "secretary"
+        assert (cfg["mcpServers"]["org-broker"]["headers"]["Authorization"]
+                == "Bearer ${ORG_BROKER_TOKEN}")
+        assert b.get_bind(captured["broker_token"]).auth_role == "secretary"
         assert captured["argv"][0] == "claude"
     finally:
         for b in started:
@@ -292,7 +300,7 @@ def test_org_up_notifies_when_discarding_stale_sidecar(tmp_path, monkeypatch, ca
 
     rc = launcher.org_up(
         _up_args(state_dir), spawn_daemon=fake_spawn,
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     try:
         assert rc == 0
@@ -319,7 +327,7 @@ def test_org_up_no_stale_notice_on_clean_first_start(tmp_path, capsys):
 
     rc = launcher.org_up(
         _up_args(state_dir), spawn_daemon=fake_spawn,
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     try:
         assert rc == 0
@@ -391,7 +399,7 @@ def test_org_up_wires_channel_into_secretary(live_daemon):
     b, state_dir = live_daemon
     captured = {}
 
-    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
+    def fake_launch(argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None):
         captured["argv"] = argv
         captured["observer_secret"] = observer_secret
         return 0
@@ -489,7 +497,7 @@ def test_org_up_does_not_cold_start_when_admin_token_missing(tmp_path, monkeypat
         raise AssertionError("must not spawn a second daemon over a claimed state_dir")
 
     rc = launcher.org_up(_up_args(state_dir), spawn_daemon=fake_spawn,
-                         launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0)
+                         launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0)
     assert rc == 2                                 # token_missing → 明示エラー
     assert launched == []                          # TUI も起動しない
     assert not os.path.exists(os.path.join(state_dir, "secretary-mcp.json"))
@@ -716,7 +724,7 @@ def test_org_up_errors_when_mcp_surface_unhealthy(live_daemon, monkeypatch):
     rc = launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: launched.append(argv) or 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: launched.append(argv) or 0,
     )
     assert rc == 2
     assert launched == []
@@ -729,7 +737,7 @@ def test_reuse_probe_session_is_deregistered(live_daemon):
     launcher.org_up(
         _up_args(state_dir),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     # admin-* の probe bind は close() で registered=False に落ちている。
     registered_admin = [
@@ -1025,6 +1033,50 @@ def test_launch_claude_fallback_includes_observer_secret(monkeypatch, capsys):
     assert "ORG_BROKER_CHANNEL_OBSERVER=obs-handoff-secret" in out
 
 
+# ================================ up/adopt: broker token の env 運搬 (#218)
+def test_launch_claude_injects_broker_token_into_env_not_argv(monkeypatch):
+    """token は exec の env で渡り、argv には載らない。"""
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(argv=argv, env=env),
+    )
+    launcher._launch_claude(["claude"], broker_token="agent-tok")
+    assert captured["env"]["ORG_BROKER_TOKEN"] == "agent-tok"
+    assert "agent-tok" not in json.dumps(captured["argv"])
+
+
+def test_launch_claude_omits_broker_token_when_not_given(monkeypatch):
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.delenv("ORG_BROKER_TOKEN", raising=False)
+    captured = {}
+    monkeypatch.setattr(
+        launcher.os, "execvpe",
+        lambda file, argv, env: captured.update(env=env),
+    )
+    launcher._launch_claude(["claude"])
+    assert "ORG_BROKER_TOKEN" not in captured["env"]
+
+
+def test_org_adopt_forwards_the_rotated_token_to_launch(tmp_path, monkeypatch):
+    """adopt 応答の ``token`` が launch の env 経路 (broker_token) へ届く。"""
+    state_dir = str(tmp_path / "broker")
+    _write_discoverable_sidecar(state_dir)
+    _stub_admin_rpc(monkeypatch, adopt={**_adopt_ok(), "token": "adopted-tok"},
+                    status=_status_ok(_pending("ad-01")))
+    seen = {}
+
+    def launch(argv, state_dir=None, observer_secret=None, root_cwd=None,
+               broker_token=None):
+        seen.update(argv=argv, broker_token=broker_token)
+        return 0
+
+    assert launcher.org_adopt(_adopt_args(state_dir), launch=launch) == 0
+    assert seen["broker_token"] == "adopted-tok"
+    assert "adopted-tok" not in json.dumps(seen["argv"])
+
+
 # =========================== org adopt: 配達所有権の明示 handover (#166)
 # adopt は「daemon 側で旧 session を fence してから、新しい秘密を持つ claude を起こす」
 # 操作。fence は RPC 応答の時点で既に済んでいるので、CLI 側の分岐が 1 つ狂うと
@@ -1101,7 +1153,7 @@ def _recording_launch():
     """claude 起動 seam のスパイ。``(呼び出し記録, launch)`` を返す。"""
     calls: list[dict] = []
 
-    def launch(argv, state_dir=None, observer_secret=None, root_cwd=None):
+    def launch(argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None):
         calls.append({"argv": argv, "state_dir": state_dir,
                       "observer_secret": observer_secret, "root_cwd": root_cwd})
         return 0
@@ -1158,7 +1210,8 @@ def test_org_adopt_hands_rotated_secret_to_the_launched_process(tmp_path, monkey
     assert launched[0]["root_cwd"] == os.getcwd()
     # rotate は 1 回だけ。operator の選択 (policy / force) はそのまま daemon へ渡る。
     assert [m for m, _ in calls] == ["adopt_delivery", "adopt_status"]
-    assert calls[0][1] == {"owner": "w1", "in_flight": "requeue", "force": False}
+    assert calls[0][1] == {"owner": "w1", "in_flight": "requeue", "force": False,
+                           "token_env": True}
 
 
 def test_org_adopt_threads_resume_selector_into_argv(tmp_path, monkeypatch):
@@ -1575,7 +1628,7 @@ def test_org_up_sweeps_residents_only_on_cold_path(tmp_path, monkeypatch):
 
     rc = launcher.org_up(
         _up_args(state_dir, reap=True), spawn_daemon=fake_spawn,
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     try:
         assert rc == 0
@@ -1595,7 +1648,7 @@ def test_org_up_reuse_does_not_sweep_residents(live_daemon, monkeypatch):
     rc = launcher.org_up(
         _up_args(state_dir, reap=True),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     assert rc == 0
     assert calls == []                                 # reuse では sweep しない
@@ -1609,7 +1662,7 @@ def test_org_up_conflict_does_not_sweep_residents(live_daemon, monkeypatch):
     launcher.org_up(
         _up_args(state_dir, backend=other),
         spawn_daemon=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
-        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None: 0,
+        launch=lambda argv, state_dir=None, observer_secret=None, root_cwd=None, broker_token=None: 0,
     )
     assert calls == []
 

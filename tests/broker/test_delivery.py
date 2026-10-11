@@ -2628,3 +2628,48 @@ def test_venv_wrapper_backend_is_unchanged(tmp_path):
     dispatch_tool(b, _ops(b), "spawn_claude_pane",
                   {"direction": "vertical", "name": "w", "cwd": str(tmp_path)})
     _assert_pane_venv_activated(adapter.spawned[-1], venv)
+
+
+# ====================================== #218 broker token の pane env 運搬
+def test_spawn_claude_hands_token_via_pane_env_when_backend_can(
+    tmp_path, fake_adapter,
+):
+    """``token_via_pane_env`` の backend では token を pane env で渡し、mcp-config
+    (= argv の inline JSON。herdr 0.7.5 ではシェルに打ち込まれる) には env 参照だけを
+    残す。"""
+    fake_adapter.token_via_pane_env = True
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    token = _pane_env(fake_adapter)["ORG_BROKER_TOKEN"]
+    assert b.get_bind(token).agent_id == "w"
+    argv = fake_adapter.spawned[-1]["argv"]
+    assert token not in json.dumps(argv)
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert cfg["mcpServers"]["org-broker"]["headers"]["Authorization"] == (
+        "Bearer ${ORG_BROKER_TOKEN}")
+
+
+def test_spawn_claude_keeps_literal_token_when_env_rides_a_command_line(
+    tmp_path, fake_adapter,
+):
+    """tmux / wezterm (flag 無し) は env がコマンドラインに載るので直書きのまま。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    fake_adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w", "cwd": "/repo"})
+    assert "ORG_BROKER_TOKEN" not in _pane_env(fake_adapter)
+    argv = fake_adapter.spawned[-1]["argv"]
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    token = cfg["mcpServers"]["org-broker"]["headers"]["Authorization"].removeprefix(
+        "Bearer ")
+    assert b.get_bind(token).agent_id == "w"
+
+
+def test_token_via_pane_env_is_declared_only_where_env_skips_the_command_line():
+    """経路表 (docs/broker-token-env-decision.md) と flag を一致させる。"""
+    from claude_org_runtime.terminal import HerdrAdapter, TmuxAdapter, WezTermAdapter
+    assert HerdrAdapter.token_via_pane_env is True
+    assert not getattr(TmuxAdapter, "token_via_pane_env", False)
+    assert not getattr(WezTermAdapter, "token_via_pane_env", False)

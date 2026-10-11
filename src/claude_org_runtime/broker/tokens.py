@@ -31,6 +31,10 @@ if TYPE_CHECKING:  # mixin が前提とする Broker の共有状態 (型のみ)
 # 追い出せる。token 保持者は drain も呼べるので新しい露出ではない (#168)。
 MAX_SESSIONS_PER_BIND = 16
 
+# token を env 参照で渡すときの変数名 (#218)。mcp-config には ``${ORG_BROKER_TOKEN}``
+# だけが残り、値は起動プロセスの env で渡す。
+TOKEN_ENV = "ORG_BROKER_TOKEN"
+
 
 @dataclass
 class AgentBind:
@@ -200,9 +204,9 @@ class TokenMixin:
         """spawn 時に子の --mcp-config へ加える channel sidecar の stdio server 定義。
 
         channel sidecar (:mod:`claude_org_runtime.broker.channel_sidecar`) を stdio
-        MCP サーバーとして子 claude に load させる。token は env に**リテラルで**載せる
-        (:meth:`mcp_config_for` と同方針。``${VAR}`` 展開自体は動くことを確認済み —
-        decision note §4.4)。daemon URL は base (``/mcp`` 無し) で渡し、
+        MCP サーバーとして子 claude に load させる。delivery cred は env に**リテラルで**
+        載せる (fork による replay は observer lease が fence する。agent token の env
+        参照化 #218 の対象外)。daemon URL は base (``/mcp`` 無し) で渡し、
         sidecar が ``/poll-claims`` / ``/confirm-delivered`` を叩く。
         """
         return {
@@ -227,20 +231,26 @@ class TokenMixin:
             bind.registered = True
             bind.registered_at = time.time()
 
-    def mcp_config_for(self, token: str, server_name: str = "org-broker") -> dict:
-        """--mcp-config に渡す JSON。token は static headers に埋める (確定事項 (2))。
+    def mcp_config_for(
+        self, token: str, server_name: str = "org-broker", *, token_env: bool = False,
+    ) -> dict:
+        """--mcp-config に渡す JSON。
 
-        ``${VAR}`` 参照は **Claude Code 2.1.296 で headers 内も展開される** (未設定時は
-        parse 失敗せずリテラルのまま送られる) ことを確認済み (#168, decision note §4.4)。
-        token を env 経由に移せば fork による pull path の再生を閉じられるが、起動
-        契約の変更なので未採用。
+        既定は token を static headers に直書きする。``token_env=True`` なら header を
+        ``Bearer ${ORG_BROKER_TOKEN}`` (:data:`TOKEN_ENV`) にし、呼び元が token を起動
+        プロセスの env で渡す (#218)。Claude Code は ``${VAR}`` を起動時に一度だけ展開し、
+        resume / fork / continue / ``/mcp`` 再接続は起動時の env を再生しないため、
+        config だけを replay した session は認証されない (未設定なら literal が届いて
+        401)。env を安全に渡せない起動経路は既定の直書きのまま
+        (docs/broker-token-env-decision.md)。
         """
+        auth = f"Bearer ${{{TOKEN_ENV}}}" if token_env else f"Bearer {token}"
         return {
             "mcpServers": {
                 server_name: {
                     "type": "http",
                     "url": self.url,
-                    "headers": {"Authorization": f"Bearer {token}"},
+                    "headers": {"Authorization": auth},
                 }
             }
         }

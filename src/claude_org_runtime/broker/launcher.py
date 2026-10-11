@@ -59,6 +59,7 @@ from ..terminal import (
     venv_bin_dir,
 )
 from . import residents, sidecar, surface
+from .tokens import TOKEN_ENV
 from .rpc import ADMIN_RPC_TIMEOUT, _McpClient, _admin_rpc  # noqa: F401 - 後方互換 re-export
 
 DEFAULT_STATE_DIR = ".state/broker"
@@ -184,11 +185,16 @@ def _mint_secretary(
     secretary session だけが delivery generation を bump できるようにする (fork replay の
     takeover を断つ)。observer は org up の human-facing 経路だけが指定する opt-in で、
     他の admin channel mint (secret handoff を持たない) は従来どおり last-register-wins。
+
+    ``token_env: True`` を要求し、返る ``mcp_config`` (= 0600 の secretary-mcp.json と
+    argv の inline JSON) に token を書かせず ``${ORG_BROKER_TOKEN}`` だけを残す (#218)。
+    token 自体は :func:`_launch_claude` が exec の env で渡す。``token_env`` を知らない
+    旧 daemon は直書きの config を返すが、env も渡るのでどちらでも認証は通る。
     """
     return _admin_rpc(
         host, port, admin_token, "mint_token",
         {"role": "secretary", "name": name, "cwd": root_cwd,
-         "channel": True, "observer": True},
+         "channel": True, "observer": True, "token_env": True},
     )
 
 
@@ -262,6 +268,7 @@ def _launch_claude(
     argv: list[str], state_dir: str | None = None,
     observer_secret: str | None = None,
     root_cwd: str | None = None,
+    broker_token: str | None = None,
 ) -> int:
     """secretary TUI を起動する。POSIX は exec で置換、Windows は subprocess。
 
@@ -300,6 +307,13 @@ def _launch_claude(
     になるよう secret を渡す (Codex review P2)。表示 argv は既に delivery cred 入りの
     mcp-config を含む (どちらも localhost-only 信頼前提の秘密) ため追加の露出増ではない。
 
+    ``broker_token`` が渡されれば ``ORG_BROKER_TOKEN`` を子環境へ注入する (#218)。
+    mcp-config の header が ``Bearer ${ORG_BROKER_TOKEN}`` を参照しており、Claude Code は
+    起動時の env からこれを一度だけ展開する。exec / subprocess の env で渡すので
+    コマンドラインにも画面にも出ない。fallback の 1 行コマンドだけは手で打つために
+    前置する (observer 秘密と同じ扱い。#218 以前は argv の config に token が直書きされて
+    いたので露出は増えない)。
+
     **段1 folder-trust は意図的に機械承認しない (ja#575 設計判断)**: 起動した
     secretary は (未 trust の cwd では) 初回に Claude Code の folder-trust プロンプトを
     出すが、本関数はそこへ Enter を**送らない**。exec/subprocess で launcher 自身が
@@ -320,6 +334,8 @@ def _launch_claude(
         env["ORG_BROKER_STATE_DIR"] = sidecar.absolutize(state_dir)
     if observer_secret:
         env["ORG_BROKER_CHANNEL_OBSERVER"] = observer_secret
+    if broker_token:
+        env[TOKEN_ENV] = broker_token
     # Issue #130: secretary も workspace の .venv を継承させる (root_cwd = secretary の
     # cwd)。これは daemon-spawned worker/dispatcher ペイン (server._adapter_spawn が主戦場)
     # に対する secretary 用の補助整合で、root TUI を子ペインと揃える。.venv が無ければ
@@ -362,6 +378,8 @@ def _launch_claude(
             # observed になるよう secret を前置する (無しだと sidecar が unobserved で
             # 止まり push が届かない — Codex P2)。argv は既に delivery cred 入り。
             prefix += f"ORG_BROKER_CHANNEL_OBSERVER={shlex.quote(observer_secret)} "
+        if broker_token:
+            prefix += f"{TOKEN_ENV}={shlex.quote(broker_token)} "
         print("claude を起動できませんでした。以下を手動で実行してください:")
         print("  " + prefix + " ".join(shlex.quote(a) for a in argv))
         return 0
@@ -578,7 +596,7 @@ def org_up(
     # 子環境へ注入する (mcp-config には載せない非 replay 信号)。channel 非要求 mint や
     # 旧 daemon 応答では None で、その場合は従来の last-register-wins に委ねる。
     return launch(argv, state_dir, observer_secret=mint.get("observer_secret"),
-                  root_cwd=root_cwd)
+                  root_cwd=root_cwd, broker_token=mint.get("token"))
 
 
 # ===========================================================================
@@ -687,6 +705,8 @@ def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
     try:
         res = _admin_rpc(host, port, admin_token, "adopt_delivery", {
             "owner": owner, "in_flight": args.in_flight, "force": args.force,
+            # token を config に書かせず env で渡す (#218、org up と同じ)。
+            "token_env": True,
         })
     except urllib.error.URLError:
         # **fence 前**に落ちたので配達所有権は動いていない。そう言い切る。
@@ -735,7 +755,7 @@ def org_adopt(args: argparse.Namespace, *, launch=_launch_claude) -> int:
     print(f"org adopt: launching claude for owner={owner} "
           f"({len(argv)} argv tokens)")
     return launch(argv, state_dir, observer_secret=res["observer_secret"],
-                  root_cwd=root_cwd)
+                  root_cwd=root_cwd, broker_token=res.get("token"))
 
 
 # ===========================================================================

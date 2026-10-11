@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Broker token by env reference where the launch path allows it (#218).**
+  `org up`, `org adopt` and herdr `spawn_claude_pane` now write
+  `Authorization: Bearer ${ORG_BROKER_TOKEN}` into the MCP config and pass the
+  token in the launched process's env. Claude Code expands it once at startup
+  and never replays that env on resume / fork / continue / `/mcp` reconnect,
+  so a session that only replays the config gets 401. tmux / wezterm spawns
+  and admin callers that do not pass `token_env: true` (claude-org-ja's renga
+  path) keep the literal token, because their env would ride a command line.
+  `secretary-mcp.json` no longer authenticates on its own: resume through
+  `org adopt --resume`. New: `mint_token` / `adopt_delivery` `token_env` param,
+  the `token_via_pane_env` adapter flag, and a live check
+  (`CLAUDE_ORG_RUNTIME_LIVE_CLAUDE=1`) for the expansion behaviour. See
+  `docs/broker-token-env-decision.md`.
+
 ## [0.1.49] - 2026-10-11
 
 ### Added

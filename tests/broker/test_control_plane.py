@@ -863,3 +863,75 @@ def test_pid_alive_false_for_reaped_child():
 def test_pid_alive_false_for_nonpositive_or_nonint(bad):
     """0 / 負値 / 非 int は非生存 (壊れた sidecar pid を alive と誤認しない)。"""
     assert sidecar.pid_alive(bad) is False
+
+
+# ================================ #218 broker token は env 参照で渡せる
+def _mcp_initialize_status(broker: Broker, authorization: str) -> int:
+    """MCP ``initialize`` を指定の Authorization で 1 回送り HTTP status を返す。"""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}}
+    req = urllib.request.Request(
+        broker.url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/event-stream",
+                 "Authorization": authorization},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_admin_mint_token_env_keeps_the_token_out_of_mcp_config(admin_broker):
+    """``token_env`` 指定時、config には ``${ORG_BROKER_TOKEN}`` だけが残る。"""
+    res = _admin_post(admin_broker, {"method": "mint_token", "params": {
+        "role": "secretary", "channel": True, "token_env": True}}, "ADMIN-SECRET")
+    servers = res["mcp_config"]["mcpServers"]
+    assert servers["org-broker"]["headers"]["Authorization"] == (
+        "Bearer ${ORG_BROKER_TOKEN}")
+    assert res["token"] not in json.dumps(res["mcp_config"])
+    assert admin_broker.get_bind(res["token"]) is not None
+    # env で token を渡した client (= Claude Code が展開した後の header) は通る。
+    assert _mcp_initialize_status(admin_broker, f"Bearer {res['token']}") == 200
+
+
+def test_admin_mint_token_rejects_non_bool_token_env(admin_broker):
+    res = _admin_post(admin_broker, {"method": "mint_token", "params": {
+        "role": "secretary", "token_env": "yes"}}, "ADMIN-SECRET",
+        expect_status=400)
+    assert res["ok"] is False
+    assert "token_env" in res["error"]
+
+
+def test_unexpanded_token_placeholder_is_unauthenticated(admin_broker):
+    """``ORG_BROKER_TOKEN`` 未設定の session (env を再生しない resume / fork) は
+    Claude Code が ``${...}`` を literal のまま送る。broker はこれを「認証なし」と
+    して 401 で返す (#218 の非 replay 性の土台)。"""
+    _admin_post(admin_broker, {"method": "mint_token", "params": {
+        "role": "secretary", "token_env": True}}, "ADMIN-SECRET")
+    assert _mcp_initialize_status(
+        admin_broker, "Bearer ${ORG_BROKER_TOKEN}") == 401
+    assert _mcp_initialize_status(admin_broker, "Bearer ") == 401
+
+
+def test_admin_adopt_delivery_token_env_returns_token_beside_config(admin_broker):
+    """adopt の ``token_env``: config は env 参照、付け替え後の token は応答に載る。"""
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec", "token_env": True})
+    assert res["ok"] is True
+    servers = res["mcp_config"]["mcpServers"]
+    assert servers["org-broker"]["headers"]["Authorization"] == (
+        "Bearer ${ORG_BROKER_TOKEN}")
+    assert res["token"] not in json.dumps(res["mcp_config"])
+    assert admin_broker.get_bind(res["token"]).agent_id == "sec"
+
+
+def test_admin_adopt_delivery_default_does_not_return_token(admin_broker):
+    """``token_env`` 無しの adopt は従来どおり (token は config の中だけ)。"""
+    _mint_channel_owner(admin_broker, "sec")
+    res = _adopt(admin_broker, {"owner": "sec"})
+    assert "token" not in res
+    assert _adopt(admin_broker, {"owner": "sec", "token_env": 1, "force": True},
+                  expect_status=400)["ok"] is False
