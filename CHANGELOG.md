@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A latching register refusal always reaches the journal (#230).** The
+  stand-down journal shares one cooldown (`lease_seconds`) per owner. Right
+  after `org adopt`, the incumbent's fenced poll (`delivery_poll_fenced`) had
+  just used it, so a session that latched in an `adopt --force` race lost its
+  `delivery_register_superseded` line, and nothing recorded why it went
+  silent. Latching refusals (`unobserved`, `suppressed_bg_hosted`) now skip
+  the cooldown and do not reset it. A latched sidecar never retries, so each
+  instance journals this at most once.
 - **An expired `org adopt` gives the incumbent its observer lease back
   (#232).** The adopt rotated the incumbent's lease, and the expiry sweep only
   dropped the adopt's own lease, so after the revert the owner had no lease:

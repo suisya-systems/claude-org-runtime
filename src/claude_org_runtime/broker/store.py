@@ -867,6 +867,13 @@ class StoreMixin:
         すると queue.jsonl が毎秒太る。同一 ``(instance, reason)`` の反復は ``count`` /
         ``last`` を進めるだけにし、遷移にも duplicate 検知と同じ lease window の cooldown
         を owner 単位で掛ける。継続状態の観測は delivery_dump が担う。
+
+        **latch する拒否 (:data:`LATCHING_REFUSALS`) は cooldown を素通りする** (Issue
+        #230)。latch した sidecar は二度と register しないので、その遷移は instance ごと
+        生涯 1 回しか来ず、間引く対象のスパムが存在しない。一方で落とすと取り戻せない:
+        引き継ぎ直後は現職の fence された poll (``delivery_poll_fenced``) が cooldown を
+        使ったばかりで、``--force`` 競合で latch した session の
+        ``delivery_register_superseded`` が journal から消え、恒久沈黙の原因が残らない。
         """
         per_owner = self._delivery_standdowns.setdefault(owner, {})
         prev = per_owner.get(instance_id)
@@ -875,18 +882,21 @@ class StoreMixin:
             prev["count"] += 1
             return prev, False
         # owner 単位の journal cooldown (instance が交互に来ても発散させない)。
+        # latch は生涯 1 回きりなので cooldown に掛けず、cooldown も消費しない
+        # (消費させると、今度は直後の非 latch 遷移が食われる。Issue #230)。
+        latched = reason in LATCHING_REFUSALS
         last_journal = max((r["journalled_at"] for r in per_owner.values()),
                            default=0.0)
-        emit = now - last_journal > self.lease_seconds
+        emit = latched or now - last_journal > self.lease_seconds
         rec = {
             "instance": instance_id,
             "reason": reason,
-            "latched": reason in LATCHING_REFUSALS,
+            "latched": latched,
             # 同じ instance が reason を遷移しても「いつから黙っているか」は保つ。
             "since": prev["since"] if prev is not None else now,
             "last": now,
             "count": (prev["count"] + 1) if prev is not None else 1,
-            "journalled_at": now if emit else last_journal,
+            "journalled_at": now if emit and not latched else last_journal,
         }
         per_owner[instance_id] = rec
         # 無制限成長を防ぐ。捨てるのは **latch していない古い記録から** (latch した
