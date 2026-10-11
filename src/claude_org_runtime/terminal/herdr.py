@@ -575,6 +575,11 @@ class HerdrAdapter:
     # mcp-config に直書きせず pane env (``ORG_BROKER_TOKEN``) で渡す (#218)。
     token_via_pane_env: ClassVar[bool] = True
 
+    # 人間可読な表示名を spawn(display_name=) で受け取る (Issue #123)。agent.start の
+    # name は herdr 0.7.5 の正規表現制約と一意性 (counter) を担う機械名のまま残し、
+    # 観測者向けの表示だけを pane.rename (pane label) で上書きする。
+    supports_display_name: ClassVar[bool] = True
+
 
     # Herdr pane.send_keys が emit 可能な canonical 部分集合 (= _HERDR_KEY_MAP の key)。
     supported_named_keys: ClassVar[frozenset[str]] = frozenset(_HERDR_KEY_MAP)
@@ -963,6 +968,7 @@ class HerdrAdapter:
         space: SpaceDescriptor | None = None,
         env: dict[str, str] | None = None,
         kind: str | None = None,
+        display_name: str | None = None,
     ) -> PaneRef:
         """argv を space の workspace/tab に起動し PaneRef を返す。
 
@@ -975,6 +981,9 @@ class HerdrAdapter:
         - ``kind`` (Issue #151 A): broker の意味的な種別 (``"claude"`` / ``"codex"`` /
           generic は None)。**argv[0] から推測しない**: wrapper 経路や generic spawn で
           破綻するため、broker が知っている種別を明示的に受け取る。
+        - ``display_name`` (Issue #123): 観測者向けの表示名 (例 ``fix-issue-114``)。
+          起動後に ``pane.rename`` で pane label へ載せる。表示専用なので失敗しても
+          spawn は落とさない (:meth:`_set_display_name`)。
 
         agent 起動の実体は protocol で 2 経路に分かれる (:meth:`_probe_protocol`):
 
@@ -1021,6 +1030,8 @@ class HerdrAdapter:
                         spawned_at=time.time(),
                     )
                 self._cleanup_root_pane(sp, pane_id)
+                if display_name:
+                    self._set_display_name(pane_id, display_name)
                 return PaneRef(
                     pane_id=pane_id,
                     window_id=sp.workspace_id,
@@ -1151,6 +1162,21 @@ class HerdrAdapter:
         except BaseException:
             self._discard_pane(pane_id)
             raise
+
+    def _set_display_name(self, pane_id: Any, display_name: str) -> None:
+        """pane label を人間可読な表示名にする (Issue #123、best-effort)。
+
+        ownership / 世代判定は workspace label (:func:`_parse_label`) と registry が
+        担い、pane label は読まないので上書きしても安全。表示専用のため、未対応の
+        herdr (``pane.rename`` を持たない旧 protocol 等) でのエラーは握り潰す
+        (起動済みの agent を表示名のために巻き戻さない)。
+        """
+        try:
+            self._client.request(
+                "pane.rename", {"pane_id": pane_id, "label": display_name}
+            )
+        except HerdrError:
+            pass
 
     def _discard_pane(self, pane_id: Any) -> None:
         """確保途中で失敗した pane を best-effort で閉じる (孤児を残さない)。

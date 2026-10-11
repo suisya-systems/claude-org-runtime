@@ -747,6 +747,8 @@ def test_build_plan_worker_spawn_carries_sandbox_settings(tmp_path: Path) -> Non
         "github.com",
         "pypi.org",
         "registry.npmjs.org",
+        "index.crates.io",
+        "static.crates.io",
         "chatgpt.com",
         "auth.openai.com",
     } <= set(sandbox["network"]["allowedDomains"])
