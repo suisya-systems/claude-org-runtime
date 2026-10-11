@@ -187,7 +187,7 @@ class ObserverLease:
 
     ``arming_until`` は **armed 相にだけ効く期限** (Issue #165)。spawn 経路は秘密を adapter
     の env 経路で子へ渡すが、その到達は backend ごとに実装が違い (tmux は ``-e``、wezterm は
-    argv 書き換え、herdr protocol 17 は ``pane.split`` 経由のシェル継承)、リポジトリ外の
+    argv 書き換え、herdr protocol 17 / 22 は ``pane.split`` 経由のシェル継承)、リポジトリ外の
     挙動に依存する。届かない環境では **その pane 自身の sidecar が秘密を提示できない** ため、
     無期限 armed だと組織全体の push が恒久的に無音になる。一度も observed register が来ない
     まま期限を過ぎた lease は落として今日の last-register-wins に戻す: 誰も秘密を提示できて

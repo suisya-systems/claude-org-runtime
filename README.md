@@ -83,8 +83,12 @@ requires **claude-org-runtime 0.1.38 or newer**. herdr 0.7.5 (wire protocol 17)
 rewrote the `agent.start` API in a breaking way; earlier runtime releases only
 speak the protocol 14 / 16 shape and fail to spawn against it. Runtime 0.1.38
 keeps the legacy path, so herdr 0.7.1-0.7.4 (protocol 14 / 16) still work
-unchanged. A permanently unsupported protocol is rejected at startup with
+unchanged. herdr 0.9.0-0.9.3 (protocol 22) need a **claude-org-runtime release newer than 0.1.49**;
+they keep the 0.7.5 `agent.start` shape. herdr 0.8.x (protocol 19 / 20)
+is not supported. A permanently unsupported protocol is rejected at startup with
 `herdr_protocol_unsupported` rather than failing silently.
+`claude_org_runtime.terminal.herdr.protocol_for_version((major, minor, patch))`
+maps a herdr release to its wire protocol (`None` for releases it does not know).
 
 ## Reference role prompts
 
