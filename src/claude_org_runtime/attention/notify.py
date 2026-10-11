@@ -248,6 +248,10 @@ def _backend_command(
         # Issue #32: the script travels as ``-EncodedCommand`` (base64
         # of UTF-16LE), so the command line is pure ASCII and non-ASCII
         # title/body survive WSL interop and any Windows code page.
+        # The toast XML is a separate base64 literal inside the script:
+        # user text never appears as PowerShell source, so quotes
+        # (including the U+2018/U+2019 that PowerShell also treats as
+        # ``'``) can neither break the script nor inject code.
         # The toast itself is silent; the beep is the audio channel so
         # ``cfg.sound`` keeps its meaning. A failing beep is swallowed:
         # the toast was already shown, so the event counts as delivered.
@@ -257,6 +261,7 @@ def _backend_command(
             f"<text>{xml_escape(safe_body)}</text>"
             '</binding></visual><audio silent="true"/></toast>'
         )
+        xml_b64 = base64.b64encode(toast_xml.encode("utf-8")).decode("ascii")
         beep = "\ntry { [console]::beep(800,200) } catch {}" if play_sound else ""
         script = (
             "$ErrorActionPreference = 'Stop'\n"
@@ -265,7 +270,8 @@ def _backend_command(
             "$null = [Windows.Data.Xml.Dom.XmlDocument,"
             " Windows.Data.Xml.Dom, ContentType = WindowsRuntime]\n"
             "$x = New-Object Windows.Data.Xml.Dom.XmlDocument\n"
-            f"$x.LoadXml('{_ps_quote(toast_xml)}')\n"
+            "$x.LoadXml([Text.Encoding]::UTF8.GetString("
+            f"[Convert]::FromBase64String('{xml_b64}')))\n"
             "[Windows.UI.Notifications.ToastNotificationManager]::"
             f"CreateToastNotifier('{_TOAST_APP_ID}')"
             ".Show([Windows.UI.Notifications.ToastNotification]::new($x))"
@@ -300,10 +306,6 @@ def _strip_control(s: str) -> str:
 
 def _apple_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _ps_quote(s: str) -> str:
-    return s.replace("'", "''")
 
 
 def _placeholders(template: str) -> set[str]:

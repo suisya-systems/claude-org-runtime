@@ -8,6 +8,7 @@ unknown placeholder fallback, truncation, and bilingual support.
 from __future__ import annotations
 
 import base64
+import re
 from io import StringIO
 
 import pytest
@@ -362,6 +363,13 @@ def _toast_script(cmd: list[str]) -> str:
     return base64.b64decode(cmd[-1]).decode("utf-16-le")
 
 
+def _toast_xml(cmd: list[str]) -> str:
+    """Decode the base64 toast XML embedded in the script."""
+    m = re.search(r"FromBase64String\('([A-Za-z0-9+/=]*)'\)", _toast_script(cmd))
+    assert m
+    return base64.b64decode(m.group(1)).decode("utf-8")
+
+
 def test_windows_toast_sound_off_still_shows_toast() -> None:
     """The toast is visible without sound: desktop stays intended, no beep."""
     calls: list[list[str]] = []
@@ -373,10 +381,10 @@ def test_windows_toast_sound_off_still_shows_toast() -> None:
     assert result.desktop_dispatched is True
     assert result.bell_dispatched is False
     assert len(calls) == 1
-    script = _toast_script(calls[0])
-    assert "<text>CI failed</text>" in script
-    assert "<text>PR #42 finished with failed.</text>" in script
-    assert "beep" not in script
+    xml = _toast_xml(calls[0])
+    assert "<text>CI failed</text>" in xml
+    assert "<text>PR #42 finished with failed.</text>" in xml
+    assert "beep" not in _toast_script(calls[0])
 
 
 def test_windows_toast_beeps_in_same_script_when_sound_on() -> None:
@@ -399,22 +407,26 @@ def test_windows_toast_japanese_survives_as_ascii_command_line() -> None:
         log_stream=StringIO(), runner=lambda cmd: calls.append(cmd),
     )
     assert all(arg.isascii() for arg in calls[0][1:])
-    script = _toast_script(calls[0])
-    assert "<text>窓口が判断待ちです</text>" in script
-    assert "<text>承認してください</text>" in script
+    xml = _toast_xml(calls[0])
+    assert "<text>窓口が判断待ちです</text>" in xml
+    assert "<text>承認してください</text>" in xml
 
 
-def test_windows_toast_escapes_xml_and_powershell_quotes() -> None:
+def test_windows_toast_user_text_never_reaches_powershell_source() -> None:
+    """Quotes, including U+2018/U+2019 (PowerShell treats them as ``'``),
+    must not break or inject into the script: user text only exists
+    inside the base64 XML literal."""
     calls: list[list[str]] = []
-    ev = _event(title="<b>&'x'", body="a</text><text>b")
+    ev = _event(title="<b>&'x\u2019", body="a</text><text>b\u2018')")
     notify(
         ev, AttentionConfig(sound="off"), backend="windows-toast",
         log_stream=StringIO(), runner=lambda cmd: calls.append(cmd),
     )
     script = _toast_script(calls[0])
-    # XML-escaped, then ``'`` doubled for the single-quoted PS string.
-    assert "<text>&lt;b&gt;&amp;''x''</text>" in script
-    assert "<text>a&lt;/text&gt;&lt;text&gt;b</text>" in script
+    assert script.isascii()
+    xml = _toast_xml(calls[0])
+    assert "<text>&lt;b&gt;&amp;'x\u2019</text>" in xml
+    assert "<text>a&lt;/text&gt;&lt;text&gt;b\u2018')</text>" in xml
 
 
 def test_windows_toast_strips_control_chars() -> None:
@@ -424,9 +436,9 @@ def test_windows_toast_strips_control_chars() -> None:
         ev, AttentionConfig(sound="off"), backend="windows-toast",
         log_stream=StringIO(), runner=lambda cmd: calls.append(cmd),
     )
-    script = _toast_script(calls[0])
-    assert "<text>okevil</text>" in script
-    assert "<text>hithere</text>" in script
+    xml = _toast_xml(calls[0])
+    assert "<text>okevil</text>" in xml
+    assert "<text>hithere</text>" in xml
 
 
 def test_windows_toast_failure_falls_back_to_bell(capsys) -> None:
