@@ -152,7 +152,9 @@ def _emit_channel(content: str, meta: dict) -> None:
 # #150: host は content を ``<channel ...>`` タグで包んでモデルへ見せるため、本文中の
 # ``<channel`` / ``</channel`` は別メッセージの境界に見えうる。その ``<`` だけを実体参照に
 # 置き換えて無害化する (大小文字・``<`` 直後の空白も同扱い)。
-_CHANNEL_TAG_RE = re.compile(r"<(?=\s*/?\s*channel\b)", re.IGNORECASE)
+# ``/`` と後続空白を 1 つの省略可能グループにし、2 つの ``\s*`` が同じ空白列を奪い合う
+# 二次バックトラックを避ける (本文は送信者制御・長さ無制限)。
+_CHANNEL_TAG_RE = re.compile(r"<(?=\s*(?:/\s*)?channel\b)", re.IGNORECASE)
 # from_name は ``<channel>`` の属性値に載るので、値を閉じる引用符・タグを閉じる山括弧・
 # 改行類 (空白以外の whitespace) を除く。
 _FROM_NAME_STRIP_RE = re.compile(r"[\"'<>]|[^\S ]")

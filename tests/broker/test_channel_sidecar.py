@@ -9,6 +9,8 @@ queue row -> claude/channel payload 変換) を固定する。
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from claude_org_runtime.broker import channel_sidecar as cs
@@ -110,6 +112,15 @@ def test_channel_payload_leaves_other_angle_brackets_alone():
     content, meta = cs._channel_payload(
         {"id": "r", "entry": {"from_name": "w 1", "message": "a<b> <channels"}})
     assert content == "a<b> <channels" and meta["from_name"] == "w 1"
+
+
+def test_channel_payload_tag_match_is_linear_on_long_whitespace():
+    """#150: ``<`` + 長い空白列 + 非一致文字で二次バックトラックしない。"""
+    body = "<" + " " * 200_000 + "x"
+    start = time.monotonic()
+    content, _ = cs._channel_payload({"id": "r", "entry": {"message": body}})
+    assert content == body
+    assert time.monotonic() - start < 2.0
 
 # ===================================================== Issue #129 stand-down guard
 def _reset_sidecar_state():
