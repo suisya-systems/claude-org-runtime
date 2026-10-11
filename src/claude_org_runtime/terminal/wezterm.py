@@ -122,6 +122,9 @@ class WezTermAdapter:
     # type_text は bracketed paste (複数行を 1 draft として置ける)。user_turn が
     # 複数行本文を許すかの判定に使う (Issue #163)。
     bracketed_paste: ClassVar[bool] = True
+    # ``env K=V`` (Windows: ``cmd /c set``) は起動 argv に載るが起動の一瞬だけ。直書きなら
+    # claude の argv に生存中ずっと載るので env 渡しの方が露出は短い (#222)。
+    token_via_pane_env: ClassVar[bool] = True
 
     # raw-key vocabulary (Issue #108): WezTerm adapter は full gap ではなく
     # **既存実装で送れる subset** を宣言する (design review 確定事項 (5))。Enter は

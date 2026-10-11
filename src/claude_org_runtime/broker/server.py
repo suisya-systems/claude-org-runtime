@@ -1580,8 +1580,8 @@ class Broker(TokenMixin, StoreMixin):
             delivery_cred = self.issue_delivery_cred(agent_id)
             # token を env で渡せる backend (pane env を API で渡し、コマンドラインにも
             # 画面にも出さない) では config に ``${ORG_BROKER_TOKEN}`` だけを残す (#218)。
-            # env がコマンドライン経由になる backend (tmux ``-e`` / wezterm ``env K=V``)
-            # は直書きのまま (docs/broker-token-env-decision.md の経路表)。
+            # tmux ``-e`` / wezterm ``env K=V`` は起動の一瞬だけ tmux / env の argv に
+            # 載るが、直書きより露出は短い (#222。docs/broker-token-env-decision.md)。
             token_env = getattr(self.adapter, "token_via_pane_env", False)
             mcp_config = self.mcp_config_for(token, token_env=token_env)
             mcp_config["mcpServers"]["org-broker-channel"] = (

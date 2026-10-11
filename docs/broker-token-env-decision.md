@@ -1,13 +1,13 @@
 # Broker token: env reference where the launch path can pass env safely
 
-**Status:** Decided and shipped (#218).
-**Refs:** #218 (measurements in its two comments), #168, `docs/channel-delivery-model-decision.md` §4.4 / §6.5.
+**Status:** Decided and shipped (#218); extended to tmux and wezterm (#222).
+**Refs:** #218, #222 (measurements in its two comments), #168, `docs/channel-delivery-model-decision.md` §4.4 / §6.5.
 
 ## Decision
 
 The broker agent token moves out of the MCP config and into the launching process's env, **only on launch
-paths that can set that env without putting the token on a command line, in shell history or on a pane's
-screen**. On those paths the config says `"Authorization": "Bearer ${ORG_BROKER_TOKEN}"` and the token
+paths that can set that env without leaving the token in shell history or on a pane's screen, and without
+keeping it on a command line for the life of the process**. On those paths the config says `"Authorization": "Bearer ${ORG_BROKER_TOKEN}"` and the token
 travels as `ORG_BROKER_TOKEN`. Every other path keeps writing the token into the config, as before.
 
 `mcp_config_for(token, token_env=True)` emits the reference. Callers opt in: the admin RPCs `mint_token` and
@@ -33,8 +33,10 @@ That closes the pull door of `channel-delivery-model-decision.md` §4.4 on those
 longer gives a process the full token. This is the same non-replay property the observer lease already relies
 on (§6.5.1).
 
-Not done: moving the token into env on a path where env itself rides a command line. A short-lived command
-line is still readable by any local user through `ps` / `/proc`, and #218 rules that out.
+Accepted residual (#222): on tmux and wezterm, env rides the launcher's command line (`tmux new-session -e K=V`,
+`env K=V claude ...`). That line is readable through `ps` / `/proc` only while the launcher runs, a moment at
+startup. A literal token in the config sits in claude's own argv for the whole life of the process, so env is
+strictly shorter exposure. #218 first held these back; #222 reversed that on this comparison.
 
 ## Launch paths
 
@@ -45,15 +47,15 @@ line is still readable by any local user through `ps` / `/proc`, and #218 rules 
 | `org up` fallback when `claude` is not found | human types the printed line | `ORG_BROKER_TOKEN=...` prefix in the printed line | env (printed) | Known limitation: the line shows the token. Before #218 it showed it inside the inline config, so exposure is unchanged. |
 | `org adopt` | same as `org up` | exec env | **env** | Needs a daemon with #218. An older daemon ignores `token_env`, returns a literal config and no `token`, and the launch still authenticates. |
 | `spawn_claude_pane`, herdr | `pane.split` / `agent.start` API | `env` param over the herdr socket | **env** | `token_via_pane_env = True`. Under herdr 0.7.5 the command line is typed into the pane, and with env the typed line carries only `${ORG_BROKER_TOKEN}` instead of the token. |
-| `spawn_claude_pane`, tmux | `tmux new-session -e K=V` | the tmux client's argv | literal | env would sit on a command line. |
-| `spawn_claude_pane`, wezterm | `wezterm cli spawn -- env K=V ...` (Windows: `cmd /c set "K=V"&& ...`) | argv | literal | Same. |
+| `spawn_claude_pane`, tmux | `tmux new-session -e K=V` | the tmux client's argv | **env** | `token_via_pane_env = True` (#222). Residual: the token is in the tmux client's argv for the instant of launch. It is no longer in claude's argv. |
+| `spawn_claude_pane`, wezterm | `wezterm cli spawn -- env K=V ...` (Windows: `cmd /c set "K=V"&& ...`) | the `env` / `cmd` argv | **env** | Same (#222). Residual: the token is in the `env` (or `cmd`) argv for the instant before it execs claude. |
 | claude-org-ja on renga (`tools/transport.py`) | ja passes `--mcp-config` in renga `spawn_claude_pane` `args[]`; renga types the command into the pane's shell | renga has no per-pane env; a `VAR=... claude` prefix would be typed, shown and kept in history | literal | Same. ja calls `mint_token` without `token_env` and gets the old config. |
 | other admin `mint_token` callers | caller-defined | - | literal | Opt-in only. |
 | `broker serve` manual token print | human | - | literal | Debug output; it prints the token by design. |
 
 On the literal paths the token stays in claude's argv for the life of the process, as it did before #218.
-The table changes when a backend gains a way to set pane env that skips the command line: set
-`token_via_pane_env = True` on that adapter and add it to
+Adding a backend: set `token_via_pane_env = True` on its adapter when env reaches claude with a shorter
+exposure than a literal config (a startup-only launcher argv counts) and add it to
 `tests/broker/test_delivery.py::test_token_via_pane_env_is_declared_only_where_env_skips_the_command_line`.
 
 ## What changes for operators

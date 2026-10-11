@@ -107,6 +107,10 @@ class TmuxAdapter:
     # type_text は bracketed paste (複数行を 1 draft として置ける)。user_turn が
     # 複数行本文を許すかの判定に使う (Issue #163)。
     bracketed_paste: ClassVar[bool] = True
+    # ``-e K=V`` は tmux クライアントの argv に載るが、それは起動の一瞬だけ。token を
+    # mcp-config に直書きすると claude の argv に生存中ずっと載るので、env 渡しの方が
+    # 露出は厳密に短い (#222。docs/broker-token-env-decision.md)。
+    token_via_pane_env: ClassVar[bool] = True
 
     # tmux は send-keys が一級プリミティブで、full raw-key vocabulary を emit できる。
     # 対応表 (_TMUX_KEY_MAP) の key = canonical 全集合 (テストで包含を固定)。

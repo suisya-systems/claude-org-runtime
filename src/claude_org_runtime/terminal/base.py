@@ -259,8 +259,9 @@ class TerminalAdapter(Protocol):
     コマンドライン・シェル履歴・ペインの画面のどれにも出さずに pane プロセスへ渡せる
     backend であることの宣言。True の backend へは broker が mcp-config の header を
     ``Bearer ${ORG_BROKER_TOKEN}`` にし、token を ``env`` で渡す。Herdr=True (API の
-    ``env`` param)、tmux/wezterm=False (``-e K=V`` / ``env K=V`` はプロセスの
-    コマンドラインに載る) で、False の backend は token 直書きのまま。
+    ``env`` param)。tmux/wezterm=True (#222): ``-e K=V`` / ``env K=V`` は tmux / env の
+    argv に起動の一瞬だけ載るが、直書きなら claude の argv に生存中ずっと載るので、
+    露出は厳密に短くなる。False の backend は token 直書きのまま。
     """
 
     def spawn(

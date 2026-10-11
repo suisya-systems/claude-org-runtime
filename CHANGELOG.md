@@ -14,13 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Authorization: Bearer ${ORG_BROKER_TOKEN}` into the MCP config and pass the
   token in the launched process's env. Claude Code expands it once at startup
   and never replays that env on resume / fork / continue / `/mcp` reconnect,
-  so a session that only replays the config gets 401. tmux / wezterm spawns
-  and admin callers that do not pass `token_env: true` (claude-org-ja's renga
-  path) keep the literal token, because their env would ride a command line.
+  so a session that only replays the config gets 401. Admin callers that do
+  not pass `token_env: true` (claude-org-ja's renga path) keep the literal
+  token, because renga has no per-pane env.
   `secretary-mcp.json` no longer authenticates on its own: resume through
   `org adopt --resume`. New: `mint_token` / `adopt_delivery` `token_env` param,
   the `token_via_pane_env` adapter flag, and a live check
   (`CLAUDE_ORG_RUNTIME_LIVE_CLAUDE=1`) for the expansion behaviour. See
+  `docs/broker-token-env-decision.md`.
+- **tmux and wezterm `spawn_claude_pane` pass the broker token by env too
+  (#222).** Both adapters set `token_via_pane_env`. Before, the token sat in
+  claude's argv for the whole life of the process; now it appears only in the
+  launcher's argv (`tmux new-session -e`, `env K=V` / `cmd /c set`) for the
+  instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
 ## [0.1.49] - 2026-10-11
