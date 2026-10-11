@@ -150,6 +150,7 @@ class Broker(TokenMixin, StoreMixin):
         self._delivery_instances: dict[str, str] = {}     # owner -> current-gen instance id
         self._delivery_poll_seen: dict[str, dict[str, float]] = {}  # owner -> {instance: ts}
         self._duplicate_emit_at: dict[tuple[str, str, str], float] = {}  # dup emit cooldown
+        self._adopt_fenced: dict[str, dict[str, None]] = {}  # owner -> adopt が fence した instance
         # observed-session binding (Issue #129 問題 A)。owner -> ObserverLease。human
         # launcher が assert_observer で束ね、非 replay 秘密を提示できる sidecar のみ
         # generation を bump できる (fork replay の takeover を断つ)。_lock で守る。

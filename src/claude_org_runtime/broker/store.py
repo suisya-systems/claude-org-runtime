@@ -327,6 +327,9 @@ class StoreMixin:
     # duplicate-claimer 検知: owner -> {instance_id: last poll ts} と emit cooldown。
     _delivery_poll_seen: dict[str, dict[str, float]]
     _duplicate_emit_at: dict[tuple[str, str, str], float]  # (owner, iA, iB) -> last emit ts
+    # 明示 adopt が意図して fence した instance (Issue #231)。owner -> {instance: None}
+    # (挿入順 = fence 順)。duplicate 検知から外すための印。
+    _adopt_fenced: dict[str, dict[str, None]]
     # observed-session binding (Issue #129 問題 A)。owner -> 現在の observer lease。
     _observer_leases: dict[str, ObserverLease]
     # 明示 adopt (#166)。owner -> 進行中の adopt 操作 (高々 1 件)。
@@ -577,6 +580,8 @@ class StoreMixin:
                 self._delivery_generations[owner] = rollback.generation
                 if rollback.instance is not None and not pane_gone:
                     self._delivery_instances[owner] = rollback.instance
+                    # 復帰した現職は fence された抜け殻ではない (Issue #231)。
+                    self._adopt_fenced.get(owner, {}).pop(rollback.instance, None)
                     restored = True
                 # 現職の observer lease も戻す (#232)。条件は instance と同じ fence
                 # 健在 + pane 生存に、**自分の lease を落とした** (= 枠を他人が
@@ -728,7 +733,14 @@ class StoreMixin:
                     gen = self._generation_of(owner) + 1
                     self._delivery_generations[owner] = gen
                     # **現世代 instance を消す** = 旧 sidecar は次 poll で stale_sidecar。
-                    self._delivery_instances.pop(owner, None)
+                    fenced_instance = self._delivery_instances.pop(owner, None)
+                    if fenced_instance is not None:
+                        # 意図した fence の印 (Issue #231)。duplicate 検知から外す。
+                        marks = self._adopt_fenced.setdefault(owner, {})
+                        marks[fenced_instance] = None
+                        # ponytail: 上限は adopt 回数に対する安全弁。古い印から捨てる。
+                        while len(marks) > _STANDDOWN_MAX_PER_OWNER:
+                            del marks[next(iter(marks))]
                     moved = 0
                     for row in self._rows.values():
                         if row.state != CLAIMED or row.to_id != owner:
@@ -928,8 +940,20 @@ class StoreMixin:
             del seen[iid]
         others = [i for i in seen if i != instance_id]
         seen[instance_id] = now
+        # adopt が意図して fence した instance と、それを引き継いだ現職の組は重複では
+        # ない (Issue #231)。adopt 後の旧 pane は「都合のよい時に閉じてよい」抜け殻で、
+        # fence された sidecar は claim せず poll だけ続ける = 想定どおりの状態。それを
+        # urgent で鳴らすと、本物の無音喪失を知らせる唯一のシグナルを operator が無視する
+        # ように訓練してしまう。**両側が説明済み** (現職 or adopt-fenced) の組だけを外す:
+        # adopt-fenced の旧 sidecar と、説明のつかない fork の組は従来どおり検知する。
+        accounted = set(self._adopt_fenced.get(owner, ()))
+        cur = self._delivery_instances.get(owner)
+        if cur is not None:
+            accounted.add(cur)
         journal: list[tuple[str, dict]] = []
         for other in others:
+            if instance_id in accounted and other in accounted:
+                continue
             lo, hi = sorted((instance_id, other))
             key = (owner, lo, hi)
             last = self._duplicate_emit_at.get(key, 0.0)
@@ -1306,6 +1330,10 @@ class StoreMixin:
                         per_owner.pop(instance_id, None)
                         if not per_owner:
                             del self._delivery_standdowns[owner]
+                    # register し直した instance は adopt の抜け殻ではない (Issue #231)。
+                    # 印を残すと、後で last-register-wins に fence された時の本物の
+                    # 二重 sidecar が検知から漏れる。
+                    self._adopt_fenced.get(owner, {}).pop(instance_id, None)
                     observed = lease is not None
                     if observed:
                         # observed sidecar の register で lease を activate (armed->TTL 計時
@@ -1597,6 +1625,7 @@ class StoreMixin:
             self._delivery_generations.pop(owner, None)
             self._delivery_instances.pop(owner, None)
             self._delivery_poll_seen.pop(owner, None)
+            self._adopt_fenced.pop(owner, None)
             # observed-session binding も落とす (Issue #129): 残ると同名 respawn 後に
             # 旧 observer lease を継承し、新 session の sidecar が claim できなくなる
             # (誤束縛)。**これが sticky lease の主要な解除経路** でもある (Issue #169):
