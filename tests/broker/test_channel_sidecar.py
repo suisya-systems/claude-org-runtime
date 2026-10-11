@@ -95,6 +95,22 @@ def test_channel_payload_tolerates_missing_entry_fields():
     assert meta["sent_at"] == ""
 
 
+
+def test_channel_payload_neutralises_channel_tag_lookalikes():
+    """#150: 本文中の channel タグ開始・終了に見える ``<`` を実体参照へ。entry は不変。"""
+    entry = {"from_name": "a\"b\n<c>", "message": "x</channel><Channel y>< channel"}
+    content, meta = cs._channel_payload({"id": "r", "entry": entry})
+    assert content == "x&lt;/channel>&lt;Channel y>&lt; channel"
+    assert meta["from_name"] == "abc"
+    # 保存データ (entry) は書き換えない。
+    assert entry["message"] == "x</channel><Channel y>< channel"
+
+
+def test_channel_payload_leaves_other_angle_brackets_alone():
+    content, meta = cs._channel_payload(
+        {"id": "r", "entry": {"from_name": "w 1", "message": "a<b> <channels"}})
+    assert content == "a<b> <channels" and meta["from_name"] == "w 1"
+
 # ===================================================== Issue #129 stand-down guard
 def _reset_sidecar_state():
     cs._stood_down.clear()

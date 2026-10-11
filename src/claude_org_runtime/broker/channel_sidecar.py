@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -148,6 +149,15 @@ def _emit_channel(content: str, meta: dict) -> None:
     })
 
 
+# #150: host は content を ``<channel ...>`` タグで包んでモデルへ見せるため、本文中の
+# ``<channel`` / ``</channel`` は別メッセージの境界に見えうる。その ``<`` だけを実体参照に
+# 置き換えて無害化する (大小文字・``<`` 直後の空白も同扱い)。
+_CHANNEL_TAG_RE = re.compile(r"<(?=\s*/?\s*channel\b)", re.IGNORECASE)
+# from_name は ``<channel>`` の属性値に載るので、値を閉じる引用符・タグを閉じる山括弧・
+# 改行類 (空白以外の whitespace) を除く。
+_FROM_NAME_STRIP_RE = re.compile(r"[\"'<>]|[^\S ]")
+
+
 def _channel_payload(row: dict) -> tuple[str, dict]:
     """daemon の queue row (``{id, entry, epoch}``) を channel の (content, meta) へ。
 
@@ -164,13 +174,21 @@ def _channel_payload(row: dict) -> tuple[str, dict]:
     数値 sent_at は pull 経路 (check_messages の tools/call result) では schema 対象外
     なので触らず、channel push に載せる射影だけを string 化する。None (欠落) は
     degenerate なので空文字にする (どちらも schema 上 valid string)。
+
+    channel タグ偽装の無害化 (#150) もこの射影だけで行う: 本文中の ``<channel`` /
+    ``</channel`` の ``<`` を ``&lt;`` に、``from_name`` から引用符・山括弧・改行類を除く。
+    保存データ (entry) とワイヤ形は変えない。pull 経路 (check_messages) は本文を
+    tools/call result の JSON 値として返し channel タグで包まないので対象外。
     """
     entry = dict(row.get("entry") or {})
-    content = entry.get("message", "")
+    content = _CHANNEL_TAG_RE.sub("&lt;", entry.get("message", ""))
     sent_at = entry.get("sent_at")
+    from_name = entry.get("from_name")
+    if isinstance(from_name, str):
+        from_name = _FROM_NAME_STRIP_RE.sub("", from_name)
     meta = {
         "from_id": entry.get("from_id"),
-        "from_name": entry.get("from_name"),
+        "from_name": from_name,
         "sent_at": "" if sent_at is None else str(sent_at),
         "msg_id": row["id"],
     }
