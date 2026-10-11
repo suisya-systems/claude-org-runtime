@@ -2598,6 +2598,41 @@ def test_spawn_omits_kind_for_backends_without_the_capability(tmp_path):
     assert _kind_of_last_spawn(adapter) is conftest._UNSET
 
 
+def test_spawn_threads_display_name_to_capable_backend(tmp_path):
+    """spawn 時の name を観測者向け表示名として渡す (Issue #123)。"""
+    adapter = FakeAdapter(supports_display_name=True)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    disp = _ops(b)
+
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "fix-issue-114"})
+    assert adapter.spawned[-1]["display_name"] == "fix-issue-114"
+
+    dispatch_tool(b, disp, "spawn_codex_pane",
+                  {"direction": "vertical", "name": "w-codex"})
+    assert adapter.spawned[-1]["display_name"] == "w-codex"
+
+    sec = _ops(b, "s2", "secretary")
+    dispatch_tool(b, sec, "spawn_pane",
+                  {"direction": "horizontal", "command": "watch ls", "name": "w-gen"})
+    assert adapter.spawned[-1]["display_name"] == "w-gen"
+
+    # name 無しは None (adapter 既定の表示に委ねる)。
+    dispatch_tool(b, disp, "spawn_claude_pane", {"direction": "vertical"})
+    assert adapter.spawned[-1]["display_name"] is None
+
+
+def test_spawn_omits_display_name_for_backends_without_the_capability(tmp_path):
+    """tmux / wezterm の spawn シグネチャは不変に保つ (display_name を渡さない)。"""
+    adapter = FakeAdapter()  # supports_display_name=False (既定)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w"})
+    assert adapter.spawned[-1]["display_name"] is conftest._UNSET
+
+
 def test_venv_pane_env_backend_gets_virtual_env_without_argv_rewrite(tmp_path):
     """``venv_path_via_pane_env`` な backend では argv を書き換えない (#151 A)。
 

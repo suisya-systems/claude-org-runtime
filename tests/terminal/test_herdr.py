@@ -409,6 +409,36 @@ def test_spawn_creates_workspace_then_agent(server: FakeHerdrServer, tmp_path) -
     assert server.params_for("pane.close")["pane_id"] == "w1:p1"
 
 
+def test_spawn_display_name_renames_pane_after_start(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # Issue #123: 機械名 (agent.start name) は保ち、表示名は pane.rename で載せる。
+    _wire_spawn(server, pane_id="w1:p2")
+    server.on("pane.rename", {"type": "ok"})
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path), display_name="fix-issue-114")
+    assert ref.pane_id == "w1:p2"
+    assert server.methods_called() == [
+        "workspace.create", "agent.start", "pane.close", "pane.rename",
+    ]
+    assert server.params_for("pane.rename") == {
+        "pane_id": "w1:p2", "label": "fix-issue-114",
+    }
+    assert server.params_for("agent.start")["name"] != "fix-issue-114"
+
+
+def test_spawn_display_name_rename_failure_does_not_fail_spawn(
+    server: FakeHerdrServer, tmp_path
+) -> None:
+    # 表示専用: pane.rename 未対応 (fake は未登録 method を invalid_request で返す)
+    # でも起動済みの agent を巻き戻さない。
+    _wire_spawn(server, pane_id="w1:p2")
+    a = _adapter(server)
+    ref = a.spawn(["claude"], cwd=str(tmp_path), display_name="fix-issue-114")
+    assert ref.pane_id == "w1:p2"
+    assert "w1:p2" in a._owned_panes
+
+
 def test_spawn_injects_env_into_agent_start_params(
     server: FakeHerdrServer, tmp_path
 ) -> None:

@@ -262,6 +262,10 @@ class TerminalAdapter(Protocol):
     ``env`` param)。tmux/wezterm=True (#222): ``-e K=V`` / ``env K=V`` は tmux / env の
     argv に起動の一瞬だけ載るが、直書きなら claude の argv に生存中ずっと載るので、
     露出は厳密に短くなる。False の backend は token 直書きのまま。
+
+    人間可読な表示名 (任意 ClassVar ``supports_display_name``、#123): True の backend
+    へは broker が spawn 時の ``name`` を ``spawn(display_name=)`` で渡し、観測者向けの
+    pane 表示に使わせる (Herdr=True、``pane.rename``)。持たない backend には渡さない。
     """
 
     def spawn(
@@ -272,6 +276,7 @@ class TerminalAdapter(Protocol):
         space: "SpaceDescriptor | None" = ...,
         env: "dict[str, str] | None" = ...,
         kind: "str | None" = ...,
+        display_name: "str | None" = ...,
     ) -> PaneRef: ...
 
     def list_panes(self) -> list[dict]: ...

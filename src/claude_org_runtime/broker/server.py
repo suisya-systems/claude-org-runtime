@@ -1463,6 +1463,7 @@ class Broker(TokenMixin, StoreMixin):
         role: str | None, project: str | None,
         kind: str | None = None,
         env_extra: dict[str, str] | None = None,
+        display_name: str | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1503,6 +1504,10 @@ class Broker(TokenMixin, StoreMixin):
         を verbatim replay しても process env は継承しないため秘密を replay できない。
         **先に** 敷いてから broker 所有のキー (state dir / venv) を載せるので、呼び元が
         それらを上書きすることはない。
+
+        ``display_name`` (Issue #123) は spawn 時の ``name`` (例 ``fix-issue-114``)。
+        ``supports_display_name`` な backend (Herdr) にのみ渡し、観測者向けの pane 表示に
+        使わせる。tmux/wezterm のシグネチャは不変。
         """
         env = {**(env_extra or {}),
                "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
@@ -1514,6 +1519,8 @@ class Broker(TokenMixin, StoreMixin):
         extra: dict = {}
         if getattr(self.adapter, "supports_agent_kind", False):
             extra["kind"] = kind
+        if getattr(self.adapter, "supports_display_name", False):
+            extra["display_name"] = display_name
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
             return self.adapter.spawn(
@@ -1619,6 +1626,7 @@ class Broker(TokenMixin, StoreMixin):
                 env_extra[TOKEN_ENV] = token
             ref = self._adapter_spawn(
                 argv, cwd, role, project, kind="claude", env_extra=env_extra,
+                display_name=name,
             )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
@@ -1687,7 +1695,9 @@ class Broker(TokenMixin, StoreMixin):
                 # 原子的に拒否する。予約名は解放してから返す。
                 self._release_name(name)
                 return _err(str(e))
-            ref = self._adapter_spawn(argv, cwd, role, project, kind="codex")
+            ref = self._adapter_spawn(
+                argv, cwd, role, project, kind="codex", display_name=name,
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1729,7 +1739,9 @@ class Broker(TokenMixin, StoreMixin):
         token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
-            ref = self._adapter_spawn(argv, cwd, role, project, kind=None)  # generic: agent ではない
+            ref = self._adapter_spawn(  # generic: agent ではない
+                argv, cwd, role, project, kind=None, display_name=name,
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
