@@ -111,6 +111,9 @@ class TmuxAdapter:
     # mcp-config に直書きすると claude の argv に生存中ずっと載るので、env 渡しの方が
     # 露出は厳密に短い (#222。docs/broker-token-env-decision.md)。
     token_via_pane_env: ClassVar[bool] = True
+    # spawn(split_target=, direction=) で既存 pane を split できる (Issue #62)。
+    # broker が getattr で読み、解決済み target pane と方向を渡す。
+    supports_split_target: ClassVar[bool] = True
 
     # tmux は send-keys が一級プリミティブで、full raw-key vocabulary を emit できる。
     # 対応表 (_TMUX_KEY_MAP) の key = canonical 全集合 (テストで包含を固定)。
@@ -192,18 +195,24 @@ class TmuxAdapter:
         cwd: str | None = None,
         new_window: bool = True,
         env: dict[str, str] | None = None,
+        split_target: str | None = None,
+        direction: str | None = None,
     ) -> PaneRef:
-        """新しい detached session に argv を起動し PaneRef を返す。
+        """argv を起動し PaneRef を返す。
 
-        tmux の「ウィンドウ」相当は session (本 backend は常に専用 socket 上の
-        新規 session で検証する)。new_window は WezTerm 面との互換のため受けるが、
-        tmux では常に新 session を作る (既存 renga 等の pane には触らない)。
+        ``split_target`` (Issue #62): 指定時はその pane を ``split-window`` で分割し、
+        同じ window に並べる (``direction="vertical"`` = 左右 ``-h`` / それ以外 = 上下
+        ``-v``。renga の direction 語彙)。``-d`` で既存の active pane (= ``focused``)
+        を動かさない。target が消えていた / 狭すぎて split できない時は新規 session に
+        フォールバックする。未指定 (最初の spawn) は専用 socket 上に detached session を
+        新規作成する。new_window は WezTerm 面との互換のため受けるが使わない。
 
         ``env`` (Issue #122): pane プロセスへ **追加注入する** 環境変数。tmux 一級の
-        ``new-session -e KEY=VALUE`` で渡す。``-e`` は指定した変数のみを上書きし、残りは
-        tmux サーバー環境から継承する。env dict はそのまま親環境へ載せる値専用
-        (``ORG_BROKER_STATE_DIR`` / ``VIRTUAL_ENV``) で、この経路では ``VAR=... command``
-        の shell 前置はしない (backend 間で挙動を割らないため native 機構に載せる)。
+        ``-e KEY=VALUE`` (new-session / split-window 共通) で渡す。``-e`` は指定した変数
+        のみを上書きし、残りは tmux サーバー環境から継承する。env dict はそのまま親環境へ
+        載せる値専用 (``ORG_BROKER_STATE_DIR`` / ``VIRTUAL_ENV``) で、この経路では
+        ``VAR=... command`` の shell 前置はしない (backend 間で挙動を割らないため native
+        機構に載せる)。
 
         ただし Issue #130 の ``PATH`` の venv prepend は **env dict では行わない**:
         login shell の profile 初期化が ``-e`` で渡した ``PATH`` を後から再構築して
@@ -212,21 +221,36 @@ class TmuxAdapter:
         その wrapper は broker が渡す ``argv`` に既に織り込まれており、本メソッドは
         それを shlex-join してそのまま実行する (adapter 側は argv を素通しするだけ)。
         """
-        session = self._new_session_name()
         # argv を 1 本の shell-command 文字列にして渡す (tmux はこれを既定 shell
         # 経由で実行する)。shlex.quote で各要素を安全に連結する。
         cmd_str = " ".join(shlex.quote(a) for a in argv)
-        args = [
-            "new-session", "-d", "-s", session,
-            "-x", str(self.width), "-y", str(self.height),
-            "-P", "-F", "#{pane_id}\t#{window_id}\t#{session_name}",
-        ]
+        tail = ["-P", "-F", "#{pane_id}\t#{window_id}\t#{session_name}"]
         for key, value in (env or {}).items():
-            args += ["-e", f"{key}={value}"]
+            tail += ["-e", f"{key}={value}"]
         if cwd:
-            args += ["-c", cwd]
-        args += [cmd_str]
-        proc = self._tmux(*args)
+            tail += ["-c", cwd]
+        tail += [cmd_str]
+        proc = None
+        if split_target is not None:
+            flag = "-h" if direction == "vertical" else "-v"
+            proc = self._tmux(
+                "split-window", "-d", flag, "-t", str(split_target), *tail,
+                check=False,
+            )
+        if proc is None or proc.returncode != 0:
+            # ponytail: split 失敗は理由を問わず新規 session (旧挙動) に落とす。
+            # 「同 session の new-window」へ寄せるのは必要になってから。
+            session = self._new_session_name()
+            # new-session -e は値を **session 環境** に残し、同 session への後続 split が
+            # それを継承する (token / observer 秘密が別 agent に漏れる)。pane は起動済み
+            # なので、同じコマンド列 (``;`` 連結 = 間に他 client が割り込まない) で消す。
+            unset: list[str] = []
+            for key in env or {}:
+                unset += [";", "set-environment", "-t", session, "-u", key]
+            proc = self._tmux(
+                "new-session", "-d", "-s", session,
+                "-x", str(self.width), "-y", str(self.height), *tail, *unset,
+            )
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
         return PaneRef(pane_id=pane_id, window_id=window_id, tab_id=window_id)
@@ -303,8 +327,7 @@ class TmuxAdapter:
 
     # ------------------------------------------------------------------ kill
     def kill_pane(self, pane_id: str) -> None:
-        """spawn した検証 pane の後始末 (kill-pane)。単一 pane の session なら
-        session ごと消える。本 backend 内部用。"""
+        """spawn した pane の後始末 (kill-pane)。最後の pane なら session ごと消える。"""
         self._tmux("kill-pane", "-t", str(pane_id), check=False)
 
     def kill_server(self) -> None:

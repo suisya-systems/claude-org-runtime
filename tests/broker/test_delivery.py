@@ -2633,6 +2633,42 @@ def test_spawn_omits_display_name_for_backends_without_the_capability(tmp_path):
     assert adapter.spawned[-1]["display_name"] is conftest._UNSET
 
 
+def test_spawn_threads_split_target_and_direction_to_capable_backend(tmp_path):
+    """Issue #62: tmux は target pane を split する (新 session を作らない)。
+
+    broker は解決済みの handle と direction を全 spawn 経路から渡す。
+    """
+    adapter = FakeAdapter(supports_split_target=True)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    focused = adapter.add_pane(active=True, handle="%0")
+    disp = _ops(b)
+
+    dispatch_tool(b, disp, "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w-claude"})
+    sp = adapter.spawned[-1]
+    assert (sp["split_target"], sp["direction"]) == (focused, "vertical")
+
+    worker = sp["handle"]
+    dispatch_tool(b, disp, "spawn_codex_pane",
+                  {"direction": "horizontal", "target": "w-claude", "name": "w-codex"})
+    sp = adapter.spawned[-1]
+    assert (sp["split_target"], sp["direction"]) == (worker, "horizontal")
+
+    sec = _ops(b, "s2", "secretary")
+    dispatch_tool(b, sec, "spawn_pane",
+                  {"direction": "horizontal", "command": "watch ls", "name": "w-gen"})
+    assert adapter.spawned[-1]["split_target"] == focused
+
+
+def test_spawn_omits_split_target_for_backends_without_the_capability(tmp_path):
+    adapter = FakeAdapter()  # supports_split_target=False (既定)
+    b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
+    adapter.add_pane(active=True)
+    dispatch_tool(b, _ops(b), "spawn_claude_pane",
+                  {"direction": "vertical", "name": "w"})
+    assert adapter.spawned[-1]["split_target"] is conftest._UNSET
+
+
 def test_venv_pane_env_backend_gets_virtual_env_without_argv_rewrite(tmp_path):
     """``venv_path_via_pane_env`` な backend では argv を書き換えない (#151 A)。
 
