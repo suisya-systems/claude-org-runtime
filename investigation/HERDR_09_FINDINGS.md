@@ -1,6 +1,6 @@
 # herdr 0.9.3 (protocol 22) の実測結果と broker E2E (Issue #237)
 
-実行: `investigation/run_09_probe.sh`（中身は `herdr_09_probe.py`）。
+実行: `investigation/run_09_probe.sh`（中身は `herdr_09_probe.py`）。全セクションの結果は `_run_09/report.json` に、`--e2e-only` で再実行した E2E の結果は `_run_09/report_e2e.json` に出る。
 - 隔離: 専用の `herdr --session herdr-0-9-spike` を使い、既定 session と稼働中の組織には触れていない。
 - 固定化: `HERDR_CONFIG_PATH` で `version_check` / `manifest_check` を無効化し、実行中に版と検出 manifest が変わらないようにした。
 - 実測日: 2026-10-11。
@@ -22,10 +22,10 @@
 18 と 21 はリリースされていない。
 
 - `ping` の `protocol` は `wire.rs` の `PROTOCOL_VERSION` と同じ値を返す。
-- 18〜22 の bump は TUI client/server 間の binary wire 向けで、内容は kitty key release / native key identity / workspace group close。JSON socket API は別の契約で、client shell 向けには `ENDPOINT_PROTOCOL_GENERATION = 1` を持つ。
+- 18〜22 の bump は TUI client/server 間の binary wire 向けで、内容は kitty key release / native key lifecycle / terminal bell の転送 / workspace group close / native key identity。JSON socket API は別の契約で、client shell 向けには `ENDPOINT_PROTOCOL_GENERATION = 1` を持つ。
 - adapter が使う method は ping / workspace.create・list・close / pane.list・get・layout・split・move・close・read・send_text・send_keys・rename / agent.start。0.9.3 ではどれも request param、result の field、error code が 0.7.5 と同じで、変更は任意 field の追加だけだった。
   - 追加された任意 field: `workspace.create.source_workspace_id` / `pane.split.right_click` / `PaneInfo.restore_error` / `AgentInfo.completion_seq` / `pane.report_agent.resume_argv`。
-  - `deny_unknown_fields` はどの tag にも無い。
+  - JSON API の schema（`src/api` と `src/protocol`）には、どの tag にも `deny_unknown_fields` が無い。
 - adapter の変更は「22 を `PROTOCOL_AGENT_API_V075` に入れる」ことだけ。`SUPPORTED_PROTOCOLS` だけに足すと、22 が legacy 経路に落ちて #151 の症状が再発する。
 - 0.9.3 では `workspace.close` に `close_group` が増えた。worktree group に属する workspace を閉じるには `close_group: true` が要り、無いと `workspace_group_close_required` が返る。adapter が作る workspace は group に入らないので影響しない。
 
@@ -57,5 +57,6 @@ reap 閾値（`reap_min_*`）は変えない。0.9.3 の `pane.list` は今回�
 
 ## 0.9.3 で他に変わった点（adapter への影響なし）
 
-- 新しい pane の環境から `CLAUDECODE` / `CLAUDE_CODE_*` / `TMUX` / `WEZTERM_PANE` 等が除去され、`TERM_PROGRAM=herdr` が設定される。adapter が `pane.split` の `env` で明示的に渡す値は、除去の後に適用されるので届く（E2E の broker token 受け渡しで確認した）。
-- `pane.send_input{pane_id, text, keys}` が追加された。`send_line` を 1 往復にまとめられるが、今回は必要ない。
+- （0.9.2 以降）新しい pane の環境から `CLAUDECODE` / `CLAUDE_CODE_*` / `TMUX` / `WEZTERM_PANE` 等が除去され、`TERM_PROGRAM=herdr` が設定される。adapter が `pane.split` の `env` で明示的に渡す値は、除去の後に適用されるので届く（E2E の broker token 受け渡しで確認した）。
+
+実測した版は 0.9.3 だけである。0.9.0-0.9.2 も protocol は 22 で、adapter が使う JSON schema にも差が無い。adapter は protocol で判定しているので、これらの版も同じ経路で受理する。

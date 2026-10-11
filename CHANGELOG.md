@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured and is still rejected with `herdr_protocol_unsupported`. The new
   `protocol_for_version((major, minor, patch))` maps a herdr release to its
   protocol, or returns `None` for a release it does not know. claude-org-ja's
-  herdr preflight uses it instead of its local table.
+  herdr preflight tries it before its own local table. Only herdr 0.9.3 was
+  measured; 0.9.0-0.9.2 speak the same protocol and JSON schema.
 - **herdr panes show the worker's name (#123).** `spawn_claude_pane` /
   `spawn_codex_pane` / `spawn_pane` pass their `name` (e.g. `fix-issue-114`)
   to backends that declare the new `supports_display_name` adapter flag, as

@@ -1306,9 +1306,8 @@ class HerdrAdapter:
     def _agent_start_timeout_ms(self) -> int:
         """0.7.5 ``agent.start`` の ``timeout_ms`` (許容 3000 < x <= 300000)。
 
-        socket timeout より**長くしない**: 先に socket 側が切れると herdr 側の
-        待ちは無意味になり、adapter からは ``adapter_unavailable`` に見えるため
-        (関係を明示せよ、という Codex Minor 指摘への対応)。
+        herdr 側の起動保留窓 (``agent.start`` 自体はブロックしない、0.9.3 実測)。
+        値は socket timeout に揃え、許容範囲へ clamp するだけ。
         """
         ms = int(self.timeout * 1000)
         return max(3001, min(ms, 300000))
