@@ -68,7 +68,7 @@ class Broker(TokenMixin, StoreMixin):
         observer_arming_seconds: float = 600.0,
         adopt_arming_seconds: float = store.DEFAULT_ADOPT_ARMING_SECONDS,
         reclaim_warn_threshold: int = 3,
-        renotify_seconds: float | None = 300.0,
+        renotify_seconds: float | None = None,
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
         root_cwd: str | None = None,
@@ -118,8 +118,10 @@ class Broker(TokenMixin, StoreMixin):
         self.adopt_arming_seconds = adopt_arming_seconds
         self.reclaim_warn_threshold = reclaim_warn_threshold
         # push confirm 後に受領の兆候 (返信 / check_messages での消化) を待つ秒数 (#131
-        # 暫定)。超えたら同じ id のまま pull 専用で再通知 + 再ナッジする。None / 0 で無効。
-        # 5 分 = idle な agent が返信するには十分長く、取りこぼしに人が気付くより短い。
+        # 暫定)。超えたら同じ id のまま pull 専用で再通知 + 再ナッジする。**既定 None = 無効
+        # (opt-in)**: 返信を伴わないメッセージ (ack / CLOSE_PANE / CI 通知等) が二重配達
+        # され、msg_id dedup を持たない受け手が同じ指示を二度実行しうるため。受け手側の
+        # msg_id 重複排除が入ってから有効化する。有効化時の目安は 300 (5 分)。
         self.renotify_seconds = renotify_seconds
         # admin HTTP RPC (token mint / graceful shutdown) の認証 token。None なら
         # admin 面は無効 (/admin は 404)。serve が生成し sidecar 0600 に書く。既存

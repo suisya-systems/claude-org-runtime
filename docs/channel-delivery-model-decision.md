@@ -333,7 +333,7 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
    #81's scope and is not built.
 
    Until it exists, the daemon uses the receipt evidence it already observes. A push-confirmed row waits
-   `renotify_seconds` (default 300s, `None`/0 disables) for a sign of receipt: the recipient sending a message
+   `renotify_seconds` for a sign of receipt: the recipient sending a message
    back to the row's sender. Without one, the row returns to `UNDELIVERED` marked **pull-only** - `poll_claims`
    never re-claims it, because the push path that lost it once can lose it again - the recipient is nudged, and
    the next `check_messages` returns it with the same `msg_id` the channel meta carried. Consuming it there is
@@ -347,6 +347,12 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
    in the Problem B case the visible session keeps taking turns while another host swallowed the frame, so
    general activity would mask exactly the loss this exists to catch. Remove this fallback when the host-accept
    signal lands.
+
+   **The fallback is opt-in: `renotify_seconds` defaults to `None` (off).** Many organisation messages carry no
+   reply (acks to workers, `CLOSE_PANE`, `CI_COMPLETED` notices), so enabling it by default would redeliver
+   them all after the window, and today's receiving agents do not dedupe by `msg_id` - they could execute the
+   same instruction twice. **Enable it only after receivers drop duplicates by `msg_id`**; 300s is the
+   suggested value then.
 
 ---
 

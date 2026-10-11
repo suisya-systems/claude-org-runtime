@@ -84,8 +84,8 @@ def test_send_to_third_party_is_not_receipt(tmp_path):
     assert [m["msg_id"] for m in b.drain(dst)] == [row.id]
 
 
-def test_disabled_when_renotify_seconds_none(tmp_path):
-    b = Broker(state_dir=tmp_path, adapter=None, renotify_seconds=None)
+def test_disabled_by_default(tmp_path):
+    b = Broker(state_dir=tmp_path, adapter=None)   # 既定 = 無効 (opt-in)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     row, _ = _push_delivered(b, src, "dst")
     _expire(row)
