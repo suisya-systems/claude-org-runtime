@@ -365,6 +365,11 @@ def _launch_claude(
             # secretary out of its workspace root (self-review MINOR).
             argv = login_shell_venv_wrapper(argv, bin_dir, run_cwd=root_cwd)
     if os.name != "nt":
+        # exec はユーザー空間の stdio バッファを捨てる。stdout が TTY でない (リダイレクト /
+        # パイプ) と block buffering なので、org up / org adopt の状況表示 (adoption id・
+        # in-flight 件数・arming 期限) が丸ごと消える (#177 dogfood Defect 4)。
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.execvpe(argv[0], argv, env)  # 返らない (プロセス置換)
         return 0  # pragma: no cover (execvpe 成功時は到達しない)
     try:
