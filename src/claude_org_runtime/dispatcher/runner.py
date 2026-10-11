@@ -306,6 +306,9 @@ WORKER_SANDBOX_SETTINGS: dict[str, Any] = {
                 "pypi.org",
                 "files.pythonhosted.org",
                 "registry.npmjs.org",
+                # cargo: sparse index + crate downloads (the index's "dl")
+                "index.crates.io",
+                "static.crates.io",
                 "chatgpt.com",
                 "*.chatgpt.com",
                 "developers.openai.com",
