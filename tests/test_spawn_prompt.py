@@ -632,3 +632,31 @@ def test_record_write_failure_fails_closed(
     code, out = _run_step(monkeypatch, capsys, _stdin(COMPOSER, None),
                           "--state-dir", str(blocker), "--target", "w")
     assert code == 2 and out["error"].startswith("decision record:")
+
+
+def test_record_write_failure_revokes_previous_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    from claude_org_runtime.dispatcher import spawn_prompt
+
+    write_decision_record(tmp_path, "w", None, {"state": "folder_trust",
+                          "action": ACTION_SEND_KEYS, "send_keys": {"enter": True}})
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(spawn_prompt.os, "replace", boom)
+    code, out = _run_step(monkeypatch, capsys, _stdin(COMPOSER, None),
+                          *_step_args(tmp_path, "--target", "w"))
+    assert code == 2 and out["error"].startswith("decision record:")
+    assert not decision_record_path(tmp_path, "w").exists()
+
+
+def test_invalid_input_with_unusable_state_dir_keeps_json_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("", encoding="utf-8")
+    code, out = _run_step(monkeypatch, capsys, "not json",
+                          "--state-dir", str(blocker), "--target", "w")
+    assert code == 2 and "error" in out

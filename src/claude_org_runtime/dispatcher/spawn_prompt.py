@@ -61,6 +61,7 @@ PreToolUse hook in the Dispatcher's pane can allow exactly the authorised
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -359,7 +360,8 @@ def cmd_spawn_prompt_step(args: argparse.Namespace) -> int:
     # RecursionError = pathologically nested input. All are invalid input (2).
     except (ValueError, TypeError, RecursionError) as exc:
         if target is not None:
-            decision_record_path(Path(args.state_dir), target).unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                decision_record_path(Path(args.state_dir), target).unlink(missing_ok=True)
         print(json.dumps({"error": str(exc)}, ensure_ascii=True))
         return EXIT_INVALID
     result = decide(screen, previous_lines, elapsed_ms, args.deadline_ms)
@@ -367,8 +369,10 @@ def cmd_spawn_prompt_step(args: argparse.Namespace) -> int:
         try:
             write_decision_record(Path(args.state_dir), target, args.task_id, result)
         except OSError as exc:
-            # Without a record a guard hook would deny the key anyway; fail
-            # closed so the caller escalates instead of retrying the key.
+            # Fail closed: drop the previous pass's record (best effort) so it
+            # cannot keep authorising its keys, and make the caller escalate.
+            with contextlib.suppress(OSError):
+                decision_record_path(Path(args.state_dir), target).unlink(missing_ok=True)
             print(json.dumps({"error": f"decision record: {exc}"}, ensure_ascii=True))
             return EXIT_INVALID
     result["elapsed_ms"] = elapsed_ms

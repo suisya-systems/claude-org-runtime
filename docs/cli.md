@@ -189,7 +189,8 @@ PreToolUse hook). Path:
 ```
 
 Written atomically (temp file + rename) when the action is `send_keys` or
-`done`; **removed** for `wait`, `escalate` and invalid input, so a record from
+`done`; **removed** (best effort) for `wait`, `escalate`, invalid input and a
+failed write, so a record from
 an earlier key pass never authorises a key on a screen that now says wait.
 Each pass overwrites the previous record for that target.
 
