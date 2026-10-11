@@ -2651,10 +2651,10 @@ def test_spawn_claude_hands_token_via_pane_env_when_backend_can(
         "Bearer ${ORG_BROKER_TOKEN}")
 
 
-def test_spawn_claude_keeps_literal_token_when_env_rides_a_command_line(
+def test_spawn_claude_keeps_literal_token_when_backend_has_no_env_flag(
     tmp_path, fake_adapter,
 ):
-    """tmux / wezterm (flag 無し) は env がコマンドラインに載るので直書きのまま。"""
+    """flag を宣言しない backend は token 直書きのまま。"""
     b = Broker(state_dir=tmp_path, adapter=fake_adapter)
     fake_adapter.add_pane(active=True)
     dispatch_tool(b, _ops(b), "spawn_claude_pane",
@@ -2671,5 +2671,8 @@ def test_token_via_pane_env_is_declared_only_where_env_skips_the_command_line():
     """経路表 (docs/broker-token-env-decision.md) と flag を一致させる。"""
     from claude_org_runtime.terminal import HerdrAdapter, TmuxAdapter, WezTermAdapter
     assert HerdrAdapter.token_via_pane_env is True
-    assert not getattr(TmuxAdapter, "token_via_pane_env", False)
-    assert not getattr(WezTermAdapter, "token_via_pane_env", False)
+    # tmux / wezterm: env は起動 argv に一瞬載るだけで、直書き (claude の argv に
+    # 生存中載り続ける) より露出が短い (#222)。
+    assert TmuxAdapter.token_via_pane_env is True
+    # wezterm の native Windows は cmd が claude の終了まで token 入り argv を保持する。
+    assert WezTermAdapter.token_via_pane_env is (os.name != "nt")
