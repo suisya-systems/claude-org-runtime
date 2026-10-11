@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **herdr panes show the worker's name (#123).** `spawn_claude_pane` /
+  `spawn_codex_pane` / `spawn_pane` pass their `name` (e.g. `fix-issue-114`)
+  to backends that declare the new `supports_display_name` adapter flag, as
+  `spawn(display_name=)`. The herdr adapter sets it as the pane label via
+  `pane.rename` after start; the machine `agent.start` name is unchanged. The
+  rename is best-effort: a herdr without `pane.rename` still spawns. tmux and
+  wezterm are unchanged.
 - **Broker token by env reference where the launch path allows it (#218).**
   `org up`, `org adopt` and herdr `spawn_claude_pane` now write
   `Authorization: Bearer ${ORG_BROKER_TOKEN}` into the MCP config and pass the
