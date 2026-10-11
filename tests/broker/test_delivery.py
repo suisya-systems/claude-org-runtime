@@ -1631,13 +1631,19 @@ def test_latched_journal_does_not_consume_the_standdown_cooldown(tmp_path, clock
     _registered(b, "sec")
     b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
+    b.register_delivery_instance(dc, "fork-a", observer=None)   # cooldown を使う
+    clock.advance(1.0)
+    # 両方の latch 理由が cooldown の内側でも journal に出る。
     b.register_delivery_instance(dc, "bg", bg_hosted=True)
     b.register_delivery_instance(dc, "old", observer="stale")
-    clock.advance(1.0)
-    b.register_delivery_instance(dc, "fork", observer=None)
     assert len(_journal_events(b, "delivery_suppressed_bg_hosted")) == 1
     assert len(_journal_events(b, "delivery_register_superseded")) == 1
-    assert len(_journal_events(b, "delivery_register_unobserved")) == 1
+    # fork-a から 30s 超・latch からは 30s 未満。latch が cooldown を張り直して
+    # いれば、ここで fork-b が食われる。
+    clock.advance(30.0)
+    b.register_delivery_instance(dc, "fork-b", observer=None)
+    assert [e["instance"] for e in _journal_events(
+        b, "delivery_register_unobserved")] == ["fork-a", "fork-b"]
 
 
 def test_reset_delivery_state_clears_standdowns(tmp_path):
