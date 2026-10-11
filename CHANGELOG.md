@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
+### Fixed
+
+- **Worker sandbox allows crates.io downloads (#196).** The `strictAllowlist`
+  overlay now lists `index.crates.io` (sparse index) and `static.crates.io`
+  (crate downloads), so `cargo` can resolve and fetch dependencies in workers.
+  `crates.io` itself (search / publish API) stays blocked.
+
 ## [0.1.49] - 2026-10-11
 
 ### Added
