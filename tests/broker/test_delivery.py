@@ -1600,6 +1600,46 @@ def test_repeated_pending_refusals_do_not_grow_the_journal(tmp_path):
     assert b.delivery_dump()["standdowns"]["sec"]["manual"]["count"] == 20
 
 
+def test_superseded_latch_right_after_adopt_is_journalled(tmp_path, clock):
+    """**回帰 (#230)**: 引き継ぎ直後の ``--force`` 競合で latch した session の
+    ``delivery_register_superseded`` が stand-down の journal cooldown に食われない。
+
+    adopt 直後は fence された現職の poll が ``delivery_poll_fenced`` で owner の
+    cooldown を使ったばかり。latch は instance ごと生涯 1 回きりで、ここで落とすと
+    恒久沈黙の原因が journal のどこにも残らない。
+    """
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst")
+    first = b.adopt_delivery("dst")
+    assert b.poll_claims(dc, gen, iid)["error"] == "stale_sidecar"
+    assert len(_journal_events(b, "delivery_poll_fenced")) == 1
+    b.adopt_delivery("dst", force=True)
+    clock.advance(5.0)                              # cooldown (30s) の内側
+    res = b.register_delivery_instance(
+        dc, "first-session", observer=first["observer_secret"])
+    assert res["error"] == "unobserved"
+    sup = _journal_events(b, "delivery_register_superseded")
+    assert [(e["instance"], e["latched"]) for e in sup] == [("first-session", True)]
+
+
+def test_latched_journal_does_not_consume_the_standdown_cooldown(tmp_path, clock):
+    """latch の journal は cooldown を素通りするだけでなく **消費もしない**。消費させると
+    直後に来た非 latch 遷移 (ここでは fork の ``delivery_register_unobserved``) が
+    今度は食われ、取りこぼしが latch から別のイベントへ移るだけになる。"""
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0)
+    _registered(b, "sec")
+    b.assert_observer("sec")
+    dc = b.issue_delivery_cred("sec")
+    b.register_delivery_instance(dc, "bg", bg_hosted=True)
+    b.register_delivery_instance(dc, "old", observer="stale")
+    clock.advance(1.0)
+    b.register_delivery_instance(dc, "fork", observer=None)
+    assert len(_journal_events(b, "delivery_suppressed_bg_hosted")) == 1
+    assert len(_journal_events(b, "delivery_register_superseded")) == 1
+    assert len(_journal_events(b, "delivery_register_unobserved")) == 1
+
+
 def test_reset_delivery_state_clears_standdowns(tmp_path):
     """close_pane 相当の reset で stand-down 記録も消える (同名 respawn の誤読を防ぐ)。"""
     b = Broker(state_dir=tmp_path, adapter=None)
