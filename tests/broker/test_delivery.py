@@ -2436,6 +2436,118 @@ def test_adopt_arming_seconds_defaults_to_the_broker_tunable(tmp_path):
     assert b._pending_adoptions["dst"].armed_until <= time.time() + 1.5
 
 
+# ============================== Issue #231 adopt-fenced sidecar is not a duplicate
+def _adopted(b: Broker, owner: str = "dst"):
+    """現職 sidecar ``old`` を立て、adopt して ``new`` で引き継ぐ (clean adopt)。"""
+    dc, gen_old, _ = _sidecar(b, owner, "old")
+    res = b.adopt_delivery(owner)
+    reg = b.register_delivery_instance(dc, "new", observer=res["observer_secret"])
+    assert reg["ok"] is True
+    return dc, gen_old, reg["generation"]
+
+
+def test_clean_adopt_with_the_old_pane_open_raises_no_duplicate(tmp_path, clock):
+    """**再現 (#231)**: clean adopt 後、旧 pane を開いたままにしても duplicate を出さない。
+
+    adopt 後の旧 sidecar は fence され claim せず poll だけ続ける = 想定どおりの状態。
+    以前は (旧, 新) の組が lease window ごとに ``duplicate_sidecar_detected`` を出し、
+    attention が urgent で「二つの session が同じ channel を claim している」と鳴らした。
+    cooldown をまたいで poll し続けても出ないことを固定する。
+    """
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=10.0)
+    _registered(b, "dst")
+    dc, gen_old, gen_new = _adopted(b)
+    for _ in range(4):
+        assert b.poll_claims(dc, gen_old, "old")["error"] == "stale_sidecar"
+        assert "error" not in b.poll_claims(dc, gen_new, "new")
+        clock.advance(6.0)   # 4 回で lease window (10s) を 2 度またぐ
+    assert _journal_events(b, "duplicate_sidecar_detected") == []
+    # 意図した fence であることは従来どおり stand-down 面に残る。
+    assert _journal_events(b, "delivery_poll_fenced")[0]["instance"] == "old"
+
+
+def test_repeated_adopts_leave_every_fenced_pane_quiet(tmp_path, clock):
+    """adopt を重ねても (old -> new -> newest)、fence された抜け殻同士も含め鳴らない。"""
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=10.0)
+    _registered(b, "dst")
+    dc, gen_old, gen_new = _adopted(b)
+    res = b.adopt_delivery("dst")
+    reg = b.register_delivery_instance(dc, "newest", observer=res["observer_secret"])
+    assert reg["ok"] is True
+    for _ in range(3):
+        for inst, gen in (("old", gen_old), ("new", gen_new),
+                          ("newest", reg["generation"])):
+            b.poll_claims(dc, gen, inst)
+        clock.advance(6.0)
+    assert _journal_events(b, "duplicate_sidecar_detected") == []
+
+
+def test_unfenced_second_sidecar_is_still_a_duplicate_after_adopt(tmp_path):
+    """adopt の除外は **adopt が fence した instance だけ**。説明のつかない sidecar
+    (fork が persisted mcp-config を replay した等) は従来どおり duplicate で検知する。
+    """
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc, gen_old, gen_new = _adopted(b)
+    b.poll_claims(dc, gen_old, "old")
+    b.poll_claims(dc, gen_new, "new")
+    b.poll_claims(dc, gen_new, "fork")
+    pairs = {tuple(sorted(d["instances"]))
+             for d in _journal_events(b, "duplicate_sidecar_detected")}
+    assert pairs == {("fork", "new"), ("fork", "old")}
+
+
+def test_two_unfenced_sessions_claiming_are_still_a_duplicate(tmp_path):
+    """adopt の無い本物の重複 (last-register-wins で 2 session が claim を奪い合う) は
+    従来どおり ``duplicate_sidecar_detected`` を出し、attention は urgent で鳴らす。
+    """
+    from claude_org_runtime.attention.classifier import classify_duplicate_sidecar
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc = b.issue_delivery_cred("dst")
+    reg_a = b.register_delivery_instance(dc, "a")
+    reg_b = b.register_delivery_instance(dc, "b")
+    b.poll_claims(dc, reg_a["generation"], "a")
+    b.poll_claims(dc, reg_b["generation"], "b")
+    dups = _journal_events(b, "duplicate_sidecar_detected")
+    assert [set(d["instances"]) for d in dups] == [{"a", "b"}]
+    assert classify_duplicate_sidecar(dups[0]).severity == "urgent"
+
+
+def test_expired_adopt_restored_incumbent_is_not_left_marked_fenced(tmp_path, clock):
+    """失効で現職へ戻ったら、その instance は adopt の抜け殻ではない。印を残すと、
+    以後に別 sidecar が last-register-wins で現職を奪った本物の重複が検知から漏れる。
+    """
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
+               adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    dc, gen, iid = _sidecar(b, "dst", "old")
+    b.adopt_delivery("dst")
+    clock.advance(0.1)
+    assert b.poll_claims(dc, gen, iid).get("error") is None   # 現職へ復帰
+    assert iid not in b._adopt_fenced.get("dst", {})
+
+
+def test_reregistered_instance_is_not_left_marked_fenced(tmp_path):
+    """adopt で fence された instance が register し直したら印を外す (#231)。"""
+    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0)
+    _registered(b, "dst")
+    dc, _gen, _new = _adopted(b)
+    assert "old" in b._adopt_fenced["dst"]
+    b._observer_leases.pop("dst")   # last-register-wins に戻した状況
+    b.register_delivery_instance(dc, "old")
+    assert "old" not in b._adopt_fenced["dst"]
+
+
+def test_reset_delivery_state_clears_adopt_fenced_marks(tmp_path):
+    """close_pane 相当の reset で印も消える (同名 respawn に継承しない)。"""
+    b = Broker(state_dir=tmp_path, adapter=None)
+    _registered(b, "dst")
+    _adopted(b)
+    b.reset_delivery_state("dst")
+    assert "dst" not in b._adopt_fenced
+
+
 # ============================== Issue #129 HTTP wire (observer / bg_hosted)
 def test_claim_owner_observer_and_bg_over_http(broker):
     """/claim-owner が observer 秘密 (Phase 2) と bg_hosted marker (Phase 1) を配線する。"""
