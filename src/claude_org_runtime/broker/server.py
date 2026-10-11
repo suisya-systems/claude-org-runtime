@@ -48,7 +48,7 @@ from ..terminal import (
 from . import sidecar, store, surface, user_turn
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
-from .tokens import MAX_SESSIONS_PER_BIND, AgentBind, TokenMixin
+from .tokens import MAX_SESSIONS_PER_BIND, TOKEN_ENV, AgentBind, TokenMixin
 
 
 class Broker(TokenMixin, StoreMixin):
@@ -301,6 +301,11 @@ class Broker(TokenMixin, StoreMixin):
         有効にする。``channel`` を要し、True の時だけ observer lease を assert して
         ``observer_secret`` を返す。呼び元はこの秘密を子プロセス env へ handoff する契約
         (org up 経路)。指定しない channel mint は従来の last-register-wins のまま。
+
+        ``token_env`` (任意、既定 False、#218): True なら ``mcp_config`` の header を
+        ``Bearer ${ORG_BROKER_TOKEN}`` にする。呼び元は返った ``token`` を起動する
+        claude の env へ渡す契約 (org up)。指定しない呼び元 (ja の renga 経路等) は
+        従来どおり token 直書きの config を受け取る。
         """
         role = params.get("role", "worker")
         if role not in surface.ROOT_ROLE_CHOICES:
@@ -340,6 +345,9 @@ class Broker(TokenMixin, StoreMixin):
         if observer and not channel:
             return {"ok": False,
                     "error": "[invalid_params] observer requires channel"}
+        token_env = params.get("token_env", False)
+        if not isinstance(token_env, bool):
+            return {"ok": False, "error": "[invalid_params] token_env must be a boolean"}
         # 既定 agent_id は毎回一意にする: 固定名だと複数回 mint した token が同一
         # agent として bind/queue を共有し配送先が曖昧化する (agent_id 基準の
         # 配送/排出。Codex review Major)。明示 name 指定時はそれを agent_id に使うが、
@@ -352,7 +360,7 @@ class Broker(TokenMixin, StoreMixin):
             )
         except ValueError as e:
             return {"ok": False, "error": str(e)}
-        mcp_config = self.mcp_config_for(token)
+        mcp_config = self.mcp_config_for(token, token_env=token_env)
         # channel 配線 (push 一次配送 §9.5): ``channel`` 要求時のみ org-broker-channel
         # sidecar (OWNER=この agent) を mcp_config に積み delivery-scoped credential を
         # 発行する。secretary(窓口) mint 経路が子 (spawn_claude) と同じ channel sidecar を
@@ -401,6 +409,11 @@ class Broker(TokenMixin, StoreMixin):
         MCP ツール面にも delivery credential にも出さない — lease より弱い主体が
         所有権を奪える経路を作らないため。``/admin`` は ``admin.token`` (0600) の
         bearer のみ受理し、その検証は :meth:`_AdminHandler._handle_admin` が行う。
+
+        ``token_env`` (任意、既定 False、#218) は :meth:`admin_mint_token` と同じ:
+        True なら config は token を env 参照し、呼び元が ``ORG_BROKER_TOKEN`` を渡す。
+        その token は応答に ``token`` として載せる (adopt は既存 owner の token を
+        再利用するので、env で渡す値をここ以外から得る手段が呼び元に無い)。
         """
         owner = params.get("owner")
         if not isinstance(owner, str) or not owner:
@@ -414,6 +427,9 @@ class Broker(TokenMixin, StoreMixin):
             # bool を厳密に要求する (truthy 文字列で現職の fence が誤って上書きされない
             # ように。channel / observer / bg_hosted と同じ検証方針)。
             return {"ok": False, "error": "[invalid_params] force must be a boolean"}
+        token_env = params.get("token_env", False)
+        if not isinstance(token_env, bool):
+            return {"ok": False, "error": "[invalid_params] token_env must be a boolean"}
         arming_seconds = params.get("arming_seconds", self.adopt_arming_seconds)
         if isinstance(arming_seconds, bool) or not isinstance(
                 arming_seconds, (int, float)):
@@ -428,11 +444,13 @@ class Broker(TokenMixin, StoreMixin):
         delivery_cred = result.pop("_delivery_cred", "")
         if not result.get("ok"):
             return result
-        mcp_config = self.mcp_config_for(owner_token)
+        mcp_config = self.mcp_config_for(owner_token, token_env=token_env)
         mcp_config["mcpServers"]["org-broker-channel"] = (
             self.channel_server_config(delivery_cred, owner)
         )
         result["mcp_config"] = mcp_config
+        if token_env:
+            result["token"] = owner_token
         return result
 
     def admin_adopt_status(self, params: dict) -> dict:
@@ -1560,7 +1578,12 @@ class Broker(TokenMixin, StoreMixin):
             # (least-privilege)。子 claude が sidecar を subprocess として起こす
             # ため broker は sidecar を直接 spawn しない (pane kill で道連れに落ちる)。
             delivery_cred = self.issue_delivery_cred(agent_id)
-            mcp_config = self.mcp_config_for(token)
+            # token を env で渡せる backend (pane env を API で渡し、コマンドラインにも
+            # 画面にも出さない) では config に ``${ORG_BROKER_TOKEN}`` だけを残す (#218)。
+            # env がコマンドライン経由になる backend (tmux ``-e`` / wezterm ``env K=V``)
+            # は直書きのまま (docs/broker-token-env-decision.md の経路表)。
+            token_env = getattr(self.adapter, "token_via_pane_env", False)
+            mcp_config = self.mcp_config_for(token, token_env=token_env)
             mcp_config["mcpServers"]["org-broker-channel"] = (
                 self.channel_server_config(delivery_cred, agent_id)
             )
@@ -1591,9 +1614,11 @@ class Broker(TokenMixin, StoreMixin):
             # 秘密は **mcp-config に載せず** pane プロセス env で渡す。mcp-config は
             # fork/resume が verbatim replay する面そのものなので、そこへ載せた瞬間に
             # 「fork が replay できない信号」という lease の存在理由が消える。
+            env_extra = {"ORG_BROKER_CHANNEL_OBSERVER": observer_secret}
+            if token_env:
+                env_extra[TOKEN_ENV] = token
             ref = self._adapter_spawn(
-                argv, cwd, role, project, kind="claude",
-                env_extra={"ORG_BROKER_CHANNEL_OBSERVER": observer_secret},
+                argv, cwd, role, project, kind="claude", env_extra=env_extra,
             )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。

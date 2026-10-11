@@ -254,6 +254,13 @@ class TerminalAdapter(Protocol):
     tmux/wezterm=False (:func:`venv_pane_prep` の wrapper 方式のまま不変)。True の
     backend へは broker が argv を書き換えず ``VIRTUAL_ENV`` のみ env に載せる
     (:func:`venv_pane_env`)。
+
+    broker token の env 運搬 (任意 ClassVar ``token_via_pane_env``、#218): ``env`` を
+    コマンドライン・シェル履歴・ペインの画面のどれにも出さずに pane プロセスへ渡せる
+    backend であることの宣言。True の backend へは broker が mcp-config の header を
+    ``Bearer ${ORG_BROKER_TOKEN}`` にし、token を ``env`` で渡す。Herdr=True (API の
+    ``env`` param)、tmux/wezterm=False (``-e K=V`` / ``env K=V`` はプロセスの
+    コマンドラインに載る) で、False の backend は token 直書きのまま。
     """
 
     def spawn(

@@ -133,6 +133,12 @@ fork / `--resume` inherits the env (the same bet as §6.5.1). Moving the token i
 (spawn, `launcher.py`, adopt, and anyone who builds a config from `mcp_config_for`) and is left as a
 separate decision; until it ships, the residual below stands.
 
+**Update (#218):** measured on 2.1.296: interactive mode expands too, and resume / fork / continue / `/mcp`
+reconnect do not replay the launch env. The token now travels in env (`Bearer ${ORG_BROKER_TOKEN}`) on
+`org up`, `org adopt` and herdr spawns. tmux / wezterm spawns and claude-org-ja's renga path still write it
+into the config, because their only way to pass env goes through a command line. The residual below now
+applies to those paths only. Per-path table: `docs/broker-token-env-decision.md`.
+
 **Residual, and when it fires.** Any process holding the persisted mcp-config can call `check_messages`
 and destructively drain the owner's queue. It fires only on an **active tool call** by that process - pull
 has no passive wake-up (the nudge types into the owner's pane, not the fork's), so this is already
@@ -300,8 +306,9 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
    more reliance on an existing bet.
 2. **The pull door narrows but does not close.** The full token is in the persisted config *by design*.
    The premise that HTTP MCP can only carry static headers turned out false (§4.4, tested in #168):
-   `${VAR}` indirection works, so the door *can* close by changing how the token is transported. Until
-   that launch-contract change is made, the residual in §4.4 stands.
+   `${VAR}` indirection works, so the door *can* close by changing how the token is transported. #218 made
+   that change where the launch path can pass env safely; the residual in §4.4 stands for the tmux /
+   wezterm / renga paths (`docs/broker-token-env-decision.md`).
 3. **Adoption is discipline-dependent.** ~~A legitimate session started by hand (`claude --resume`) carries no
    observer secret, so it registers `unobserved`, sets `_stood_down`, and - because that latch has no
    `clear()` - **never receives push for the life of the process**.~~
