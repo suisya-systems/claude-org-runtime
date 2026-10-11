@@ -5,6 +5,8 @@ from __future__ import annotations
 from io import StringIO
 from typing import Optional
 
+import pytest
+
 from claude_org_runtime.attention.platform import (
     bell,
     detect_backend,
@@ -43,9 +45,10 @@ def test_linux_without_notify_send_falls_back() -> None:
 
 
 def test_wsl_with_powershell() -> None:
+    """Issue #32: WSL raises a WinRT toast through powershell.exe."""
     assert detect_backend(
         system="Linux", is_wsl=True, which=_which_factory({"powershell.exe"}),
-    ) == "wsl"
+    ) == "windows-toast"
 
 
 def test_wsl_without_powershell_falls_back() -> None:
@@ -54,48 +57,25 @@ def test_wsl_without_powershell_falls_back() -> None:
     ) == "stdout"
 
 
-def test_wsl_prefers_wsl_notify_send_when_present() -> None:
-    """Issue #25: prefer wsl-notify-send.exe (real toast) over Write-Host."""
+def test_wsl_ignores_wsl_notify_send() -> None:
+    """Issue #32: wsl-notify-send.exe alone (UTF-8 broken) is not used."""
     assert detect_backend(
         system="Linux", is_wsl=True,
-        which=_which_factory({"wsl-notify-send.exe", "powershell.exe"}),
-    ) == "wsl-notify-send"
+        which=_which_factory({"wsl-notify-send.exe"}),
+    ) == "stdout"
 
 
-def test_wsl_falls_back_to_write_host_without_wsl_notify_send() -> None:
-    """No wsl-notify-send.exe + powershell.exe present → legacy ``wsl`` path."""
+@pytest.mark.parametrize("exe", ["powershell.exe", "powershell"])
+def test_windows_with_powershell(exe) -> None:
     assert detect_backend(
-        system="Linux", is_wsl=True, which=_which_factory({"powershell.exe"}),
-    ) == "wsl"
-
-
-def test_windows_with_powershell() -> None:
-    assert detect_backend(
-        system="Windows", is_wsl=False,
-        which=_which_factory({"powershell.exe"}),
-    ) == "windows"
+        system="Windows", is_wsl=False, which=_which_factory({exe}),
+    ) == "windows-toast"
 
 
 def test_windows_without_powershell_falls_back() -> None:
     assert detect_backend(
         system="Windows", is_wsl=False, which=_which_factory(set()),
     ) == "stdout"
-
-
-def test_windows_prefers_wsl_notify_send_when_present() -> None:
-    """Issue #33: Windows native prefers wsl-notify-send.exe over Write-Host."""
-    assert detect_backend(
-        system="Windows", is_wsl=False,
-        which=_which_factory({"wsl-notify-send.exe", "powershell.exe"}),
-    ) == "wsl-notify-send"
-
-
-def test_windows_uses_wsl_notify_send_without_powershell() -> None:
-    """Edge case: wsl-notify-send.exe present but powershell.exe missing."""
-    assert detect_backend(
-        system="Windows", is_wsl=False,
-        which=_which_factory({"wsl-notify-send.exe"}),
-    ) == "wsl-notify-send"
 
 
 def test_unknown_system_falls_back() -> None:

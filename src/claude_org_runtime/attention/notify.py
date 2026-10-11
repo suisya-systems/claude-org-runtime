@@ -20,18 +20,27 @@ Sub-process invocation:
 
 from __future__ import annotations
 
+import base64
 import shutil
 import string
 import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from xml.sax.saxutils import escape as xml_escape
 
 from .classifier import AttentionEvent
 from .config import ALLOWED_PLACEHOLDERS, AttentionConfig
 from .platform import Backend, bell, detect_backend
 
 _SUBPROCESS_TIMEOUT_SEC: float = 5.0
+
+# Windows PowerShell's own AppUserModelID: it is registered on every
+# Windows 10+ host, so toasts show without registering an app of our own.
+_TOAST_APP_ID = (
+    r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}"
+    r"\WindowsPowerShell\v1.0\powershell.exe"
+)
 
 
 @dataclass(frozen=True)
@@ -121,18 +130,6 @@ def notify(
     play_sound = _should_play_sound(cfg.sound, event.severity)
     desktop_intended = bool(cfg.desktop) and chosen != "stdout"
 
-    # Legacy Windows / WSL Write-Host backends signal exclusively
-    # through the embedded ``[console]::beep`` — ``Write-Host`` goes to
-    # a captured PowerShell stdout we discard, so it is invisible to
-    # the user. With sound suppressed the subprocess would dispatch
-    # successfully yet deliver nothing, so downgrade to intentional
-    # stdout-only delivery instead of pretending it worked.
-    # ``wsl-notify-send`` is intentionally excluded: it raises a real
-    # Windows toast which stays visible regardless of ``cfg.sound``,
-    # so suppressing sound must not suppress the toast itself.
-    if chosen in ("windows", "wsl") and not play_sound:
-        desktop_intended = False
-
     log_stream.write(
         f"[attention] {event.severity.upper()} {event.kind} "
         f"key={event.key} task={event.task_id or '-'} :: {title}\n"
@@ -158,19 +155,15 @@ def notify(
     #   - macOS / Linux: notification is visual-only; ring the bell as
     #     the audio channel (afplay / paplay would be a richer choice
     #     but those would each need an opt-in dep — bell stays generic).
-    #   - Windows / WSL: ``[console]::beep`` is already inside the
-    #     PowerShell command, so adding a bell here would double up.
-    #   - wsl-notify-send: the dispatcher fires a companion
-    #     ``powershell.exe`` beep alongside a successful toast; we
-    #     suppress the bell there to avoid double audio. If the toast
-    #     subprocess itself failed (binary missing, host notifications
-    #     blocked, etc.) the bell becomes the audio fallback, matching
-    #     the macOS / Linux failure path.
+    #   - windows-toast: the PowerShell script beeps after a shown
+    #     toast, so a successful dispatch suppresses the bell to avoid
+    #     double audio. If the toast subprocess failed the bell becomes
+    #     the audio fallback, matching the macOS / Linux failure path.
     #   - desktop disabled / dispatch failed / stdout-only: bell is
     #     the only audio surface left.
-    should_bell = play_sound and chosen not in ("windows", "wsl")
-    if chosen == "wsl-notify-send" and desktop_dispatched:
-        should_bell = False
+    should_bell = play_sound and not (
+        chosen == "windows-toast" and desktop_dispatched
+    )
     if should_bell:
         bell()
         bell_dispatched = True
@@ -201,15 +194,9 @@ def _dispatch_desktop(
     return to ``False`` so :func:`notify` falls back to a bell — and,
     crucially, the caller does not mark the event as dedup'd, so the
     next poll re-attempts the notification. ``play_sound`` is threaded
-    in so the Windows / WSL PowerShell command can conditionally
+    in so the ``windows-toast`` PowerShell script can conditionally
     include the ``[console]::beep`` — otherwise ``cfg.sound='off'``
-    would still ring a beep on those platforms.
-
-    The ``wsl-notify-send`` backend is special: the binary itself has
-    no beep flag, so when ``play_sound`` is set we fire a second
-    ``powershell.exe [console]::beep`` subprocess after the toast.
-    A failing beep does not demote the toast result — the user already
-    saw the notification, so the event still counts as delivered.
+    would still ring a beep on Windows / WSL.
     """
     cmd = _backend_command(backend, title, body, play_sound=play_sound)
     if cmd is None:
@@ -231,36 +218,7 @@ def _dispatch_desktop(
             file=sys.stderr,
         )
         return False
-    if backend == "wsl-notify-send" and play_sound:
-        _dispatch_wsl_notify_send_beep(run_fn)
     return True
-
-
-def _dispatch_wsl_notify_send_beep(run_fn: Callable[[list[str]], Any]) -> None:
-    """Fire the supplementary PowerShell beep next to a wsl-notify-send toast.
-
-    Logged as a warning on failure but never demotes the toast result:
-    the user has already seen the toast, so the event is delivered even
-    if the audio side fails (host with no console audio, etc.).
-    """
-    beep_cmd = [
-        "powershell.exe", "-NoProfile", "-Command",
-        "[console]::beep(800,200)",
-    ]
-    try:
-        beep_result = run_fn(beep_cmd)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(
-            f"warning: wsl-notify-send beep subprocess failed: {exc}",
-            file=sys.stderr,
-        )
-        return
-    beep_rc = getattr(beep_result, "returncode", 0)
-    if beep_rc and beep_rc != 0:
-        print(
-            f"warning: wsl-notify-send beep exited with code {beep_rc}",
-            file=sys.stderr,
-        )
 
 
 def _safe_subprocess_run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -286,32 +244,36 @@ def _backend_command(
         return ["osascript", "-e", script]
     if backend == "linux":
         return ["notify-send", safe_title, safe_body]
-    if backend == "wsl-notify-send":
-        # Upstream main.go: ``--category`` is documented as
-        # "Notification category (used as title)" — passing the
-        # rendered title there gives the toast a per-event headline
-        # that respects user template overrides, while the body goes
-        # in the positional argument. Beep is a separate subprocess
-        # fired by :func:`_dispatch_desktop` when ``play_sound`` is
-        # set; the binary itself has no audio flag.
-        return [
-            "wsl-notify-send.exe",
-            "--category", safe_title,
-            safe_body,
-        ]
-    if backend in ("windows", "wsl"):
-        # Honour ``cfg.sound`` on the PowerShell path: include the
-        # beep iff the caller asked for sound. Without this guard
-        # ``sound="off"`` users still hear a beep on Windows / WSL.
-        beep = "; [console]::beep(800,200)" if play_sound else ""
-        message = (
-            f"Write-Host '{_ps_quote(safe_title)}: "
-            f"{_ps_quote(safe_body)}'{beep}"
+    if backend == "windows-toast":
+        # Issue #32: the script travels as ``-EncodedCommand`` (base64
+        # of UTF-16LE), so the command line is pure ASCII and non-ASCII
+        # title/body survive WSL interop and any Windows code page.
+        # The toast itself is silent; the beep is the audio channel so
+        # ``cfg.sound`` keeps its meaning. A failing beep is swallowed:
+        # the toast was already shown, so the event counts as delivered.
+        toast_xml = (
+            '<toast><visual><binding template="ToastGeneric">'
+            f"<text>{xml_escape(safe_title)}</text>"
+            f"<text>{xml_escape(safe_body)}</text>"
+            '</binding></visual><audio silent="true"/></toast>'
         )
-        if backend == "windows":
-            ps = shutil.which("powershell.exe") or "powershell"
-            return [ps, "-NoProfile", "-Command", message]
-        return ["powershell.exe", "-NoProfile", "-Command", message]
+        beep = "\ntry { [console]::beep(800,200) } catch {}" if play_sound else ""
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$null = [Windows.UI.Notifications.ToastNotificationManager,"
+            " Windows.UI.Notifications, ContentType = WindowsRuntime]\n"
+            "$null = [Windows.Data.Xml.Dom.XmlDocument,"
+            " Windows.Data.Xml.Dom, ContentType = WindowsRuntime]\n"
+            "$x = New-Object Windows.Data.Xml.Dom.XmlDocument\n"
+            f"$x.LoadXml('{_ps_quote(toast_xml)}')\n"
+            "[Windows.UI.Notifications.ToastNotificationManager]::"
+            f"CreateToastNotifier('{_TOAST_APP_ID}')"
+            ".Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+            f"{beep}"
+        )
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        ps = shutil.which("powershell.exe") or "powershell"
+        return [ps, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
     return None
 
 

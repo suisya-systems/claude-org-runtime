@@ -5,10 +5,8 @@ unit tests can drive every branch without a real OS check. Per §5:
 
 * macOS  → ``osascript display notification``
 * Linux  → ``notify-send``
-* WSL    → ``wsl-notify-send.exe`` (Windows toast) when installed,
-  else ``powershell.exe`` Write-Host fallback
-* Windows → ``wsl-notify-send.exe`` (Windows toast) when installed,
-  else PowerShell beep + Write-Host fallback
+* WSL / Windows → ``powershell.exe`` raising a WinRT toast
+  (``windows-toast``; no install needed on the Windows host)
 * anything else / missing binary → ``"stdout"`` (caller bells + logs)
 """
 
@@ -21,7 +19,7 @@ import sys
 from typing import Callable, Literal, Optional
 
 Backend = Literal[
-    "macos", "linux", "windows", "wsl", "wsl-notify-send", "stdout",
+    "macos", "linux", "windows-toast", "stdout",
 ]
 
 
@@ -46,22 +44,14 @@ def detect_backend(
 
     if sys_name == "Linux":
         if wsl:
-            # Prefer wsl-notify-send.exe: it surfaces a real Windows
-            # toast notification, while the legacy Write-Host path only
-            # writes to a captured PowerShell stdout that the user never
-            # sees (Issue #25). Fall back when the binary is not on PATH
-            # so users without the optional install keep the existing
-            # beep-via-powershell behavior bit-for-bit.
-            if which_fn("wsl-notify-send.exe"):
-                return "wsl-notify-send"
-            return "wsl" if which_fn("powershell.exe") else "stdout"
+            # Issue #32: a WinRT toast via powershell.exe replaces
+            # wsl-notify-send.exe, which mangles non-ASCII arguments.
+            return "windows-toast" if which_fn("powershell.exe") else "stdout"
         return "linux" if which_fn("notify-send") else "stdout"
 
     if sys_name == "Windows":
-        if which_fn("wsl-notify-send.exe"):
-            return "wsl-notify-send"
         if which_fn("powershell.exe") or which_fn("powershell"):
-            return "windows"
+            return "windows-toast"
         return "stdout"
 
     return "stdout"
