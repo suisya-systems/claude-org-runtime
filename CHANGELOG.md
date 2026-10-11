@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.49] - 2026-10-11
+
 ### Added
 
 - **Interim re-notify for push-confirmed messages with no sign of receipt
@@ -65,8 +67,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `send_keys` stays unserialized (raw keys must not wait behind a turn); a
   single-line `user_turn` withholds Enter unless the draft is its own body.
 
+### Changed
+
+- **`Broker(clock=...)` injects the delivery time source (#210).** Claim
+  lease, observer arming / TTL, adopt arming and the stale-lease probe read
+  it; the default stays `time.time`, so production behaviour is unchanged.
+  Tests drive a fake clock instead of sleeping against 50-100ms windows, so
+  slow (Windows) runners can no longer expire a window early.
+- **Role config schema documents non-`PreToolUse` hook events (#180).**
+  `worker_roles.<role>.hooks` was never restricted to `PreToolUse`; `Stop`,
+  `SubagentStop`, `PostToolUse` and `PostToolBatch` render verbatim and
+  validate by exact event name. The contract is recorded in
+  `$comment_hook_events`; no event list is enforced and no turn-end policy
+  ships. A CLI test pins the verbatim emission.
+
 ### Fixed
 
+- **Channel pushes can no longer forge a second message (#150).** The host
+  wraps a push in a `<channel ...>` tag, so a body containing `<channel` or
+  `</channel` could read to the receiving model as a separate message. The
+  push projection now writes that `<` as `&lt;` and strips quotes, angle
+  brackets and non-space whitespace from `meta.from_name`. Stored entries and
+  the wire shape are unchanged; the pull path returns the body as a JSON value
+  and is not touched.
+- **The fallback nudge no longer submits over a stalled multi-line
+  `user_turn` draft (#207).** The nudge's idle re-check read only the `❯` row,
+  so a draft left on the composer's continuation rows looked idle and
+  `NUDGE_TEXT` could be appended and submitted. It now also runs the full
+  composer check and defers on any draft.
 - **Sessions sharing an agent token no longer evict each other (#168).** A
   fork or `--resume` replays the mcp-config, so two processes can hold the same
   token. Before, the second `initialize` overwrote the bind's only session
@@ -107,6 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invoked by another name (`/usr/bin/docker`, `docker.exe`, `sh -c`), which
   the allow set does not auto-approve either.
 
+- **Broker re-nudges when a sidecar dies between claim and confirm (#78).**
+  Lease reap only ran lazily inside RPCs and never nudged, so a claimed row
+  whose sidecar died before `/confirm-delivered` stalled silently:
+  `check_messages` skips live claims and no further nudge was sent. A claim
+  now arms a per-owner lease-expiry timer that reaps the expired claim and
+  re-nudges the recipient so `check_messages` picks the message up.
 - **`attention watch` no longer looks dead after a pane resize (#41).** The
   watcher was never killed by a resize (SIGWINCH is ignored by default; a pty
   repro survives repeated 104 <-> 210 column resizes), but renga clears a
@@ -156,12 +190,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config` is recorded as `exception`; `iterations` counts completed scans. A
   missing `state.db` / `events` table is not created, and a failed write
   only warns on stderr.
-- **Broker re-nudges when a sidecar dies between claim and confirm (#78).**
-  Lease reap only ran lazily inside RPCs and never nudged, so a claimed row
-  whose sidecar died before `/confirm-delivered` stalled silently:
-  `check_messages` skips live claims and no further nudge was sent. A claim
-  now arms a per-owner lease-expiry timer that reaps the expired claim and
-  re-nudges the recipient so `check_messages` picks the message up.
 
 ## [0.1.47] - 2026-10-08
 
