@@ -2674,4 +2674,5 @@ def test_token_via_pane_env_is_declared_only_where_env_skips_the_command_line():
     # tmux / wezterm: env は起動 argv に一瞬載るだけで、直書き (claude の argv に
     # 生存中載り続ける) より露出が短い (#222)。
     assert TmuxAdapter.token_via_pane_env is True
-    assert WezTermAdapter.token_via_pane_env is True
+    # wezterm の native Windows は cmd が claude の終了まで token 入り argv を保持する。
+    assert WezTermAdapter.token_via_pane_env is (os.name != "nt")

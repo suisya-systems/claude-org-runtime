@@ -122,9 +122,11 @@ class WezTermAdapter:
     # type_text は bracketed paste (複数行を 1 draft として置ける)。user_turn が
     # 複数行本文を許すかの判定に使う (Issue #163)。
     bracketed_paste: ClassVar[bool] = True
-    # ``env K=V`` (Windows: ``cmd /c set``) は起動 argv に載るが起動の一瞬だけ。直書きなら
-    # claude の argv に生存中ずっと載るので env 渡しの方が露出は短い (#222)。
-    token_via_pane_env: ClassVar[bool] = True
+    # POSIX の ``env K=V claude`` は exec で置き換わるので token は起動の一瞬しか argv に
+    # 載らず、直書きより露出が短い (#222)。native Windows の ``cmd /c set "K=V"&& claude``
+    # は cmd が claude の終了まで残り token も argv に残り続ける (直書きに加えて cmd 側にも
+    # 載る) ので宣言しない。
+    token_via_pane_env: ClassVar[bool] = os.name != "nt"
 
     # raw-key vocabulary (Issue #108): WezTerm adapter は full gap ではなく
     # **既存実装で送れる subset** を宣言する (design review 確定事項 (5))。Enter は

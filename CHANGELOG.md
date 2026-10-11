@@ -23,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CLAUDE_ORG_RUNTIME_LIVE_CLAUDE=1`) for the expansion behaviour. See
   `docs/broker-token-env-decision.md`.
 - **tmux and wezterm `spawn_claude_pane` pass the broker token by env too
-  (#222).** Both adapters set `token_via_pane_env`. Before, the token sat in
+  (#222).** tmux and POSIX wezterm set `token_via_pane_env` (native Windows wezterm does not: `cmd /c set` outlives the launch holding the token). Before, the token sat in
   claude's argv for the whole life of the process; now it appears only in the
-  launcher's argv (`tmux new-session -e`, `env K=V` / `cmd /c set`) for the
+  launcher's argv (`tmux new-session -e`, `env K=V`) for the
   instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
