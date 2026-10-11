@@ -1236,6 +1236,35 @@ def test_protocol_17_selects_v075_agent_api(server: FakeHerdrServer) -> None:
     assert a._uses_v075_agent_api()
 
 
+def test_protocol_22_selects_v075_agent_api(server: FakeHerdrServer) -> None:
+    # herdr 0.9.x (Issue #237): agent.start は 17 と同形なので v075 経路。
+    server.protocol = 22
+    server.version = "0.9.3"
+    a = _adapter(server)
+    assert a._protocol == 22
+    assert a._uses_v075_agent_api()
+
+
+@pytest.mark.parametrize(
+    "version, expected",
+    [
+        ((0, 7, 1), 14),
+        ((0, 7, 4), 16),
+        ((0, 7, 5), 17),
+        ((0, 8, 0), 19),
+        ((0, 8, 2), 20),
+        ((0, 9, 0), 22),
+        ((0, 9, 3), 22),
+        ((0, 8, 1), None),   # tag が無い版
+        ((0, 6, 10), None),
+        ((0, 9, 4), None),   # 未知の将来版は推測しない
+        ([0, 9, 3], 22),     # tuple 以外の sequence も受ける
+    ],
+)
+def test_protocol_for_version(version, expected) -> None:
+    assert herdr_mod.protocol_for_version(version) == expected
+
+
 @pytest.mark.parametrize("protocol", sorted(SUPPORTED_PROTOCOLS))
 def test_every_supported_protocol_constructs(
     server: FakeHerdrServer, protocol: int
@@ -1244,7 +1273,7 @@ def test_every_supported_protocol_constructs(
     assert _adapter(server)._protocol == protocol
 
 
-@pytest.mark.parametrize("protocol", [13, 15, 18, 99])
+@pytest.mark.parametrize("protocol", [13, 15, 18, 19, 20, 21, 23, 99])
 def test_unsupported_protocol_fails_fast(
     server: FakeHerdrServer, protocol: int
 ) -> None:
@@ -2045,9 +2074,16 @@ def test_born_empty_workspace_with_foreign_pane_is_not_closed(
 # herdr 0.7.5 (protocol 17) agent.start 追随 — Issue #151 A
 # ---------------------------------------------------------------------------
 
-def test_v075_spawn_splits_pane_then_starts_agent(server: FakeHerdrServer, tmp_path):
-    """0.7.5 は agent.start が pane を作らないので、先に pane.split で確保する。"""
+@pytest.mark.parametrize("protocol", sorted(PROTOCOL_AGENT_API_V075))
+def test_v075_spawn_splits_pane_then_starts_agent(
+    server: FakeHerdrServer, tmp_path, protocol: int
+):
+    """0.7.5 は agent.start が pane を作らないので、先に pane.split で確保する。
+
+    0.9.x (protocol 22) も同じ wire 形 (Issue #237)。
+    """
     _wire_spawn_v075(server)
+    server.protocol = protocol
     a = _adapter(server)
     ref = a.spawn(["claude", "--flag"], cwd=str(tmp_path), kind="claude")
 

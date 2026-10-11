@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **herdr 0.9.x support (wire protocol 22) (#237).** The herdr adapter now
+  accepts protocol 22 (herdr 0.9.0-0.9.3) on the same `agent.start` path as
+  protocol 17. The JSON socket methods the adapter uses only gained optional
+  fields between 0.7.5 and 0.9.3. Protocol bumps 18-22 cover herdr's
+  client/server binary wire. herdr 0.8.x (protocol 19 / 20) has not been
+  measured and is still rejected with `herdr_protocol_unsupported`. The new
+  `protocol_for_version((major, minor, patch))` maps a herdr release to its
+  protocol, or returns `None` for a release it does not know. claude-org-ja's
+  herdr preflight tries it before its own local table. Only herdr 0.9.3 was
+  measured; 0.9.0-0.9.2 speak the same protocol and JSON schema.
 - **herdr panes show the worker's name (#123).** `spawn_claude_pane` /
   `spawn_codex_pane` / `spawn_pane` pass their `name` (e.g. `fix-issue-114`)
   to backends that declare the new `supports_display_name` adapter flag, as

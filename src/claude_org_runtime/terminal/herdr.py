@@ -6,10 +6,11 @@ docs/design/herdr-workspace-layout.md (merged PR #31, Issue #110 = workspace
 レイアウトポリシー)。実測裏付け: docs/reports/herdr-socket-spike.md (Herdr 0.7.1 /
 protocol 14) + investigation/LAYOUT_PROBE_FINDINGS.md (probe 6 配置決定性)。
 
-**対応 protocol** (Issue #151): 14 (0.7.0-0.7.1) / 16 (0.7.2-0.7.4) / 17 (0.7.5〜)。
+**対応 protocol** (Issue #151 / #237): 14 (0.7.0-0.7.1) / 16 (0.7.2-0.7.4) / 17 (0.7.5) /
+22 (0.9.0-0.9.3)。
 ``__post_init__`` の ``ping`` で確定し (:meth:`HerdrAdapter._probe_protocol`)、範囲外なら
 ``herdr_protocol_unsupported`` で **副作用なしに fail-fast** する。pane / workspace / tab
-系の wire schema は本 adapter が使う範囲で 14〜17 に差が無く、**差分は agent 系 API のみ**
+系の wire schema は本 adapter が使う範囲で 14〜22 に差が無く、**差分は agent 系 API のみ**
 なので、分岐は agent.start の 2 経路 (:data:`PROTOCOL_AGENT_API_LEGACY` /
 :data:`PROTOCOL_AGENT_API_V075`) に閉じる。
 
@@ -128,16 +129,40 @@ CODE_AGENT_PANE_BUSY = "agent_pane_busy"
 # wire protocol 対応範囲 (Issue #151 B)
 # ---------------------------------------------------------------------------
 # herdr の protocol 番号 (herdr src wire.rs): 0.7.0-0.7.1 = 14 / 0.7.2-0.7.4 = 16 /
-# 0.7.5 = 17。pane.* / workspace.* / tab.* の schema は 14〜17 で本 adapter が使う
-# 範囲に差が無く、**差分は agent 系 API のみ**なので 2 系統に分けて分岐する。
+# 0.7.5 = 17 / 0.8.0 = 19 / 0.8.2 = 20 / 0.9.0-0.9.3 = 22 (18 / 21 は未リリース)。
+# pane.* / workspace.* / tab.* の schema は 14〜22 で本 adapter が使う範囲に差が無く
+# (18〜22 の bump は TUI client/server 間の binary wire 用で、JSON socket API は
+# 追加的変更のみ。Issue #237)、**差分は agent 系 API のみ**なので 2 系統に分けて分岐する。
 #
 # legacy: agent.start が pane を自分で作る (params: name/argv/cwd/workspace_id/
 #   tab_id/split/focus/env)。着地が focused 駆動になるため spawn-then-move で補正する。
 PROTOCOL_AGENT_API_LEGACY = frozenset({14, 16})
 # v075: agent.start は pane を作らず、**既存の空きシェル pane** を pane_id で指して
 #   起動コマンドを打ち込む (params: name/kind/pane_id/args/timeout_ms)。配置は決定的。
-PROTOCOL_AGENT_API_V075 = frozenset({17})
+#   22 (0.9.x) も agent.start は 17 と同形 (Issue #237、実 0.9.3 server で E2E 確認)。
+#   19 / 20 (0.8.x) は schema 上は同形だが実測していないので受理しない。
+PROTOCOL_AGENT_API_V075 = frozenset({17, 22})
 SUPPORTED_PROTOCOLS = PROTOCOL_AGENT_API_LEGACY | PROTOCOL_AGENT_API_V075
+
+# herdr release -> wire protocol (各 tag の wire.rs ``PROTOCOL_VERSION``)。0.8.1 は
+# tag が無い。ja の preflight (tools/check_herdr_compat.py) が version 文字列から
+# protocol を導出するための SoT で、対応可否 (SUPPORTED_PROTOCOLS) とは独立した事実表。
+_PROTOCOL_BY_VERSION: dict[tuple[int, int, int], int] = {
+    (0, 7, 0): 14, (0, 7, 1): 14,
+    (0, 7, 2): 16, (0, 7, 3): 16, (0, 7, 4): 16,
+    (0, 7, 5): 17,
+    (0, 8, 0): 19, (0, 8, 2): 20,
+    (0, 9, 0): 22, (0, 9, 1): 22, (0, 9, 2): 22, (0, 9, 3): 22,
+}
+
+
+def protocol_for_version(version: Sequence[int]) -> int | None:
+    """herdr の版 ``(major, minor, patch)`` から wire protocol を返す (Issue #237)。
+
+    表に無い版 (未知の将来版 / 未 tag 版) は ``None`` = 推測しない。self-update で
+    版が進んだら、ja 側は ``ping`` の実 protocol で判定することになる。
+    """
+    return _PROTOCOL_BY_VERSION.get(tuple(version))  # type: ignore[arg-type]
 
 # 構築時の ping が socket 不通で確定できなかった状態 (未確定)。恒久的な非対応と
 # 区別する: 未確定は spawn 時に再 probe され、そこで確定 or 明示エラーになる。
@@ -373,7 +398,9 @@ class _HerdrClient:
 #
 # 本表は protocol 14 の実測だが、``pane.*`` の wire schema は 0.7.4 (protocol 16) の
 # ``herdr api schema`` および 0.7.5 (protocol 17) でも無変更であることを確認済み
-# (Issue #151: 0.7.4→0.7.5 の破壊的変更は agent 系 API のみ)。
+# (Issue #151: 0.7.4→0.7.5 の破壊的変更は agent 系 API のみ)。0.9.3 (protocol 22) の
+# 実 server で再実測しても accept / reject は同じだった (Issue #237、
+# investigation/HERDR_09_FINDINGS.md)。
 _HERDR_KEY_MAP: dict[str, str] = {
     "enter": "enter",
     "tab": "tab",
@@ -1196,9 +1223,8 @@ class HerdrAdapter:
         なら前提が崩れている。その PaneRef を返すと broker は起動していない pane を
         agent として登録してしまうため、ここで落として診断可能にする。
 
-        なお 0.7.5 の起動完了待ちは ``agent.start`` の ``timeout_ms``
-        (:meth:`_agent_start_timeout_ms`) が herdr 側で担っており、起動しきらなければ
-        herdr がエラーを返す = adapter からは通常の :class:`HerdrError` になる。
+        なお ``agent.start`` は起動完了を待たずに返る (0.7.5〜0.9.3 とも、
+        ``timeout_ms`` は herdr 側の起動保留窓であってブロッキング待ちではない)。
         """
         agent = res.get("agent") or {}
         landed = agent.get("pane_id")
@@ -1280,9 +1306,8 @@ class HerdrAdapter:
     def _agent_start_timeout_ms(self) -> int:
         """0.7.5 ``agent.start`` の ``timeout_ms`` (許容 3000 < x <= 300000)。
 
-        socket timeout より**長くしない**: 先に socket 側が切れると herdr 側の
-        待ちは無意味になり、adapter からは ``adapter_unavailable`` に見えるため
-        (関係を明示せよ、という Codex Minor 指摘への対応)。
+        herdr 側の起動保留窓 (``agent.start`` 自体はブロックしない、0.9.3 実測)。
+        値は socket timeout に揃え、許容範囲へ clamp するだけ。
         """
         ms = int(self.timeout * 1000)
         return max(3001, min(ms, 300000))
