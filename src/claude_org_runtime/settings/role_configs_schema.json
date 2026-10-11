@@ -27,6 +27,7 @@
     "block-dispatcher-out-of-scope.sh",
     "block-relative-close-pane.sh"
   ],
+  "$comment_hook_events": "Issue #180: hook events are not limited to PreToolUse. roles.<role>.required_hooks[].event and the keys of worker_roles.<role>.hooks accept any Claude Code hook event name -- including turn-boundary events (Stop, SubagentStop) and post-action events (PostToolUse, PostToolBatch) -- with the same shape PreToolUse uses. matcher / matcher_contains may be omitted for matcher-less events such as Stop (an omitted matcher_contains matches any matcher). `settings generate` emits worker_roles hooks verbatim, and the consumer validator (core_harness.validator.validate_config) matches required_hooks by exact event name. No event list is enforced here on purpose, so a new Claude Code event needs no schema change. The bundled roles ship no non-PreToolUse hooks: which script runs at turn end is the consumer's policy.",
   "$comment_roles_sandbox": "Phase 1 (Refs `claude-org-ja#378`): each entry under `roles.<role>` may now also include an optional `sandbox` object using the same shape and structured-anchor entry form documented under `worker_roles.$comment_sandbox` / `worker_roles.$comment_sandbox_anchor`. This lets secretary / dispatcher / curator declare Layer 3 sandbox intent alongside the existing Layer 2 `required_allow` / `required_deny` audit constraints. Roles without `sandbox` are treated as sandbox-disabled (backward compatible).",
   "roles": {
     "repo_shared": {

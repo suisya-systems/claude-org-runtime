@@ -121,6 +121,31 @@ def test_cli_writes_to_out_file(tmp_path: Path) -> None:
     assert isinstance(parsed, dict)
 
 
+def test_cli_emits_non_pretooluse_hook_events(tmp_path: Path) -> None:
+    # Issue #180: hook events are not limited to PreToolUse. Any Claude Code
+    # event declared under worker_roles.<role>.hooks -- matcher-less ones such
+    # as Stop included -- is emitted verbatim by `settings generate`.
+    turn_end = [{"hooks": [{"type": "command", "command": "bash \"{claude_org_path}/.hooks/turn-end.sh\""}]}]
+    events = ("Stop", "SubagentStop", "PostToolUse", "PostToolBatch")
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        json.dumps({"worker_roles": {"x": {"hooks": {e: turn_end for e in events}}}}),
+        encoding="utf-8",
+    )
+    out = tmp_path / "settings.local.json"
+    rc = generator.main([
+        "--schema", str(schema_path),
+        "--role", "x",
+        "--worker-dir", str(tmp_path / "wd"),
+        "--claude-org-path", "/co",
+        "--out", str(out),
+    ])
+    assert rc == 0
+    hooks = json.loads(out.read_text(encoding="utf-8"))["hooks"]
+    assert sorted(hooks) == sorted(events)
+    assert hooks["Stop"] == [{"hooks": [{"type": "command", "command": "bash \"/co/.hooks/turn-end.sh\""}]}]
+
+
 def test_cli_unknown_role_returns_2(tmp_path: Path) -> None:
     rc = generator.main([
         "--role", "nope-not-a-role",
