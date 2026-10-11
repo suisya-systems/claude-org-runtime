@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.50] - 2026-10-12
+
 ### Added
 
 - **`spawn-prompt-step` decision record for a send_keys guard hook (#244).**
@@ -70,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An adopt-fenced sidecar is no longer reported as a duplicate (#231).**
+  `org adopt` fences the previous sidecar on purpose; it keeps polling until its
+  pane is closed, and every such pair was counted as
+  `duplicate_sidecar_detected`, which the attention watcher reports as urgent.
+  The broker now marks adopt fences and skips a pair only when both sides are
+  accounted for. An unexplained sidecar (fork replay, last-register-wins race)
+  is still detected.
+- **`org up` / `org adopt` flush stdio before exec (#233).** exec dropped the
+  block-buffered status lines when stdout was not a TTY, so redirected logs
+  came out empty.
 - **The dispatcher parses herdr pane ids past the 9th pane (#240).**
   herdr numbers panes in bijective base-32 over
   `123456789ABCDEFGHJKMNPQRSTVWXYZ0`, so the 10th pane in a workspace is
