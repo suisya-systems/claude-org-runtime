@@ -324,6 +324,29 @@ Stated plainly, because a decision recorded without its weaknesses is not usable
    message. This is inherent to emitting before confirming and is not fixed by keeping. If strict
    at-most-once action is required, it needs its own item - and receiver-side dedupe (§4.2) does not solve it,
    since the two sessions are different processes.
+9. **A push confirm is not a host accept (#131, Issue #81 family). Still open; interim fallback shipped.**
+   `/confirm-delivered` follows the sidecar's stdout flush of the `notifications/claude/channel` frame. Nothing
+   tells the daemon whether Claude Code actually injected the body into the session, so a host that drops the
+   frame (the background-hosted case of #129 Problem B, when the explicit `bg_hosted` marker is absent) still
+   gets the row confirmed - at-most-once loss. **Closing this needs a host-accept signal from Claude Code
+   itself**, which does not exist today and which this repo cannot provide. Gating confirm on that signal is
+   #81's scope and is not built.
+
+   Until it exists, the daemon uses the receipt evidence it already observes. A push-confirmed row waits
+   `renotify_seconds` (default 300s, `None`/0 disables) for a sign of receipt: the recipient sending a message
+   back to the row's sender. Without one, the row returns to `UNDELIVERED` marked **pull-only** - `poll_claims`
+   never re-claims it, because the push path that lost it once can lose it again - the recipient is nudged, and
+   the next `check_messages` returns it with the same `msg_id` the channel meta carried. Consuming it there is
+   the final receipt; there is no second re-notify. The deadline is evaluated on any sidecar's poll tick and on
+   `check_messages`, not on a timer, so it can run late while no sidecar is polling. Every event is journalled as
+   `renotify_no_receipt`.
+
+   The trade-off is deliberate: a message that legitimately needs no reply is delivered twice. That falls on the
+   duplicate side the delivery guarantee already chose (at-least-once + idempotent display), and the receiver can
+   drop it by `msg_id`. A check_messages call alone, or a message to someone else, is **not** counted as receipt:
+   in the Problem B case the visible session keeps taking turns while another host swallowed the frame, so
+   general activity would mask exactly the loss this exists to catch. Remove this fallback when the host-accept
+   signal lands.
 
 ---
 
