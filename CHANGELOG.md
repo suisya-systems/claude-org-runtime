@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close the replayed-token pull path. That change is not made here; see
   `docs/channel-delivery-model-decision.md` §4.4.
 
+- **Japanese (non-ASCII) attention toasts now show on WSL / Windows
+  (#32).** `wsl-notify-send.exe` mangles non-ASCII arguments, so a toast
+  with a Japanese title silently never appeared. The new `windows-toast`
+  backend has `powershell.exe` raise a WinRT toast instead. The script is
+  passed as `-EncodedCommand` (base64 of UTF-16LE), so the command line is
+  pure ASCII. It needs no install on the Windows host and is selected
+  whenever `powershell.exe` is on `PATH`. `wsl-notify-send.exe` is no longer
+  used. The old `wsl` / `windows` `Write-Host` backends showed nothing on
+  screen and are removed. The toast itself is silent; the urgent beep now
+  runs in the same PowerShell process. Needs a paired ja doc sync
+  (`docs/operations/attention-watch.md` §3 / §3.1).
+
 - **Workers can no longer push images with the host's docker credentials
   (#149).** Worker templates allow `docker build` / `docker buildx build` and
   run them outside the sandbox, so `--push` or `--output type=registry` wrote
