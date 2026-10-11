@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Broker reads the request body before an early reject (#201).** A 401 /
+  403 / 404 answered before the body was read left unread bytes on the
+  socket; closing it made Windows send a RST that aborted the client's read
+  of the response (`ConnectionAbortedError` [WinError 10053]), and on a
+  keep-alive connection the leftover body was parsed as the next request.
+  The handler now drains the body (up to 1 MiB) before every response.
 - **Worker sandbox allows crates.io downloads (#196).** The `strictAllowlist`
   overlay now lists `index.crates.io` (sparse index) and `static.crates.io`
   (crate downloads), so `cargo` can resolve and fetch dependencies in workers.

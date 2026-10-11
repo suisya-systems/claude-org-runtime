@@ -15,6 +15,7 @@ Codex design review が org up/down launcher の前提として要求した 3 �
 
 from __future__ import annotations
 
+import http.client
 import json
 import signal
 import threading
@@ -318,6 +319,27 @@ def test_admin_disabled_when_no_admin_token(broker):
     res = _admin_post(broker, {"method": "shutdown"}, token="anything",
                       expect_status=404)
     assert res is None
+
+
+def test_early_reject_consumes_request_body(broker):
+    """早期拒否 (404/401) でも request body を読み切ってから応答する (#201)。
+
+    未読 body を残すと Windows は close 時に RST を送り、クライアントの応答読みが
+    WinError 10053 で落ちる。同じ欠陥は keep-alive で決定的に見える: 残った body
+    が次の request として parse される。1 接続に拒否される request を続けて流し、
+    後続が正しく応答されることを確かめる。
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", broker.port, timeout=10)
+    try:
+        body = json.dumps({"method": "shutdown"})
+        for path, status in (("/admin", 404), ("/mcp", 401), ("/nope", 404)):
+            conn.request("POST", path, body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            assert resp.status == status, (path, resp.status)
+    finally:
+        conn.close()
 
 
 def test_admin_unknown_method_rejected(admin_broker):
