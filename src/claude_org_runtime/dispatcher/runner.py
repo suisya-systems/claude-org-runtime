@@ -2555,7 +2555,9 @@ def _tab_limit_escalation(
     return plan
 
 
-def approve_spawn_prompts_step(task_id: str, worker_name: str) -> dict[str, Any]:
+def approve_spawn_prompts_step(
+    task_id: str, worker_name: str, state_dir: Optional[Path] = None,
+) -> dict[str, Any]:
     """The after_spawn step that clears Claude Code's startup prompts.
 
     Replaces the blind ``send_keys(enter=True)`` (2026-09-25 incident: the
@@ -2563,9 +2565,16 @@ def approve_spawn_prompts_step(task_id: str, worker_name: str) -> dict[str, Any]
     worker). The decision lives in :mod:`.spawn_prompt`; the Dispatcher only
     runs inspect -> ``spawn-prompt-step`` -> send_keys as ``instructions`` say.
     Identical for the renga and broker transports.
+
+    With ``state_dir`` the step is bound to the worker pane (``--target``) and
+    persists its decision record there for a send_keys guard hook (#244).
     """
     deadline_ms = _spawn_prompt.DEFAULT_APPROVAL_DEADLINE_MS
     poll_interval_ms = 1000
+    decide_argv = ["spawn-prompt-step", "--deadline-ms", str(deadline_ms)]
+    if state_dir is not None:
+        decide_argv += ["--target", worker_name, "--task-id", task_id,
+                        "--state-dir", str(state_dir)]
     return {
         "tool": "approve_spawn_prompts",
         "target": worker_name,
@@ -2573,7 +2582,7 @@ def approve_spawn_prompts_step(task_id: str, worker_name: str) -> dict[str, Any]
         # tall pane the dialog can sit above them with blank rows below.
         "inspect": {"tool": "inspect_pane", "target": worker_name,
                     "format": "grid"},
-        "decide_argv": ["spawn-prompt-step", "--deadline-ms", str(deadline_ms)],
+        "decide_argv": decide_argv,
         "deadline_ms": deadline_ms,
         "poll_interval_ms": poll_interval_ms,
         "escalate": {
@@ -3127,7 +3136,7 @@ def build_plan(
             "expect_name": worker_name,
             "deadline_ms": 3000,
         },
-        approve_spawn_prompts_step(task_id, worker_name),
+        approve_spawn_prompts_step(task_id, worker_name, state_dir),
         {
             "tool": "list_peers",
             "reason": (f"wait for {worker_name} to appear as a peer "

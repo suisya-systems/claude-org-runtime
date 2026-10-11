@@ -1753,7 +1753,13 @@ def _assert_approve_step(plan: ActionPlan) -> None:
     # Full screen: a bottom-N trim can cut a dialog off on a tall pane.
     assert "lines" not in step["inspect"]
     assert step["decide_argv"][0] == "spawn-prompt-step"
-    assert step["decide_argv"][-1] == str(DEFAULT_APPROVAL_DEADLINE_MS)
+    argv = step["decide_argv"]
+    flags = dict(zip(argv[1::2], argv[2::2]))
+    assert flags["--deadline-ms"] == str(DEFAULT_APPROVAL_DEADLINE_MS)
+    # #244: bound to the worker pane, so a guard hook can match send_keys.
+    assert flags["--target"] == plan.spawn["name"]
+    assert flags["--task-id"] == plan.task_id
+    assert "--state-dir" in flags
     assert step["deadline_ms"] == DEFAULT_APPROVAL_DEADLINE_MS
     assert step["escalate"]["message"].startswith("SPAWN_PROMPT_UNRESOLVED:")
     assert "Never send a bare Enter" in step["instructions"]
@@ -1789,3 +1795,15 @@ def test_build_plan_broker_after_spawn_approves_prompts(tmp_path: Path) -> None:
     )
     assert plan.status == "ready_to_spawn"
     _assert_approve_step(plan)
+
+
+def test_approve_step_without_state_dir_keeps_legacy_argv() -> None:
+    from claude_org_runtime.dispatcher.runner import approve_spawn_prompts_step
+    from claude_org_runtime.dispatcher.spawn_prompt import (
+        DEFAULT_APPROVAL_DEADLINE_MS,
+    )
+
+    step = approve_spawn_prompts_step("t1", "worker-t1")
+    assert step["decide_argv"] == [
+        "spawn-prompt-step", "--deadline-ms", str(DEFAULT_APPROVAL_DEADLINE_MS),
+    ]

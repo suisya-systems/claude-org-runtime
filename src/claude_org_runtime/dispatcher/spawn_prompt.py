@@ -46,14 +46,28 @@ Exit codes:
   10 -- action ``escalate`` (10, not 1, so a Python traceback is never
         misread as an escalation or vice versa)
   2  -- invalid input (bad JSON, missing / invalid field, unrecognized screen
-        shape); stdout carries ``{"error": ...}``
+        shape, invalid ``--target``) or the decision record could not be
+        written; stdout carries ``{"error": ...}``
+
+Decision record (Issue #244): with ``--target <pane>`` the step also persists
+its decision to ``<state-dir>/dispatcher/spawn-prompt/<target>.json`` so a
+PreToolUse hook in the Dispatcher's pane can allow exactly the authorised
+``send_keys`` (and the post-approval kickoff after ``done``). It is written for
+``send_keys`` and ``done`` and removed for every other outcome. Without
+``--target`` nothing is read or written. The format is a stable contract, see
+``docs/cli.md`` and :func:`read_decision_record`.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import re
+import tempfile
+import time
+from pathlib import Path
 import sys
 import unicodedata
 from typing import Any
@@ -250,6 +264,75 @@ def decide(
     return result
 
 
+RECORD_SCHEMA_VERSION = 1
+# One Dispatcher turn sits between the step and its send_keys; a record older
+# than this no longer reflects the screen it was decided on.
+RECORD_TTL_MS = 30000
+# Used as a file name, so no path separators or leading dot.
+_TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def decision_record_path(state_dir: Path, target: str) -> Path:
+    return Path(state_dir) / "dispatcher" / "spawn-prompt" / f"{target}.json"
+
+
+def write_decision_record(
+    state_dir: Path, target: str, task_id: str | None,
+    result: dict[str, Any], now_ms: int | None = None,
+) -> Path | None:
+    """Persist ``result`` for ``target`` (``send_keys`` / ``done``) or remove it.
+
+    Atomic (temp file + ``os.replace``), so a reader never sees half a record.
+    Returns the record path when one was written, ``None`` when removed.
+    """
+    path = decision_record_path(state_dir, target)
+    if result["action"] not in (ACTION_SEND_KEYS, ACTION_DONE):
+        # A record left over from an earlier key pass must not authorise a key
+        # on a screen that now says wait / escalate.
+        path.unlink(missing_ok=True)
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    record = {
+        "schema_version": RECORD_SCHEMA_VERSION,
+        "task_id": task_id,
+        "target": target,
+        "action": result["action"],
+        "send_keys": result.get("send_keys"),
+        "state": result["state"],
+        "decided_at_ms": now_ms,
+        "expires_at_ms": now_ms + RECORD_TTL_MS,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{target}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=True)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def read_decision_record(
+    state_dir: Path, target: str, now_ms: int | None = None,
+) -> dict[str, Any] | None:
+    """Reference reader for consumers: the unexpired record for ``target`` or ``None``."""
+    if not _TARGET_RE.match(target):
+        return None
+    try:
+        record = json.loads(decision_record_path(state_dir, target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if (not isinstance(record, dict) or record.get("schema_version") != RECORD_SCHEMA_VERSION
+            or record.get("target") != target
+            or not isinstance(record.get("expires_at_ms"), int)
+            or now_ms >= record["expires_at_ms"]):
+        return None
+    return record
+
+
 EXIT_OK = 0
 EXIT_INVALID = 2
 EXIT_ESCALATE = 10
@@ -257,7 +340,11 @@ EXIT_ESCALATE = 10
 
 def cmd_spawn_prompt_step(args: argparse.Namespace) -> int:
     """One iteration of the approve_spawn_prompts loop: stdin JSON -> decision JSON."""
+    target = args.target
     try:
+        if target is not None and not _TARGET_RE.match(target):
+            target = None  # never touch a path built from a bad name
+            raise ValueError("--target must match [A-Za-z0-9_][A-Za-z0-9_.-]*")
         payload = json.loads(sys.stdin.read())
         if not isinstance(payload, dict):
             raise ValueError("input must be a JSON object")
@@ -272,9 +359,22 @@ def cmd_spawn_prompt_step(args: argparse.Namespace) -> int:
     # json.JSONDecodeError is a ValueError; TypeError = unsortable "row" values,
     # RecursionError = pathologically nested input. All are invalid input (2).
     except (ValueError, TypeError, RecursionError) as exc:
+        if target is not None:
+            with contextlib.suppress(OSError):
+                decision_record_path(Path(args.state_dir), target).unlink(missing_ok=True)
         print(json.dumps({"error": str(exc)}, ensure_ascii=True))
         return EXIT_INVALID
     result = decide(screen, previous_lines, elapsed_ms, args.deadline_ms)
+    if target is not None:
+        try:
+            write_decision_record(Path(args.state_dir), target, args.task_id, result)
+        except OSError as exc:
+            # Fail closed: drop the previous pass's record (best effort) so it
+            # cannot keep authorising its keys, and make the caller escalate.
+            with contextlib.suppress(OSError):
+                decision_record_path(Path(args.state_dir), target).unlink(missing_ok=True)
+            print(json.dumps({"error": f"decision record: {exc}"}, ensure_ascii=True))
+            return EXIT_INVALID
     result["elapsed_ms"] = elapsed_ms
     result["deadline_ms"] = args.deadline_ms
     # ensure_ascii: the cursor glyph in a reason must not crash a cp932 console.
@@ -298,5 +398,18 @@ def add_subparser(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "--deadline-ms", type=int, default=DEFAULT_APPROVAL_DEADLINE_MS,
         help=("escalate instead of keying once elapsed_ms reaches this "
               f"(default: {DEFAULT_APPROVAL_DEADLINE_MS})"),
+    )
+    sp.add_argument(
+        "--target", default=None,
+        help=("pane name / id the decision is for; when given, persist the "
+              "decision record for a send_keys guard hook (omit: no record)"),
+    )
+    sp.add_argument(
+        "--task-id", default=None,
+        help="task id stored in the decision record (requires --target)",
+    )
+    sp.add_argument(
+        "--state-dir", default=".state",
+        help="state directory root for the decision record (default: .state)",
     )
     sp.set_defaults(func=cmd_spawn_prompt_step)

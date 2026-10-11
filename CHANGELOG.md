@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`spawn-prompt-step` decision record for a send_keys guard hook (#244).**
+  `dispatcher spawn-prompt-step` takes `--target <pane>` (plus optional
+  `--task-id` / `--state-dir`). With a target it writes
+  `<state-dir>/dispatcher/spawn-prompt/<target>.json` for `send_keys` and
+  `done` decisions (exact keys, prompt state, 30s expiry) and removes it for
+  every other outcome. `delegate-plan` now passes the worker pane, task id and
+  state dir in `approve_spawn_prompts.decide_argv`. Calls without `--target`
+  behave as before. The record format is a stable contract in `docs/cli.md`;
+  `read_decision_record()` is the reference reader.
 - **herdr 0.9.x support (wire protocol 22) (#237).** The herdr adapter now
   accepts protocol 22 (herdr 0.9.0-0.9.3) on the same `agent.start` path as
   protocol 17. The JSON socket methods the adapter uses only gained optional

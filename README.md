@@ -65,6 +65,10 @@ claude-org-runtime dispatcher delegate-plan \
 
 See [`docs/cli.md`](docs/cli.md) for the full CLI reference, the `org up` /
 `org down` flags, and the migration recipe for `claude-org-ja` consumers.
+`dispatcher spawn-prompt-step --target <pane>` also writes a decision record
+under `<state-dir>/dispatcher/spawn-prompt/` for a send_keys guard hook; its
+format is a stable contract documented in
+[`docs/cli.md`](docs/cli.md#decision-record-stable-contract-issue-244).
 
 ## Broker
 
