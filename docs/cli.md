@@ -160,6 +160,71 @@ and file tree off the frame *before* laying out panes, so every rect in
 the pane area's own `x` offset. Nothing in the split arithmetic takes a
 sidebar width as an operand.
 
+## `dispatcher spawn-prompt-step`
+
+One pass of the `approve_spawn_prompts` after_spawn step: reads
+`{"screen", "previous_screen", "elapsed_ms"}` on stdin and prints the next
+action (`send_keys` / `wait` / `done` / `escalate`) for a freshly spawned
+worker's folder-trust / dev-channel prompts. Exit codes: 0 decision emitted,
+10 escalate, 2 invalid input or decision record not writable.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--deadline-ms` | `120000` | Escalate instead of keying once `elapsed_ms` reaches this. |
+| `--target` | none | Pane name / id the decision is for. Enables the decision record. Must match `[A-Za-z0-9_][A-Za-z0-9_.-]*`, otherwise exit 2. |
+| `--task-id` | none | Stored in the record as `task_id` (`null` when omitted). |
+| `--state-dir` | `.state` | State directory root that holds the record. |
+
+`delegate-plan` passes `--target worker-<task_id> --task-id <task_id>
+--state-dir <its --state-dir>` in `decide_argv` (#244). Without `--target`
+the step reads and writes nothing, exactly as before.
+
+### Decision record (stable contract, Issue #244)
+
+For a send_keys guard hook running in the Dispatcher's pane (claude-org-ja's
+PreToolUse hook). Path:
+
+```
+<state-dir>/dispatcher/spawn-prompt/<target>.json
+```
+
+Written atomically (temp file + rename) when the action is `send_keys` or
+`done`; **removed** for `wait`, `escalate` and invalid input, so a record from
+an earlier key pass never authorises a key on a screen that now says wait.
+Each pass overwrites the previous record for that target.
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "fix-issue-114",
+  "target": "worker-fix-issue-114",
+  "action": "send_keys",
+  "send_keys": {"keys": ["Down"]},
+  "state": "folder_trust",
+  "decided_at_ms": 1791749769408,
+  "expires_at_ms": 1791749799408
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema_version` | int | `1`. A reader must reject any other value. |
+| `task_id` | string / null | `--task-id`. |
+| `target` | string | `--target`; equals the file name stem. |
+| `action` | `"send_keys"` / `"done"` | The decision. |
+| `send_keys` | object / null | Exactly the keys authorised: `{"enter": true}` or `{"keys": ["Down"]}` / `{"keys": ["Up"]}`. `null` for `done`. |
+| `state` | string | Classified prompt state: `folder_trust` / `dev_channel` / `done`. |
+| `decided_at_ms` | int | Unix epoch ms when the step decided. |
+| `expires_at_ms` | int | `decided_at_ms + 30000`. The record is invalid at or after this time. |
+
+Hook guidance: allow a `send_keys` to `target` only when an unexpired record
+exists and either its `action` is `send_keys` and the call's keys equal
+`send_keys` exactly, or its `action` is `done` (the pane is past its startup
+prompts). Treat a missing, unparsable, expired or mismatched record as deny.
+`claude_org_runtime.dispatcher.spawn_prompt.read_decision_record(state_dir,
+target)` implements the read side (returns the record or `None`). New fields
+may be added within `schema_version` 1; consumers should ignore unknown keys.
+
 ## `settings generate`
 
 Renders a per-role `<worker_dir>/.claude/settings.local.json` from the

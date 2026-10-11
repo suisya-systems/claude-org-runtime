@@ -517,3 +517,118 @@ def test_spaceless_cursor_on_reject_moves_not_enters() -> None:
 def test_spaceless_unknown_dialog_footer_waits() -> None:
     r = decide(["Somenewdialog", "❯1.Foo", "Entertoconfirm"], None, 0)
     assert r["state"] == STATE_UNKNOWN
+
+
+# --- decision record (#244) -------------------------------------------------
+
+from claude_org_runtime.dispatcher.spawn_prompt import (  # noqa: E402
+    RECORD_TTL_MS,
+    decision_record_path,
+    read_decision_record,
+    write_decision_record,
+)
+
+
+def _step_args(tmp_path, *extra: str) -> list[str]:
+    return ["--state-dir", str(tmp_path), *extra]
+
+
+def _stdin(screen: list[str], previous: list[str] | None) -> str:
+    return json.dumps({"screen": _grid(screen),
+                       "previous_screen": None if previous is None else _grid(previous),
+                       "elapsed_ms": 5})
+
+
+@pytest.mark.parametrize(
+    ("screen", "previous", "action", "keys"),
+    [
+        (FOLDER_TRUST_NO_FIRST, FOLDER_TRUST_NO_FIRST, ACTION_SEND_KEYS, {"keys": ["Down"]}),
+        (COMPOSER, None, ACTION_DONE, None),
+    ],
+)
+def test_record_written_for_keys_and_done(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+    screen: list[str], previous: list[str] | None, action: str, keys: dict | None,
+) -> None:
+    code, out = _run_step(monkeypatch, capsys, _stdin(screen, previous),
+                          *_step_args(tmp_path, "--target", "worker-t1", "--task-id", "t1"))
+    assert (code, out["action"]) == (0, action)
+    assert out.get("send_keys") == keys
+    rec = json.loads(decision_record_path(tmp_path, "worker-t1").read_text(encoding="utf-8"))
+    assert rec == {
+        "schema_version": 1, "task_id": "t1", "target": "worker-t1",
+        "action": action, "send_keys": keys, "state": out["state"],
+        "decided_at_ms": rec["decided_at_ms"],
+        "expires_at_ms": rec["decided_at_ms"] + RECORD_TTL_MS,
+    }
+    assert read_decision_record(tmp_path, "worker-t1") == rec
+
+
+def test_record_bound_to_target(tmp_path) -> None:
+    result = {"state": "folder_trust", "action": ACTION_SEND_KEYS, "send_keys": {"enter": True}}
+    write_decision_record(tmp_path, "worker-a", "a", result, now_ms=1000)
+    assert read_decision_record(tmp_path, "worker-a", now_ms=1000)["target"] == "worker-a"
+    assert read_decision_record(tmp_path, "worker-b", now_ms=1000) is None
+    assert read_decision_record(tmp_path, "../worker-a", now_ms=1000) is None
+
+
+def test_record_expires(tmp_path) -> None:
+    result = {"state": "folder_trust", "action": ACTION_SEND_KEYS, "send_keys": {"enter": True}}
+    write_decision_record(tmp_path, "w", None, result, now_ms=1000)
+    assert read_decision_record(tmp_path, "w", now_ms=1000 + RECORD_TTL_MS - 1) is not None
+    assert read_decision_record(tmp_path, "w", now_ms=1000 + RECORD_TTL_MS) is None
+
+
+@pytest.mark.parametrize(
+    ("stdin", "extra", "code"),
+    [
+        (json.dumps({"screen": [""], "previous_screen": None, "elapsed_ms": 5}), (), 0),
+        (json.dumps({"screen": [""], "previous_screen": None, "elapsed_ms": 500}),
+         ("--deadline-ms", "500"), 10),
+        ("not json", (), 2),
+    ],
+    ids=["wait", "escalate", "invalid"],
+)
+def test_no_record_for_wait_and_stale_one_removed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+    stdin: str, extra: tuple[str, ...], code: int,
+) -> None:
+    # A record from an earlier key pass must not survive a wait / escalate.
+    write_decision_record(tmp_path, "w", None, {"state": "folder_trust",
+                          "action": ACTION_SEND_KEYS, "send_keys": {"enter": True}})
+    got, _ = _run_step(monkeypatch, capsys, stdin,
+                       *_step_args(tmp_path, "--target", "w", *extra))
+    assert got == code
+    assert not decision_record_path(tmp_path, "w").exists()
+
+
+def test_no_target_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    code, out = _run_step(monkeypatch, capsys,
+                          _stdin(FOLDER_TRUST_NO_FIRST, FOLDER_TRUST_NO_FIRST), via_cli=True)
+    assert (code, out["action"]) == (0, ACTION_SEND_KEYS)
+    assert set(out) == {"state", "action", "send_keys", "reason", "elapsed_ms", "deadline_ms"}
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("target", ["../x", "a/b", ".hidden", ""])
+def test_invalid_target_rejected_without_touching_disk(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+    target: str,
+) -> None:
+    code, out = _run_step(monkeypatch, capsys, _stdin(COMPOSER, None),
+                          *_step_args(tmp_path, "--target", target))
+    assert code == 2 and "--target" in out["error"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_record_write_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("", encoding="utf-8")  # state dir is a file: mkdir fails
+    code, out = _run_step(monkeypatch, capsys, _stdin(COMPOSER, None),
+                          "--state-dir", str(blocker), "--target", "w")
+    assert code == 2 and out["error"].startswith("decision record:")
