@@ -289,7 +289,8 @@ WORKER_DOCKER_PUSH_DENY: tuple[str, ...] = (
     "Bash(docker * push *)",  # docker image|manifest|compose push, docker --config x push
     "Bash(docker *--push*)",  # build|buildx build|bake --push
     "Bash(docker *push=*)",  # --output type=image,push=true
-    "Bash(docker *type=registry*)",  # --output / -o / --cache-to type=registry
+    "Bash(docker *type=registry*)",  # --output / -o type=registry
+    "Bash(docker *--cache-to*)",  # every cache export; a bare ref means registry
     "Bash(docker *imagetools create*)",  # buildx imagetools create
 )
 WORKER_SANDBOX_SETTINGS: dict[str, Any] = {

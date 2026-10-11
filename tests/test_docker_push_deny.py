@@ -44,6 +44,8 @@ PUSHES = [
     "docker buildx build -o type=registry -t reg.example/app:1 .",
     "docker buildx build -o type=image,name=reg.example/app:1,push=true .",
     "docker buildx build --cache-to type=registry,ref=reg.example/app:cache .",
+    "docker buildx build --cache-to reg.example/app:cache .",
+    "docker buildx build --cache-to=type=gha .",
     "docker buildx bake --push",
     "docker buildx imagetools create -t reg.example/app:2 reg.example/app:1",
 ]

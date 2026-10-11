@@ -73,13 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to any registry in `~/.docker/config.json`. The worker `--settings` overlay
   now carries `permissions.deny` rules (`runner.WORKER_DOCKER_PUSH_DENY`) for
   `docker push`, `image|manifest|compose push`, `--push`, `push=`,
-  `type=registry` (also `--cache-to`), and `buildx imagetools create`. Deny
-  wins over the allow set and applies to every dispatched worker, whatever
-  schema rendered its project settings. Local builds and pulls from private
-  registries are unchanged. Hiding `config.json` was measured and rejected:
-  docker reads it outside the sandbox anyway, and an unreadable config makes
-  the CLI warn and go anonymous, exactly like a missing one, so private pulls
-  break. Not covered: `--cache-to` backends other than `registry`, and docker
+  `type=registry`, any `--cache-to` (a bare ref is a registry export), and
+  `buildx imagetools create`. Deny wins over the allow set and applies to
+  every dispatched worker, whatever schema rendered its project settings.
+  Local builds and pulls from private registries are unchanged. Hiding
+  `config.json` was measured and rejected: docker reads it outside the sandbox
+  anyway, and an unreadable config makes the CLI warn and go anonymous,
+  exactly like a missing one, so private pulls break. Not covered: docker
   invoked by another name (`/usr/bin/docker`, `docker.exe`, `sh -c`), which
   the allow set does not auto-approve either.
 
