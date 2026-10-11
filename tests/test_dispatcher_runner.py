@@ -101,8 +101,19 @@ def test_rect_adjacent_no_overlap() -> None:
         ("w1W:p2", 2),      # Herdr handle (alphanumeric workspace segment)
         ("w1:p1", 1),       # Herdr handle (numeric workspace segment)
         ("w_live:p2", 2),   # Herdr handle (underscore in workspace segment)
-        ("w9:p99", 99),
-        ("w0:p0", 0),
+        # Herdr pane segment is bijective base-32 over herdr's
+        # ``123456789ABCDEFGHJKMNPQRSTVWXYZ0`` table, not decimal (#240).
+        ("w1:p9", 9),
+        ("w1:pA", 10),      # 10th pane
+        ("w1:pH", 17),
+        ("w1:pJ", 18),      # I is skipped
+        ("w1:pZ", 31),
+        ("w0:p0", 32),      # 0 is the last digit
+        ("w1:p11", 33),     # first two-char segment
+        ("w9:p99", 297),
+        ("w1:p00", 1056),   # last two-char segment
+        ("w1:p111", 1057),
+        ("w_live:pA", 10),
         ("  w1W:p2  ", 2),  # surrounding whitespace tolerated
     ],
 )
@@ -115,7 +126,9 @@ def test_parse_pane_id_accepts_both_formats(raw: object, expected: int) -> None:
     ["", "%", "%x", "abc", "1.0", "%-1", None, True,
      # Herdr-shaped but malformed: missing pane number, non-numeric pane
      # segment, missing ``:p`` separator, or empty workspace segment.
-     "w1W:p", "w1W:px", "w1W", "w:p2", "w1W:2"],
+     "w1W:p", "w1W:px", "w1W", "w:p2", "w1W:2",
+     # Outside herdr's pane alphabet: lowercase, I/L/O/U, other symbols.
+     "w1:pa", "w1:pI", "w1:pL", "w1:pO", "w1:pU", "w1:p-1", "w1:pA_"],
 )
 def test_parse_pane_id_rejects_malformed(raw: object) -> None:
     with pytest.raises(ValueError):
@@ -269,7 +282,16 @@ def test_parse_panes_parses_herdr_pane_handles() -> None:
         {"id": "w1W:p2", "name": "worker-x", "role": "worker",
          "x": 200, "y": 0, "width": 100, "height": 50},
     ])
-    assert [p.id for p in panes] == [0, 2]
+    assert [p.id for p in panes] == [32, 2]
+
+
+def test_herdr_pane_id_order_matches_herdr_numbering() -> None:
+    # #240: the decoded key is choose_split's tie-breaker, so it must follow
+    # herdr's own pane order across digit and length boundaries.
+    seq = ["w1:p1", "w1:p9", "w1:pA", "w1:pZ", "w1:p0", "w1:p11", "w1:p1A",
+           "w1:p00", "w1:p111"]
+    keys = [_parse_pane_id(s) for s in seq]
+    assert keys == sorted(keys) and len(set(keys)) == len(keys)
 
 
 def test_choose_split_picks_dispatcher_when_curator_unsplittable() -> None:

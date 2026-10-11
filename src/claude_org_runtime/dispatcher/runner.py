@@ -89,10 +89,15 @@ _ALL_DIGITS = re.compile(r"^\d+$")
 # ``w`` and the ``:p`` separator: the Herdr adapter does not constrain it to
 # alphanumerics (its ids include ``w_live`` / ``w_old``) and ``_workspace_of``
 # just splits on the first colon, so match any non-colon run here rather than a
-# fixed char class. The pane segment is numeric. The captured group is the
-# trailing pane number, which :func:`_parse_pane_id` reduces to its int
-# tie-breaker key (see terminal/herdr.py ``_workspace_of`` and ``list_panes``).
-_HERDR_PANE_ID = re.compile(r"^w[^:]+:p([0-9]+)$")
+# fixed char class. The pane segment is herdr's ``encode_public_number``
+# output, not decimal: the 10th pane is ``p9``'s successor ``pA`` (#240). The
+# alphabet below is the 32-char table in the herdr binary (0.7.5-0.9.3): digits
+# 1-9, then A-Z without I/L/O/U, then ``0``. With no zero digit it reads as
+# bijective base-32, so ``0`` is the 32nd pane and ``11`` the 33rd.
+# :func:`_parse_pane_id` decodes the captured segment to its int tie-breaker
+# key (see terminal/herdr.py ``_workspace_of`` and ``list_panes``).
+_HERDR_PANE_DIGITS = "123456789ABCDEFGHJKMNPQRSTVWXYZ0"
+_HERDR_PANE_ID = re.compile(r"^w[^:]+:p([%s]+)$" % _HERDR_PANE_DIGITS)
 
 # Balanced split constants -- keep in sync with
 # claude-org-ja `.claude/skills/org-delegate/references/pane-layout.md`.
@@ -593,7 +598,8 @@ def _parse_pane_id(raw: Any) -> int:
     emits tmux ``pane_id`` strings of the form ``%N`` (``"%0"``, ``"%1"``);
     the Herdr backend emits ``w<workspace>:p<pane>`` handles (``"w1W:p2"``,
     ``"w_live:p2"``). All three are accepted and reduced to the
-    integer ``N`` -- for Herdr ``N`` is the trailing pane number. The value is
+    integer ``N`` -- for Herdr ``N`` is the decoded pane number (``p9`` -> 9,
+    ``pA`` -> 10; see ``_HERDR_PANE_DIGITS``). The value is
     used only as the deterministic tie-breaker in :func:`choose_split` (the
     spawn itself targets by ``target_name``), so the ``%`` prefix / Herdr
     workspace segment carry no information worth preserving and a single
@@ -620,7 +626,10 @@ def _parse_pane_id(raw: Any) -> int:
             return int(body)
         herdr = _HERDR_PANE_ID.match(s)
         if herdr is not None:
-            return int(herdr.group(1))
+            n = 0
+            for c in herdr.group(1):
+                n = n * 32 + _HERDR_PANE_DIGITS.index(c) + 1
+            return n
     raise ValueError(
         f"unrecognised pane id {raw!r}: expected a renga numeric id "
         f"(e.g. 1, \"2\"), a tmux pane_id (e.g. \"%0\", \"%1\") or a Herdr "
