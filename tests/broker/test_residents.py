@@ -616,3 +616,55 @@ def test_preflight_output_is_ascii(resident_dir, monkeypatch):
         observe=lambda p, **k: ProcObservation(1000.0, None, None),
     )
     buf.getvalue().encode("ascii")  # raises if any non-ASCII leaked into announces
+
+
+# ================================================== #146 dogfood follow-ups
+def test_pid_alive_treats_linux_zombie_as_dead(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    _fake_proc(proc, 77, starttime_ticks=1, btime=1)
+    monkeypatch.setattr(residents.sidecar, "pid_alive", lambda p: True)
+    assert residents._pid_alive(77, proc_root=str(proc)) is True
+    stat = proc / "77" / "stat"
+    stat.write_text(stat.read_text(encoding="utf-8").replace(") S ", ") Z "),
+                    encoding="utf-8")
+    assert residents._pid_alive(77, proc_root=str(proc)) is False
+    # no /proc entry (macOS / Windows): defer to sidecar.pid_alive
+    assert residents._pid_alive(78, proc_root=str(proc)) is True
+
+
+def test_preflight_foreign_hints_root_cwd_when_only_root_differs(resident_dir, monkeypatch):
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    sd = str(resident_dir)
+    monkeypatch.setattr(residents, "_hostname", lambda: "H")
+    real_root = resident_dir.parent / "real-root"
+    _write(rdir, "w", _record(sd, str(real_root), name="w", pid=21))
+    other = _record(sd, str(real_root), name="x", pid=22, host="OTHER")
+    _write(rdir, "x", other)
+    buf = io.StringIO()
+    rep = residents.preflight_residents(
+        sd, sd, reap=True, stream=buf, os_name="linux", alive=lambda p: True,
+        terminate=lambda *a, **k: pytest.fail("foreign must not be terminated"),
+    )
+    assert rep.rows == ["foreign_live", "foreign_live"]
+    w_line, x_line = buf.getvalue().splitlines()[1:]
+    assert f"--root-cwd {os.path.realpath(real_root)}" in w_line
+    assert "--root-cwd" not in x_line  # other host: no misleading hint
+
+
+def test_preflight_nan_started_at_message_blames_registration(resident_dir, monkeypatch):
+    rdir = resident_dir / residents.RESIDENTS_DIRNAME
+    root = str(resident_dir)
+    monkeypatch.setattr(residents, "_hostname", lambda: "H")
+    rec = _record(root, root, name="nan", pid=15)
+    (rdir / "nan.json").write_text(
+        json.dumps({**rec, "started_at": float("nan")}), encoding="utf-8")
+    for reap in (False, True):
+        buf = io.StringIO()
+        residents.preflight_residents(
+            root, root, reap=reap, stream=buf, os_name="linux", alive=lambda p: True,
+            observe=lambda p, **k: ProcObservation(1000.0, None, None),
+            terminate=lambda *a, **k: pytest.fail("must not terminate"),
+        )
+        out = buf.getvalue()
+        assert "non-finite started_at" in out
+        assert "platform" not in out and "stop manually" not in out

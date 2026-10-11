@@ -162,6 +162,24 @@ def _observe_linux(pid: int, proc_root: str) -> ProcObservation | None:
     )
 
 
+def _pid_alive(pid: int, *, proc_root: str = "/proc") -> bool:
+    """:func:`sidecar.pid_alive` + Linux zombie (``/proc/<pid>/stat`` state ``Z``) は dead。
+
+    POSIX の ``kill(pid, 0)`` は未回収の zombie にも成功するため、親が wait しない resident
+    を SIGTERM すると「SIGKILL 後も生存」と誤報し登録簿を残していた (#146 dogfood)。
+    ``/proc`` が無い OS では従来どおり sidecar.pid_alive に委ねる。
+    """
+    # ponytail: macOS の zombie は未検出 (ps -o stat= で拾える)。実害が出たら足す。
+    try:
+        with open(f"{proc_root}/{pid}/stat", "r", encoding="utf-8", errors="replace") as f:
+            stat = f.read()
+        if stat[stat.rfind(")") + 2:].startswith("Z"):
+            return False
+    except OSError:
+        pass
+    return sidecar.pid_alive(pid)
+
+
 def _observe_darwin(pid: int, *, run=subprocess.run) -> ProcObservation | None:
     """macOS: ``ps -o lstart=,comm=`` で開始時刻 (1 秒解像度) と実行パスを得る。
 
@@ -464,7 +482,7 @@ def _wait_dead(pid: int, grace: float, alive, sleep) -> bool:
 def _terminate_process(
     pid: int, *, os_name: str, expected_start_time: float | None,
     grace: float = REAP_GRACE, proc_root: str = "/proc",
-    observe=_observe_process_identity, alive=sidecar.pid_alive,
+    observe=_observe_process_identity, alive=_pid_alive,
     kill=os.kill, run=subprocess.run, sleep=time.sleep,
 ) -> str:
     """所有かつ identity 一致した live resident を停止する。**Windows は SIGTERM の直訳を
@@ -565,7 +583,7 @@ def _manual_stop_cmd(pid, os_name: str) -> str:
 def preflight_residents(
     state_dir: str, root_cwd: str | None, *, reap: bool = False,
     prefix: str = "org up", os_name: str | None = None, stream=sys.stderr,
-    observe=_observe_process_identity, alive=sidecar.pid_alive,
+    observe=_observe_process_identity, alive=_pid_alive,
     terminate=_terminate_process,
 ) -> ResidentSweepReport:
     """``<state-dir>/residents/*.json`` を走査し、告知 (既定) か回収 (``reap``) する。
@@ -602,8 +620,11 @@ def preflight_residents(
         ownership = "mismatch"
         is_alive = False
         identity = "unknown"
+        hint = ""
         if load_state == "ok":
             ownership = ownership_match(record.get("owner") or {}, my_owner)
+            if ownership != "match":
+                hint = _root_cwd_hint(record["owner"], state_dir, my_owner)
             is_alive = bool(alive(pid)) if isinstance(pid, int) and pid > 0 else False
             if is_alive and ownership == "match":
                 obs = observe(pid, os_name=os_name)
@@ -615,9 +636,24 @@ def preflight_residents(
         _handle_row(
             row, path=path, name=name, pid=pid, version=version, os_name=os_name,
             record=record, reap=reap, prefix=prefix, stream=stream,
-            terminate=terminate, report=report,
+            terminate=terminate, report=report, hint=hint,
         )
     return report
+
+
+def _root_cwd_hint(owner: dict, state_dir: str, my_owner: dict) -> str:
+    """同じ host + state_dir で root_cwd だけが違う登録なら ``--root-cwd`` を案内する。
+
+    clean な org down は sidecar を消すので、案内どおり ``org down --reap`` を再実行すると
+    root_cwd が cwd に落ち、``org up --root-cwd`` で起動した org の resident が foreign に
+    見える (#146 dogfood)。指紋が登録の root_cwd で再現できるときだけ出す (別 host の
+    登録には出さない)。ownership 判定自体は変えない (安全側のまま)。
+    """
+    rec_root = owner.get("root_cwd")
+    if (os.path.normcase(os.path.realpath(owner.get("state_dir") or "")) != my_owner["state_dir"]
+            or repo_fingerprint(rec_root, state_dir) != owner.get("fingerprint")):
+        return ""
+    return f" It was registered with root_cwd={rec_root}; if that is this org, rerun with --root-cwd {rec_root}"
 
 
 def _emit(stream, prefix, msg) -> None:
@@ -626,7 +662,7 @@ def _emit(stream, prefix, msg) -> None:
 
 def _handle_row(
     row, *, path, name, pid, version, os_name, record, reap, prefix, stream,
-    terminate, report: ResidentSweepReport,
+    terminate, report: ResidentSweepReport, hint: str = "",
 ) -> None:
     """1 レコードの告知 (既定) / 行動 (reap)。文字列は ASCII のみ (cp932 コンソール安全)。"""
     started_at = record.get("started_at")
@@ -649,18 +685,24 @@ def _handle_row(
 
     if row == ROW_STALE_FOREIGN:
         report.foreign += 1
-        _emit(stream, prefix, f"pre-flight:   name={name} pid={pid} STALE and owned by a different org instance; leaving it alone.")
+        _emit(stream, prefix, f"pre-flight:   name={name} pid={pid} STALE and owned by a different org instance; leaving it alone.{hint}")
         return
 
     if row == ROW_FOREIGN_LIVE:
         report.foreign += 1
         if reap:
-            _emit(stream, prefix, f"reap: skipped name={name} pid={pid} (owned by a different org instance).")
+            _emit(stream, prefix, f"reap: skipped name={name} pid={pid} (owned by a different org instance).{hint}")
         else:
-            _emit(stream, prefix, f"pre-flight:   name={name} pid={pid} owned by a different org instance; leaving it alone.")
+            _emit(stream, prefix, f"pre-flight:   name={name} pid={pid} owned by a different org instance; leaving it alone.{hint}")
         return
 
     if row == ROW_UNVERIFIABLE:
+        if not (isinstance(started_at, (int, float)) and math.isfinite(started_at)):
+            # 原因はプラットフォームではなく登録側。PID 未照合なので kill も案内しない (#146)。
+            if reap:
+                report.skipped += 1
+            _emit(stream, prefix, f"{'reap: skipped' if reap else 'pre-flight:  '} name={name} pid={pid} registration has a non-finite started_at ({started_at}); will not be reaped. Fix or remove {path.name}.")
+            return
         if reap:
             report.skipped += 1
             _emit(stream, prefix, f"reap: skipped name={name} pid={pid} (identity unverifiable on {os_name}); stop manually: {_manual_stop_cmd(pid, os_name)}")
