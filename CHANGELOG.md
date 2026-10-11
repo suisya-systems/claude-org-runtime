@@ -67,6 +67,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Workers can no longer push images with the host's docker credentials
+  (#149).** Worker templates allow `docker build` / `docker buildx build` and
+  run them outside the sandbox, so `--push` or `--output type=registry` wrote
+  to any registry in `~/.docker/config.json`. The worker `--settings` overlay
+  now carries `permissions.deny` rules (`runner.WORKER_DOCKER_PUSH_DENY`) for
+  `docker push`, `image|manifest|compose push`, `--push`, `push=`,
+  `type=registry`, any `--cache-to` (a bare ref is a registry export), and
+  `buildx imagetools create`. Deny wins over the allow set and applies to
+  every dispatched worker, whatever schema rendered its project settings.
+  Local builds and pulls from private registries are unchanged. Hiding
+  `config.json` was measured and rejected: docker reads it outside the sandbox
+  anyway, and an unreadable config makes the CLI warn and go anonymous,
+  exactly like a missing one, so private pulls break. Not covered: docker
+  invoked by another name (`/usr/bin/docker`, `docker.exe`, `sh -c`), which
+  the allow set does not auto-approve either.
+
 - **`attention watch` no longer looks dead after a pane resize (#41).** The
   watcher was never killed by a resize (SIGWINCH is ignored by default; a pty
   repro survives repeated 104 <-> 210 column resizes), but renga clears a
