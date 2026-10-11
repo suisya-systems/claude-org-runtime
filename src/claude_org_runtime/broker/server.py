@@ -72,8 +72,13 @@ class Broker(TokenMixin, StoreMixin):
         respawn_burst_window: float = 10.0,
         respawn_burst_threshold: int = 5,
         root_cwd: str | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         self.state_dir = Path(state_dir)
+        # 配送ライフサイクル (lease / observer arming・TTL / adopt arming / renotify) の時刻源。
+        # テストは偽の時計を注入して期限切れ・未切れを決定的に作る (Issue #210)。
+        # 本番は wall-clock (lease_until 等は delivery_dump で wall-clock として晒す)。
+        self._clock = clock
         self.state_dir.mkdir(parents=True, exist_ok=True)
         # root workspace cwd (serve の --root-cwd)。spawn 時の venv 探索フォールバック
         # 基準に使う (Issue #130): pane 自身の cwd/.venv を優先し、無ければ
@@ -921,7 +926,7 @@ class Broker(TokenMixin, StoreMixin):
         """
         if self.adapter is None:
             return False
-        now = time.time()
+        now = self._clock()
         with self._lock:
             _lease, state = self._observer_state_locked(owner, now)
             if state != store.OBSERVER_STALE:

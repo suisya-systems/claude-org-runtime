@@ -281,6 +281,30 @@ class FakeAdapter:
         return PANE_LIVE_ALIVE
 
 
+class FakeClock:
+    """Broker(clock=...) に注入する手動進行の時計 (Issue #210)。
+
+    lease / arming の期限切れ・未切れを wall-clock の sleep と短い窓に頼らず
+    ``advance`` で決定的に作る。lease watch の ``threading.Timer`` は実時間で
+    張られるので、失効後の reap + 再 nudge は ``Broker._lease_watch_fire`` を
+    直接呼んで駆動する。
+    """
+
+    def __init__(self, start: float = 1_000_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock():
+    return FakeClock()
+
+
 @pytest.fixture
 def fake_adapter():
     return FakeAdapter()

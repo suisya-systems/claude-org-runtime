@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .tokens import AgentBind
 
 # ---------------------------------------------------------------- row states
@@ -332,6 +334,8 @@ class StoreMixin:
     # lease watch timer を張済の owner (Issue #78)。owner ごと高々 1 本に保つ。
     _lease_watch_armed: set[str]
     state_dir: Path
+    # 配送ライフサイクルの時刻源 (既定 time.time。テストは偽の時計を注入する, Issue #210)。
+    _clock: "Callable[[], float]"
     lease_seconds: float
     observer_lease_seconds: float
     adopt_arming_seconds: float
@@ -434,7 +438,7 @@ class StoreMixin:
         self._observer_leases[owner] = ObserverLease(
             secret=secret, expires_at=None,
             arming_until=None if arming_seconds is None
-            else time.time() + arming_seconds,
+            else self._clock() + arming_seconds,
             adoption_id=adoption_id,
         )
         return secret
@@ -600,7 +604,7 @@ class StoreMixin:
         届いた時点で期限切れが検知される。
         """
         with self._lock:
-            journal = self._sweep_adoptions_locked(time.time())
+            journal = self._sweep_adoptions_locked(self._clock())
         for event_name, fields in journal:
             self._journal(event_name, **fields)
 
@@ -654,7 +658,7 @@ class StoreMixin:
                 "[invalid_arming_seconds] arming_seconds must be a positive number")}
         journal: list[tuple[str, dict]] = []
         with self._lock:
-            now = time.time()
+            now = self._clock()
             journal.extend(self._sweep_adoptions_locked(now))
             err, full_token, delivery_cred = self._adopt_owner_check_locked(owner)
             if err is not None:
@@ -769,7 +773,7 @@ class StoreMixin:
         """
         journal: list[tuple[str, dict]] = []
         with self._lock:
-            now = time.time()
+            now = self._clock()
             journal.extend(self._sweep_adoptions_locked(now))
             pending = self._pending_adoptions.get(owner)
             _lease, state = self._observer_state_locked(owner, now)
@@ -947,7 +951,7 @@ class StoreMixin:
         journal すべき ``(id, reclaim_count)`` のリストを return し、呼び元が lock
         解放後に :meth:`_journal` する (非再入 Lock の自己デッドロック回避)。
         """
-        now = time.time()
+        now = self._clock()
         reaped: list[tuple[str, int]] = []
         for row in self._rows.values():
             if row.state == CLAIMED and row.lease_until < now:
@@ -1050,7 +1054,7 @@ class StoreMixin:
         if next_expiry is not None:
             # まだ live な claim (後続 poll の claim / 早着火) はその期限で再監視する。
             self._arm_lease_watch(
-                owner, max(0.0, next_expiry - time.time()) + _LEASE_WATCH_MARGIN)
+                owner, max(0.0, next_expiry - self._clock()) + _LEASE_WATCH_MARGIN)
 
     # --------------------------------------------------------------- enqueue
     def enqueue(self, from_bind: "AgentBind", to_id: str, message: str) -> dict:
@@ -1120,7 +1124,7 @@ class StoreMixin:
         self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         with self._lock:
             reaped = self._reap_locked()
-            due = self._renotify_due_locked(time.time())
+            due = self._renotify_due_locked(self._clock())
             out: list[dict] = []
             for row in self._rows.values():
                 if row.state == UNDELIVERED and row.to_id == bind.agent_id:
@@ -1201,7 +1205,7 @@ class StoreMixin:
             owner = self._delivery_owner_locked(token)
             if owner is None:
                 return {"ok": False, "error": "unauthorized"}
-            now = time.time()
+            now = self._clock()
             journal.extend(self._sweep_adoptions_locked(now))
             if bg_hosted:
                 # Phase 1: 明示 bg-hosted marker -> register/claim 抑止 (generation 不変)。
@@ -1332,7 +1336,7 @@ class StoreMixin:
             owner = self._delivery_owner_locked(token)
             if owner is None:
                 return {"error": "unauthorized", "rows": []}
-            now = time.time()
+            now = self._clock()
             # ponytail: 再通知の期限判定は周期タスクを持たず、生きている sidecar の
             # ~1s poll (全 owner 分) と check_messages を tick にする。sidecar が 1 本も
             # 生きていない間は判定が遅れる (行は DELIVERED のまま)。要るなら timer 化。
@@ -1490,7 +1494,7 @@ class StoreMixin:
                           "state": row.state, "owner": row.owner}
             else:
                 row.state = DELIVERED
-                row.awaiting_receipt_since = time.time()   # #131: 受領の兆候待ち
+                row.awaiting_receipt_since = self._clock()   # #131: 受領の兆候待ち
                 journal = ("delivered", {"id": rid, "owner": owner})
                 result = {"ok": True}
         self._journal_reaped(reaped)
@@ -1601,7 +1605,7 @@ class StoreMixin:
         self._sweep_adoptions()   # #166: 期限切れ adopt の失敗確定 (lock 外の入口)
         with self._lock:
             reaped = self._reap_locked()
-            now = time.time()
+            now = self._clock()
             by_state: dict[str, int] = {}
             for row in self._rows.values():
                 by_state[row.state] = by_state.get(row.state, 0) + 1
