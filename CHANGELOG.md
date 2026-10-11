@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Resident pre-flight / `--reap` dogfood fixes (#146).** On Linux an
+  unreaped zombie resident now counts as exited, so `--reap` no longer reports
+  "still alive after SIGKILL" and leaves its registration behind. A resident
+  registered under the same host and state dir but a different root now gets a
+  `--root-cwd <root>` hint instead of a bare "different org instance" (rerunning
+  `org down --reap` after a clean `org down` falls back to the cwd). A
+  registration with a non-finite `started_at` is reported as such, without a
+  platform blame or a `kill` suggestion for the unverified pid.
 - **Broker reads the request body before an early reject (#201).** A 401 /
   403 / 404 answered before the body was read left unread bytes on the
   socket; closing it made Windows send a RST that aborted the client's read
