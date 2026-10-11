@@ -41,3 +41,19 @@ jobs:
           python -m pip install -e .[dev]
       - name: Run pytest
         run: python -m pytest -x -q
+
+  # Single, stable check name for branch protection. Requiring each matrix
+  # leg by name breaks whenever the matrix changes, and leaving legs out is
+  # how a red-on-Windows PR auto-merged (#136). This job fails unless every
+  # leg passed; `always()` keeps it from being skipped (a skipped required
+  # check counts as passing) when a leg fails.
+  pytest-required:
+    name: pytest (all)
+    needs: pytest
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix leg to pass
+        run: |
+          echo "pytest matrix result: ${{ needs.pytest.result }}"
+          test "${{ needs.pytest.result }}" = "success"
