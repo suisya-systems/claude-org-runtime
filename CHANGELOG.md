@@ -48,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dispatcher parses herdr pane ids past the 9th pane (#240).**
+  herdr numbers panes in bijective base-32 over
+  `123456789ABCDEFGHJKMNPQRSTVWXYZ0`, so the 10th pane in a workspace is
+  `w1:pA`, the 32nd is `w1:p0` and the 33rd is `w1:p11`. `delegate-plan`
+  assumed decimal pane numbers and rejected these ids, so dispatch fell back
+  to manual degraded mode. It now decodes the segment in herdr's own order,
+  which keeps the `choose_split` tie-break stable. Measured on herdr 0.9.3
+  up to the 1061st pane.
 - **A latching register refusal always reaches the journal (#230).** The
   stand-down journal shares one cooldown (`lease_seconds`) per owner. Right
   after `org adopt`, the incumbent's fenced poll (`delivery_poll_fenced`) had
