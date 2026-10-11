@@ -167,7 +167,22 @@ def test_spawn_injects_env_via_new_session_e_flag(adapter: TmuxAdapter) -> None:
     idx = args.index("-e")
     assert args[idx + 1] == "ORG_BROKER_STATE_DIR=/abs/state"
     # -e is applied to new-session (env), never a shell 'VAR=... cmd' prefix.
-    assert args[-1] == "claude"
+    assert args[args.index(";") - 1] == "claude"
+
+
+def test_new_session_drops_env_from_session_environment(adapter: TmuxAdapter) -> None:
+    # Issue #62 (Codex P1): new-session -e persists into the session env, which
+    # later splits inherit. The same command list must unset every injected key.
+    adapter._fake.queue((0, "%4\t@3\tclaude-org-broker-9-3", ""))
+    adapter.spawn(["claude"], env={"ORG_BROKER_TOKEN": "t", "K": "V"})
+    args = _args(adapter._fake.last)
+    session = args[args.index("-s") + 1]
+    tail = args[args.index("claude"):]
+    assert tail == [
+        "claude",
+        ";", "set-environment", "-t", session, "-u", "ORG_BROKER_TOKEN",
+        ";", "set-environment", "-t", session, "-u", "K",
+    ]
 
 
 def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
@@ -233,7 +248,7 @@ def test_spawn_carries_venv_login_shell_wrapper(
     # VIRTUAL_ENV via -e (env dict channel, same as ORG_BROKER_STATE_DIR).
     assert f"VIRTUAL_ENV={venv}" in args
     # PATH prepend rides the shlex-joined command string (post-profile export).
-    cmd_str = args[-1]
+    cmd_str = args[args.index(";") - 1]
     assert base.venv_bin_dir(venv) in cmd_str
     assert "export PATH=" in cmd_str
     assert "/bin/bash -lc" in cmd_str and 'exec "$@"' in cmd_str

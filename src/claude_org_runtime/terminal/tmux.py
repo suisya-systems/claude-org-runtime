@@ -240,9 +240,16 @@ class TmuxAdapter:
         if proc is None or proc.returncode != 0:
             # ponytail: split 失敗は理由を問わず新規 session (旧挙動) に落とす。
             # 「同 session の new-window」へ寄せるのは必要になってから。
+            session = self._new_session_name()
+            # new-session -e は値を **session 環境** に残し、同 session への後続 split が
+            # それを継承する (token / observer 秘密が別 agent に漏れる)。pane は起動済み
+            # なので、同じコマンド列 (``;`` 連結 = 間に他 client が割り込まない) で消す。
+            unset: list[str] = []
+            for key in env or {}:
+                unset += [";", "set-environment", "-t", session, "-u", key]
             proc = self._tmux(
-                "new-session", "-d", "-s", self._new_session_name(),
-                "-x", str(self.width), "-y", str(self.height), *tail,
+                "new-session", "-d", "-s", session,
+                "-x", str(self.width), "-y", str(self.height), *tail, *unset,
             )
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
