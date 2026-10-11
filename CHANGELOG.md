@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
+### Fixed
+
+- **tmux spawns split the target pane instead of opening a new session (#62).**
+  `spawn_claude_pane` / `spawn_codex_pane` / `spawn_pane` on the tmux backend
+  now `split-window` the resolved `target` (default `focused`) in its window,
+  honouring `direction` (`vertical` = side by side, `horizontal` = top/bottom)
+  and leaving focus where it was. All agents share one window, `list_panes`
+  reports real geometry, and one agent exiting no longer takes down its own
+  tmux server. The first spawn, or a split that tmux refuses (target gone, too
+  small), still opens a new session. New adapter flag: `supports_split_target`.
+
 ## [0.1.49] - 2026-10-11
 
 ### Added

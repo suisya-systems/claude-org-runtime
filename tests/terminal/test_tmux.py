@@ -176,6 +176,34 @@ def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
     assert "-e" not in _args(adapter._fake.last)
 
 
+@pytest.mark.parametrize("direction,flag", [("vertical", "-h"), ("horizontal", "-v")])
+def test_spawn_with_split_target_splits_that_pane(
+    adapter: TmuxAdapter, direction: str, flag: str
+) -> None:
+    # Issue #62: a split target joins the existing window instead of a new session.
+    adapter._fake.queue((0, "%7\t@0\tclaude-org-broker-9-1", ""))
+    ref = adapter.spawn(
+        ["claude"], cwd="/w", env={"K": "V"}, split_target="%1", direction=direction,
+    )
+    assert (ref.pane_id, ref.window_id) == ("%7", "@0")
+    assert len(adapter._fake.calls) == 1
+    args = _args(adapter._fake.last)
+    assert args[:5] == ["split-window", "-d", flag, "-t", "%1"]
+    assert "K=V" in args and ["-c", "/w"] == args[args.index("-c"):args.index("-c") + 2]
+    assert args[-1] == "claude"
+
+
+def test_spawn_split_failure_falls_back_to_new_session(adapter: TmuxAdapter) -> None:
+    adapter._fake.queue(
+        (1, "", "can't find pane: %1"),
+        (0, "%8\t@5\tclaude-org-broker-9-2", ""),
+    )
+    ref = adapter.spawn(["cat"], split_target="%1", direction="vertical")
+    assert ref.pane_id == "%8"
+    assert _args(adapter._fake.calls[0])[0] == "split-window"
+    assert _args(adapter._fake.last)[0] == "new-session"
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX-only login-shell wrapper (tmux is a POSIX-only backend)",
@@ -285,6 +313,10 @@ def test_find_tmux_raises_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tmux_mod.shutil, "which", lambda _n: None)
     with pytest.raises(FileNotFoundError):
         tmux_mod.find_tmux()
+
+
+def test_tmux_supports_split_target() -> None:
+    assert TmuxAdapter.supports_split_target is True
 
 
 def test_tmux_is_isolated_session() -> None:

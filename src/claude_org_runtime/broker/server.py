@@ -1447,9 +1447,9 @@ class Broker(TokenMixin, StoreMixin):
     def _resolve_split_target(self, target: str) -> tuple["PaneId | None", dict | None]:
         """spawn 対象 pane を解決・検証する (Major 対応)。
 
-        renga は target pane を split する契約。adapter は方向 split を持たない
-        (§4.7 Phase 4) ため実 spawn は new window になるが、**明示 target の
-        誤指定は検出する**: 解決不能かつ 'focused' 既定でなければ pane_not_found。
+        renga は target pane を split する契約。``supports_split_target`` な backend
+        (tmux) は解決した handle を実際に split し、持たない backend では実 spawn は
+        adapter 既定の配置になる。どちらでも **明示 target の誤指定は検出する**: 解決不能かつ 'focused' 既定でなければ pane_not_found。
         'focused' 既定は broker が caller pane を把握していない場合があるため
         best-effort で通す。返り値は (resolved_handle, error_result)。
         """
@@ -1463,6 +1463,8 @@ class Broker(TokenMixin, StoreMixin):
         role: str | None, project: str | None,
         kind: str | None = None,
         env_extra: dict[str, str] | None = None,
+        split_target: "PaneId | None" = None,
+        direction: str | None = None,
     ):
         """adapter.spawn を backend の能力に応じて呼ぶ (Issue #110 §6.2 Layer C)。
 
@@ -1503,6 +1505,10 @@ class Broker(TokenMixin, StoreMixin):
         を verbatim replay しても process env は継承しないため秘密を replay できない。
         **先に** 敷いてから broker 所有のキー (state dir / venv) を載せるので、呼び元が
         それらを上書きすることはない。
+
+        ``split_target`` / ``direction`` (Issue #62) は ``supports_split_target`` な
+        backend (tmux) にのみ渡す。target pane を方向指定で split させ、全 agent を
+        1 window に並べる。持たない backend は従来どおり adapter 既定の配置。
         """
         env = {**(env_extra or {}),
                "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
@@ -1514,6 +1520,9 @@ class Broker(TokenMixin, StoreMixin):
         extra: dict = {}
         if getattr(self.adapter, "supports_agent_kind", False):
             extra["kind"] = kind
+        if getattr(self.adapter, "supports_split_target", False):
+            extra["split_target"] = split_target
+            extra["direction"] = direction
         if getattr(self.adapter, "supports_space_layout", False):
             space = surface.space_descriptor_for(role, project)
             return self.adapter.spawn(
@@ -1531,9 +1540,9 @@ class Broker(TokenMixin, StoreMixin):
         agent_id は name から導出 (無ければ生成)。argv は broker が構造化ビルダーで
         組み (default-deny guard 込み)、--mcp-config で token を注入する。子 token の
         権限 tier (auth_role) は表示 role の自己申告ではなく **caller tier で上限を
-        切った** tier にする (Blocker: spawn 時 tier 昇格の阻止)。adapter は方向
-        split を持たない (§4.7 Phase 4) ため direction / target は受理して
-        記録・検証し、実 spawn は adapter.spawn (new window) で行う (本段の既知挙動)。
+        切った** tier にする (Blocker: spawn 時 tier 昇格の阻止)。direction / target は
+        ``supports_split_target`` な backend (tmux) では実際の split に使い、持たない
+        backend では受理・記録・検証のみ (配置は adapter 既定)。
         """
         if self.adapter is None:
             return _err("[no_backend] no terminal adapter configured")
@@ -1619,6 +1628,7 @@ class Broker(TokenMixin, StoreMixin):
                 env_extra[TOKEN_ENV] = token
             ref = self._adapter_spawn(
                 argv, cwd, role, project, kind="claude", env_extra=env_extra,
+                split_target=split_handle, direction=direction,
             )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token / delivery cred があれば掃除する。
@@ -1687,7 +1697,10 @@ class Broker(TokenMixin, StoreMixin):
                 # 原子的に拒否する。予約名は解放してから返す。
                 self._release_name(name)
                 return _err(str(e))
-            ref = self._adapter_spawn(argv, cwd, role, project, kind="codex")
+            ref = self._adapter_spawn(
+                argv, cwd, role, project, kind="codex",
+                split_target=split_handle, direction=direction,
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
@@ -1729,7 +1742,10 @@ class Broker(TokenMixin, StoreMixin):
         token: str | None = None  # generic spawn では None のまま
         try:
             argv = ["sh", "-c", command] if command else ["sh"]
-            ref = self._adapter_spawn(argv, cwd, role, project, kind=None)  # generic: agent ではない
+            ref = self._adapter_spawn(  # generic: agent ではない
+                argv, cwd, role, project, kind=None,
+                split_target=split_handle, direction=direction,
+            )
         except BaseException:
             # 失敗時のみ予約を解放し、発行済み token があれば掃除する。成功時は
             # 予約を保持したまま _register_pane が _lock 下で meta 登録と予約
