@@ -1933,6 +1933,34 @@ def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path, cl
     assert expired[0]["restored_generation"] == gen
 
 
+def test_expired_adopt_restores_the_incumbents_observer_lease(tmp_path, clock):
+    """**回帰 (#232)**: 期限切れは現職の observer lease も戻す (fork 保護の復帰)。
+
+    adopt の rotate は現職の lease を差し替える。失効時に adopt の lease を落とすだけだと
+    owner は lease 無し (last-register-wins) に戻り、現職の ``secretary-mcp.json`` を
+    秘密無しで replay した session が register して現職を fence してしまう。
+    """
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
+               adopt_arming_seconds=0.05)
+    src, _dst = _registered(b, "src"), _registered(b, "dst")
+    secret = b.assert_observer("dst")              # org up の現職 A
+    dc = b.issue_delivery_cred("dst")
+    gen = b.register_delivery_instance(dc, "A", observer=secret)["generation"]
+    b.adopt_delivery("dst")                        # 登録前に死ぬ launch
+    clock.advance(0.1)
+
+    assert b.adopt_status("dst")["observer_state"] != "none"   # sweep 入口
+    expired = _journal_events(b, "delivery_adopt_expired")[0]
+    assert expired["restored"] is True and expired["lease_restored"] is True
+    replay = b.register_delivery_instance(dc, "replay")        # 秘密無しの replay
+    assert replay["ok"] is False and replay["error"] == "observer_pending"
+    b.enqueue(src, "dst", "still-for-A")
+    rows = b.poll_claims(dc, gen, "A")["rows"]
+    assert [r["entry"]["message"] for r in rows] == ["still-for-A"]
+    # 戻ったのは現職の秘密そのもの (A の再 register 相当の提示が通る)。
+    assert b._observer_leases["dst"].secret == secret
+
+
 def test_closing_the_superseded_pane_does_not_kill_the_adopted_session(
     tmp_path, fake_adapter,
 ):
@@ -2055,6 +2083,9 @@ def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
     assert expired["pane_gone"] is True
     assert expired["restored"] is False            # 死んだ instance を名乗らない
     assert "w" not in b._delivery_instances
+    # 死んだ現職の lease も戻さない: 秘密を提示できる者が居ない lease は、以後の
+    # register を observer_pending で塞ぎ続けるだけになる (#232)。
+    assert expired["lease_restored"] is False and "w" not in b._observer_leases
 
 
 def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
@@ -2062,7 +2093,8 @@ def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
 ):
     """**回帰**: ``force`` は原状 **一式** を引き継ぐ (generation だけではない)。
 
-    復帰状態は generation / instance / full token / 切り離した pane の 4 点あり、
+    復帰状態は generation / instance / full token / 切り離した pane / observer lease の
+    5 点あり、
     supersede 時に一部だけ引き継ぐと、その adopt も失効した時に中途半端な復元になる:
     token は先行 adopt が発行した方に戻り (旧プロセスは締め出されたまま)、pane 情報が
     空なので既に閉じた pane を「まだ在る」と誤判定して死んだ instance を ``restored``
@@ -2099,6 +2131,9 @@ def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
     assert b.get_bind(second["_owner_token"]) is None
     # pane の切り離し印も外れている (閉じれば通常どおり掃除される)。
     assert b._pane_meta[str(out["id"])].get("adopted_away") is None
+    # lease も **最初の** 現職のもの (先行 adopt が張った方ではない, #232)。
+    assert expired["lease_restored"] is True
+    assert b._observer_leases["w"].secret == secret
 
 
 def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path, clock):
@@ -2142,6 +2177,29 @@ def test_expired_adopt_does_not_clobber_a_lease_installed_after_the_deadline(tmp
     assert b._observer_leases["dst"].secret == fresh
     assert _journal_events(b, "delivery_adopt_expired")[0]["lease_dropped"] is False
     assert b.register_delivery_instance(dc, "fresh-obs", observer=fresh)["ok"] is True
+
+
+def test_expired_adopt_does_not_restore_the_incumbent_lease_over_a_fresh_one(
+    tmp_path, clock,
+):
+    """compare-and-restore (#232): 現職の lease を戻すのは **自分の lease を落とせた時だけ**。
+
+    期限後・sweep 前に re-assert された lease は今まさに有効な保護で、fence はまだ
+    健在 (誰も register していない) なので、``dropped`` の条件が無いと古い現職の
+    lease で上書きされ、新しい秘密を持つ session が superseded で latch される。
+    """
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
+    _registered(b, "dst")
+    old = b.assert_observer("dst")
+    dc = b.issue_delivery_cred("dst")
+    assert b.register_delivery_instance(dc, "A", observer=old)["ok"] is True
+    b.adopt_delivery("dst")
+    clock.advance(0.1)
+    fresh = b.assert_observer("dst")      # sweep 前の re-assert (assert は sweep しない)
+    b.adopt_status("dst")                 # sweep 入口
+    expired = _journal_events(b, "delivery_adopt_expired")[0]
+    assert expired["lease_dropped"] is False and expired["lease_restored"] is False
+    assert b._observer_leases["dst"].secret == fresh
 
 
 def test_expired_adopt_does_not_restore_the_fence_after_someone_registered(tmp_path):

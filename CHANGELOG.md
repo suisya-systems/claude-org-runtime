@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An expired `org adopt` gives the incumbent its observer lease back
+  (#232).** The adopt rotated the incumbent's lease, and the expiry sweep only
+  dropped the adopt's own lease, so after the revert the owner had no lease:
+  a replay of the incumbent's MCP config without the observer secret
+  registered (last-register-wins) and fenced the restored session. The
+  rollback now snapshots the incumbent's lease and restores it under the same
+  compare-and-restore condition as the instance (fence still in place, the
+  detached pane still alive, and the lease slot still holding the adopt's
+  lease). `delivery_adopt_expired` gains a `lease_restored` field.
 - **Resident pre-flight / `--reap` dogfood fixes (#146).** On Linux an
   unreaped zombie resident now counts as exited, so `--reap` no longer reports
   "still alive after SIGKILL" and leaves its registration behind. A resident

@@ -229,6 +229,10 @@ class AdoptRollback:
     # adopt が切り離した pane id。空でない場合、失効時に **その pane がまだ在るか** が
     # 「instance を復帰してよいか」の判定材料になる。
     detached_panes: list[str] = field(default_factory=list)
+    # adopt の rotate が差し替える前の現職の observer lease (None = lease 無し)。
+    # 戻さないと、復帰した旧 session は fork 保護を失い、秘密無しの replay が
+    # last-register-wins で旧 session を fence できてしまう (#232)。
+    observer_lease: ObserverLease | None = None
 
 
 @dataclass
@@ -567,12 +571,22 @@ class StoreMixin:
             # は detached_panes が空なので、この判定の対象外。
             pane_gone = bool(rollback.detached_panes) and not reattached
             restored = False
+            lease_restored = False
             if (self._generation_of(owner) == pending.fenced_generation
                     and owner not in self._delivery_instances):
                 self._delivery_generations[owner] = rollback.generation
                 if rollback.instance is not None and not pane_gone:
                     self._delivery_instances[owner] = rollback.instance
                     restored = True
+                # 現職の observer lease も戻す (#232)。条件は instance と同じ fence
+                # 健在 + pane 生存に、**自分の lease を落とした** (= 枠を他人が
+                # 張り直していない) ことを足す。pane ごと消えた現職の lease を戻すと、
+                # 秘密を提示できる者が居ない lease が以後の register を
+                # observer_pending で塞ぎ続ける。
+                if (dropped and rollback.observer_lease is not None
+                        and not pane_gone):
+                    self._observer_leases[owner] = rollback.observer_lease
+                    lease_restored = True
             # full token も元へ戻す (compare-and-restore)。adopt は旧プロセスの token を
             # 付け替えて MCP 面を切っているので、失効時に戻さないと「配達は旧 session に
             # 返ったのに MCP は死んだまま」という半死状態が残る。付け替え後の token が
@@ -588,6 +602,7 @@ class StoreMixin:
                 "adoption_id": pending.adoption_id,
                 "armed_seconds": round(pending.armed_until - pending.started_at, 3),
                 "lease_dropped": dropped,
+                "lease_restored": lease_restored,
                 "generation": pending.fenced_generation,
                 "restored": restored,
                 "restored_generation": rollback.generation if restored else None,
@@ -689,6 +704,7 @@ class StoreMixin:
                             instance=self._delivery_instances.get(owner),
                             token=full_token,
                             detached_panes=list(detached),
+                            observer_lease=self._observer_leases.get(owner),
                         )
                     else:
                         # force による明示 supersede。**先行 adopt が敗けたことを残す**
