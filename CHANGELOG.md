@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instant of launch. That startup-only exposure remains and is documented in
   `docs/broker-token-env-decision.md`.
 
+### Removed
+
+- **herdr 0.7.0-0.7.4 (wire protocols 14 / 16) are no longer supported (#239).**
+  The herdr adapter now accepts only protocols 17 (herdr 0.7.5) and 22 (herdr
+  0.9.0-0.9.3). Protocols 14 and 16 fail fast at startup with
+  `herdr_protocol_unsupported`, before any workspace is created. The legacy
+  spawn path they needed is gone: the old `agent.start` call that let herdr
+  create the pane, and the `pane.move` correction that moved a misplaced pane
+  into its space. `PROTOCOL_AGENT_API_LEGACY` and `PROTOCOL_AGENT_API_V075` are
+  removed; use `SUPPORTED_PROTOCOLS`. `venv_path_via_pane_env` is now a plain
+  `True` class attribute and no longer probes the server. Upgrade herdr to 0.9.3
+  (or 0.7.5), or stay on runtime 0.1.49 to keep using 0.7.4.
+
 ### Fixed
 
 - **The dispatcher parses herdr pane ids past the 9th pane (#240).**

@@ -36,8 +36,6 @@ from claude_org_runtime.terminal.herdr import (
     CODE_NAME_IN_USE,
     CODE_PANE_NOT_FOUND,
     CODE_PROTOCOL_UNSUPPORTED,
-    PROTOCOL_AGENT_API_LEGACY,
-    PROTOCOL_AGENT_API_V075,
     SUPPORTED_PROTOCOLS,
     PANE_LIVE_ALIVE,
     PANE_LIVE_GONE,
@@ -76,7 +74,7 @@ class FakeHerdrServer:
       a server that drops the connection mid-roundtrip).
     """
 
-    def __init__(self, path: str, protocol: int = 16, version: str = "0.7.4") -> None:
+    def __init__(self, path: str, protocol: int = 22, version: str = "0.9.3") -> None:
         self.path = path
         self.handlers: dict[str, Handler] = {}
         self.requests: list[dict] = []
@@ -84,8 +82,8 @@ class FakeHerdrServer:
         # ``ping`` の pong は herdr 0.7.4 バイナリの ``herdr api schema`` で実測した
         # 形 (success_response の result): type/version/protocol は required、
         # capabilities は nullable。adapter は __post_init__ で必ず 1 往復するので
-        # (Issue #151 B) 既定ハンドラとして先に積む。0.7.5 経路を試すテストは
-        # ``server.protocol = 17`` を立ててから adapter を構築する。
+        # (Issue #151 B) 既定ハンドラとして先に積む。別 protocol を試すテストは
+        # ``server.protocol`` を立ててから adapter を構築する。
         self.protocol = protocol
         self.version = version
         self.on(
@@ -216,45 +214,21 @@ def server() -> FakeHerdrServer:
         pass
 
 
-def _wire_spawn(server: FakeHerdrServer, *, pane_id: str = "w1:p2") -> None:
-    """Register the happy-path spawn chain: workspace.create -> agent.start ->
-    pane.close (root cleanup)."""
-    server.on(
-        "workspace.create",
-        {
-            "type": "workspace_created",
-            "workspace": {"workspace_id": "w1", "active_tab_id": "w1:t1"},
-            "tab": {"tab_id": "w1:t1", "workspace_id": "w1"},
-            "root_pane": {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
-        },
-    )
-    server.on(
-        "agent.start",
-        lambda params: {
-            "type": "agent_started",
-            "agent": {"pane_id": pane_id, "name": params.get("name")},
-        },
-    )
-    server.on("pane.close", {"type": "ok"})
-
-
-def _wire_spawn_v075(
+def _wire_spawn(
     server: FakeHerdrServer,
     *,
     pane_id: str = "w1:p2",
     busy_times: int = 0,
 ) -> None:
-    """protocol 17 の spawn 連鎖を張る: workspace.create -> pane.split ->
-    (pane.send_text) -> agent.start -> pane.close (root cleanup)。
+    """spawn 連鎖を張る: workspace.create -> pane.split -> (pane.send_text) ->
+    agent.start -> pane.close (root cleanup)。
 
-    fake 側で herdr 0.7.5 の**バリデーションを再現する** (name 正規表現 / kind と
+    fake 側で herdr 0.7.5 以降の**バリデーションを再現する** (name 正規表現 / kind と
     pane_id の必須性)。実バイナリが手元に無いため、これが name 短縮や必須 param の
     退行を捕まえる唯一の関門になる。
 
     ``busy_times`` 回だけ ``agent_pane_busy`` を返してから成功する (retry の検証)。
     """
-    server.protocol = 17
-    server.version = "0.7.5"
     server.on(
         "workspace.create",
         {
@@ -390,25 +364,6 @@ def test_herdr_in_valid_backends() -> None:
 # spawn
 # ---------------------------------------------------------------------------
 
-def test_spawn_creates_workspace_then_agent(server: FakeHerdrServer, tmp_path) -> None:
-    _wire_spawn(server, pane_id="w1:p2")
-    a = _adapter(server)
-    ref = a.spawn(["claude", "--flag"], cwd=str(tmp_path))
-    assert (ref.pane_id, ref.window_id, ref.tab_id) == ("w1:p2", "w1", "w1:t1")
-    # order: workspace.create -> agent.start -> pane.close (root cleanup)
-    assert server.methods_called() == [
-        "workspace.create",
-        "agent.start",
-        "pane.close",
-    ]
-    ap = server.params_for("agent.start")
-    assert ap["argv"] == ["claude", "--flag"]
-    assert ap["workspace"] == "w1" and ap["tab"] == "w1:t1"
-    assert ap["cwd"] == str(tmp_path)
-    # root shell pane (w1:p1) is the one closed
-    assert server.params_for("pane.close")["pane_id"] == "w1:p1"
-
-
 def test_spawn_display_name_renames_pane_after_start(
     server: FakeHerdrServer, tmp_path
 ) -> None:
@@ -416,10 +371,11 @@ def test_spawn_display_name_renames_pane_after_start(
     _wire_spawn(server, pane_id="w1:p2")
     server.on("pane.rename", {"type": "ok"})
     a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path), display_name="fix-issue-114")
+    ref = a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
+                  display_name="fix-issue-114")
     assert ref.pane_id == "w1:p2"
     assert server.methods_called() == [
-        "workspace.create", "agent.start", "pane.close", "pane.rename",
+        "workspace.create", "pane.split", "agent.start", "pane.close", "pane.rename",
     ]
     assert server.params_for("pane.rename") == {
         "pane_id": "w1:p2", "label": "fix-issue-114",
@@ -434,57 +390,33 @@ def test_spawn_display_name_rename_failure_does_not_fail_spawn(
     # でも起動済みの agent を巻き戻さない。
     _wire_spawn(server, pane_id="w1:p2")
     a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path), display_name="fix-issue-114")
+    ref = a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
+                  display_name="fix-issue-114")
     assert ref.pane_id == "w1:p2"
     assert "w1:p2" in a._owned_panes
 
 
-def test_spawn_injects_env_into_agent_start_params(
+def test_spawn_injects_env_into_pane_split_params(
     server: FakeHerdrServer, tmp_path
 ) -> None:
-    # Issue #122: Herdr protocol supports env injection via agent.start's `env`
-    # param (socket spike). The broker threads ORG_BROKER_STATE_DIR through here.
+    # Issue #122: env rides the pane.split ``env`` param (agent.start has no env
+    # since herdr 0.7.5). The broker threads ORG_BROKER_STATE_DIR through here.
     _wire_spawn(server, pane_id="w1:p2")
     a = _adapter(server)
-    a.spawn(["claude"], cwd=str(tmp_path),
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
             env={"ORG_BROKER_STATE_DIR": "/abs/state"})
-    assert server.params_for("agent.start")["env"] == {
+    assert server.params_for("pane.split")["env"] == {
         "ORG_BROKER_STATE_DIR": "/abs/state"
     }
 
 
-def test_spawn_without_env_omits_agent_start_env_param(
+def test_spawn_without_env_omits_pane_split_env_param(
     server: FakeHerdrServer, tmp_path
 ) -> None:
     _wire_spawn(server, pane_id="w1:p2")
     a = _adapter(server)
-    a.spawn(["claude"], cwd=str(tmp_path))  # no env -> no param (backward compat)
-    assert "env" not in server.params_for("agent.start")
-
-
-def test_spawn_carries_venv_login_shell_wrapper(
-    server: FakeHerdrServer, tmp_path, monkeypatch
-) -> None:
-    # Issue #130: the broker's post-profile login-shell wrapper (venv_pane_prep)
-    # rides Herdr's `agent.start` argv verbatim, and VIRTUAL_ENV rides the `env`
-    # param. Herdr's own login shell rebuilds PATH, so the `export PATH` inside
-    # the wrapped argv is what re-activates the venv.
-    from claude_org_runtime.terminal.base import venv_pane_prep
-
-    monkeypatch.setenv("SHELL", "/bin/bash")
-    (tmp_path / ".venv" / "bin").mkdir(parents=True)
-    (tmp_path / ".venv" / "bin" / "python").write_text("")
-    wrapped, env = venv_pane_prep(["claude", "--flag"], str(tmp_path), None)
-
-    _wire_spawn(server, pane_id="w1:p2")
-    a = _adapter(server)
-    a.spawn(wrapped, cwd=str(tmp_path), env=env)
-    ap = server.params_for("agent.start")
-    assert ap["env"] == {"VIRTUAL_ENV": f"{tmp_path}/.venv"}
-    # wrapped argv reaches agent.start verbatim (Herdr does not rewrite argv).
-    assert ap["argv"][0] == "/bin/bash" and ap["argv"][1] == "-lc"
-    assert f'export PATH={tmp_path}/.venv/bin:"$PATH"' in ap["argv"][2]
-    assert ap["argv"][-2:] == ["claude", "--flag"]
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")  # no env -> no param
+    assert "env" not in server.params_for("pane.split")
 
 
 def test_spawn_second_reuses_workspace_no_recreate(
@@ -492,22 +424,22 @@ def test_spawn_second_reuses_workspace_no_recreate(
 ) -> None:
     _wire_spawn(server)
     a = _adapter(server)
-    a.spawn(["claude"], cwd=str(tmp_path))
+    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     server.requests.clear()
     # the reuse path verifies the cached workspace still exists (§4.2 / Codex P2) via
     # workspace.list before reusing it — wire it present so reuse proceeds.
     server.on("workspace.list", {"workspaces": [{"workspace_id": "w1", "label": "l"}]})
-    server.on(
-        "agent.start",
-        {"type": "agent_started", "agent": {"pane_id": "w1:p3", "name": "x"}},
-    )
-    ref2 = a.spawn(["codex"], cwd=str(tmp_path))
+    server.on("pane.split", {"pane": {"pane_id": "w1:p3", "workspace_id": "w1"}})
+    ref2 = a.spawn(["codex"], cwd=str(tmp_path), kind="codex")
     assert ref2.pane_id == "w1:p3"
-    # no second workspace.create (reuse), no root cleanup; agent.start into the same w1/t1.
+    # no second workspace.create (reuse), no root cleanup; split inside the same w1,
+    # anchored on the first agent pane (the root pane is already gone).
     assert "workspace.create" not in server.methods_called()
-    assert "agent.start" in server.methods_called()
-    assert server.params_for("agent.start")["workspace"] == "w1"
-    assert server.params_for("agent.start")["split"] == "down"
+    assert "pane.close" not in server.methods_called()
+    split = server.params_for("pane.split")
+    assert split["workspace_id"] == "w1"
+    assert split["target_pane_id"] == "w1:p2"
+    assert split["direction"] == "down"
 
 
 def test_spawn_cwd_preflight_rejects_before_any_socket_call(
@@ -523,174 +455,6 @@ def test_spawn_cwd_preflight_rejects_before_any_socket_call(
     assert exc.value.code == CODE_CWD_INVALID
     # layout must not be mutated: no request reached the server
     assert server.requests[before:] == []
-
-
-# ---------------------------------------------------------------------------
-# placement reconciliation (Issue #114 Fix-C: agent.start ignores workspace param
-# and lands in the focused *user* workspace; spawn must pane.move it back into the
-# dedicated tab, before root cleanup, only when actually diverged)
-# ---------------------------------------------------------------------------
-
-def _wire_spawn_diverged(
-    server: FakeHerdrServer,
-    *,
-    dedicated: str = "w2",
-    tab: str = "w2:t1",
-    root: str = "w2:p1",
-    landed_pane: str = "w1:p2",
-    landed_ws: str = "w1",
-    moved_pane: str = "w2:p2",
-    terminal_id: str = "term_disp",
-) -> None:
-    """Wire the DIVERGED spawn chain (Issue #114): ``agent.start`` reports the pane
-    landed in the focused *user* workspace (``landed_ws``), diverging from the
-    dedicated one (``dedicated``), so spawn must ``pane.move`` it into the dedicated
-    tab and return the post-move id (``moved_pane``)."""
-    server.on(
-        "workspace.create",
-        {
-            "type": "workspace_created",
-            "workspace": {"workspace_id": dedicated, "active_tab_id": tab},
-            "root_pane": {"pane_id": root, "workspace_id": dedicated, "tab_id": tab},
-        },
-    )
-    server.on(
-        "agent.start",
-        lambda params: {
-            "type": "agent_started",
-            "agent": {
-                "pane_id": landed_pane,
-                "workspace_id": landed_ws,
-                "terminal_id": terminal_id,
-                "name": params.get("name"),
-            },
-        },
-    )
-    server.on(
-        "pane.move",
-        {
-            "type": "pane_move",
-            "move_result": {
-                "changed": True,
-                "previous_pane_id": landed_pane,
-                "pane": {
-                    "pane_id": moved_pane,
-                    "workspace_id": dedicated,
-                    "terminal_id": terminal_id,
-                },
-            },
-        },
-    )
-    server.on("pane.close", {"type": "ok"})
-
-
-def test_spawn_diverged_moves_pane_into_dedicated_tab_before_root_cleanup(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    _wire_spawn_diverged(server)
-    a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path))
-    # PaneRef reports the POST-move id + dedicated ws + preserved terminal_id.
-    assert ref.pane_id == "w2:p2"
-    assert ref.window_id == "w2"
-    assert ref.terminal_id == "term_disp"
-    # order matters: move must precede root cleanup (else the dedicated ws auto-closes
-    # when its root pane is closed and the move target tab disappears).
-    assert server.methods_called() == [
-        "workspace.create",
-        "agent.start",
-        "pane.move",
-        "pane.close",
-    ]
-    mv = server.params_for("pane.move")
-    assert mv["pane_id"] == "w1:p2"
-    assert mv["destination"] == {"type": "tab", "tab_id": "w2:t1", "split": "down"}
-    # root cleanup closes the dedicated ws's root pane, NOT the moved agent pane.
-    assert server.params_for("pane.close")["pane_id"] == "w2:p1"
-
-
-def test_spawn_not_diverged_skips_move_idempotent(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    """Idempotency (requirement): if a future Herdr honors the workspace param and the
-    pane lands directly in the dedicated ws, spawn must NOT issue a (double) move."""
-    server.on(
-        "workspace.create",
-        {
-            "type": "workspace_created",
-            "workspace": {"workspace_id": "w2", "active_tab_id": "w2:t1"},
-            "root_pane": {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1"},
-        },
-    )
-    server.on(
-        "agent.start",
-        lambda params: {
-            "type": "agent_started",
-            "agent": {
-                "pane_id": "w2:p2",
-                "workspace_id": "w2",  # honored: lands in dedicated
-                "terminal_id": "term_ok",
-                "name": params.get("name"),
-            },
-        },
-    )
-    server.on("pane.close", {"type": "ok"})
-    a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path))
-    assert ref.pane_id == "w2:p2"
-    assert ref.terminal_id == "term_ok"
-    assert "pane.move" not in server.methods_called()
-    assert server.methods_called() == ["workspace.create", "agent.start", "pane.close"]
-
-
-def test_spawn_divergence_detected_via_pane_id_prefix_when_workspace_id_absent(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    """If agent.start omits ``workspace_id`` (older/newer schema), divergence is still
-    detected from the ``wN:pM`` pane_id prefix, so the move still fires."""
-    _wire_spawn_diverged(server)
-    # drop workspace_id from the agent response; keep the w1 pane_id prefix.
-    server.on(
-        "agent.start",
-        lambda params: {
-            "type": "agent_started",
-            "agent": {"pane_id": "w1:p2", "terminal_id": "term_disp",
-                      "name": params.get("name")},
-        },
-    )
-    a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path))
-    assert ref.pane_id == "w2:p2"  # moved
-    assert "pane.move" in server.methods_called()
-
-
-def test_spawn_diverged_move_failure_closes_stranded_pane_and_raises(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    """If the corrective move fails, the pane is stranded in the user's workspace
-    (isolation broken). spawn best-effort closes it and propagates the error rather
-    than returning an isolation-broken PaneRef; root cleanup never runs."""
-    _wire_spawn_diverged(server)
-    server.on("pane.move", {"error": {"code": "invalid_request", "message": "nope"}})
-    a = _adapter(server)
-    with pytest.raises(HerdrError) as exc:
-        a.spawn(["claude"], cwd=str(tmp_path))
-    assert exc.value.code == CODE_INVALID_PARAMS
-    # the stranded landed pane (w1:p2) is best-effort closed; root (w2:p1) is NOT.
-    closes = [r for r in server.requests
-              if r.get("method") == "pane.close"]
-    assert [c["params"]["pane_id"] for c in closes] == ["w1:p2"]
-
-
-def test_spawn_diverged_move_missing_post_move_id_is_internal(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    _wire_spawn_diverged(server)
-    server.on("pane.move", {"type": "pane_move", "move_result": {"changed": True}})
-    a = _adapter(server)
-    with pytest.raises(HerdrError) as exc:
-        a.spawn(["claude"], cwd=str(tmp_path))
-    assert exc.value.code == CODE_INTERNAL
 
 
 # ---------------------------------------------------------------------------
@@ -822,10 +586,7 @@ def test_list_panes_active_false_for_unfocused(
     _wire_spawn(server)
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path))
-    server.on(
-        "agent.start",
-        {"type": "agent_started", "agent": {"pane_id": "w1:p3", "name": "x"}},
-    )
+    server.on("pane.split", {"pane": {"pane_id": "w1:p3", "workspace_id": "w1"}})
     a.spawn(["codex"], cwd=str(tmp_path))
     server.on(
         "pane.list",
@@ -895,7 +656,7 @@ def test_list_panes_degraded_escapes_to_gone_and_recreates(
         assert a.list_panes() == []
     assert a._workspace_id is None       # GONE -> space dropped -> recreatable
     server.requests.clear()
-    _wire_spawn(server, pane_id="w2:p2")  # re-arm workspace.create/agent.start
+    _wire_spawn(server, pane_id="w2:p2")  # re-arm workspace.create/pane.split
     server.on(
         "workspace.create",
         {
@@ -1224,25 +985,12 @@ def test_close_workspace(server: FakeHerdrServer, tmp_path) -> None:
 def test_construction_pings_and_records_protocol(server: FakeHerdrServer) -> None:
     a = _adapter(server)
     assert server.methods_called(include_ping=True) == ["ping"]
-    assert a._protocol == 16
-    assert not a._uses_v075_agent_api()
-
-
-def test_protocol_17_selects_v075_agent_api(server: FakeHerdrServer) -> None:
-    server.protocol = 17
-    server.version = "0.7.5"
-    a = _adapter(server)
-    assert a._protocol == 17
-    assert a._uses_v075_agent_api()
-
-
-def test_protocol_22_selects_v075_agent_api(server: FakeHerdrServer) -> None:
-    # herdr 0.9.x (Issue #237): agent.start は 17 と同形なので v075 経路。
-    server.protocol = 22
-    server.version = "0.9.3"
-    a = _adapter(server)
     assert a._protocol == 22
-    assert a._uses_v075_agent_api()
+
+
+def test_supported_protocols_are_exactly_17_and_22() -> None:
+    # Issue #239: 14 / 16 (herdr 0.7.0-0.7.4) と旧 agent.start 経路は削除済み。
+    assert SUPPORTED_PROTOCOLS == frozenset({17, 22})
 
 
 @pytest.mark.parametrize(
@@ -1273,7 +1021,7 @@ def test_every_supported_protocol_constructs(
     assert _adapter(server)._protocol == protocol
 
 
-@pytest.mark.parametrize("protocol", [13, 15, 18, 19, 20, 21, 23, 99])
+@pytest.mark.parametrize("protocol", [13, 14, 15, 16, 18, 19, 20, 21, 23, 99])
 def test_unsupported_protocol_fails_fast(
     server: FakeHerdrServer, protocol: int
 ) -> None:
@@ -1295,8 +1043,9 @@ def test_unsupported_protocol_fails_fast(
         assert str(supported) in str(exc.value)
 
 
+@pytest.mark.parametrize("protocol", [14, 16, 99])
 def test_unsupported_protocol_leaves_no_disk_side_effect(
-    server: FakeHerdrServer, tmp_path
+    server: FakeHerdrServer, tmp_path, protocol: int
 ) -> None:
     """fail-fast は **副作用ゼロ**であること (Codex Major 1)。
 
@@ -1304,7 +1053,7 @@ def test_unsupported_protocol_leaves_no_disk_side_effect(
     進むと、対応版へ戻した時の世代会計 (§5.2) が狂い、起動時 sweep が別世代を
     孤児と誤認する。
     """
-    server.protocol = 99
+    server.protocol = protocol
     state_dir = tmp_path / "broker-state"
     with pytest.raises(HerdrError) as exc:
         HerdrAdapter(socket_path=server.path, timeout=2.0, state_dir=str(state_dir))
@@ -1341,11 +1090,6 @@ def test_unreachable_socket_does_not_block_construction(tmp_path) -> None:
     with pytest.raises(HerdrError) as exc:
         a._ensure_protocol()
     assert exc.value.code == CODE_ADAPTER_UNAVAILABLE
-
-
-def test_protocol_families_are_disjoint_and_cover_supported() -> None:
-    assert PROTOCOL_AGENT_API_LEGACY.isdisjoint(PROTOCOL_AGENT_API_V075)
-    assert PROTOCOL_AGENT_API_LEGACY | PROTOCOL_AGENT_API_V075 == SUPPORTED_PROTOCOLS
 
 
 # ---------------------------------------------------------------------------
@@ -1430,8 +1174,7 @@ def test_malformed_response_is_internal_not_adapter_unavailable(
 
 def _wire_multi(server: FakeHerdrServer) -> dict:
     """Stateful multi-space wiring: ``workspace.create`` hands out w1,w2,... and
-    ``agent.start`` lands the pane directly in the requested workspace (strategy A
-    respected in the fake -> no move needed), recording each pane in its own space.
+    ``pane.split`` creates the pane in the requested workspace.
     """
     state = {"ws": 0, "pane": 1}
 
@@ -1443,20 +1186,20 @@ def _wire_multi(server: FakeHerdrServer) -> dict:
             "root_pane": {"pane_id": f"{wid}:p0"},
         }
 
-    def start(params: dict) -> dict:
+    def split(params: dict) -> dict:
         state["pane"] += 1
-        wid = params.get("workspace")
+        wid = params.get("workspace_id")
         return {
-            "agent": {
+            "pane": {
                 "pane_id": f"{wid}:p{state['pane']}",
                 "workspace_id": wid,
-                "name": params.get("name"),
                 "terminal_id": f"t{state['pane']}",
             }
         }
 
     server.on("workspace.create", create)
-    server.on("agent.start", start)
+    server.on("pane.split", split)
+    server.on("pane.send_text", {"type": "ok"})
     server.on("pane.close", {"type": "ok"})
     return state
 
@@ -1619,46 +1362,6 @@ def test_project_space_swept_on_last_pane_close_control_preserved(
     assert SPACE_CONTROL in a._spaces
 
 
-def test_reconcile_moves_diverged_project_pane_into_its_own_tab_not_foreign(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    # agent.start rides along into the focused *foreign* workspace w9; reconcile must
-    # pane.move it into the project space's own tab and NEVER close the foreign ws
-    # (self-ownership gate, §7.3 BLOCKER invariant).
-    state = {"ws": 0}
-
-    def create(_params: dict) -> dict:
-        state["ws"] += 1
-        wid = f"w{state['ws']}"
-        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
-                "root_pane": {"pane_id": f"{wid}:p0"}}
-
-    server.on("workspace.create", create)
-    server.on(
-        "agent.start",
-        lambda p: {"agent": {"pane_id": "w9:p5", "workspace_id": "w9",
-                             "terminal_id": "tX"}},
-    )
-    server.on(
-        "pane.move",
-        lambda p: {"move_result": {"pane": {
-            "pane_id": p["destination"]["tab_id"].split(":")[0] + ":p5",
-            "terminal_id": "tX",
-        }}},
-    )
-    server.on("pane.close", {"type": "ok"})
-    a = _adapter(server)
-    ref = a.spawn(["claude"], cwd=str(tmp_path), space=SpaceDescriptor("project:x"))
-    assert ref.window_id == "w1"             # project space is the first-created ws
-    assert ref.pane_id == "w1:p5"            # moved into the project tab
-    mv = server.params_for("pane.move")
-    assert mv["destination"]["tab_id"] == "w1:t1"
-    # foreign w9 is never adopted into the owned set and never closed
-    assert "workspace.close" not in server.methods_called()
-    assert not any(s.workspace_id == "w9" for s in a._spaces.values())
-    assert a._owned_panes["w1:p5"].workspace_id == "w1"
-
-
 def test_startup_sweep_closes_old_generation_only(
     server: FakeHerdrServer, tmp_path
 ) -> None:
@@ -1751,31 +1454,6 @@ def test_failed_project_sweep_retries_via_pending_and_respawn_creates_fresh(
     server.on("workspace.close", {"type": "ok"})
     a._retry_pending_sweep()
     assert ref_p.window_id not in a._pending_sweep
-
-
-def test_reconcile_move_honors_per_space_split_direction(
-    server: FakeHerdrServer, tmp_path
-) -> None:
-    # §8: under strategy C the operative placement is pane.move, so the per-space
-    # split_direction must reach pane.move (agent.start's split is ignored by Herdr).
-    state = {"ws": 0}
-
-    def create(_p: dict) -> dict:
-        state["ws"] += 1
-        wid = f"w{state['ws']}"
-        return {"workspace": {"workspace_id": wid, "active_tab_id": f"{wid}:t1"},
-                "root_pane": {"pane_id": f"{wid}:p0"}}
-
-    server.on("workspace.create", create)
-    server.on("agent.start",
-              lambda p: {"agent": {"pane_id": "w9:p5", "workspace_id": "w9"}})
-    server.on("pane.move",
-              lambda p: {"move_result": {"pane": {"pane_id": "w1:p5"}}})
-    server.on("pane.close", {"type": "ok"})
-    a = _adapter(server)
-    a.spawn(["claude"], cwd=str(tmp_path),
-            space=SpaceDescriptor(SPACE_CONTROL, split_direction="right"))
-    assert server.params_for("pane.move")["destination"]["split"] == "right"
 
 
 def test_fresh_state_dir_is_created_and_generation_persisted(tmp_path) -> None:
@@ -2035,12 +1713,12 @@ def _wire_create_incrementing(server: FakeHerdrServer) -> dict:
 def test_born_empty_workspace_swept_on_spawn_failure(
     server: FakeHerdrServer, tmp_path
 ) -> None:
-    # Codex confirmation P2: when agent.start fails before root cleanup, the just-created
+    # Codex confirmation P2: when the agent spawn fails before root cleanup, the just-created
     # project workspace still holds only its OWN workspace.create root pane. The born-empty
     # sweep must treat that root pane as own (not foreign) and CLOSE the workspace — not
     # classify the root as an occupant and leak it forever.
     _wire_create_incrementing(server)
-    server.on("agent.start", {"agent": {}})   # no pane_id -> spawn fails after create
+    server.on("pane.split", {"pane": {}})   # no pane_id -> spawn fails after create
     server.on("pane.list", {"panes": [{"pane_id": "w1:p0", "workspace_id": "w1"}]})  # only root
     server.on("workspace.close", {"type": "ok"})
     a = _adapter(server)
@@ -2057,7 +1735,7 @@ def test_born_empty_workspace_with_foreign_pane_is_not_closed(
     # If a foreign pane is present alongside our own root pane, the workspace must NOT be
     # closed (isolation) — only our own panes are excluded from the occupancy check.
     _wire_create_incrementing(server)
-    server.on("agent.start", {"agent": {}})   # spawn fails after create
+    server.on("pane.split", {"pane": {}})   # spawn fails after create
     server.on("pane.list", {"panes": [
         {"pane_id": "w1:p0", "workspace_id": "w1"},     # our root
         {"pane_id": "w1:pF", "workspace_id": "w1"},     # a foreign pane
@@ -2071,10 +1749,10 @@ def test_born_empty_workspace_with_foreign_pane_is_not_closed(
 
 
 # ---------------------------------------------------------------------------
-# herdr 0.7.5 (protocol 17) agent.start 追随 — Issue #151 A
+# herdr 0.7.5+ (protocol 17 / 22) agent.start — Issue #151 A
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("protocol", sorted(PROTOCOL_AGENT_API_V075))
+@pytest.mark.parametrize("protocol", sorted(SUPPORTED_PROTOCOLS))
 def test_v075_spawn_splits_pane_then_starts_agent(
     server: FakeHerdrServer, tmp_path, protocol: int
 ):
@@ -2082,7 +1760,7 @@ def test_v075_spawn_splits_pane_then_starts_agent(
 
     0.9.x (protocol 22) も同じ wire 形 (Issue #237)。
     """
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     server.protocol = protocol
     a = _adapter(server)
     ref = a.spawn(["claude", "--flag"], cwd=str(tmp_path), kind="claude")
@@ -2090,7 +1768,7 @@ def test_v075_spawn_splits_pane_then_starts_agent(
     assert server.methods_called() == [
         "workspace.create", "pane.split", "agent.start", "pane.close",
     ]
-    assert ref.pane_id == "w1:p2"
+    assert (ref.pane_id, ref.window_id, ref.tab_id) == ("w1:p2", "w1", "w1:t1")
     assert ref.terminal_id == "term_v075"
 
     # pane.split は workspace / 分割元を明示するので focused 相乗りは起きない。
@@ -2110,19 +1788,11 @@ def test_v075_spawn_splits_pane_then_starts_agent(
     assert 3000 < ap["timeout_ms"] <= 300000
 
 
-def test_v075_spawn_does_not_move_pane(server: FakeHerdrServer, tmp_path):
-    """配置が決定的なので戦略 C (spawn-then-move) は使わない。"""
-    _wire_spawn_v075(server)
-    a = _adapter(server)
-    a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
-    assert "pane.move" not in server.methods_called()
-
-
 def test_v075_root_pane_is_closed_but_never_the_agent_pane(
     server: FakeHerdrServer, tmp_path
 ):
     """root cleanup が agent pane を殺さないこと (Codex Blocker 4)。"""
-    _wire_spawn_v075(server, pane_id="w1:p2")
+    _wire_spawn(server, pane_id="w1:p2")
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     closed = [
@@ -2141,7 +1811,7 @@ def test_v075_agent_pane_equal_to_root_is_not_closed(
     残したままだと **次の spawn がこの agent の pane を閉じてしまう** ため、
     root_pane_id は必ずクリアする。
     """
-    _wire_spawn_v075(server, pane_id="w1:p1")  # split が root と同じ id を返す縁ケース
+    _wire_spawn(server, pane_id="w1:p1")  # split が root と同じ id を返す縁ケース
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     assert "pane.close" not in server.methods_called()
@@ -2152,7 +1822,7 @@ def test_v075_agent_pane_busy_is_retried(server: FakeHerdrServer, tmp_path, monk
     """pane 生成直後の shell 起動レースは retry で吸収する (Codex Blocker 5)。"""
     slept: list[float] = []
     monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(slept.append))
-    _wire_spawn_v075(server, busy_times=2)
+    _wire_spawn(server, busy_times=2)
     a = _adapter(server)
     ref = a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     assert ref.pane_id == "w1:p2"
@@ -2164,7 +1834,7 @@ def test_v075_agent_pane_busy_exhausted_raises(
     server: FakeHerdrServer, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
-    _wire_spawn_v075(server, busy_times=999)
+    _wire_spawn(server, busy_times=999)
     a = _adapter(server)
     with pytest.raises(HerdrError) as exc:
         a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
@@ -2177,7 +1847,7 @@ def test_v075_permanent_agent_error_is_not_retried(
 ):
     """恒久的な引数不正 (未対応 kind) は retry せず即座に返す。"""
     monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     server.on(
         "agent.start",
         {"error": {"code": "unsupported_agent_kind", "message": "nope"}},
@@ -2192,7 +1862,7 @@ def test_v075_permanent_agent_error_is_not_retried(
 # --- agent name (herdr 0.7.5 の ^[a-z][a-z0-9_-]{0,31}$) --------------------
 
 def test_v075_agent_name_matches_herdr_regex(server: FakeHerdrServer, tmp_path):
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     assert AGENT_NAME_RE.match(server.params_for("agent.start")["name"])
@@ -2206,7 +1876,6 @@ def test_v075_agent_name_is_compliant_and_unique(
     server: FakeHerdrServer, space_key: str
 ) -> None:
     """短縮しても regex 適合かつ同時 spawn で衝突しないこと (Codex Major 2)。"""
-    server.protocol = 17
     a = _adapter(server)
     names = [a._agent_name(space_key) for _ in range(500)]
     for n in names:
@@ -2215,15 +1884,7 @@ def test_v075_agent_name_is_compliant_and_unique(
     assert len(set(names)) == len(names)  # counter が一意性を担う
 
 
-def test_legacy_agent_name_format_is_unchanged(server: FakeHerdrServer) -> None:
-    """legacy 経路の name は従来どおり (0.7.4 pin 運用の可読性を変えない)。"""
-    a = _adapter(server)  # protocol 16
-    name = a._agent_name(SPACE_CONTROL)
-    assert name.startswith(f"{a.label_prefix}/{a.org_instance_id}/g{a.generation}/")
-    assert "/" in name
-
-
-# --- venv 継承 (Issue #130 との衝突を protocol で分ける) --------------------
+# --- venv 継承 (Issue #130 / #151 A) ---------------------------------------
 
 def test_v075_venv_path_is_exported_after_pane_creation(
     server: FakeHerdrServer, tmp_path
@@ -2234,7 +1895,7 @@ def test_v075_venv_path_is_exported_after_pane_creation(
     打ち込みは pane が prompt に戻った後に効くので、profile が PATH を再構築して
     .venv/bin を消す Issue #130 Blocker 2 が構造的に起きない。
     """
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     a = _adapter(server)
     a.spawn(
         ["claude"], cwd=str(tmp_path), kind="claude",
@@ -2252,17 +1913,15 @@ def test_v075_venv_path_is_exported_after_pane_creation(
 
 
 def test_v075_no_venv_sends_nothing(server: FakeHerdrServer, tmp_path):
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     a = _adapter(server)
     a.spawn(["claude"], cwd=str(tmp_path), kind="claude", env={"X": "1"})
     assert "pane.send_text" not in server.methods_called()
 
 
-def test_venv_path_via_pane_env_flag_follows_protocol(server: FakeHerdrServer):
-    """broker が読む能力フラグは protocol に追従する (legacy は wrapper 方式のまま)。"""
-    assert _adapter(server).venv_path_via_pane_env is False
-    server.protocol = 17
-    assert _adapter(server).venv_path_via_pane_env is True
+def test_venv_path_via_pane_env_flag_is_true() -> None:
+    """broker が読む能力フラグ。agent.start に argv が無く wrapper を運べないため。"""
+    assert HerdrAdapter.venv_path_via_pane_env is True
 
 
 # --- generic spawn (kind なし) ---------------------------------------------
@@ -2275,29 +1934,13 @@ def test_v075_generic_spawn_uses_send_text_not_agent_start(
     0.7.5 の kind は許容ラベル制で任意コマンドに対応する値が無く、使うと
     unsupported_agent_kind になるため。
     """
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     a = _adapter(server)
     ref = a.spawn(["sh", "-c", "echo 'a b'"], cwd=str(tmp_path), kind=None)
     assert "agent.start" not in server.methods_called()
     assert ref.pane_id == "w1:p2"
     # 打ち込みはシェルが再度 word splitting するので quote が要る。
     assert server.params_for("pane.send_text")["text"] == "sh -c 'echo '\"'\"'a b'\"'\"''\n"
-
-
-# --- legacy 経路の非退行 ----------------------------------------------------
-
-def test_legacy_spawn_wire_is_unchanged_by_kind_argument(
-    server: FakeHerdrServer, tmp_path
-):
-    """kind を受け取っても legacy の agent.start wire は一切変わらないこと。"""
-    _wire_spawn(server)
-    a = _adapter(server)
-    a.spawn(["claude", "--x"], cwd=str(tmp_path), kind="claude")
-    ap = server.params_for("agent.start")
-    assert ap["argv"] == ["claude", "--x"]   # argv をそのまま渡す (wrapper 温存)
-    assert "kind" not in ap
-    assert "pane_id" not in ap
-    assert "pane.split" not in server.methods_called()
 
 
 # --- v075 失敗経路で確保した pane を必ず回収する (self-review Major) -------
@@ -2321,13 +1964,13 @@ def test_v075_failed_agent_start_closes_the_split_pane(
     """
     monkeypatch.setattr(HerdrAdapter, "_sleep", staticmethod(lambda _s: None))
     if wire == "permanent":
-        _wire_spawn_v075(server)
+        _wire_spawn(server)
         server.on(
             "agent.start",
             {"error": {"code": "unsupported_agent_kind", "message": "nope"}},
         )
     else:
-        _wire_spawn_v075(server, **wire)
+        _wire_spawn(server, **wire)
     a = _adapter(server)
     with pytest.raises(HerdrError) as exc:
         a.spawn(["claude"], cwd=str(tmp_path), kind="claude",
@@ -2345,7 +1988,7 @@ def test_v075_failed_send_text_closes_the_split_pane(
     server: FakeHerdrServer, tmp_path
 ):
     """agent.start 以前 (venv 打ち込み) で失敗した場合も回収すること。"""
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     server.on("pane.send_text", {"error": {"code": "pane_not_found", "message": "x"}})
     a = _adapter(server)
     with pytest.raises(HerdrError):
@@ -2363,7 +2006,7 @@ def test_v075_agent_landing_in_a_different_pane_is_an_error(
 ):
     """応答が別 pane を指したら PaneRef を返さない (起動していない pane を
     agent として登録させない)。"""
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     server.on(
         "agent.start",
         lambda p: {"type": "agent_started", "argv": [],
@@ -2381,7 +2024,7 @@ def test_v075_timeout_ms_is_derived_from_socket_timeout(
 ):
     """timeout_ms が socket timeout 由来の実値であること (範囲だけの assert は
     clamp のせいで常に真になり退行を捕まえられない)。"""
-    _wire_spawn_v075(server)
+    _wire_spawn(server)
     a = HerdrAdapter(socket_path=server.path, timeout=12.0)
     a.spawn(["claude"], cwd=str(tmp_path), kind="claude")
     assert server.params_for("agent.start")["timeout_ms"] == 12000

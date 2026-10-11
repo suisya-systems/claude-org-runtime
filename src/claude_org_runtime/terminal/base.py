@@ -83,7 +83,7 @@ class PaneRef:
     backend での「タブ / ウィンドウ」相当 (tmux では window_id / session を充てる)。
 
     terminal_id は backend が付ける **プロセス/端末の安定 identity** (Herdr
-    ``terminal_id``)。pane_id は移送 (pane.move) や backend の id 再利用で変わりうるが
+    ``terminal_id``)。pane_id は pane の移動や backend の id 再利用で変わりうるが
     terminal_id はプロセスに紐づき不変 (Issue #114 実測)。broker はこれを reaper の
     id 再利用ガード (workspace 非依存 liveness と照合) に使う。持たない backend
     (tmux/wezterm) は ``None`` (id 再利用ガードは効かないが従来経路は不変)。
