@@ -29,6 +29,8 @@ from claude_org_runtime.attention.readers import (
 )
 from claude_org_runtime.broker.server import Broker
 
+from ..broker.conftest import FakeClock
+
 
 def _registered(b: Broker, agent_id: str):
     tok = b.issue_token(agent_id, agent_id, "worker")
@@ -139,13 +141,15 @@ def test_real_broker_adopt_expiry_reaches_the_attention_layer(
     this journal line is the failure report, and it only helps anyone if
     it survives the trip through the reader and the classifier.
     """
-    b, cred = _adopt_ready(tmp_path / "broker", adopt_arming_seconds=0.05)
+    clock = FakeClock()
+    b, cred = _adopt_ready(tmp_path / "broker", adopt_arming_seconds=0.05,
+                           clock=clock)
     b.register_delivery_instance(cred, "inst-old")
     res = b.adopt_delivery("secretary")
     assert res["ok"] is True
-    # Lower-bound claim only: the deadline is behind us, so the next
-    # delivery-side entry point has to fail the adoption.
-    time.sleep(0.2)
+    # The deadline is behind us, so the next delivery-side entry point
+    # has to fail the adoption.
+    clock.advance(0.2)
     b.adopt_status("secretary")
 
     rows = read_broker_delivery_signals(
@@ -214,7 +218,9 @@ def test_completed_adopt_produces_no_attention_event(tmp_path: Path) -> None:
     handover would page the operator and the urgent tier would stop
     meaning anything.
     """
-    b, cred = _adopt_ready(tmp_path / "broker", adopt_arming_seconds=0.05)
+    clock = FakeClock()
+    b, cred = _adopt_ready(tmp_path / "broker", adopt_arming_seconds=0.05,
+                           clock=clock)
     b.register_delivery_instance(cred, "inst-old")
     res = b.adopt_delivery("secretary")
     reg = b.register_delivery_instance(
@@ -222,7 +228,7 @@ def test_completed_adopt_produces_no_attention_event(tmp_path: Path) -> None:
     )
     assert reg["ok"] is True
     # Past the original deadline: a completed adopt must not expire.
-    time.sleep(0.2)
+    clock.advance(0.2)
     b.adopt_status("secretary")
 
     rows = read_broker_delivery_signals(

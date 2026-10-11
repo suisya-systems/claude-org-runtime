@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import json
+import types
 
 import jsonschema
 import pytest
 
-from claude_org_runtime.broker import surface
+from claude_org_runtime.broker import surface, user_turn
 from claude_org_runtime.broker.server import Broker
 from claude_org_runtime.broker.surface import ToolArgError, dispatch_tool
 from claude_org_runtime.broker.user_turn import (
@@ -16,7 +17,22 @@ from claude_org_runtime.broker.user_turn import (
 )
 from claude_org_runtime.schema import broker_queue_event_schema
 
+from .conftest import FakeClock
+
 RULE = "─" * 40
+
+
+@pytest.fixture(autouse=True)
+def _virtual_time(monkeypatch):
+    """settle / submit の待ち窓を仮想時間で回す (Issue #210)。
+
+    sleep は時計を進めるだけなので、窓が切れるのは「何回 poll したか」で決まり、
+    遅い runner (Windows の sleep 分解能 ~15ms) でも 2 フレーム目を取りこぼさない。
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(user_turn, "time",
+                        types.SimpleNamespace(monotonic=clock, sleep=clock.advance))
+    return clock
 
 
 def composer(content: str = "", footer: str = "  ? for shortcuts") -> str:

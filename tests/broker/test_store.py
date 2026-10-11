@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+from claude_org_runtime.broker import store
 from claude_org_runtime.broker.server import Broker
 
 # An "idle" Claude TUI screen per classify_pane_state: a bare "❯ " prompt.
@@ -133,11 +134,11 @@ def _wait_sent(adapter: FakeAdapter, n: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _claim_and_die(tmp_path, *, confirm: bool):
+def _claim_and_die(tmp_path, clock, *, confirm: bool):
     """enqueue -> 初回 nudge -> sidecar claim。confirm しなければ sidecar 死亡を模す。"""
     adapter = FakeAdapter(IDLE_SCREEN)
-    b = Broker(state_dir=tmp_path, adapter=adapter, lease_seconds=0.2,
-               nudge_defer_interval=0.01)
+    b = Broker(state_dir=tmp_path, adapter=adapter, lease_seconds=30.0,
+               nudge_defer_interval=0.01, clock=clock)
     src = _registered(b, "src")
     dst = _registered(b, "dst", pane_id="%9")
     dc = b.issue_delivery_cred("dst")
@@ -151,20 +152,46 @@ def _claim_and_die(tmp_path, *, confirm: bool):
     if confirm:
         assert b.confirm_delivered(
             dc, res["rows"][0]["id"], res["epoch"], gen, "i1")["ok"] is True
+    with b._lock:
+        assert "dst" in b._lease_watch_armed   # claim が lease watch を張った
+    # lease 失効 -> watch timer 発火 (実時間の Timer を待たず偽の時計で決定的に)。
+    clock.advance(31.0)
+    b._lease_watch_fire("dst")
     return b, adapter, dst
 
 
-def test_claim_before_confirm_death_renudges_on_lease_expiry(tmp_path):
+def test_claim_before_confirm_death_renudges_on_lease_expiry(tmp_path, clock):
     # Issue #78: claim 後 confirm 前に sidecar が死んでも、他の RPC 無しで lease
     # 失効時に reap + 再 nudge され、check_messages で配達される (at-least-once)。
-    b, adapter, dst = _claim_and_die(tmp_path, confirm=False)
+    b, adapter, dst = _claim_and_die(tmp_path, clock, confirm=False)
     assert _wait_sent(adapter, 2)
     assert [m["message"] for m in b.drain(dst)] == ["survive-me"]
 
 
-def test_confirmed_claim_does_not_renudge(tmp_path):
-    b, adapter, _dst = _claim_and_die(tmp_path, confirm=True)
-    time.sleep(0.5)  # lease (0.2s) 失効後も再 nudge しない
+def test_lease_watch_before_expiry_does_not_reap(tmp_path, clock):
+    # 期限前の発火 (早着火) は reap せず、残存 claim の期限で張り直すだけ。
+    adapter = FakeAdapter(IDLE_SCREEN)
+    b = Broker(state_dir=tmp_path, adapter=adapter, lease_seconds=30.0,
+               nudge_defer_interval=0.01, clock=clock)
+    src = _registered(b, "src")
+    _registered(b, "dst", pane_id="%9")
+    dc = b.issue_delivery_cred("dst")
+    gen = b.register_delivery_instance(dc, "i1")["generation"]
+    b.enqueue(src, "dst", "m")
+    assert _wait_sent(adapter, 1)
+    assert len(b.poll_claims(dc, gen, "i1")["rows"]) == 1
+    clock.advance(29.0)
+    rearmed: list[tuple[str, float]] = []
+    b._arm_lease_watch = lambda owner, delay: rearmed.append((owner, delay))
+    b._lease_watch_fire("dst")
+    with b._lock:
+        assert [r.state for r in b._rows.values()] == ["CLAIMED"]
+    assert rearmed == [("dst", pytest.approx(1.0 + store._LEASE_WATCH_MARGIN))]
+    assert len(adapter.sent) == 1
+
+
+def test_confirmed_claim_does_not_renudge(tmp_path, clock):
+    b, adapter, _dst = _claim_and_die(tmp_path, clock, confirm=True)
     assert len(adapter.sent) == 1
     with b._lock:
         assert b._lease_watch_armed == set()

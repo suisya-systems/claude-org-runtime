@@ -116,15 +116,15 @@ def test_check_messages_drains_unclaimed(tmp_path):
     assert b.drain(dst) == []  # at-most-once on DELIVERED
 
 
-def test_lease_reap_recovers_dead_sidecar(tmp_path):
+def test_lease_reap_recovers_dead_sidecar(tmp_path, clock):
     """confirm されないまま lease 失効した行は再 eligible 化し喪失しない (§9.3)。"""
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.enqueue(src, "dst", "survive-me")
     dc, gen, iid = _sidecar(b, "dst")
     res = b.poll_claims(dc, gen, iid)  # CLAIMED (sidecar 死亡で confirm せず)
     assert _row_states(b, "dst") == [CLAIMED]
-    time.sleep(0.1)  # lease 失効を待つ
+    clock.advance(0.1)  # lease 失効まで進める
     # check_messages (pull fallback) が reap して再配達する = 喪失しない。
     msgs = b.drain(dst)
     assert [m["message"] for m in msgs] == ["survive-me"]
@@ -133,15 +133,15 @@ def test_lease_reap_recovers_dead_sidecar(tmp_path):
     assert row.reclaim_count == 1
 
 
-def test_confirm_after_lease_expiry_rejected(tmp_path):
+def test_confirm_after_lease_expiry_rejected(tmp_path, clock):
     """lease 失効後の confirm は not_claimed で拒否 (reap で UNDELIVERED へ戻る)。"""
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     dc, gen, iid = _sidecar(b, "dst")
     b.enqueue(src, "dst", "x")
     res = b.poll_claims(dc, gen, iid)
     rid = res["rows"][0]["id"]
-    time.sleep(0.1)
+    clock.advance(0.1)
     conf = b.confirm_delivered(dc, rid, res["epoch"], gen, iid)
     assert conf["ok"] is False and conf["error"] == "not_claimed"
 
@@ -960,15 +960,15 @@ def test_no_observer_lease_keeps_last_register_wins(tmp_path):
     assert b.register_delivery_instance(dc, "i2")["generation"] == 2   # bump 継続
 
 
-def test_observer_lease_armed_survives_slow_startup(tmp_path):
+def test_observer_lease_armed_survives_slow_startup(tmp_path, clock):
     """Codex P2: assert から初回 register までの起動遅延が TTL を超えても、armed lease は
     失効しない (register 前に wall-clock で失効すると fork/replay 保護が黙って外れる)。
     初回 observed register まで fork は unobserved で弾かれ続ける。"""
-    b = Broker(state_dir=tmp_path, adapter=None, observer_lease_seconds=0.1)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, observer_lease_seconds=0.1)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
     dc = b.issue_delivery_cred("sec")
-    time.sleep(0.2)   # TTL(0.1) を超える起動遅延 (段1 folder-trust 放置等)
+    clock.advance(0.2)   # TTL(0.1) を超える起動遅延 (段1 folder-trust 放置等)
     # armed lease は失効していない: 秘密無し fork は依然 refuse される。
     assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
             == "observer_pending")
@@ -979,7 +979,7 @@ def test_observer_lease_armed_survives_slow_startup(tmp_path):
     assert dumped["state"] == "active" and isinstance(dumped["expires_at"], float)
 
 
-def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
+def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path, clock):
     """**この挙動は Issue #169 で意図的に変えた。元に戻さないこと。**
 
     以前ここは「poll が止まって TTL 経過 -> lease 失効 -> 秘密無し register が通る」を
@@ -997,11 +997,11 @@ def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
     (pane の close/reap、再 spawn の re-assert、adopt #166) だけが開ける。止まっていた
     現職が戻ってくれば lease は active に戻る。
     """
-    # 時間の刻みについて: 「renew されているから active のまま」は **上限側** の主張
-    # なので、遅い CI runner (Windows) でスケジューリングが遅れると偽陽性で落ちる。
-    # 1 回の poll 間隔 (0.2) を TTL (1.0) の 1/5 に取って余裕を持たせつつ、合計経過
-    # (0.8) は TTL を超えるようにして「renew が効いている」ことは依然として証明する。
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+    # 時間は偽の時計で進める (Issue #210)。「renew されているから active のまま」は
+    # **上限側** の主張で、wall-clock だと遅い CI runner (Windows) で偽陽性になる。
+    # 1 回の poll 間隔 (0.2) は TTL (1.0) 未満、合計経過 (0.8) は TTL 超にして
+    # 「renew が効いている」ことを証明する。
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
                observer_lease_seconds=1.0)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
@@ -1009,12 +1009,12 @@ def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
     gen = b.register_delivery_instance(dc, "obs", observer=secret)["generation"]
     # poll が renew するので、TTL 超の合計時間でも lease は active のまま。
     for _ in range(4):
-        time.sleep(0.2)
+        clock.advance(0.2)
         b.poll_claims(dc, gen, "obs")
     assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
     # poll を止めて TTL 経過 -> stale。**fence は維持される** (こちらは下限側の主張
     # なので、遅れて到達しても結論は変わらない)。
-    time.sleep(1.2)
+    clock.advance(1.2)
     assert b.delivery_dump()["observers"]["sec"]["state"] == "stale"
     assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
             == "observer_pending")
@@ -1023,7 +1023,7 @@ def test_observer_lease_stays_fenced_after_the_heartbeat_stops(tmp_path):
     b.poll_claims(dc, gen, "obs")
     assert b.delivery_dump()["observers"]["sec"]["state"] == "active"
     # 秘密を持つ本人は stale の間も register できる (pane 内で sidecar が再起動した等)。
-    time.sleep(1.2)
+    clock.advance(1.2)
     assert b.register_delivery_instance(dc, "obs2", observer=secret)["ok"] is True
 
 
@@ -1114,7 +1114,7 @@ def test_spawn_claude_lease_fences_fork_but_not_the_spawned_session(
 
 
 def test_spawn_claude_lease_armed_survives_a_session_slower_than_the_ttl(
-    tmp_path, fake_adapter,
+    tmp_path, clock, fake_adapter,
 ):
     """acceptance (#165): 起動が TTL より遅い session が TTL で fence されない。
 
@@ -1122,7 +1122,7 @@ def test_spawn_claude_lease_armed_survives_a_session_slower_than_the_ttl(
     poll heartbeat で renew) を spawn 経路で固定する。段1 folder-trust プロンプトの
     放置等で初回 register が TTL を大きく超えても、秘密を持つ session は登録できる。
     """
-    b = Broker(state_dir=tmp_path, adapter=fake_adapter,
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=fake_adapter,
                observer_lease_seconds=0.1)
     fake_adapter.add_pane(active=True)
     disp = _ops(b)
@@ -1131,7 +1131,7 @@ def test_spawn_claude_lease_armed_survives_a_session_slower_than_the_ttl(
     secret = _pane_env(fake_adapter)["ORG_BROKER_CHANNEL_OBSERVER"]
     dc = [t for t, bd in b._binds.items()
           if bd.agent_id == "slow" and bd.scope == "delivery"][0]
-    time.sleep(0.25)          # TTL(0.1) の 2 倍以上の起動遅延
+    clock.advance(0.25)          # TTL(0.1) の 2 倍以上の起動遅延
     # armed lease は失効していないので fork はまだ弾かれる。
     assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
             == "observer_pending")
@@ -1348,14 +1348,14 @@ def test_superseded_instance_cannot_win_the_claim_back_by_retrying(tmp_path):
     assert b._delivery_instances["sec"] == "new"
 
 
-def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path):
+def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path, clock):
     """acceptance (#169): stand-down した session が **再起動なしで** 回復する。
 
     ただし回復の条件は「粘ったから」でも「時間が経ったから」でもなく、**外部が
     現職の消滅を宣言したから** — ここでは pane の close/reap
     (:meth:`reset_delivery_state`)、つまり broker が実際に観測した死。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
                observer_lease_seconds=0.2)
     _registered(b, "sec")
     secret = b.assert_observer("sec")
@@ -1366,7 +1366,7 @@ def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path):
         b.poll_claims(dc, gen, "obs")
         assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
                 == "observer_pending")
-    time.sleep(0.3)                                    # heartbeat 途絶 (stale) でも同じ
+    clock.advance(0.3)                                    # heartbeat 途絶 (stale) でも同じ
     assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
             == "observer_pending")
     # pane が実際に閉じた (close_pane / reap) -> lease は落ちる -> 同じ再試行が通る。
@@ -1375,7 +1375,7 @@ def test_pending_instance_recovers_when_the_pane_actually_dies(tmp_path):
     assert b.register_delivery_instance(dc, "manual", observer=None)["ok"] is True
 
 
-def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, fake_adapter):
+def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, clock, fake_adapter):
     """sticky lease の主要な解除経路 (pane の close/reap) は **opportunistic** で、
     ``resolve_target`` / ``_reserve_name`` を通る入口からしか走らない。``/claim-owner``
     は store にしか届かないので、pane が broker の外で死ぬ (crash / 端末ごと閉じる) と
@@ -1391,7 +1391,7 @@ def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, fake_a
     ここで直るのは「stale lease が pane より長生きして bookkeeping が残り続ける」方で、
     同 agent_id の **新しい spawn** は綺麗な状態から始められる。
     """
-    b = Broker(state_dir=tmp_path, adapter=fake_adapter, lease_seconds=0.0,
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=fake_adapter, lease_seconds=0.0,
                observer_lease_seconds=0.1)
     fake_adapter.add_pane(active=True)
     disp = _ops(b)
@@ -1401,7 +1401,7 @@ def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, fake_a
     dc = [t for t, bd in b._binds.items()
           if bd.agent_id == "w" and bd.scope == "delivery"][0]
     b.register_delivery_instance(dc, "orig", observer=secret)
-    time.sleep(0.15)                                  # heartbeat 途絶 -> stale
+    clock.advance(0.15)                                  # heartbeat 途絶 -> stale
     # pane が **生きている** 間は stale でも fence を維持する (Ctrl+Z / suspend 相当)。
     assert (b.register_delivery_instance(dc, "manual", observer=None)["error"]
             == "observer_pending")
@@ -1423,14 +1423,14 @@ def test_stale_lease_is_released_when_the_pane_died_out_of_band(tmp_path, fake_a
     assert b._observer_leases["w"].secret == fresh
 
 
-def test_spawn_lease_expires_if_it_is_never_activated(tmp_path, fake_adapter):
+def test_spawn_lease_expires_if_it_is_never_activated(tmp_path, clock, fake_adapter):
     """acceptance (#165 の安全弁): 秘密が子へ届かない環境で恒久無音にならない。
 
     spawn 経路の lease は活性化期限つき。期限内に一度も observed register が来なければ
     (= 誰も秘密を提示できていない = 守るべき現職が存在しない)、lease を落として今日の
     last-register-wins に戻す。保護が外れる瞬間なので journal に必ず残す。
     """
-    b = Broker(state_dir=tmp_path, adapter=fake_adapter, observer_arming_seconds=0.1)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=fake_adapter, observer_arming_seconds=0.1)
     fake_adapter.add_pane(active=True)
     disp = _ops(b)
     dispatch_tool(b, disp, "spawn_claude_pane",
@@ -1441,21 +1441,21 @@ def test_spawn_lease_expires_if_it_is_never_activated(tmp_path, fake_adapter):
     assert (b.register_delivery_instance(dc, "no-secret")["error"]
             == "observer_pending")
     assert b.delivery_dump()["observers"]["w"]["state"] == "armed"
-    time.sleep(0.15)
+    clock.advance(0.15)
     # 期限切れ: lease が落ちて今日の挙動 (last-register-wins) に戻る。
     assert b.register_delivery_instance(dc, "no-secret")["ok"] is True
     assert "w" not in b._observer_leases
     assert _journal_events(b, "observer_arming_expired")[0]["owner"] == "w"
 
 
-def test_secretary_path_lease_never_expires_while_armed(tmp_path):
+def test_secretary_path_lease_never_expires_while_armed(tmp_path, clock):
     """launcher / secretary 経路は **無期限 armed** のまま (段1 folder-trust は人間の
     承認待ちで、分どころか時間オーダーで放置されうる)。活性化期限は spawn 経路だけ。"""
-    b = Broker(state_dir=tmp_path, adapter=None, observer_arming_seconds=0.1)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, observer_arming_seconds=0.1)
     _registered(b, "sec")
     secret = b.assert_observer("sec")          # arming_seconds を渡さない = 無期限
     dc = b.issue_delivery_cred("sec")
-    time.sleep(0.15)
+    clock.advance(0.15)
     assert (b.register_delivery_instance(dc, "fork", observer=None)["error"]
             == "observer_pending")
     assert b.register_delivery_instance(dc, "obs", observer=secret)["ok"] is True
@@ -1882,19 +1882,19 @@ def test_adopt_rejects_invalid_in_flight_and_arming_seconds(tmp_path):
     assert "dst" not in b._delivery_generations
 
 
-def test_adopt_expires_when_the_adopting_session_never_registers(tmp_path):
+def test_adopt_expires_when_the_adopting_session_never_registers(tmp_path, clock):
     """期限内に adopting register が来なければ adopt は **失敗** で、必ず journal に残る。
 
     adopt は旧 sidecar をその場で降ろすので、起動に失敗すると誰も配達しない owner が
     残る。この失敗が沈黙すると「秘密は出したので成功」という最悪の記録だけが残り、
     attention watcher が operator へ能動通知する材料も無くなる。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
     _registered(b, "dst")
     b.issue_delivery_cred("dst")
     res = b.adopt_delivery("dst")
     assert res["arming_seconds"] == 0.05
-    time.sleep(0.1)                       # 期限を **過ぎた** ことだけを主張する
+    clock.advance(0.1)                       # 期限を **過ぎた** ことだけを主張する
     b.adopt_status("dst")                 # sweep 入口
     expired = _journal_events(b, "delivery_adopt_expired")
     assert len(expired) == 1
@@ -1905,7 +1905,7 @@ def test_adopt_expires_when_the_adopting_session_never_registers(tmp_path):
     assert b.adopt_status("dst")["pending"] is None
 
 
-def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path):
+def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path, clock):
     """**回帰**: 期限切れは lease を落とすだけでは足りない。fence 前の
     ``(generation, instance)`` を戻して、旧 sidecar の配達を実際に復活させる。
 
@@ -1916,13 +1916,13 @@ def test_expired_adopt_restores_the_previous_sidecars_delivery_path(tmp_path):
     ``poll_claims`` が通ることで固定する (ここは fenced sidecar の poll 自身が sweep 入口
     でもある)。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
                adopt_arming_seconds=0.05)
     src, _dst = _registered(b, "src"), _registered(b, "dst")
     dc, gen, iid = _sidecar(b, "dst")
     b.adopt_delivery("dst")
     b.enqueue(src, "dst", "back-to-the-incumbent")
-    time.sleep(0.1)
+    clock.advance(0.1)
     rows = b.poll_claims(dc, gen, iid)["rows"]
     assert [r["entry"]["message"] for r in rows] == ["back-to-the-incumbent"]
     assert b._delivery_generations["dst"] == gen
@@ -2004,20 +2004,20 @@ def test_adopt_does_not_leave_two_live_processes_sharing_one_bind(tmp_path):
                 if bd.agent_id == "dst" and bd.scope == "full"]) == 1
 
 
-def test_expired_adopt_gives_the_previous_process_its_token_back(tmp_path):
+def test_expired_adopt_gives_the_previous_process_its_token_back(tmp_path, clock):
     """**回帰**: 失効時は token 付け替えも巻き戻す。
 
     巻き戻さないと「配達は旧 session に返したが MCP 面は締め出したまま」という半死
     状態になる。復帰は配達経路だけでなく、その session が broker と話す手段まで含めて
     初めて原状復帰になる。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
     _registered(b, "dst")
     old_token = [t for t, bd in b._binds.items()
                  if bd.agent_id == "dst" and bd.scope == "full"][0]
     b.issue_delivery_cred("dst")
     adopted = b.adopt_delivery("dst")["_owner_token"]
-    time.sleep(0.1)
+    clock.advance(0.1)
     b.adopt_status("dst")                          # sweep 入口
 
     assert b.get_bind(old_token) is not None       # 旧プロセスの token が戻る
@@ -2026,7 +2026,7 @@ def test_expired_adopt_gives_the_previous_process_its_token_back(tmp_path):
 
 
 def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
-    tmp_path, fake_adapter,
+    tmp_path, clock, fake_adapter,
 ):
     """**回帰**: 切り離した pane が既に閉じられていたら ``restored`` を名乗らない。
 
@@ -2036,7 +2036,7 @@ def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
     復帰できない時は復帰できないと言う方が、operator は次の一手 (再 adopt / 再 spawn) を
     選べる。
     """
-    b = Broker(state_dir=tmp_path, adapter=fake_adapter, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=fake_adapter, adopt_arming_seconds=0.05)
     fake_adapter.add_pane(active=True)
     disp = _ops(b)
     out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
@@ -2049,7 +2049,7 @@ def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
     res = b.adopt_delivery("w")
     assert res["detached_panes"] == [str(out["id"])]
     b.close_pane_target(str(out["id"]))            # 抜け殻を閉じる
-    time.sleep(0.1)
+    clock.advance(0.1)
     b.adopt_status("w")                            # sweep 入口
 
     expired = _journal_events(b, "delivery_adopt_expired")[0]
@@ -2059,7 +2059,7 @@ def test_expired_adopt_does_not_claim_it_restored_a_closed_pane(
 
 
 def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
-    tmp_path, fake_adapter,
+    tmp_path, clock, fake_adapter,
 ):
     """**回帰**: ``force`` は原状 **一式** を引き継ぐ (generation だけではない)。
 
@@ -2069,7 +2069,7 @@ def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
     空なので既に閉じた pane を「まだ在る」と誤判定して死んだ instance を ``restored``
     と名乗る。一式を丸ごと写すことで、復帰状態を将来足しても引き継ぎ漏れが起きない。
     """
-    b = Broker(state_dir=tmp_path, adapter=fake_adapter, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=fake_adapter, adopt_arming_seconds=0.05)
     fake_adapter.add_pane(active=True)
     disp = _ops(b)
     out = _text(dispatch_tool(b, disp, "spawn_claude_pane",
@@ -2086,7 +2086,7 @@ def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
     second = b.adopt_delivery("w", force=True)
     # 2 回目は既に切り離し済なので detached は空 — ここで現状を撮ると pane 情報を失う。
     assert second["detached_panes"] == []
-    time.sleep(0.1)
+    clock.advance(0.1)
     b.adopt_status("w")                            # sweep 入口
 
     expired = _journal_events(b, "delivery_adopt_expired")[-1]
@@ -2102,7 +2102,7 @@ def test_forced_adopt_carries_the_whole_rollback_state_not_just_the_generation(
     assert b._pane_meta[str(out["id"])].get("adopted_away") is None
 
 
-def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path):
+def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_path, clock):
     """**回帰**: ``force`` で先行 adopt を supersede した時、復帰先は先行 adopt が
     fence した **後** の中間状態ではなく、最初に fence する前の現職でなければならない。
 
@@ -2111,32 +2111,32 @@ def test_forced_adopt_expiry_restores_the_original_incumbent_not_the_fence(tmp_p
     空のままの generation が入り、元の sidecar は stale のまま = 復帰したつもりで owner は
     無音のまま残る。adopt を 2 回続けて失敗させるという、最も慌てている時に踏む経路。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, lease_seconds=30.0,
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, lease_seconds=30.0,
                adopt_arming_seconds=0.05)
     src, _dst = _registered(b, "src"), _registered(b, "dst")
     dc, gen, iid = _sidecar(b, "dst")
     b.adopt_delivery("dst")                       # 1 回目: 現職を fence
     b.adopt_delivery("dst", force=True)           # 2 回目: 1 回目を supersede
     b.enqueue(src, "dst", "back-to-the-original-incumbent")
-    time.sleep(0.1)
+    clock.advance(0.1)
     rows = b.poll_claims(dc, gen, iid)["rows"]    # 元の現職が復活していること
     assert [r["entry"]["message"] for r in rows] == ["back-to-the-original-incumbent"]
     assert b._delivery_generations["dst"] == gen
     assert b._delivery_instances["dst"] == iid
 
 
-def test_expired_adopt_does_not_clobber_a_lease_installed_after_the_deadline(tmp_path):
+def test_expired_adopt_does_not_clobber_a_lease_installed_after_the_deadline(tmp_path, clock):
     """compare-and-delete: 期限切れが落とすのは **自分が張った lease だけ**。
 
     期限後に別経路 (再 spawn の re-assert / 後続 adopt) が張り直した lease を巻き添えに
     すると、今まさに有効な fork 保護が黙って外れる。新しい session は mute されないので
     誰も気付かないまま、replay した fork が takeover できる状態に戻る。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
     _registered(b, "dst")
     dc = b.issue_delivery_cred("dst")
     b.adopt_delivery("dst")
-    time.sleep(0.1)
+    clock.advance(0.1)
     fresh = b.assert_observer("dst")      # 期限後に張り直された別 caller の lease
     b.adopt_status("dst")                 # sweep 入口
     assert b._pending_adoptions == {}
@@ -2175,18 +2175,18 @@ def test_expired_adopt_does_not_restore_the_fence_after_someone_registered(tmp_p
     assert [r["entry"]["message"] for r in rows] == ["for-the-live-session"]
 
 
-def test_an_expired_adoption_does_not_block_the_next_adopt(tmp_path):
+def test_an_expired_adoption_does_not_block_the_next_adopt(tmp_path, clock):
     """失敗した adopt が owner を人質に取らない。
 
     sweep が adopt 入口の先頭に無いと、1 回目が失敗した owner は期限の記録が残ったまま
     ``[adopt_in_flight]`` を返し続け、operator は「既に死んでいる adopt」に対して
     ``force`` を強要される (force は先行 session を降ろす意味を持つので、意味論が濁る)。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
     _registered(b, "dst")
     b.issue_delivery_cred("dst")
     first = b.adopt_delivery("dst")
-    time.sleep(0.1)
+    clock.advance(0.1)
     second = b.adopt_delivery("dst")
     assert second["ok"] is True and second["adoption_id"] != first["adoption_id"]
     assert _journal_events(b, "delivery_adopt_expired")[0]["adoption_id"] == \
@@ -2195,19 +2195,19 @@ def test_an_expired_adoption_does_not_block_the_next_adopt(tmp_path):
     assert _journal_events(b, "delivery_adopt_superseded") == []
 
 
-def test_expired_adopt_is_swept_by_check_messages_when_nothing_polls(tmp_path):
+def test_expired_adopt_is_swept_by_check_messages_when_nothing_polls(tmp_path, clock):
     """poll 入口だけに sweep を置かない。
 
     adopt の主用途は「session が死んだ owner の引き継ぎ」で、そこでは poll する sidecar
     が 1 つも居ない。まさに通知したいケース (adopt したが起動に失敗した dead owner) だけ
     が永久に検知されないのを防ぐため、pull 経路 (check_messages) も sweep 入口になる。
     """
-    b = Broker(state_dir=tmp_path, adapter=None, adopt_arming_seconds=0.05)
+    b = Broker(state_dir=tmp_path, clock=clock, adapter=None, adopt_arming_seconds=0.05)
     src, dst = _registered(b, "src"), _registered(b, "dst")
     b.issue_delivery_cred("dst")
     res = b.adopt_delivery("dst")
     b.enqueue(src, "dst", "someone-is-waiting")
-    time.sleep(0.1)
+    clock.advance(0.1)
     assert [m["message"] for m in b.drain(dst)] == ["someone-is-waiting"]
     expired = _journal_events(b, "delivery_adopt_expired")
     assert len(expired) == 1 and expired[0]["adoption_id"] == res["adoption_id"]
