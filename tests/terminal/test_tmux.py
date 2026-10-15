@@ -171,8 +171,8 @@ def test_spawn_injects_env_via_new_session_e_flag(adapter: TmuxAdapter) -> None:
 
 
 def test_new_session_drops_env_from_session_environment(adapter: TmuxAdapter) -> None:
-    # Issue #62 (Codex P1): new-session -e persists into the session env, which
-    # later splits inherit. The same command list must unset every injected key.
+    # Issue #62 (Codex P1): new-session -e persists into the session env, where
+    # show-environment can read it. The same command list must unset every injected key.
     adapter._fake.queue((0, "%4\t@3\tclaude-org-broker-9-3", ""))
     adapter.spawn(["claude"], env={"ORG_BROKER_TOKEN": "t", "K": "V"})
     args = _args(adapter._fake.last)
@@ -189,34 +189,6 @@ def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
     adapter._fake.queue((0, "%5\t@4\tclaude-org-broker-9-4", ""))
     adapter.spawn(["cat"])
     assert "-e" not in _args(adapter._fake.last)
-
-
-@pytest.mark.parametrize("direction,flag", [("vertical", "-h"), ("horizontal", "-v")])
-def test_spawn_with_split_target_splits_that_pane(
-    adapter: TmuxAdapter, direction: str, flag: str
-) -> None:
-    # Issue #62: a split target joins the existing window instead of a new session.
-    adapter._fake.queue((0, "%7\t@0\tclaude-org-broker-9-1", ""))
-    ref = adapter.spawn(
-        ["claude"], cwd="/w", env={"K": "V"}, split_target="%1", direction=direction,
-    )
-    assert (ref.pane_id, ref.window_id) == ("%7", "@0")
-    assert len(adapter._fake.calls) == 1
-    args = _args(adapter._fake.last)
-    assert args[:5] == ["split-window", "-d", flag, "-t", "%1"]
-    assert "K=V" in args and ["-c", "/w"] == args[args.index("-c"):args.index("-c") + 2]
-    assert args[-1] == "claude"
-
-
-def test_spawn_split_failure_falls_back_to_new_session(adapter: TmuxAdapter) -> None:
-    adapter._fake.queue(
-        (1, "", "can't find pane: %1"),
-        (0, "%8\t@5\tclaude-org-broker-9-2", ""),
-    )
-    ref = adapter.spawn(["cat"], split_target="%1", direction="vertical")
-    assert ref.pane_id == "%8"
-    assert _args(adapter._fake.calls[0])[0] == "split-window"
-    assert _args(adapter._fake.last)[0] == "new-session"
 
 
 @pytest.mark.skipif(
@@ -330,8 +302,11 @@ def test_find_tmux_raises_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
         tmux_mod.find_tmux()
 
 
-def test_tmux_supports_split_target() -> None:
-    assert TmuxAdapter.supports_split_target is True
+def test_tmux_does_not_split_target_panes() -> None:
+    # Issue #247: splitting the 'focused' (= dispatcher) pane halved its width on
+    # every spawn. tmux spawns are always one pane per detached session, so the
+    # broker must not hand the adapter a split target.
+    assert getattr(TmuxAdapter, "supports_split_target", False) is False
 
 
 def test_tmux_is_isolated_session() -> None:

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **tmux spawns no longer split the dispatcher pane (#247).** Since 0.1.50 the
+  default `focused` target resolved to the dispatcher's pane and every
+  `spawn_claude_pane` / `spawn_codex_pane` / `spawn_pane` ran
+  `split-window` on it, halving its width each time (110 -> 42 -> 21 columns)
+  until prompts wrapped and `spawn-prompt-step` stalled. The tmux backend now
+  opens one detached session per spawn again, whatever the `target`: attach and
+  switch with `Ctrl-b s`. `target` is still validated (`[pane_not_found]`) and
+  recorded. The adapter drops `supports_split_target`; this reverts the
+  split behaviour from #62.
+
 ## [0.1.50] - 2026-10-12
 
 ### Added
