@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.51] - 2026-10-15
+
 ### Fixed
 
 - **tmux spawns no longer split the dispatcher pane (#247).** Since 0.1.50 the
