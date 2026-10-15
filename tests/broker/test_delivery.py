@@ -2850,9 +2850,8 @@ def test_spawn_omits_display_name_for_backends_without_the_capability(tmp_path):
 
 
 def test_spawn_threads_split_target_and_direction_to_capable_backend(tmp_path):
-    """Issue #62: tmux は target pane を split する (新 session を作らない)。
-
-    broker は解決済みの handle と direction を全 spawn 経路から渡す。
+    """Issue #62: ``supports_split_target`` な backend には、broker が解決済みの
+    handle と direction を全 spawn 経路から渡す (in-tree の tmux は #247 で降りた)。
     """
     adapter = FakeAdapter(supports_split_target=True)
     b = Broker(state_dir=tmp_path / "sd", adapter=adapter)
@@ -2874,6 +2873,46 @@ def test_spawn_threads_split_target_and_direction_to_capable_backend(tmp_path):
     dispatch_tool(b, sec, "spawn_pane",
                   {"direction": "horizontal", "command": "watch ls", "name": "w-gen"})
     assert adapter.spawned[-1]["split_target"] == focused
+
+
+def test_tmux_spawn_opens_a_new_session_for_focused_and_explicit_targets(
+    tmp_path, monkeypatch
+):
+    """Issue #247: broker(tmux) の spawn は target に関係なく新規 detached session。
+
+    0.1.50 では既定の 'focused' が dispatcher pane (%0) に解決され、毎回
+    ``split-window -d`` でその幅を半減させていた。既定と明示 target の両方で
+    split-window を一度も打たず new-session になることを、実 TmuxAdapter の
+    コマンド列 (subprocess.run を stub) で固定する。
+    """
+    from claude_org_runtime.terminal import tmux as tmux_mod
+    from claude_org_runtime.terminal.tmux import TmuxAdapter
+
+    calls: list[list[str]] = []
+    spawned = iter(range(1, 100))
+
+    def run(cmd, **_kw):
+        calls.append(cmd)
+        out = ""
+        if cmd[3] == "list-panes":
+            out = "%0\t@0\tdispatcher\t0\t0\t110\t50\t0\t0\t1\t4242\n"
+        elif cmd[3] == "new-session":
+            n = next(spawned)
+            out = f"%{n}\t@{n}\tclaude-org-broker-1-{n}\n"
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(tmux_mod.subprocess, "run", run)
+    b = Broker(state_dir=tmp_path / "sd", adapter=TmuxAdapter(exe="tmux"))
+    disp = _ops(b)
+
+    for args in ({"direction": "vertical", "name": "w-focused"},
+                 {"direction": "vertical", "target": "%0", "name": "w-explicit"}):
+        before = len(calls)
+        res = dispatch_tool(b, disp, "spawn_claude_pane", args)
+        assert not res.get("isError"), res
+        verbs = [c[3] for c in calls[before:]]
+        assert "split-window" not in verbs
+        assert verbs.count("new-session") == 1
 
 
 def test_spawn_omits_split_target_for_backends_without_the_capability(tmp_path):

@@ -64,7 +64,7 @@ class FakeAdapter:
         # (kind を渡さない / venv は argv wrapper 方式)。
         self.supports_agent_kind = supports_agent_kind
         self.venv_path_via_pane_env = venv_path_via_pane_env
-        # Issue #62: tmux のように target pane を方向指定で split できる backend。
+        # Issue #62: target pane を方向指定で split できる backend (in-tree には現在無い)。
         self.supports_split_target = supports_split_target
         # Issue #123: True の時だけ broker が spawn(display_name=) を渡す。
         self.supports_display_name = supports_display_name

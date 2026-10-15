@@ -399,14 +399,15 @@ WORKER_BIND_WINDOW_SECONDS = (
     _spawn_prompt.DEFAULT_APPROVAL_DEADLINE_MS // 1000 + 30 + 15
 )
 
-# Broker-path spawn coordinates. Under the broker transport the adapter does
-# not split a specific pane by geometry (it opens a fresh detached session), so
+# Broker-path spawn coordinates. Under the broker transport the adapter never
+# splits a pane (tmux opens a fresh detached session per spawn, whatever the
+# target -- splitting "focused" halved the dispatcher pane each time, #247), so
 # choose_split() is bypassed and the spawn addresses a stable, adapter-
 # resolvable target rather than a geometry-derived balanced-split target that
 # would carry no meaning (design-review Major #4). ``"focused"`` is the literal
-# the broker spawn surface always resolves (the dispatcher issuing the spawn);
-# ``direction`` is required by the spawn schema but ignored by the broker
-# adapter, so a stable ``"vertical"`` is emitted.
+# the broker spawn surface always resolves (the dispatcher issuing the spawn)
+# and only validates; ``direction`` is required by the spawn schema but ignored
+# by the broker adapter, so a stable ``"vertical"`` is emitted.
 _BROKER_SPAWN_TARGET = "focused"
 _BROKER_SPAWN_DIRECTION = "vertical"
 

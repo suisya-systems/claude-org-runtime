@@ -111,9 +111,9 @@ class TmuxAdapter:
     # mcp-config に直書きすると claude の argv に生存中ずっと載るので、env 渡しの方が
     # 露出は厳密に短い (#222。docs/broker-token-env-decision.md)。
     token_via_pane_env: ClassVar[bool] = True
-    # spawn(split_target=, direction=) で既存 pane を split できる (Issue #62)。
-    # broker が getattr で読み、解決済み target pane と方向を渡す。
-    supports_split_target: ClassVar[bool] = True
+    # supports_split_target は持たない (Issue #247): target pane を split すると
+    # 'focused' 既定が毎回 dispatcher pane に当たって幅が半減し続けるため、spawn は
+    # target に関係なく常に専用 socket 上の新規 detached session (1 pane = 1 session)。
 
     # tmux は send-keys が一級プリミティブで、full raw-key vocabulary を emit できる。
     # 対応表 (_TMUX_KEY_MAP) の key = canonical 全集合 (テストで包含を固定)。
@@ -195,20 +195,16 @@ class TmuxAdapter:
         cwd: str | None = None,
         new_window: bool = True,
         env: dict[str, str] | None = None,
-        split_target: str | None = None,
-        direction: str | None = None,
     ) -> PaneRef:
-        """argv を起動し PaneRef を返す。
+        """新しい detached session に argv を起動し PaneRef を返す。
 
-        ``split_target`` (Issue #62): 指定時はその pane を ``split-window`` で分割し、
-        同じ window に並べる (``direction="vertical"`` = 左右 ``-h`` / それ以外 = 上下
-        ``-v``。renga の direction 語彙)。``-d`` で既存の active pane (= ``focused``)
-        を動かさない。target が消えていた / 狭すぎて split できない時は新規 session に
-        フォールバックする。未指定 (最初の spawn) は専用 socket 上に detached session を
-        新規作成する。new_window は WezTerm 面との互換のため受けるが使わない。
+        tmux の「ウィンドウ」相当は session。spawn は常に専用 socket 上の新規 session
+        (1 pane = 1 session。``tmux attach`` 後 ``Ctrl-b s`` で切り替えて見る)。既存
+        pane は split しない (Issue #247)。new_window は WezTerm 面との互換のため受けるが
+        使わない。
 
         ``env`` (Issue #122): pane プロセスへ **追加注入する** 環境変数。tmux 一級の
-        ``-e KEY=VALUE`` (new-session / split-window 共通) で渡す。``-e`` は指定した変数
+        ``new-session -e KEY=VALUE`` で渡す。``-e`` は指定した変数
         のみを上書きし、残りは tmux サーバー環境から継承する。env dict はそのまま親環境へ
         載せる値専用 (``ORG_BROKER_STATE_DIR`` / ``VIRTUAL_ENV``) で、この経路では
         ``VAR=... command`` の shell 前置はしない (backend 間で挙動を割らないため native
@@ -230,27 +226,17 @@ class TmuxAdapter:
         if cwd:
             tail += ["-c", cwd]
         tail += [cmd_str]
-        proc = None
-        if split_target is not None:
-            flag = "-h" if direction == "vertical" else "-v"
-            proc = self._tmux(
-                "split-window", "-d", flag, "-t", str(split_target), *tail,
-                check=False,
-            )
-        if proc is None or proc.returncode != 0:
-            # ponytail: split 失敗は理由を問わず新規 session (旧挙動) に落とす。
-            # 「同 session の new-window」へ寄せるのは必要になってから。
-            session = self._new_session_name()
-            # new-session -e は値を **session 環境** に残し、同 session への後続 split が
-            # それを継承する (token / observer 秘密が別 agent に漏れる)。pane は起動済み
-            # なので、同じコマンド列 (``;`` 連結 = 間に他 client が割り込まない) で消す。
-            unset: list[str] = []
-            for key in env or {}:
-                unset += [";", "set-environment", "-t", session, "-u", key]
-            proc = self._tmux(
-                "new-session", "-d", "-s", session,
-                "-x", str(self.width), "-y", str(self.height), *tail, *unset,
-            )
+        session = self._new_session_name()
+        # new-session -e は値を **session 環境** に残し、``show-environment`` で同一 uid
+        # から読める (token / observer 秘密)。pane は起動済みなので、同じコマンド列
+        # (``;`` 連結 = 間に他 client が割り込まない) で消す。
+        unset: list[str] = []
+        for key in env or {}:
+            unset += [";", "set-environment", "-t", session, "-u", key]
+        proc = self._tmux(
+            "new-session", "-d", "-s", session,
+            "-x", str(self.width), "-y", str(self.height), *tail, *unset,
+        )
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
         return PaneRef(pane_id=pane_id, window_id=window_id, tab_id=window_id)

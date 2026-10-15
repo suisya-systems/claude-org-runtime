@@ -159,8 +159,8 @@ class ObserverLease:
     - ``--mcp-config`` は inline JSON で argv に載るため、full token と delivery cred は
       元々 ``ps`` から読める (docs/channel-delivery-model-decision.md §4.4)。
     - Issue #165 で spawn 経路にも lease を張った結果、tmux backend では秘密が
-      ``new-session -e`` / ``split-window -e`` で tmux の argv に一瞬載る (session 環境
-      には残さない。Issue #62 で後続 split への継承を断つため spawn 直後に消す)。
+      ``new-session -e`` で tmux の argv に一瞬載る (session 環境には残さない。
+      ``show-environment`` で読めないよう spawn 直後に消す)。
       同一 uid なら pane プロセスの ``/proc/<pid>/environ`` からも読める。
 
     つまり cred と秘密の両方を読める同一 uid のプロセスは、正しい秘密を提示して lease に

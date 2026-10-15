@@ -1449,7 +1449,7 @@ class Broker(TokenMixin, StoreMixin):
         """spawn 対象 pane を解決・検証する (Major 対応)。
 
         renga は target pane を split する契約。``supports_split_target`` な backend
-        (tmux) は解決した handle を実際に split し、持たない backend では実 spawn は
+        は解決した handle を実際に split し、持たない backend では実 spawn は
         adapter 既定の配置になる。どちらでも **明示 target の誤指定は検出する**:
         解決不能かつ 'focused' 既定でなければ pane_not_found。
         'focused' 既定は broker が caller pane を把握していない場合があるため
@@ -1514,8 +1514,8 @@ class Broker(TokenMixin, StoreMixin):
         使わせる。tmux/wezterm のシグネチャは不変。
 
         ``split_target`` / ``direction`` (Issue #62) は ``supports_split_target`` な
-        backend (tmux) にのみ渡す。target pane を方向指定で split させ、全 agent を
-        1 window に並べる。持たない backend は従来どおり adapter 既定の配置。
+        backend にのみ渡し、target pane を方向指定で split させる。持たない backend
+        (tmux は #247 で降りた: 1 pane = 1 detached session) は adapter 既定の配置。
         """
         env = {**(env_extra or {}),
                "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
@@ -1550,7 +1550,7 @@ class Broker(TokenMixin, StoreMixin):
         組み (default-deny guard 込み)、--mcp-config で token を注入する。子 token の
         権限 tier (auth_role) は表示 role の自己申告ではなく **caller tier で上限を
         切った** tier にする (Blocker: spawn 時 tier 昇格の阻止)。direction / target は
-        ``supports_split_target`` な backend (tmux) では実際の split に使い、持たない
+        ``supports_split_target`` な backend では実際の split に使い、持たない
         backend では受理・記録・検証のみ (配置は adapter 既定)。
         """
         if self.adapter is None:
