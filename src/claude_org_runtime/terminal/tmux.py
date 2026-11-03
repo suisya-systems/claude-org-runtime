@@ -299,6 +299,9 @@ class TmuxAdapter:
         for key, value in opts.items():
             args += [";"] if args else []
             args += ["set-option", "-w", "-t", str(pane_id), f"@{key}", value]
+        if opts.get("task"):  # Issue #259: tab named after the agent, and pinned
+            args += [";", "rename-window", "-t", str(pane_id), opts["task"],
+                     ";", "set-option", "-w", "-t", str(pane_id), "automatic-rename", "off"]
         if args:
             self._tmux(*args)
             self._tmux("refresh-client", "-S", check=False)
