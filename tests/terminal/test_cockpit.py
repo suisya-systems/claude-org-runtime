@@ -84,11 +84,11 @@ def test_waiting_line_is_clickable_and_yellow() -> None:
 # ---------------------------------------------------------- ensure_cockpit
 def test_ensure_creates_org_with_home_and_links_missing_agents(adapter) -> None:
     windows = "\n".join([
-        "org\t@0\t",                       # home
-        "org\t@3\tfix-1",                  # already linked
-        "claude-org-broker-1-1\t@3\tfix-1",
-        "claude-org-broker-1-2\t@5\tfix-2",  # agent, not linked yet
-        "scratch\t@7\t",                   # not an agent (no @task)
+        "org\t@0\t\thome\toff",                       # home
+        "org\t@3\tfix-1\tfix-1\toff",                  # already linked
+        "claude-org-broker-1-1\t@3\tfix-1\tfix-1\toff",
+        "claude-org-broker-1-2\t@5\tfix-2\tfix-2\toff",  # agent, not linked yet
+        "scratch\t@7\t\tsh\toff",                   # not an agent (no @task)
     ]) + "\n"
     adapter._fake.queue((1, "", "can't find session"), (0, "", ""), (0, "", ""),
                         (0, windows, ""))
@@ -102,7 +102,7 @@ def test_ensure_creates_org_with_home_and_links_missing_agents(adapter) -> None:
 
 
 def test_ensure_reuses_an_existing_cockpit(adapter) -> None:
-    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@0\t\n", ""), (0, "1\n", ""))
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@0\t\thome\toff\n", ""), (0, "1\n", ""))
     assert cockpit.ensure_cockpit(adapter) == []
     calls = [_args(c) for c in adapter._fake.calls]
     assert not any(c[0] in ("new-session", "new-window") for c in calls)
@@ -118,7 +118,7 @@ def test_home_keeps_its_window_after_the_shell_exits(adapter) -> None:
 
 def test_ensure_recreates_a_lost_home_as_the_first_window(adapter) -> None:
     # Peek splits =org:^; without home that would be an agent's window.
-    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@3\tfix-1\n", ""),
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@3\tfix-1\tfix-1\toff\n", ""),
                         (0, "\n", ""), (0, "@9\n", ""))
     cockpit.ensure_cockpit(adapter)
     calls = [_args(c) for c in adapter._fake.calls]
@@ -363,10 +363,19 @@ def test_flags_round_trip_through_org_up_and_adopt() -> None:
 
 def test_ensure_names_attached_tabs_after_the_agent(adapter) -> None:
     """Issue #259: --attach-only links get the agent name, pinned."""
-    windows = "org\t@0\t\nclaude-org-broker-1-2\t@5\tfix-2\n"
+    windows = "org\t@0\t\thome\toff\nclaude-org-broker-1-2\t@5\tfix-2\tclaude\ton\n"
     adapter._fake.queue((0, "", ""), (0, "", ""), (0, windows, ""), (0, "1\n", ""))
     cockpit.ensure_cockpit(adapter)
     calls = [_args(c) for c in adapter._fake.calls]
     i = calls.index(["rename-window", "-t", "@5", "fix-2", ";",
                      "set-option", "-w", "-t", "@5", "automatic-rename", "off"])
     assert calls[i + 1][0] == "link-window"
+
+
+def test_ensure_reads_tmux_numeric_automatic_rename(adapter) -> None:
+    """Issue #263: tmux formats the flag as 0/1; only the unpinned one is fixed."""
+    windows = "org\t@0\t\thome\t0\norg\t@3\tfix-1\tfix-1\t0\norg\t@4\tfix-2\tfix-2\t1\n"
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, windows, ""), (0, "1\n", ""))
+    cockpit.ensure_cockpit(adapter)
+    renamed = [_args(c)[2] for c in adapter._fake.calls if "rename-window" in c]
+    assert renamed == ["@4"]
