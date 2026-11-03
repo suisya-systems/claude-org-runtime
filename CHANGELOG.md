@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`org cockpit` starts or reconnects the secretary (#250).** One command
+  now both starts the org and reconnects to it on the broker tmux backend.
+  After setting the cockpit up, `claude-org-runtime org cockpit` looks at the
+  home window: a running secretary is left alone; an idle home shell gets the
+  same `org up` a plain terminal would run (same MCP and channel wiring); a
+  secretary that exited while the daemon stayed up comes back with
+  `org adopt --continue`. Then it attaches. The secretary's pane is marked
+  with the `@org_secretary` pane option before it is respawned and is never
+  killed, inspect and mark run under a lock in the state dir so two concurrent
+  runs cannot both launch, and the respawned pane gets the caller's
+  environment (minus `TMUX` / `TMUX_PANE`). `org cockpit` takes the `org up`
+  flags and passes them on. When a daemon is up but no cockpit pane is marked
+  (the secretary runs outside the cockpit), it starts nothing instead of
+  adopting that live secretary. `--attach-only` never starts the secretary
+  (with `--no-attach`, it only sets the cockpit up, which is what
+  `--no-attach` alone did before). Starting the secretary on a non-tmux
+  backend is an error (exit 2).
+
 ## [0.1.52] - 2026-11-03
 
 ### Added

@@ -599,7 +599,52 @@ the owner permanently mute.
 | `1` | down: shutdown requested but `broker_stopped` not observed / daemon unreachable. |
 | `2` | up: unknown backend, a backend unsupported on this platform (e.g. `herdr` on native Windows), backend conflict with a live daemon, or admin mint / MCP surface unhealthy. adopt: no daemon / no admin token, the daemon rejected the adopt, or the adoption was superseded before launch. |
 
-## `broker send`
+## `org cockpit` / `org peek` (Issue #250)
+
+tmux backend only. The cockpit is a session `org` on the broker socket
+(`claude-org-broker`) with every agent window linked into it as a tab. Its
+first window, "home", hosts the secretary.
+
+```sh
+claude-org-runtime org cockpit                 # start or reconnect, then attach
+claude-org-runtime org cockpit --model opus    # org up flags are passed on
+claude-org-runtime org cockpit --attach-only   # never start the secretary
+claude-org-runtime org peek %5                 # read-only mirror of a pane
+```
+
+What one `org cockpit` does, in order:
+
+1. Unless `--attach-only`, refuses a non-tmux backend (the running daemon's, else `--backend` /
+   `ORG_BACKEND` / the OS default) with exit 2, and a missing `tmux` with
+   exit 1.
+2. Creates `org` with its home window if missing, recreates a lost home, and
+   links every agent window not yet in it.
+3. Unless `--attach-only`, under a lock (`<state-dir>/cockpit.lock`) so two
+   runs cannot both launch, looks at the home window:
+   - the pane marked `@org_secretary` is alive: leaves it alone;
+   - the marked pane is dead and the daemon answers: respawns it with
+     `org adopt --continue` (the same `--state-dir`, `--name` as `--owner`,
+     `--root-cwd`, `--model`, `--permission-mode`, `--claude-arg`);
+   - the marked pane is dead and no daemon answers, or no pane is marked and
+     home is an idle shell (or dead): marks the pane, then respawns it with
+     `org up` and the given flags. Only an unmarked idle shell is replaced
+     (`respawn-pane -k`); a marked pane is never killed;
+   - no pane is marked but a daemon answers: the secretary runs outside the
+     cockpit, so nothing is started (the message says how to move it in);
+   - more than one marked pane, or no usable home pane: exit 1, nothing
+     started.
+   The respawned pane gets the caller's environment minus `TMUX` /
+   `TMUX_PANE`, because the tmux server's environment belongs to whoever
+   started the server.
+4. Attaches (`switch-client` when already inside the broker socket), unless
+   `--no-attach`.
+
+| Flag | Description |
+|------|-------------|
+| `--no-attach` | Set the cockpit up and start the secretary, but do not attach. |
+| `--attach-only` | Never start the secretary. With `--no-attach`, only set the cockpit up and link agent windows. |
+| `org up` flags | `--state-dir`, `--backend`, `--root-cwd`, `--name`, `--model`, `--permission-mode`, `--claude-arg`, `--reap`, passed on to `org up` (see above). |
+
 
 Enqueue one message to another agent through a running broker daemon. This is a
 thin, **best-effort** bridge for plain CLI subprocesses (e.g. a pane's
