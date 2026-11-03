@@ -60,12 +60,11 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
 def _home_options(target: str) -> list[str]:
     # remain-on-exit: home must outlive its shell. The tab menu's Peek splits
     # the first cockpit window, which must never become an agent's window.
-    args: list[str] = []
-    for opt, value in ((COCKPIT_HOME_OPT, "1"), ("automatic-rename", "off"),
-                       ("remain-on-exit", "on")):
-        args += [";"] if args else []
-        args += ["set-option", "-w", "-t", target, opt, value]
-    return args
+    # Pane scope (the home shell, the window's only pane at this point), so
+    # peek splits still close when their mirror exits.
+    return ["set-option", "-w", "-t", target, COCKPIT_HOME_OPT, "1", ";",
+            "set-option", "-w", "-t", target, "automatic-rename", "off", ";",
+            "set-option", "-p", "-t", target, "remain-on-exit", "on"]
 
 
 def _repair_home(a: TmuxAdapter) -> None:

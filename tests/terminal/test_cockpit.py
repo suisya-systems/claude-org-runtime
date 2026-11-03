@@ -112,7 +112,8 @@ def test_home_keeps_its_window_after_the_shell_exits(adapter) -> None:
     adapter._fake.queue((1, "", "can't find session"))
     cockpit.ensure_cockpit(adapter)
     create = _args(adapter._fake.calls[1])
-    assert ["set-option", "-w", "-t", "=org:", "remain-on-exit", "on"] == create[-6:]
+    # Pane scope: peek splits in home must still close when their mirror exits.
+    assert ["set-option", "-p", "-t", "=org:", "remain-on-exit", "on"] == create[-6:]
 
 
 def test_ensure_recreates_a_lost_home_as_the_first_window(adapter) -> None:
@@ -223,7 +224,8 @@ def test_live_cockpit_end_to_end() -> None:
         assert "fix-2 waiting" in tab
         # Home survives its shell, and a lost home comes back as the first window.
         home = tmux("display-message", "-p", "-t", "=org:^", "#{window_id}")
-        assert tmux("show-options", "-wv", "-t", home, "remain-on-exit") == "on"
+        assert tmux("show-options", "-pv", "-t", home, "remain-on-exit") == "on"
+        assert tmux("show-options", "-wv", "-t", home, "remain-on-exit") != "on"
         a._tmux("kill-window", "-t", home)  # test only: simulate a lost home
         cockpit.ensure_cockpit(a)
         assert tmux("display-message", "-p", "-t", "=org:^", "#{@cockpit_home}") == "1"
