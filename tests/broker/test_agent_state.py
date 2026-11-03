@@ -21,6 +21,9 @@ def composer(content: str = "", footer: str = "  ? for shortcuts") -> str:
     (composer("half typed"), "idle"),
     (composer("1. first\n  2. second"), "idle"),          # a numbered draft
     (composer(footer="✻ Working… (esc to interrupt)"), "working"),
+    # a draft quoting a footer or a menu while Claude works is not a dialog
+    (composer("explain Enter to confirm", footer="✻ Working… (esc to interrupt)"), "working"),
+    (composer("❯ 1. Yes", footer="✻ Working… (esc to interrupt)"), "working"),
     # permission menu: its "Esc to cancel" is also a busy marker
     ("Do you want to proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel", "waiting"),
     ("Do you want to proceed?\n❯ 1. Yes\n  2. No\n", "waiting"),
