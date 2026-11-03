@@ -46,7 +46,10 @@ claude-org-runtime org down
 ```
 
 `org up` is reuse-or-start: a reachable daemon is reused, a stale sidecar
-is replaced. The lower-level building blocks are still available directly:
+is replaced. On the tmux backend, `claude-org-runtime org cockpit`
+does the same inside one tmux session with every agent as a tab: it starts
+the secretary in the cockpit's home window (or brings back one that exited,
+with `org adopt --continue`), then attaches. Run it again to reconnect. The lower-level building blocks are still available directly:
 
 ```sh
 # Render a per-role settings.local.json:

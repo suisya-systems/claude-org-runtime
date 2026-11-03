@@ -235,3 +235,116 @@ def test_live_cockpit_end_to_end() -> None:
         assert first.window_id not in org and second.window_id in org
     finally:
         a.kill_server()  # this test's own socket only
+
+
+@pytest.mark.skipif(os.name == "nt", reason="tmux is POSIX only")
+def test_live_cockpit_starts_keeps_and_recovers_the_secretary(monkeypatch) -> None:
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not on PATH")
+    a = TmuxAdapter(socket=f"claude-org-test-{uuid.uuid4().hex[:8]}")
+    try:
+        a._tmux("start-server")
+        cockpit.ensure_cockpit(a)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        pytest.skip("cannot start a tmux server here (no tmux, or Unix sockets denied)")
+    # Stand-in secretary: shows the env it got, then cat, which exits on C-d.
+    asked = []
+    monkeypatch.setattr(
+        cockpit, "secretary_command",
+        lambda action, args, alive: asked.append((action, alive))
+        or ["sh", "-c", 'echo "env=$COCKPIT_T"; exec cat'])
+
+    def tmux(*args: str) -> str:
+        return a._tmux(*args).stdout.strip()
+
+    def start(alive: bool) -> int:
+        return cockpit.start_secretary(a, _cockpit_args(), env={"COCKPIT_T": "1"},
+                                       cwd="/", daemon_alive=lambda: alive)
+
+    def wait_for(fmt: str, want: str) -> None:
+        for _ in range(50):
+            if tmux("display-message", "-p", "-t", home, fmt) == want:
+                return
+            __import__("time").sleep(0.1)
+        raise AssertionError(f"{fmt} never became {want!r}")
+
+    try:
+        home = tmux("display-message", "-p", "-t", "=org:^", "#{pane_id}")
+        assert start(alive=False) == 0 and asked == [("launch_kill", False)]
+        wait_for("#{pane_current_command}", "cat")
+        assert tmux("show-options", "-pv", "-t", home, "@org_secretary") == "1"
+        assert "env=1" in tmux("capture-pane", "-p", "-t", home)  # caller's env
+        assert "COCKPIT_T" not in a._tmux("show-environment", "-g", check=False).stdout
+        assert start(alive=True) == 0 and len(asked) == 1  # running: untouched
+        a._tmux("send-keys", "-t", home, "C-d")  # the secretary exits
+        wait_for("#{pane_dead}", "1")
+        assert start(alive=True) == 0 and asked[-1] == ("relaunch", True)
+        wait_for("#{pane_dead}", "0")
+        assert tmux("display-message", "-p", "-t", "=org:^", "#{pane_id}") == home
+    finally:
+        a.kill_server()  # this test's own socket only
+
+
+# --------------------------------------------------------------- secretary
+def _cockpit_args(*extra: str):
+    from claude_org_runtime.cli import build_parser
+    return build_parser().parse_args(["org", "cockpit", *extra])
+
+
+def test_live_daemon_without_a_marked_pane_starts_nothing(adapter) -> None:
+    # The secretary runs outside the cockpit: adopting it later would fence it.
+    adapter._fake.queue((0, "%1\t1\t\t0\tzsh\n", ""))
+    assert cockpit.start_secretary(adapter, _cockpit_args(), env={}, cwd="/r",
+                                   daemon_alive=lambda: True) == 0
+    assert [_args(c)[0] for c in adapter._fake.calls] == ["list-panes"]
+
+
+def test_failed_respawn_unmarks_the_pane(adapter) -> None:
+    adapter._fake.queue((0, "%1\t1\t\t0\tzsh\n", ""), (0, "", ""), (1, "", "boom"))
+    assert cockpit.start_secretary(adapter, _cockpit_args(), env={}, cwd="/r",
+                                   daemon_alive=lambda: False) == 1
+    assert _args(adapter._fake.last) == ["set-option", "-pu", "-t", "%1", "@org_secretary"]
+
+
+def test_secretary_runs_under_the_state_dir_lock(adapter, monkeypatch, tmp_path) -> None:
+    import fcntl
+    seen = []
+
+    def start(a, args, **kw):
+        with open(tmp_path / "cockpit.lock", "w") as fh, pytest.raises(BlockingIOError):
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        seen.append((kw["env"], kw["cwd"]))
+        return 0
+
+    monkeypatch.delenv("ORG_BACKEND", raising=False)
+    monkeypatch.setattr(cockpit, "_adapter", lambda: adapter)
+    monkeypatch.setattr(cockpit, "start_secretary", start)
+    assert cockpit.cmd_cockpit(_cockpit_args("--no-attach", "--state-dir", str(tmp_path))) == 0
+    assert seen and seen[0][1] == os.getcwd()
+    with open(tmp_path / "cockpit.lock", "w") as fh:  # released afterwards
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_a_running_daemon_backend_wins(adapter, monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "daemon.json").write_text('{"backend": "herdr"}', encoding="utf-8")
+    monkeypatch.setattr(cockpit, "_adapter", lambda: adapter)
+    assert cockpit.cmd_cockpit(_cockpit_args("--backend", "tmux", "--state-dir",
+                                             str(tmp_path))) == 2
+    assert "'herdr'" in capsys.readouterr().err and not adapter._fake.calls
+
+
+def test_no_daemon_is_not_alive(tmp_path) -> None:
+    assert cockpit._daemon_alive(str(tmp_path), "secretary") is False
+
+
+def test_flags_round_trip_through_org_up_and_adopt() -> None:
+    from claude_org_runtime.cli import build_parser
+    args = _cockpit_args("--model", "opus", "--claude-arg=--verbose", "--claude-arg=-x",
+                         "--reap", "--name", "sec")
+    up = cockpit.secretary_command("launch", args, daemon_alive=True)
+    parsed = build_parser().parse_args(up[up.index("org"):])
+    assert (parsed.cmd, parsed.model, parsed.claude_arg, parsed.reap, parsed.name) == \
+        ("up", "opus", ["--verbose", "-x"], True, "sec")
+    adopt = cockpit.secretary_command("relaunch", args, daemon_alive=True)
+    parsed = build_parser().parse_args(adopt[adopt.index("org"):])
+    assert (parsed.cmd, parsed.continue_session, parsed.owner) == ("adopt", True, "sec")
