@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.57] - 2026-11-03
+
 ### Fixed
 
-- broker: a named secretary admin mint now registers the secretary as the logical pane and drops the startup `manual-test` root pane (a stray, unclosable `worker` entry in `list_panes`). Bare `serve` without a secretary keeps the root pane (Issue #57 anchor).
-- Cockpit `ctx%` uses the 1M window for Sonnet 4.6+/5.x and Haiku 5.x (was 200K, so the percentage read ~5x too high).
+- broker: a named secretary admin mint now registers the secretary as the logical pane and drops the startup `manual-test` root pane (a stray, unclosable `worker` entry in `list_panes`). Bare `serve` without a secretary keeps the root pane (Issue #57 anchor) (#269).
+- Cockpit `ctx%` uses the 1M window for Sonnet 4.6+/5.x and Haiku 5.x (was 200K, so the percentage read ~5x too high) (#270).
 
 ## [0.1.56] - 2026-11-03
 
