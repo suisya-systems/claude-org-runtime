@@ -375,6 +375,16 @@ class Broker(TokenMixin, StoreMixin):
             )
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+        # 明示 name の secretary (= org up の窓口) は自身を論理ペインに載せ、serve 起動時
+        # の root 論理ペイン (manual-test, 閉じられない stray) と入れ替える。#57 の
+        # anchor / last_pane 保証は secretary ペインが引き継ぐ。無名 mint (probe / down
+        # ctrl の使い捨て) は対象外で、secretary 不在の素の serve は root を残す。
+        if role == "secretary" and name:
+            with self._lock:
+                for h in [h for h, m in self._pane_meta.items()
+                          if m.get("logical") and m.get("agent_id") == "manual-test"]:
+                    del self._pane_meta[h]
+            self.register_logical_pane(token)
         mcp_config = self.mcp_config_for(token, token_env=token_env)
         # channel 配線 (push 一次配送 §9.5): ``channel`` 要求時のみ org-broker-channel
         # sidecar (OWNER=この agent) を mcp_config に積み delivery-scoped credential を

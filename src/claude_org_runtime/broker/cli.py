@@ -197,6 +197,12 @@ def run(args: argparse.Namespace) -> int:
     # admin RPC shutdown / KeyboardInterrupt と同じ request_shutdown を立てるだけで、
     # broker_stopped の emit は finally の stop() に集約する。
     _install_signal_handlers(broker)
+    # root token + 論理ペインは sidecar / admin token の公開 **前** に登録する: 公開後だと
+    # org up の named secretary mint が先行して root 置換が空振りし、後から root が登録されて
+    # stray が残る (admin_mint_token は secretary mint 時に root 論理ペインを置き換える)。
+    # 詳細な理由 (root_cwd の absolute 化など) は下の print 群直前のコメント参照。
+    tok = issue_root_token(broker, args.root_role, root_cwd)
+    root_pane = broker.register_logical_pane(tok)
     # daemon sidecar を公開する (発見用メタ + admin token)。停止時に finally で削除。
     sidecar.write_sidecar(
         state_dir,
@@ -227,7 +233,6 @@ def run(args: argparse.Namespace) -> int:
     # os.path.abspath だと Windows daemon で posix-absolute に drive letter を前置して
     # しまい契約からずれる (codex review round 2 Minor: CLI だけ解釈ずれ)。
     # root_cwd は Broker 構築時に同じ規則で確定済 (Issue #130 の venv 探索基準と共用)。
-    tok = issue_root_token(broker, args.root_role, root_cwd)
     print(f"manual test token ({args.root_role}):", tok)
     print(f"root pane cwd (relative spawn anchor): {root_cwd}")
     print("mcp-config:", json.dumps(broker.mcp_config_for(tok)))
@@ -235,7 +240,6 @@ def run(args: argparse.Namespace) -> int:
     # bind.pane_id は None のままなので PTY ナッジは飛ばない (人間は check_messages
     # で読む)。これで list_panes に窓口が出て、子を 1 つ spawn した状態でも
     # close_pane が [last_pane] 誤判定せず子を閉じられる。
-    root_pane = broker.register_logical_pane(tok)
     print(f"root pane registered (logical, id={root_pane['id']}, role={args.root_role})")
     # 前景で shutdown 要求まで待つ。要求は (a) admin RPC (shutdown) または
     # (b) KeyboardInterrupt の二経路。シグナル (SIGINT) に依存しない停止経路を
