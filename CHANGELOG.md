@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-11-03
+
 ### Added
 
-- Cockpit shows each Claude agent's context-window usage: ` NN%` on its tab and `ctx NN%` (yellow from 70, red from 90) in the status bar for the selected window. The broker reads it from Claude Code's transcript (same source and arithmetic as renga) and publishes the `@ctx` window option; unknown usage shows nothing. (#262).
+- Cockpit shows each Claude agent's context-window usage: ` NN%` on its tab and `ctx NN%` (yellow from 70, red from 90) in the status bar for the selected window. The broker reads it from Claude Code's transcript (same source and arithmetic as renga) and publishes the `@ctx` window option; unknown usage shows nothing. (#262, #266).
+
+### Fixed
+
+- `org cockpit --attach-only` also names windows that are already linked to an agent, so their tabs get the agent name and the pin like freshly spawned ones (#263, #264).
 
 ## [0.1.55] - 2026-11-03
 
