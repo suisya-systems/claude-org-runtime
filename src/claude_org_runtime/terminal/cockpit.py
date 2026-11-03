@@ -289,7 +289,9 @@ def _lock(state_dir: str) -> TextIO:
 
 def cmd_cockpit(args: argparse.Namespace) -> int:
     state_dir = sidecar.absolutize(args.state_dir)
-    backend = _backend(args, state_dir)
+    # Only starting the secretary depends on the backend (org up / adopt);
+    # --attach-only launches nothing and just needs tmux, as before.
+    backend = "tmux" if args.attach_only else _backend(args, state_dir)
     if backend != "tmux":
         print(f"org cockpit needs the tmux backend (this org uses {backend!r})",
               file=sys.stderr)

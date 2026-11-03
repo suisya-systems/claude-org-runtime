@@ -614,7 +614,7 @@ claude-org-runtime org peek %5                 # read-only mirror of a pane
 
 What one `org cockpit` does, in order:
 
-1. Refuses a non-tmux backend (the running daemon's, else `--backend` /
+1. Unless `--attach-only`, refuses a non-tmux backend (the running daemon's, else `--backend` /
    `ORG_BACKEND` / the OS default) with exit 2, and a missing `tmux` with
    exit 1.
 2. Creates `org` with its home window if missing, recreates a lost home, and

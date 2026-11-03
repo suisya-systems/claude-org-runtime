@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the secretary runs outside the cockpit), it starts nothing instead of
   adopting that live secretary. `--attach-only` never starts the secretary
   (with `--no-attach`, it only sets the cockpit up, which is what
-  `--no-attach` alone did before). A non-tmux backend is now an error
-  (exit 2).
+  `--no-attach` alone did before). Starting the secretary on a non-tmux
+  backend is an error (exit 2).
 
 ## [0.1.52] - 2026-11-03
 

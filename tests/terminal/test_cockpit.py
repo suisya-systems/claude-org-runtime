@@ -308,6 +308,7 @@ def test_failed_respawn_unmarks_the_pane(adapter) -> None:
     assert _args(adapter._fake.last) == ["set-option", "-pu", "-t", "%1", "@org_secretary"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fcntl lock, POSIX only like tmux")
 def test_secretary_runs_under_the_state_dir_lock(adapter, monkeypatch, tmp_path) -> None:
     import fcntl
     seen = []
