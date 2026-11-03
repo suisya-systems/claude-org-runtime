@@ -135,3 +135,18 @@ def test_identity_change_republishes_role_and_task(tmp_path) -> None:
     a.options.clear()
     b.set_pane_identity(str(handle), True, "fix-2", True, "worker")
     assert a.options == [(handle, {"role": "worker", "task": "fix-2"})]
+
+
+def test_failing_secretary_lookup_does_not_stop_the_poller(tmp_path) -> None:
+    class Boom(OptionAdapter):
+        def secretary_pane_id(self):
+            raise OSError("tmux gone")
+
+    a = Boom()
+    b = _broker(tmp_path, a)
+    tok = b.issue_token("secretary", "secretary", "secretary", kind="claude")
+    b.register_logical_pane(tok)
+    b._register_pane("%1", "fix-1", "fix-1", "worker", None, "claude", None)
+    a.options.clear()
+    _poll_once(b)  # must not raise
+    assert a.options == [("%1", {"state": "idle"})]

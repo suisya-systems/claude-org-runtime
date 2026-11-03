@@ -1359,15 +1359,18 @@ class Broker(TokenMixin, StoreMixin):
                     return
                 # Issue #262: @ctx from Claude's transcript. The secretary is a
                 # logical pane; its window is the cockpit pane marked as such.
-                target = handle
-                if logical:
-                    finder = getattr(self.adapter, "secretary_pane_id", None)
-                    target = finder() if finder else None
-                    cwd = cwd or self.root_cwd
-                if target is not None:
-                    ctx = context_usage.context_percent(cwd) or ""
-                    if ctx != (last_ctx or "") and self._set_agent_options(target, ctx=ctx):
-                        self._remember(handle, agent_ctx=ctx)
+                try:
+                    target = handle
+                    if logical:
+                        finder = getattr(self.adapter, "secretary_pane_id", None)
+                        target = finder() if finder else None
+                        cwd = cwd or self.root_cwd
+                    if target is not None:
+                        ctx = context_usage.context_percent(cwd) or ""
+                        if ctx != (last_ctx or "") and self._set_agent_options(target, ctx=ctx):
+                            self._remember(handle, agent_ctx=ctx)
+                except Exception:
+                    pass  # display-only: a failed lookup must not stop the poller
                 if logical:
                     continue
                 try:
