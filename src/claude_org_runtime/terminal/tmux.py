@@ -248,7 +248,10 @@ class TmuxAdapter:
             "-x", str(self.width), "-y", str(self.height), *tail, *unset,
         )
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
-        self.apply_org_config()
+        try:
+            self.apply_org_config()
+        except (OSError, subprocess.SubprocessError):
+            pass  # cosmetic config: a timeout must not orphan the live pane
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
         return PaneRef(pane_id=pane_id, window_id=window_id, tab_id=window_id)
 

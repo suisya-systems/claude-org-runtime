@@ -57,6 +57,14 @@ def test_config_error_does_not_fail_spawn(adapter) -> None:
     assert adapter.spawn(["cat"]).pane_id == "%2"
 
 
+def test_config_timeout_does_not_fail_spawn(adapter, monkeypatch) -> None:
+    def slow(*_a, **_k):
+        raise subprocess.TimeoutExpired("tmux source-file", 15)
+    adapter._fake.queue((0, "%2\t@1\tclaude-org-broker-9-1", ""))
+    monkeypatch.setattr(adapter, "apply_org_config", slow)
+    assert adapter.spawn(["cat"]).pane_id == "%2"
+
+
 # --------------------------------------------------------- window options
 def test_set_agent_options_writes_window_options_then_refreshes(adapter) -> None:
     adapter.set_agent_options("%3", role="worker", task="fix-1", state="working")
