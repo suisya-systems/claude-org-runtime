@@ -29,7 +29,9 @@ def context_limit(model: str | None) -> int:
     m = model or ""
     if "[1m]" in m or "-1m" in m or "fable" in m or "mythos" in m:
         return 1_000_000
-    if re.search(r"opus-(4-[6-9]|[5-9])", m):
+    # Docs (context-windows, "sizes by model"): Opus 4.6+, Sonnet 4.6+/5.x and
+    # Haiku 5.x are 1M; Sonnet 4.5 and Haiku 4.x stay 200K.
+    if re.search(r"(opus|sonnet)-(4-[6-9]|[5-9])|haiku-[5-9]", m):
         return 1_000_000
     if "opus" in m and "haiku" not in m and "sonnet" not in m:
         return 500_000
