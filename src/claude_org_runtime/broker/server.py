@@ -216,6 +216,11 @@ class Broker(TokenMixin, StoreMixin):
         # finally が唯一の stop() 呼出元という契約の保険 (down のオフセット
         # スライスで broker_stopped が厳密に 1 回であることを保証する)。
         self._stopped = False
+        # tmux window-option state poller (Issue #250). Started by start() only
+        # when the adapter can write agent options; stop() sets the event.
+        self.agent_state_interval = 2.0
+        self._agent_state_stop = threading.Event()
+        self._agent_state_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -243,6 +248,11 @@ class Broker(TokenMixin, StoreMixin):
             target=self._server.serve_forever, name="broker-http", daemon=True
         )
         self._thread.start()
+        if getattr(self.adapter, "set_agent_options", None) is not None:
+            self._agent_state_thread = threading.Thread(
+                target=self._agent_state_loop, name="broker-agent-state", daemon=True
+            )
+            self._agent_state_thread.start()
         self._journal("broker_started", host=self.host, port=self.port)
 
     def stop(self) -> None:
@@ -255,6 +265,10 @@ class Broker(TokenMixin, StoreMixin):
         if self._stopped:
             return
         self._stopped = True
+        self._agent_state_stop.set()
+        if self._agent_state_thread is not None:
+            self._agent_state_thread.join(timeout=5)
+            self._agent_state_thread = None
         if self._server:
             self._server.shutdown()
             self._server.server_close()
@@ -1297,11 +1311,63 @@ class Broker(TokenMixin, StoreMixin):
                 }
         if collision is not None:
             raise ToolArgError(f"name {collision!r} collides with another pane")
+        if not meta.get("logical"):
+            self._set_agent_options(
+                handle, role=record["role"] or "",
+                task=record["name"] or meta.get("agent_id") or "",
+            )
         self._journal("pane_identity_set", pane_id=handle,
                       name=record["name"], role=record["role"])
         return _ok(record)
 
     # ---------------------------------------------------------- pane: spawn
+    def _set_agent_options(self, handle: "PaneId", **opts: str) -> bool:
+        """Publish ``@role`` / ``@task`` / ``@state`` to the backend (Issue #250).
+
+        Only for adapters that can (tmux window options). Display-only: a failure
+        (pane gone, server restarting) is swallowed and never fails the caller.
+        Call outside ``_lock`` (adapter I/O).
+        """
+        setter = getattr(self.adapter, "set_agent_options", None)
+        if setter is None:
+            return False
+        try:
+            setter(handle, **opts)
+        except Exception:
+            return False
+        return True
+
+    def _agent_state_loop(self) -> None:
+        """Poll managed Claude panes and write ``@state`` when it changes.
+
+        The runtime has no event for working / waiting / idle, so the screen is
+        sampled. Codex / generic panes are skipped: the heuristics are
+        Claude-calibrated, and an absent ``@state`` reads as unknown.
+        """
+        # ponytail: one capture per Claude pane per tick; an event source
+        # (hooks / statusline) can replace this if polling cost ever matters.
+        while not self._agent_state_stop.wait(self.agent_state_interval):
+            with self._lock:
+                targets = [
+                    (h, m.get("agent_state"))
+                    for h, m in self._pane_meta.items()
+                    if m.get("kind") == "claude" and not m.get("logical")
+                ]
+            for handle, last in targets:
+                if self._agent_state_stop.is_set():
+                    return
+                try:
+                    state = user_turn.agent_state(self.adapter.get_text(handle))
+                except Exception:
+                    continue  # pane vanished between snapshot and capture
+                if state is None or state == last:
+                    continue
+                if self._set_agent_options(handle, state=state):
+                    with self._lock:
+                        meta = self._pane_meta.get(handle)
+                        if meta is not None:
+                            meta["agent_state"] = state
+
     def _gen_agent_id(self, prefix: str) -> str:
         return f"{prefix}-{next(self._pane_counter)}"
 
@@ -1327,6 +1393,7 @@ class Broker(TokenMixin, StoreMixin):
                 "missing_since": None, "missing_count": 0,
             }
             self._reserved_names.discard(name)  # 予約を確定 meta へ昇格
+        self._set_agent_options(handle, role=role or "", task=name or agent_id)
 
     def register_logical_pane(self, token: str) -> dict:
         """human 駆動の root pane (窓口/secretary) を pane 登録簿に first-class な

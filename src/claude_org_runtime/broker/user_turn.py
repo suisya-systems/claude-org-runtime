@@ -69,6 +69,21 @@ def _is_fence(line: str) -> bool:
     return len(s) >= 8 and set(s) <= _FENCE_CHARS
 
 
+def _composer(lines: list[str]) -> tuple[tuple[int, int] | None, list[str]]:
+    """Locate the lowest composer and return ``(region, rows outside it)``.
+
+    The composer is a ❯ row with a rule directly above, up to the next rule
+    below. Its rows are the draft (a body may contain marker text), so callers
+    look for markers only outside it.
+    """
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i].strip().startswith("❯") and _is_fence(lines[i - 1]):
+            end = next((j for j in range(i + 1, len(lines)) if _is_fence(lines[j])), None)
+            if end is not None:
+                return (i, end), lines[:i - 1] + lines[end + 1:]
+    return None, lines
+
+
 def assess_screen(screen: str) -> str:
     return _parse(screen)[0]
 
@@ -86,17 +101,10 @@ def _parse(screen: str) -> tuple[str, list[str]]:
     # pane): anchor the marker window to content, not to the physical bottom.
     while lines and not lines[-1]:
         lines.pop()
-    # Locate the lowest composer: a ❯ row with a rule directly above, up to the
-    # next rule below. Its rows are the draft (a body may contain marker text).
-    region = None
-    for i in range(len(lines) - 1, 0, -1):
-        if lines[i].strip().startswith("❯") and _is_fence(lines[i - 1]):
-            end = next((j for j in range(i + 1, len(lines)) if _is_fence(lines[j])), None)
-            if end is not None:
-                region = (i, end)
-                break
+    region, outside = _composer(lines)
+    if region is None:
+        outside = lines[:-1]  # historical window: the last row is left out
     start, end = region if region else (len(lines), len(lines))
-    outside = lines[:max(start - 1, 0)] + lines[end + 1:]
     low = "\n".join(outside[-20:]).lower()
     # Dialog first: a permission menu's "Esc to cancel" is also a busy marker,
     # but the caller needs to know a blocker (not a turn) is in the way.
@@ -113,6 +121,38 @@ def _parse(screen: str) -> tuple[str, list[str]]:
         return NOT_READY, []
     draft = [lines[start].strip()[1:]] + lines[start + 1:end]
     return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
+
+
+# Cockpit state (Issue #250): a cursor on a numbered option, boxed or not
+# ("❯ 1. Yes", "│ ❯ 2. No, exit │") is a selection menu the operator must answer.
+_MENU_ROW = re.compile(r"^[│|\s]*[❯>]\s*\d+[.)]\s")
+
+
+def agent_state(screen: str) -> str | None:
+    """Map a Claude screen to the cockpit ``@state``.
+
+    ``waiting`` (a selection menu or dialog: permission prompt, trust dialog),
+    ``working`` (busy marker), ``idle`` (composer visible), or ``None`` when the
+    screen is not recognised (the caller keeps the previous value). The menu is
+    checked before busy markers: a permission menu's "Esc to cancel" is also one.
+    """
+    status, _ = _parse(screen)
+    if status in (EMPTY, DRAFT):
+        return "idle"
+    lines = [ln.rstrip() for ln in screen.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    # Only rows outside the composer (a draft may quote a menu or a footer),
+    # in the same 20-row window as the busy check.
+    outside = _composer(lines)[1][-20:]
+    if any(_MENU_ROW.match(ln) for ln in outside):
+        return "waiting"
+    spaceless = unicodedata.normalize("NFKC", "\n".join(outside).lower()).replace(" ", "")
+    if any(f in spaceless for f in _DIALOG_FOOTERS):
+        return "waiting"
+    if status == BUSY:
+        return "working"
+    return None
 
 
 # --- Codex (calibrated on renga's codex v0.153.4 fixtures) ------------------
