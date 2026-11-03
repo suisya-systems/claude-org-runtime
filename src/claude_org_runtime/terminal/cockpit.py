@@ -183,7 +183,7 @@ def start_secretary(
         a._tmux("set-option", "-pu", "-t", pane, SECRETARY_OPT, check=False)
         print(f"org cockpit: respawn-pane failed: {res.stderr.strip()}", file=sys.stderr)
         return 1
-    print(f"org cockpit: started 'org {cmd[4]}' in {pane}")
+    print(f"org cockpit: started the secretary in {pane} ({action})")
     return 0
 
 
@@ -270,9 +270,12 @@ def _daemon_alive(state_dir: str, owner: str) -> bool:
 
 
 def _backend(args: argparse.Namespace, state_dir: str) -> str:
-    # A running daemon's backend wins; otherwise what org up would pick.
-    sc = sidecar.read_sidecar(state_dir)
-    return (sc or {}).get("backend") or args.backend or default_backend()
+    # A running daemon's backend wins (a stale sidecar does not: org up replaces
+    # it); otherwise what org up would pick.
+    recorded = (sidecar.read_sidecar(state_dir) or {}).get("backend")
+    if recorded and _daemon_alive(state_dir, args.name):
+        return recorded
+    return args.backend or default_backend()
 
 
 def _lock(state_dir: str) -> TextIO:

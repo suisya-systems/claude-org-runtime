@@ -261,15 +261,17 @@ def test_live_cockpit_starts_keeps_and_recovers_the_secretary(monkeypatch) -> No
         return cockpit.start_secretary(a, _cockpit_args(), env={"COCKPIT_T": "1"},
                                        cwd="/", daemon_alive=lambda: alive)
 
-    def wait_for(fmt: str, want: str) -> None:
+    def wait_for(fmt: str, want: str | frozenset) -> None:
         for _ in range(50):
-            if tmux("display-message", "-p", "-t", home, fmt) == want:
+            got = tmux("display-message", "-p", "-t", home, fmt)
+            if got == want or (isinstance(want, frozenset) and got in want):
                 return
             __import__("time").sleep(0.1)
         raise AssertionError(f"{fmt} never became {want!r}")
 
     try:
         home = tmux("display-message", "-p", "-t", "=org:^", "#{pane_id}")
+        wait_for("#{pane_current_command}", cockpit._SHELLS)  # home shell is up
         assert start(alive=False) == 0 and asked == [("launch_kill", False)]
         wait_for("#{pane_current_command}", "cat")
         assert tmux("show-options", "-pv", "-t", home, "@org_secretary") == "1"
@@ -328,9 +330,17 @@ def test_secretary_runs_under_the_state_dir_lock(adapter, monkeypatch, tmp_path)
 def test_a_running_daemon_backend_wins(adapter, monkeypatch, tmp_path, capsys) -> None:
     (tmp_path / "daemon.json").write_text('{"backend": "herdr"}', encoding="utf-8")
     monkeypatch.setattr(cockpit, "_adapter", lambda: adapter)
+    monkeypatch.setattr(cockpit, "_daemon_alive", lambda sd, owner: True)
     assert cockpit.cmd_cockpit(_cockpit_args("--backend", "tmux", "--state-dir",
                                              str(tmp_path))) == 2
     assert "'herdr'" in capsys.readouterr().err and not adapter._fake.calls
+
+
+def test_a_stale_sidecar_backend_is_ignored(monkeypatch, tmp_path) -> None:
+    (tmp_path / "daemon.json").write_text('{"backend": "herdr"}', encoding="utf-8")
+    monkeypatch.setattr(cockpit, "_daemon_alive", lambda sd, owner: False)
+    args = _cockpit_args("--backend", "tmux", "--state-dir", str(tmp_path))
+    assert cockpit._backend(args, str(tmp_path)) == "tmux"
 
 
 def test_no_daemon_is_not_alive(tmp_path) -> None:
