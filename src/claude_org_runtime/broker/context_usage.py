@@ -12,8 +12,10 @@ import json
 import re
 from pathlib import Path
 
-#: Read this much of the transcript's end; one assistant turn is far smaller.
+#: Start with this much of the transcript's end and double (up to the cap) while
+#: no usage record is in it: a huge tool result can sit after the last turn.
 _TAIL_BYTES = 256 * 1024
+_MAX_TAIL_BYTES = 16 * 1024 * 1024
 
 
 def project_dir_name(cwd: str) -> str:
@@ -35,10 +37,20 @@ def context_limit(model: str | None) -> int:
 
 
 def _last_usage(path: Path) -> tuple[str | None, int] | None:
-    with path.open("rb") as f:
-        f.seek(0, 2)
-        f.seek(max(0, f.tell() - _TAIL_BYTES))
-        lines = f.read().decode("utf-8", errors="replace").splitlines()
+    size = _TAIL_BYTES
+    while True:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            whole = f.tell() <= size
+            f.seek(max(0, f.tell() - size))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+        got = _scan(lines)
+        if got or whole or size >= _MAX_TAIL_BYTES:
+            return got
+        size *= 2
+
+
+def _scan(lines: list[str]) -> tuple[str | None, int] | None:
     for line in reversed(lines):
         try:
             rec = json.loads(line)
