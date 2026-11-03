@@ -67,7 +67,7 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
         if in_cockpit or wid not in present:
             # Issues #259/#263: name and pin every agent tab, including ones
             # linked before; windows already right are left alone.
-            if name != task or auto != "off":
+            if name != task or auto not in ("0", "off"):  # tmux prints 0/1
                 a._tmux("rename-window", "-t", wid, task, ";",
                         "set-option", "-w", "-t", wid, "automatic-rename", "off")
         if not in_cockpit and wid not in present:

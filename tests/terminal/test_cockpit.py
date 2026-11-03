@@ -370,3 +370,12 @@ def test_ensure_names_attached_tabs_after_the_agent(adapter) -> None:
     i = calls.index(["rename-window", "-t", "@5", "fix-2", ";",
                      "set-option", "-w", "-t", "@5", "automatic-rename", "off"])
     assert calls[i + 1][0] == "link-window"
+
+
+def test_ensure_reads_tmux_numeric_automatic_rename(adapter) -> None:
+    """Issue #263: tmux formats the flag as 0/1; only the unpinned one is fixed."""
+    windows = "org\t@0\t\thome\t0\norg\t@3\tfix-1\tfix-1\t0\norg\t@4\tfix-2\tfix-2\t1\n"
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, windows, ""), (0, "1\n", ""))
+    cockpit.ensure_cockpit(adapter)
+    renamed = [_args(c)[3] for c in adapter._fake.calls if "rename-window" in c]
+    assert renamed == ["@4"]
