@@ -359,3 +359,14 @@ def test_flags_round_trip_through_org_up_and_adopt() -> None:
     adopt = cockpit.secretary_command("relaunch", args, daemon_alive=True)
     parsed = build_parser().parse_args(adopt[adopt.index("org"):])
     assert (parsed.cmd, parsed.continue_session, parsed.owner) == ("adopt", True, "sec")
+
+
+def test_ensure_names_attached_tabs_after_the_agent(adapter) -> None:
+    """Issue #259: --attach-only links get the agent name, pinned."""
+    windows = "org\t@0\t\nclaude-org-broker-1-2\t@5\tfix-2\n"
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, windows, ""), (0, "1\n", ""))
+    cockpit.ensure_cockpit(adapter)
+    calls = [_args(c) for c in adapter._fake.calls]
+    i = calls.index(["rename-window", "-t", "@5", "fix-2", ";",
+                     "set-option", "-w", "-t", "@5", "automatic-rename", "off"])
+    assert calls[i + 1][0] == "link-window"
