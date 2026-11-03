@@ -73,9 +73,13 @@ def context_percent(cwd: str | None, home: Path | None = None) -> str | None:
     """``"42%"`` for the agent working in ``cwd``, or ``None`` when unknown."""
     if not cwd:
         return None
-    d = (home or Path.home()) / ".claude" / "projects" / project_dir_name(cwd)
+    root = (home or Path.home()) / ".claude" / "projects"
+    # Current Claude Code turns '.' into '-' too (".dispatcher" -> "-dispatcher");
+    # renga's older rule keeps the dot. Look in both, newest transcript wins.
+    names = {project_dir_name(cwd), re.sub(r"[^A-Za-z0-9]", "-", cwd)}
     try:
-        newest = max(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, default=None)
+        files = [f for n in names for f in (root / n).glob("*.jsonl")]
+        newest = max(files, key=lambda p: p.stat().st_mtime, default=None)
         got = newest and _last_usage(newest)
     except OSError:
         return None

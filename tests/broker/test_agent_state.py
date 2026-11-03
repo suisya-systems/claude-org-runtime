@@ -160,3 +160,13 @@ def test_usage_found_behind_a_huge_trailing_record(tmp_path) -> None:
     big = json.dumps({"type": "user", "pad": "x" * (600 * 1024)})  # > first tail
     _transcript(tmp_path, CWD, _line(inp=100_000), big)
     assert context_percent(CWD, home=tmp_path) == "50%"
+
+
+def test_dotted_cwd_finds_the_dashed_project_dir(tmp_path) -> None:
+    from .test_context_usage import _line
+    from claude_org_runtime.broker.context_usage import context_percent
+    cwd = "/w/org/.dispatcher/.worktrees/t-1"
+    d = tmp_path / ".claude" / "projects" / "-w-org--dispatcher--worktrees-t-1"
+    d.mkdir(parents=True)
+    (d / "s.jsonl").write_text(_line(inp=100_000) + "\n", encoding="utf-8")
+    assert context_percent(cwd, home=tmp_path) == "50%"
