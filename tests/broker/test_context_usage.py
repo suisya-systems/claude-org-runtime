@@ -20,7 +20,7 @@ CWD = "/home/u/work/org/workers/foo bar/日本"
 ENCODED = "-home-u-work-org-workers-foo-bar---"  # non [A-Za-z0-9.] -> "-"
 
 
-def _line(model="claude-sonnet-5-5", inp=1, cr=0, cc=0, **extra) -> str:
+def _line(model="claude-sonnet-4-5", inp=1, cr=0, cc=0, **extra) -> str:
     msg = {"model": model, "usage": {"input_tokens": inp, "output_tokens": 9,
                                      "cache_read_input_tokens": cr,
                                      "cache_creation_input_tokens": cc}}
@@ -45,8 +45,12 @@ def test_project_dir_name_matches_claude_code() -> None:
 
 
 @pytest.mark.parametrize("model,limit", [
-    ("claude-sonnet-5-5", 200_000),
-    ("claude-haiku-5-5", 200_000),
+    ("claude-sonnet-5-5", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
+    ("claude-sonnet-4-5", 200_000),
+    ("claude-haiku-5-5", 1_000_000),
+    ("claude-haiku-4-5", 200_000),
     ("claude-opus-5-5", 1_000_000),
     ("claude-opus-4-6", 1_000_000),
     ("claude-opus-4-1", 500_000),
