@@ -957,3 +957,10 @@ def test_admin_adopt_delivery_default_does_not_return_token(admin_broker):
     assert "token" not in res
     assert _adopt(admin_broker, {"owner": "sec", "token_env": 1, "force": True},
                   expect_status=400)["ok"] is False
+
+
+def test_adopt_status_reports_whether_the_owner_is_adoptable(admin_broker):
+    """adopt_status.adoptable lets `org cockpit` choose org up over a doomed adopt."""
+    assert _adopt_status(admin_broker, {"owner": "sec"})["adoptable"] is False
+    _mint_channel_owner(admin_broker, "sec")
+    assert _adopt_status(admin_broker, {"owner": "sec"})["adoptable"] is True
