@@ -45,7 +45,7 @@ from ..terminal import (
     venv_pane_env,
     venv_pane_prep,
 )
-from . import sidecar, store, surface, user_turn
+from . import context_usage, sidecar, store, surface, user_turn
 from .store import ObserverLease, QueueRow, StoreMixin
 from .surface import PROTOCOL_VERSIONS, SERVER_INFO, ToolArgError
 from .tokens import MAX_SESSIONS_PER_BIND, TOKEN_ENV, AgentBind, TokenMixin
@@ -1349,13 +1349,27 @@ class Broker(TokenMixin, StoreMixin):
         while not self._agent_state_stop.wait(self.agent_state_interval):
             with self._lock:
                 targets = [
-                    (h, m.get("agent_state"))
+                    (h, m.get("agent_state"), m.get("agent_ctx"), m.get("cwd"),
+                     bool(m.get("logical")))
                     for h, m in self._pane_meta.items()
-                    if m.get("kind") == "claude" and not m.get("logical")
+                    if m.get("kind") == "claude"
                 ]
-            for handle, last in targets:
+            for handle, last, last_ctx, cwd, logical in targets:
                 if self._agent_state_stop.is_set():
                     return
+                # Issue #262: @ctx from Claude's transcript. The secretary is a
+                # logical pane; its window is the cockpit pane marked as such.
+                target = handle
+                if logical:
+                    finder = getattr(self.adapter, "secretary_pane_id", None)
+                    target = finder() if finder else None
+                    cwd = cwd or self.root_cwd
+                if target is not None:
+                    ctx = context_usage.context_percent(cwd) or ""
+                    if ctx != (last_ctx or "") and self._set_agent_options(target, ctx=ctx):
+                        self._remember(handle, agent_ctx=ctx)
+                if logical:
+                    continue
                 try:
                     state = user_turn.agent_state(self.adapter.get_text(handle))
                 except Exception:
@@ -1363,10 +1377,13 @@ class Broker(TokenMixin, StoreMixin):
                 if state is None or state == last:
                     continue
                 if self._set_agent_options(handle, state=state):
-                    with self._lock:
-                        meta = self._pane_meta.get(handle)
-                        if meta is not None:
-                            meta["agent_state"] = state
+                    self._remember(handle, agent_state=state)
+
+    def _remember(self, handle: "PaneId", **kv: str) -> None:
+        with self._lock:
+            meta = self._pane_meta.get(handle)
+            if meta is not None:
+                meta.update(kv)
 
     def _gen_agent_id(self, prefix: str) -> str:
         return f"{prefix}-{next(self._pane_counter)}"
