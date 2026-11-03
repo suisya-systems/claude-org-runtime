@@ -105,7 +105,7 @@ def test_spawn_links_the_new_window_into_the_cockpit(adapter) -> None:
 # ----------------------------------------------------------------- cockpit
 def test_cockpit_creates_org_and_links_only_missing_agents(adapter) -> None:
     cockpit = _cockpit()
-    windows = "org\t@0\t\norg\t@3\tfix-1\nagent-a\t@3\tfix-1\nagent-b\t@5\tfix-2\nmisc\t@7\t\n"
+    windows = "org\t@0\t\thome\toff\norg\t@3\tfix-1\tfix-1\toff\nagent-a\t@3\tfix-1\tfix-1\toff\nagent-b\t@5\tfix-2\tfix-2\toff\nmisc\t@7\t\tsh\toff\n"
     adapter._fake.queue((1, "", "can't find session"), (0, "", ""), (0, "", ""),
                         (0, windows, ""))
     assert cockpit.ensure_cockpit(adapter) == ["@5"]

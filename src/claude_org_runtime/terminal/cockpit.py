@@ -38,7 +38,8 @@ _PANE_FORMAT = (f"#{{pane_id}}\t#{{{COCKPIT_HOME_OPT}}}\t#{{{SECRETARY_OPT}}}"
 
 
 def ensure_cockpit(a: TmuxAdapter) -> list[str]:
-    """Create ``org`` if missing and link every agent window not yet in it.
+    """Create ``org`` if missing and link every agent window not yet in it,
+    naming and pinning every agent tab.
 
     The first window is "home", where the secretary runs (marked with
     ``@cockpit_home`` so :meth:`TmuxAdapter.list_panes` never reports it).
@@ -53,16 +54,23 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
         )
     a.apply_org_config()
     out = a._tmux(
-        "list-windows", "-a", "-F", "#{session_name}\t#{window_id}\t#{@task}",
+        "list-windows", "-a", "-F",
+        "#{session_name}\t#{window_id}\t#{@task}\t#{window_name}\t#{automatic-rename}",
     ).stdout
-    rows = [ln.split("\t") for ln in out.splitlines() if ln.count("\t") == 2]
-    present = {wid for sess, wid, _ in rows if sess == COCKPIT_SESSION}
+    rows = [ln.split("\t") for ln in out.splitlines() if ln.count("\t") == 4]
+    present = {r[1] for r in rows if r[0] == COCKPIT_SESSION}
     linked: list[str] = []
-    for sess, wid, task in rows:
-        if sess != COCKPIT_SESSION and task and wid not in present:
-            # Issue #259: name the tab after the agent before linking it.
-            a._tmux("rename-window", "-t", wid, task, ";",
-                    "set-option", "-w", "-t", wid, "automatic-rename", "off")
+    for sess, wid, task, name, auto in rows:
+        if not task:
+            continue
+        in_cockpit = sess == COCKPIT_SESSION
+        if in_cockpit or wid not in present:
+            # Issues #259/#263: name and pin every agent tab, including ones
+            # linked before; windows already right are left alone.
+            if name != task or auto != "off":
+                a._tmux("rename-window", "-t", wid, task, ";",
+                        "set-option", "-w", "-t", wid, "automatic-rename", "off")
+        if not in_cockpit and wid not in present:
             a._tmux("link-window", "-d", "-s", wid, "-t", f"{_TARGET}:")
             present.add(wid)
             linked.append(wid)
