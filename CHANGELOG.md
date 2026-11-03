@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.54] - 2026-11-03
+
 ### Fixed
 
 - `org cockpit` starts a fresh secretary (`org up`) instead of `org adopt --continue` when the broker daemon is up but holds no live bind for the owner (`unknown_owner` killed the home window). `adopt_status` now reports `adoptable`.
