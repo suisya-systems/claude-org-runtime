@@ -235,6 +235,8 @@ def run(args: argparse.Namespace) -> int:
     # bind.pane_id は None のままなので PTY ナッジは飛ばない (人間は check_messages
     # で読む)。これで list_panes に窓口が出て、子を 1 つ spawn した状態でも
     # close_pane が [last_pane] 誤判定せず子を閉じられる。
+    # secretary が name 付きで admin mint されると、この root 論理ペインは secretary 自身の
+    # 論理ペインに置き換わる (admin_mint_token)。secretary 不在の素の serve ではこれが残る。
     root_pane = broker.register_logical_pane(tok)
     print(f"root pane registered (logical, id={root_pane['id']}, role={args.root_role})")
     # 前景で shutdown 要求まで待つ。要求は (a) admin RPC (shutdown) または

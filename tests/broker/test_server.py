@@ -1479,3 +1479,28 @@ def test_malformed_params_still_get_a_jsonrpc_error(broker, client_factory, monk
     res = a.rpc("tools/call", "not-a-dict")
     assert res["error"]["code"] == -32603
     assert "[tool_failed] ?" in res["error"]["message"]
+
+
+# ===== startup root pane vs secretary mint (runtime-root-logical-pane-name)
+def _serve_like_startup(tmp_path, fake_adapter):
+    """cli.run と同じ: root token 発行 + 論理ペイン登録 (secretary mint 前)。"""
+    b = Broker(state_dir=tmp_path, adapter=fake_adapter)
+    b.register_logical_pane(b.issue_token("manual-test", "manual-test", "worker"))
+    return b
+
+
+def test_secretary_logical_pane_keeps_issue57_close_child(tmp_path, fake_adapter):
+    b = _serve_like_startup(tmp_path, fake_adapter)
+    sec = b.get_bind(b.admin_mint_token({"role": "secretary", "name": "secretary"})["token"])
+    dispatch_tool(b, sec, "spawn_claude_pane", {"direction": "vertical", "name": "child"})
+    out = dispatch_tool(b, sec, "close_pane", {"target": "child"})
+    assert "isError" not in out, out
+    assert _text(out)["ok"] is True
+
+
+def test_unnamed_secretary_probe_mint_keeps_root_pane(tmp_path, fake_adapter):
+    """launcher の probe / down ctrl は無名 mint。root anchor を外してはならない。"""
+    b = _serve_like_startup(tmp_path, fake_adapter)
+    assert b.admin_mint_token({"role": "secretary"})["ok"] is True
+    assert b._pane_meta.get("manual-test") is not None
+    assert b._pane_meta.get("secretary") is None
