@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **tmux: an org-only config and agent state in window options (#250, first
+  step).** Every spawn sources the packaged `org.tmux.conf` on the
+  `claude-org-broker` socket (a separate, non-fatal call, so a config error
+  never orphans the new pane). It turns on `mouse`, sets `escape-time 10` and
+  an empty `status-right`, applies Claude Code's recommended tmux settings
+  (`allow-passthrough`, `focus-events`, `extended-keys`,
+  `terminal-features xterm*:extkeys`), moves the prefix to `C-Space`, and on
+  WSL copies to the Windows clipboard through `clip.exe`. The broker writes
+  `@role`, `@task` and `@state` (`working` / `waiting` / `idle`) as window
+  options on spawn, on `set_pane_identity` and when a 2-second screen poll sees
+  the state change, then runs `refresh-client -S`. `@state` is set for Claude
+  panes only; it stays unset for Codex and generic panes.
+
+### Changed
+
+- **tmux: no default key or menu can kill an agent (#250).** The config
+  removes `prefix x`, the `prefix <` / `>` menus, and the choose-tree entry
+  points `prefix s` / `w` / `f`, whose own `x` / `X` keys kill. It also removes
+  the right-click Kill / Respawn menus, and `prefix &` now unlinks the window
+  instead of killing it. Switch sessions with `C-Space (` / `)` until the
+  cockpit lands. `list_panes` reports a window linked into two sessions once.
+  The adapter's `__main__` self-test now uses its own socket instead of
+  killing the broker server.
+
 ## [0.1.51] - 2026-10-15
 
 ### Fixed

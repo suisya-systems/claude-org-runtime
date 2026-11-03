@@ -40,6 +40,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from importlib import resources
 from typing import ClassVar
 
 from .base import NUDGE_TEXT, PaneRef  # noqa: F401  (NUDGE_TEXT 再利用)
@@ -47,6 +48,9 @@ from .keys import CANONICAL_KEYS, CTRL_LETTERS
 
 # 専用 socket 名: 既存 tmux サーバーと分離する (本体非干渉)。
 BROKER_SOCKET = "claude-org-broker"
+
+# org-only tmux config (Issue #250): safety rebinds, mouse, Claude Code settings.
+ORG_CONF = "org.tmux.conf"
 
 # canonical キー -> tmux send-keys 語彙 の明示マップ (design review 確定事項 (4))。
 # schema 名をそのまま渡すと BTab / PPage / NPage / BSpace / DC / Escape のズレで
@@ -171,12 +175,18 @@ class TmuxAdapter:
                 f"tmux list-panes failed ({proc.returncode}): {proc.stderr.strip()}"
             )
         out: list[dict] = []
+        seen: set[str] = set()
         for line in proc.stdout.splitlines():
             if not line.strip():
                 continue
             parts = line.split("\t")
             if len(parts) != len(_LIST_FIELDS):
                 continue
+            # A window linked into a second session (the cockpit, #250) lists its
+            # panes once per session; a pane is one agent, so keep the first.
+            if parts[0] in seen:
+                continue
+            seen.add(parts[0])
             rec = dict(zip(_LIST_FIELDS, parts))
             for k in ("left", "top", "width", "height", "cursor_x", "cursor_y",
                       "pane_pid"):
@@ -199,7 +209,7 @@ class TmuxAdapter:
         """新しい detached session に argv を起動し PaneRef を返す。
 
         tmux の「ウィンドウ」相当は session。spawn は常に専用 socket 上の新規 session
-        (1 pane = 1 session。``tmux attach`` 後 ``Ctrl-b s`` で切り替えて見る)。既存
+        (1 pane = 1 session。``tmux -L claude-org-broker attach`` 後 ``C-Space (`` / ``)`` で切り替えて見る。``s`` は choose-tree の kill キーを避けるため org.tmux.conf が外す)。既存
         pane は split しない (Issue #247)。new_window は WezTerm 面との互換のため受けるが
         使わない。
 
@@ -238,8 +248,34 @@ class TmuxAdapter:
             "-x", str(self.width), "-y", str(self.height), *tail, *unset,
         )
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
+        self.apply_org_config()
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
         return PaneRef(pane_id=pane_id, window_id=window_id, tab_id=window_id)
+
+    def apply_org_config(self) -> None:
+        """Source the org-only config on this socket (Issue #250).
+
+        Runs after every spawn: re-sourcing is idempotent and survives a server
+        restart without any state. A separate, non-fatal call, so a config error
+        can never orphan the pane that was just created.
+        """
+        with resources.as_file(resources.files(__package__) / ORG_CONF) as conf:
+            self._tmux("source-file", str(conf), check=False)
+
+    def set_agent_options(self, pane_id: str, **opts: str) -> None:
+        """Write ``@<key>`` **window** options for the pane's window (Issue #250).
+
+        Window options follow the window into linked sessions (session options
+        do not). ``refresh-client -S`` redraws status lines; it fails when no
+        client is attached, so it is a separate non-fatal call.
+        """
+        args: list[str] = []
+        for key, value in opts.items():
+            args += [";"] if args else []
+            args += ["set-option", "-w", "-t", str(pane_id), f"@{key}", value]
+        if args:
+            self._tmux(*args)
+            self._tmux("refresh-client", "-S", check=False)
 
     # ------------------------------------------------------------- send-keys
     def send_enter(self, pane_id: str) -> None:
@@ -325,7 +361,8 @@ if __name__ == "__main__":
     # 簡易自己診断 (Claude 不要・無課金): cat を spawn し、send-keys / capture を確認。
     import sys
 
-    a = TmuxAdapter()
+    # Own socket: never touch (or kill) the live broker server's agents.
+    a = TmuxAdapter(socket=f"claude-org-selftest-{os.getpid()}")
     ref = a.spawn(["cat"])
     print(f"spawned pane_id={ref.pane_id} window_id={ref.window_id}")
     a.type_text(ref.pane_id, "hello-tmux-adapter")

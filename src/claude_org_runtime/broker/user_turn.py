@@ -115,6 +115,38 @@ def _parse(screen: str) -> tuple[str, list[str]]:
     return (DRAFT if any(ln.strip() for ln in draft) else EMPTY), draft
 
 
+# Cockpit state (Issue #250): a cursor on a numbered option, boxed or not
+# ("❯ 1. Yes", "│ ❯ 2. No, exit │") is a selection menu the operator must answer.
+_MENU_ROW = re.compile(r"^[│|\s]*[❯>]\s*\d+[.)]\s")
+
+
+def agent_state(screen: str) -> str | None:
+    """Map a Claude screen to the cockpit ``@state``.
+
+    ``waiting`` (a selection menu or dialog: permission prompt, trust dialog),
+    ``working`` (busy marker), ``idle`` (composer visible), or ``None`` when the
+    screen is not recognised (the caller keeps the previous value). The menu is
+    checked before busy markers: a permission menu's "Esc to cancel" is also one.
+    """
+    status, _ = _parse(screen)
+    if status in (EMPTY, DRAFT):
+        return "idle"
+    lines = [ln.rstrip() for ln in screen.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    lines = lines[-21:]  # the busy-check window, plus the fence above its top row
+    for i, ln in enumerate(lines):
+        # A fence directly above makes it a composer draft that starts "1. ".
+        if _MENU_ROW.match(ln) and not (i and _is_fence(lines[i - 1])):
+            return "waiting"
+    spaceless = unicodedata.normalize("NFKC", "\n".join(lines).lower()).replace(" ", "")
+    if any(f in spaceless for f in _DIALOG_FOOTERS):
+        return "waiting"
+    if status == BUSY:
+        return "working"
+    return None
+
+
 # --- Codex (calibrated on renga's codex v0.153.4 fixtures) ------------------
 _CODEX_GLYPH = "\u203a"  # ›
 _CODEX_FOOTERS = _DIALOG_FOOTERS + ("entertocontinue",)  # update / trust prompts

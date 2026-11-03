@@ -142,7 +142,7 @@ def test_spawn_constructs_new_session(adapter: TmuxAdapter) -> None:
     adapter._fake.queue((0, "%2\t@1\tclaude-org-broker-9-1", ""))
     ref = adapter.spawn(["claude", "--flag"], cwd="/work/dir")
     assert (ref.pane_id, ref.window_id, ref.tab_id) == ("%2", "@1", "@1")
-    args = _args(adapter._fake.last)
+    args = _args(adapter._fake.calls[0])
     assert args[0] == "new-session"
     assert "-d" in args
     assert ["-x", "220"] == args[args.index("-x"):args.index("-x") + 2]
@@ -155,14 +155,14 @@ def test_spawn_constructs_new_session(adapter: TmuxAdapter) -> None:
 def test_spawn_without_cwd_omits_c_flag(adapter: TmuxAdapter) -> None:
     adapter._fake.queue((0, "%3\t@2\tclaude-org-broker-9-2", ""))
     adapter.spawn(["cat"])
-    assert "-c" not in _args(adapter._fake.last)
+    assert "-c" not in _args(adapter._fake.calls[0])
 
 
 def test_spawn_injects_env_via_new_session_e_flag(adapter: TmuxAdapter) -> None:
     # Issue #122: env は tmux 一級の `new-session -e KEY=VALUE` で渡す (shell 前置しない)。
     adapter._fake.queue((0, "%4\t@3\tclaude-org-broker-9-3", ""))
     adapter.spawn(["claude"], env={"ORG_BROKER_STATE_DIR": "/abs/state"})
-    args = _args(adapter._fake.last)
+    args = _args(adapter._fake.calls[0])
     assert args[0] == "new-session"
     idx = args.index("-e")
     assert args[idx + 1] == "ORG_BROKER_STATE_DIR=/abs/state"
@@ -175,7 +175,7 @@ def test_new_session_drops_env_from_session_environment(adapter: TmuxAdapter) ->
     # show-environment can read it. The same command list must unset every injected key.
     adapter._fake.queue((0, "%4\t@3\tclaude-org-broker-9-3", ""))
     adapter.spawn(["claude"], env={"ORG_BROKER_TOKEN": "t", "K": "V"})
-    args = _args(adapter._fake.last)
+    args = _args(adapter._fake.calls[0])
     session = args[args.index("-s") + 1]
     tail = args[args.index("claude"):]
     assert tail == [
@@ -188,7 +188,7 @@ def test_new_session_drops_env_from_session_environment(adapter: TmuxAdapter) ->
 def test_spawn_without_env_omits_e_flag(adapter: TmuxAdapter) -> None:
     adapter._fake.queue((0, "%5\t@4\tclaude-org-broker-9-4", ""))
     adapter.spawn(["cat"])
-    assert "-e" not in _args(adapter._fake.last)
+    assert "-e" not in _args(adapter._fake.calls[0])
 
 
 @pytest.mark.skipif(
@@ -216,7 +216,7 @@ def test_spawn_carries_venv_login_shell_wrapper(
 
     adapter._fake.queue((0, "%6\t@5\tclaude-org-broker-9-5", ""))
     adapter.spawn(wrapped, env=env)
-    args = _args(adapter._fake.last)
+    args = _args(adapter._fake.calls[0])
     # VIRTUAL_ENV via -e (env dict channel, same as ORG_BROKER_STATE_DIR).
     assert f"VIRTUAL_ENV={venv}" in args
     # PATH prepend rides the shlex-joined command string (post-profile export).
