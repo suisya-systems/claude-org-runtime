@@ -9,6 +9,7 @@ Subcommands:
 - ``attention scan|watch ...`` -> :mod:`claude_org_runtime.attention.cli`
 - ``broker serve ...`` -> :mod:`claude_org_runtime.broker.cli`
 - ``org up|down ...`` -> :mod:`claude_org_runtime.broker.launcher`
+- ``org cockpit|peek ...`` -> :mod:`claude_org_runtime.terminal.cockpit`
 
 The subcommands re-use the same parser builders the per-module CLIs
 expose, so flags stay in lock-step.
@@ -28,6 +29,7 @@ from .dispatcher import runner as dispatcher_runner
 from .migrate import v1_to_v2 as migrate_v1_to_v2
 from .settings import generator as settings_generator
 from .settings import sandbox_doctor
+from .terminal import cockpit as tmux_cockpit
 
 
 def _run_settings_generate(args: argparse.Namespace) -> int:
@@ -140,11 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "org session launcher: 'up' ensures a broker daemon and launches the "
             "secretary TUI; 'adopt' hands an owner's delivery ownership to a new "
-            "session; 'down' stops the daemon (signal-free) and verifies it."
+            "session; 'down' stops the daemon (signal-free) and verifies it; "
+            "'cockpit' / 'peek' are the tmux cockpit."
         ),
     )
     org_sub = org_p.add_subparsers(dest="cmd", required=True)
     broker_launcher.add_subparsers(org_sub)
+    tmux_cockpit.add_subparsers(org_sub)
 
     # migrate
     migrate_p = sub.add_parser(

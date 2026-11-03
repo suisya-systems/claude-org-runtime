@@ -37,6 +37,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -51,6 +52,10 @@ BROKER_SOCKET = "claude-org-broker"
 
 # org-only tmux config (Issue #250): safety rebinds, mouse, Claude Code settings.
 ORG_CONF = "org.tmux.conf"
+# The cockpit session (Issue #250) and the window option marking its own
+# windows (home, peek splits): those panes are not broker panes.
+COCKPIT_SESSION = "org"
+COCKPIT_HOME_OPT = "@cockpit_home"
 
 # canonical キー -> tmux send-keys 語彙 の明示マップ (design review 確定事項 (4))。
 # schema 名をそのまま渡すと BTab / PPage / NPage / BSpace / DC / Escape のズレで
@@ -155,7 +160,10 @@ class TmuxAdapter:
     # ------------------------------------------------------------------ list
     def list_panes(self) -> list[dict]:
         """`tmux list-panes -a -F` を geometry / cursor 付きで dict 化する。"""
-        proc = self._tmux("list-panes", "-a", "-F", _LIST_FMT, check=False)
+        proc = self._tmux(
+            "list-panes", "-a", "-f", f"#{{?#{{{COCKPIT_HOME_OPT}}},0,1}}",
+            "-F", _LIST_FMT, check=False,
+        )
         if proc.returncode != 0:
             # 「サーバー未起動 / session 皆無」だけを空扱いにする。socket 権限・
             # サーバー異常・format エラー等を一律 [] にすると pane_exists() が
@@ -250,8 +258,12 @@ class TmuxAdapter:
         pane_id, window_id, _sess = proc.stdout.strip().split("\t")
         try:
             self.apply_org_config()
+            # Keep the cockpit in sync (Issue #250): a tab for the new agent.
+            # Fails harmlessly when there is no cockpit session.
+            self._tmux("link-window", "-d", "-s", window_id,
+                       "-t", f"={COCKPIT_SESSION}:", check=False)
         except (OSError, subprocess.SubprocessError):
-            pass  # cosmetic config: a timeout must not orphan the live pane
+            pass  # cosmetic: a timeout must not orphan the live pane
         # tab_id には window_id を充てる (single-tab addressing is window 単位)。
         return PaneRef(pane_id=pane_id, window_id=window_id, tab_id=window_id)
 
@@ -262,8 +274,11 @@ class TmuxAdapter:
         restart without any state. A separate, non-fatal call, so a config error
         can never orphan the pane that was just created.
         """
+        # The tab menu's peek runs this runtime's own CLI, whatever PATH holds.
+        runtime = shlex.join([sys.executable, "-m", "claude_org_runtime.cli"])
         with resources.as_file(resources.files(__package__) / ORG_CONF) as conf:
-            self._tmux("source-file", str(conf), check=False)
+            self._tmux("set-option", "-g", "@org_runtime", runtime, ";",
+                       "source-file", str(conf), check=False)
 
     def set_agent_options(self, pane_id: str, **opts: str) -> None:
         """Write ``@<key>`` **window** options for the pane's window (Issue #250).

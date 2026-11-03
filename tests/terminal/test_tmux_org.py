@@ -24,7 +24,7 @@ SRC = Path(tmux_mod.__file__).resolve().parents[1]
 CONF_TEXT = (resources.files("claude_org_runtime.terminal") / ORG_CONF).read_text(
     encoding="utf-8")
 # Commands that kill or respawn, or open a chooser / menu that offers to.
-DESTRUCTIVE = re.compile(r"kill|respawn|choose-tree|display-menu|find-window|confirm")
+DESTRUCTIVE = re.compile(r"kill|respawn|choose-tree|find-window|confirm")
 
 
 @pytest.fixture
@@ -41,13 +41,23 @@ def _args(call: list[str]) -> list[str]:
 
 
 # ------------------------------------------------------------ config apply
-def test_spawn_sources_org_config_after_new_session(adapter) -> None:
+def test_spawn_sources_org_config_then_links_into_cockpit(adapter) -> None:
     adapter._fake.queue((0, "%2\t@1\tclaude-org-broker-9-1", ""))
     adapter.spawn(["cat"])
-    new_session, source = (_args(c) for c in adapter._fake.calls)
+    new_session, source, link = (_args(c) for c in adapter._fake.calls)
     assert new_session[0] == "new-session"
-    assert source[0] == "source-file"
-    assert Path(source[1]).name == ORG_CONF and Path(source[1]).is_file()
+    # @org_runtime (the CLI the tab menu's peek runs) is set before sourcing.
+    assert source[:3] == ["set-option", "-g", "@org_runtime"]
+    assert source[3].endswith("-m claude_org_runtime.cli")
+    assert source[4:6] == [";", "source-file"]
+    assert Path(source[6]).name == ORG_CONF and Path(source[6]).is_file()
+    assert link == ["link-window", "-d", "-s", "@1", "-t", "=org:"]
+
+
+def test_list_panes_hides_cockpit_windows(adapter) -> None:
+    adapter.list_panes()
+    args = _args(adapter._fake.last)
+    assert args[:4] == ["list-panes", "-a", "-f", "#{?#{@cockpit_home},0,1}"]
 
 
 def test_config_error_does_not_fail_spawn(adapter) -> None:
@@ -113,7 +123,7 @@ def test_config_unbinds_default_killers(key: str) -> None:
 
 def test_config_replaces_default_right_click_menus() -> None:
     lines = _lines()
-    assert "bind -n MouseDown3Status select-window -t=" in lines
+    assert any(ln.startswith("bind -n MouseDown3Status if -F -t = ") for ln in lines)
     assert "bind -n MouseDown3Pane select-pane -t= \\; send -M" in lines
     assert "bind -T prefix '&' unlink-window" in lines
 

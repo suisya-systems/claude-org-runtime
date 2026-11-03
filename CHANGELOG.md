@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the state change, then runs `refresh-client -S`. `@state` is set for Claude
   panes only; it stays unset for Codex and generic panes.
 
+- **tmux cockpit: every agent as a tab in one session (#250).**
+  `claude-org-runtime org cockpit` creates the `org` session on the broker
+  socket if it is missing (its first window, "home", is where the secretary
+  will run), links every agent window into it, and attaches (`--no-attach` for
+  scripts; `switch-client` when already inside the broker socket). New spawns
+  are linked automatically, and a closed agent's tab goes away with its pane.
+  Tabs show the task and its state instead of window numbers. A second status
+  line always lists the agents that need the operator, each entry clickable
+  (`#[range=window|N]`), with a yellow fill when it is non-empty. Right-click
+  on a tab offers Switch, Peek (read-only) and Back to secretary, and
+  Interrupt (Esc) only while the agent is `working` (re-checked on click).
+  There is no approve item. `claude-org-runtime org peek <pane>` is the
+  read-only mirror Peek opens beside the secretary (`capture-pane`, refreshed
+  every second); it never links or splits the agent's window. Opening the
+  cockpit in a new Windows Terminal tab is left to the claude-org-ja change
+  that moves the secretary into the cockpit.
+
 ### Changed
 
 - **tmux: no default key or menu can kill an agent (#250).** The config
@@ -32,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cockpit lands. `list_panes` reports a window linked into two sessions once.
   The adapter's `__main__` self-test now uses its own socket instead of
   killing the broker server.
+
+- **tmux `list_panes` hides the cockpit's own windows (#250)**, so the home
+  shell and peek panes are never reported as broker panes or counted by the
+  last-pane guard.
 
 ## [0.1.51] - 2026-10-15
 
