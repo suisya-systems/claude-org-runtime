@@ -306,6 +306,16 @@ class TmuxAdapter:
             self._tmux(*args)
             self._tmux("refresh-client", "-S", check=False)
 
+    def secretary_pane_id(self) -> str | None:
+        """The cockpit pane marked ``@org_secretary`` (Issue #262), else None."""
+        out = self._tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@org_secretary}",
+                         check=False).stdout
+        for ln in out.splitlines():
+            pid, _, mark = ln.partition("\t")
+            if mark == "1":
+                return pid
+        return None
+
     # ------------------------------------------------------------- send-keys
     def send_enter(self, pane_id: str) -> None:
         """Enter 1 打 (一級プリミティブ)。承認プロンプト機械承認 / submit に使う。"""

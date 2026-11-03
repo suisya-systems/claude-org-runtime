@@ -138,7 +138,7 @@ def test_config_safety_comes_first() -> None:
 
 
 @pytest.mark.parametrize("line", [
-    "set -g mouse on", "set -s escape-time 10", "set -g status-right ''",
+    "set -g mouse on", "set -s escape-time 10",
     "set -g allow-passthrough on", "set -g focus-events on",
     "set -s extended-keys on", "set -s terminal-features[90] 'xterm*:extkeys'",
     "set -g prefix C-Space", "set -s set-clipboard external",
@@ -229,3 +229,25 @@ def test_task_names_the_tab_and_pins_it(adapter) -> None:
     assert ["set-option", "-w", "-t", "%2", "automatic-rename", "off"] == args[-6:]
     adapter.set_agent_options("%2", state="idle")
     assert "rename-window" not in _args(adapter._fake.calls[2])
+
+
+# ------------------------------------------------------------- #262 @ctx
+def test_conf_shows_ctx_in_tabs_and_status_right() -> None:
+    for name in ("window-status-format", "window-status-current-format"):
+        line = next(ln for ln in CONF_TEXT.splitlines() if ln.startswith(f"set -g {name} "))
+        assert line.endswith("#{?#{@ctx}, #{@ctx},} '")  # nothing, not a gap, when unknown
+    right = next(ln for ln in CONF_TEXT.splitlines() if ln.startswith("set -g status-right "))
+    assert right.startswith("set -g status-right '#{?#{@ctx},")
+    assert right.endswith(",}'")  # unknown renders nothing
+
+
+@pytest.mark.parametrize("ctx,colour", [
+    ("0%", None), ("69%", None), ("70%", "yellow"), ("89%", "yellow"),
+    ("90%", "red"), ("99%", "red"), ("100%", "red"),
+])
+def test_status_right_thresholds(ctx, colour) -> None:
+    right = next(ln for ln in CONF_TEXT.splitlines() if ln.startswith("set -g status-right "))
+    red, yellow = (re.search(rf"#\{{m/r:(\S+?),#\{{@ctx\}}\}},#\[fg=black bg={c}\]", right).group(1)
+                   for c in ("red", "yellow"))
+    got = "red" if re.search(red, ctx) else "yellow" if re.search(yellow, ctx) else None
+    assert got == colour
