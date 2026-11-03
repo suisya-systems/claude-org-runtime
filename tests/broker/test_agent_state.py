@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from claude_org_runtime.broker.server import Broker
@@ -135,3 +137,26 @@ def test_identity_change_republishes_role_and_task(tmp_path) -> None:
     a.options.clear()
     b.set_pane_identity(str(handle), True, "fix-2", True, "worker")
     assert a.options == [(handle, {"role": "worker", "task": "fix-2"})]
+
+
+def test_failing_secretary_lookup_does_not_stop_the_poller(tmp_path) -> None:
+    class Boom(OptionAdapter):
+        def secretary_pane_id(self):
+            raise OSError("tmux gone")
+
+    a = Boom()
+    b = _broker(tmp_path, a)
+    tok = b.issue_token("secretary", "secretary", "secretary", kind="claude")
+    b.register_logical_pane(tok)
+    b._register_pane("%1", "fix-1", "fix-1", "worker", None, "claude", None)
+    a.options.clear()
+    _poll_once(b)  # must not raise
+    assert a.options == [("%1", {"state": "idle"})]
+
+
+def test_usage_found_behind_a_huge_trailing_record(tmp_path) -> None:
+    from .test_context_usage import CWD, _line, _transcript
+    from claude_org_runtime.broker.context_usage import context_percent
+    big = json.dumps({"type": "user", "pad": "x" * (600 * 1024)})  # > first tail
+    _transcript(tmp_path, CWD, _line(inp=100_000), big)
+    assert context_percent(CWD, home=tmp_path) == "50%"
