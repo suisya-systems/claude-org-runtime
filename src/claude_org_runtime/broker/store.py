@@ -808,6 +808,8 @@ class StoreMixin:
             _lease, state = self._observer_state_locked(owner, now)
             result = {
                 "ok": True, "owner": owner,
+                # False -> adopt would fail with [unknown_owner] / [no_delivery_credential].
+                "adoptable": self._adopt_owner_check_locked(owner)[0] is None,
                 "generation": self._generation_of(owner),
                 "instance_id": self._delivery_instances.get(owner),
                 "observer_state": state,

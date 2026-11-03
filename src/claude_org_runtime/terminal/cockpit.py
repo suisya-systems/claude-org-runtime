@@ -146,7 +146,7 @@ def secretary_command(action: str, args: argparse.Namespace, daemon_alive: bool)
 
 def start_secretary(
     a: TmuxAdapter, args: argparse.Namespace, *, env: dict[str, str], cwd: str,
-    daemon_alive: Callable[[], bool],
+    daemon_alive: Callable[[], bool], adoptable: Callable[[], bool] = lambda: True,
 ) -> int:
     """Start (or leave running) the secretary in the cockpit home window.
 
@@ -170,7 +170,9 @@ def start_secretary(
               "another. To move it here, exit it and run 'claude-org-runtime org "
               "adopt --continue' in the home window.", file=sys.stderr)
         return 0
-    cmd = secretary_command(action, args, alive)
+    # A live daemon with no bind for the owner cannot be adopted (unknown_owner):
+    # start a fresh secretary instead.
+    cmd = secretary_command(action, args, alive and adoptable())
     a._tmux("set-option", "-p", "-t", pane, SECRETARY_OPT, "1")
     argv = ["respawn-pane", *(["-k"] if action == "launch_kill" else []),
             "-t", pane, "-c", cwd]
@@ -256,8 +258,9 @@ def _adapter() -> TmuxAdapter | None:
         return None
 
 
-def _daemon_alive(state_dir: str, owner: str) -> bool:
-    """A broker daemon answers on ``state_dir`` (what ``org adopt --status`` asks)."""
+def _daemon_alive(state_dir: str, owner: str, key: str = "ok") -> bool:
+    """A broker daemon answers on ``state_dir`` (what ``org adopt --status`` asks);
+    ``key="adoptable"`` also needs it to hold a live bind for ``owner``."""
     res = launcher._resolve_running_daemon(state_dir)
     if res["kind"] != "ok":
         return False
@@ -266,7 +269,7 @@ def _daemon_alive(state_dir: str, owner: str) -> bool:
                                 "adopt_status", {"owner": owner})
     except OSError:  # URLError, refused, timeout
         return False
-    return bool(r and r.get("ok"))
+    return bool(r and r.get("ok") and r.get(key, True))
 
 
 def _backend(args: argparse.Namespace, state_dir: str) -> str:
@@ -306,6 +309,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
                 rc = start_secretary(
                     a, args, env=dict(os.environ), cwd=os.getcwd(),
                     daemon_alive=lambda: _daemon_alive(state_dir, args.name),
+                    adoptable=lambda: _daemon_alive(state_dir, args.name, "adoptable"),
                 )
             if rc != 0:
                 return rc

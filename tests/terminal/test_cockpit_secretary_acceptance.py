@@ -153,3 +153,17 @@ def test_non_tmux_backend_is_a_clear_error(adapter, monkeypatch, capsys) -> None
     assert rc != 0
     assert "tmux" in capsys.readouterr().err
     assert not made and not adapter._fake.calls
+
+
+def test_exited_secretary_with_daemon_but_no_bind_runs_org_up(adapter) -> None:
+    # Daemon is up but holds no live bind for the owner: adopt would die with
+    # [unknown_owner], so the cockpit must start a fresh secretary instead.
+    start = _start()
+    adapter._fake.queue(_panes("%1\t1\t1\t1\tclaude"))
+    import inspect
+    extra = ({"adoptable": lambda: False}
+             if "adoptable" in inspect.signature(start).parameters else {})
+    assert start(adapter, _args(), env=ENV, cwd="/repo",
+                 daemon_alive=lambda: True, **extra) == 0
+    (respawn,) = _respawns(adapter)
+    _command_after(respawn, "org", "up")
