@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.55] - 2026-11-03
+
+### Fixed
+
+- Cockpit tabs are named after the agent (`dispatcher`, `worker-N`) and the name is pinned (tmux automatic-rename off), on spawn (`@task`) and on `org cockpit --attach-only` for already-running agents (#259, #260).
+
 ## [0.1.54] - 2026-11-03
 
 ### Fixed
