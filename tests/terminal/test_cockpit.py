@@ -102,9 +102,27 @@ def test_ensure_creates_org_with_home_and_links_missing_agents(adapter) -> None:
 
 
 def test_ensure_reuses_an_existing_cockpit(adapter) -> None:
-    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@0\t\n", ""))
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@0\t\n", ""), (0, "1\n", ""))
     assert cockpit.ensure_cockpit(adapter) == []
-    assert not any(_args(c)[0] == "new-session" for c in adapter._fake.calls)
+    calls = [_args(c) for c in adapter._fake.calls]
+    assert not any(c[0] in ("new-session", "new-window") for c in calls)
+
+
+def test_home_keeps_its_window_after_the_shell_exits(adapter) -> None:
+    adapter._fake.queue((1, "", "can't find session"))
+    cockpit.ensure_cockpit(adapter)
+    create = _args(adapter._fake.calls[1])
+    assert ["set-option", "-w", "-t", "=org:", "remain-on-exit", "on"] == create[-6:]
+
+
+def test_ensure_recreates_a_lost_home_as_the_first_window(adapter) -> None:
+    # Peek splits =org:^; without home that would be an agent's window.
+    adapter._fake.queue((0, "", ""), (0, "", ""), (0, "org\t@3\tfix-1\n", ""),
+                        (0, "\n", ""), (0, "@9\n", ""))
+    cockpit.ensure_cockpit(adapter)
+    calls = [_args(c) for c in adapter._fake.calls]
+    assert calls[4][:6] == ["new-window", "-b", "-d", "-t", "=org:^", "-n"]
+    assert ["set-option", "-w", "-t", "@9", "@cockpit_home", "1"] == calls[5][:6]
 
 
 # ------------------------------------------------------------------ attach
@@ -203,6 +221,12 @@ def test_live_cockpit_end_to_end() -> None:
         assert re.search(r"range=window\|\d+", line2)
         tab = tmux("display-message", "-p", "-t", second.pane_id, "#{E:window-status-format}")
         assert "fix-2 waiting" in tab
+        # Home survives its shell, and a lost home comes back as the first window.
+        home = tmux("display-message", "-p", "-t", "=org:^", "#{window_id}")
+        assert tmux("show-options", "-wv", "-t", home, "remain-on-exit") == "on"
+        a._tmux("kill-window", "-t", home)  # test only: simulate a lost home
+        cockpit.ensure_cockpit(a)
+        assert tmux("display-message", "-p", "-t", "=org:^", "#{@cockpit_home}") == "1"
         # kill-pane (the runtime's only close) removes the tab from the cockpit.
         a.kill_pane(first.pane_id)
         org = tmux("list-windows", "-t", "=org", "-F", "#{window_id}").split()

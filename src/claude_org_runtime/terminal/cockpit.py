@@ -33,13 +33,12 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
     ``@cockpit_home`` so :meth:`TmuxAdapter.list_panes` never reports it).
     Returns the window ids linked by this call.
     """
-    if a._tmux("has-session", "-t", _TARGET, check=False).returncode != 0:
+    existed = a._tmux("has-session", "-t", _TARGET, check=False).returncode == 0
+    if not existed:
         # A concurrent creator wins the race; the session then exists anyway.
         a._tmux(
             "new-session", "-d", "-s", COCKPIT_SESSION, "-n", "home", ";",
-            "set-option", "-w", "-t", f"{_TARGET}:", COCKPIT_HOME_OPT, "1", ";",
-            "set-option", "-w", "-t", f"{_TARGET}:", "automatic-rename", "off",
-            check=False,
+            *_home_options(f"{_TARGET}:"), check=False,
         )
     a.apply_org_config()
     out = a._tmux(
@@ -53,7 +52,30 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
             a._tmux("link-window", "-d", "-s", wid, "-t", f"{_TARGET}:")
             present.add(wid)
             linked.append(wid)
+    if existed:
+        _repair_home(a)
     return linked
+
+
+def _home_options(target: str) -> list[str]:
+    # remain-on-exit: home must outlive its shell. The tab menu's Peek splits
+    # the first cockpit window, which must never become an agent's window.
+    args: list[str] = []
+    for opt, value in ((COCKPIT_HOME_OPT, "1"), ("automatic-rename", "off"),
+                       ("remain-on-exit", "on")):
+        args += [";"] if args else []
+        args += ["set-option", "-w", "-t", target, opt, value]
+    return args
+
+
+def _repair_home(a: TmuxAdapter) -> None:
+    """Recreate home as the first window if it was ever closed."""
+    marks = a._tmux("list-windows", "-t", _TARGET, "-F", f"#{{{COCKPIT_HOME_OPT}}}").stdout
+    if "1" in marks.split():
+        return
+    wid = a._tmux("new-window", "-b", "-d", "-t", f"{_TARGET}:^", "-n", "home",
+                  "-P", "-F", "#{window_id}").stdout.strip()
+    a._tmux(*_home_options(wid))
 
 
 def attach_argv(a: TmuxAdapter, env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
