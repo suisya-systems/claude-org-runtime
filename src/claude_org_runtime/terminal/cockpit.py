@@ -60,6 +60,9 @@ def ensure_cockpit(a: TmuxAdapter) -> list[str]:
     linked: list[str] = []
     for sess, wid, task in rows:
         if sess != COCKPIT_SESSION and task and wid not in present:
+            # Issue #259: name the tab after the agent before linking it.
+            a._tmux("rename-window", "-t", wid, task, ";",
+                    "set-option", "-w", "-t", wid, "automatic-rename", "off")
             a._tmux("link-window", "-d", "-s", wid, "-t", f"{_TARGET}:")
             present.add(wid)
             linked.append(wid)

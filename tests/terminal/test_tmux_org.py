@@ -83,7 +83,9 @@ def test_set_agent_options_writes_window_options_then_refreshes(adapter) -> None
     assert opts == [
         "set-option", "-w", "-t", "%3", "@role", "worker", ";",
         "set-option", "-w", "-t", "%3", "@task", "fix-1", ";",
-        "set-option", "-w", "-t", "%3", "@state", "working",
+        "set-option", "-w", "-t", "%3", "@state", "working", ";",
+        "rename-window", "-t", "%3", "fix-1", ";",  # Issue #259
+        "set-option", "-w", "-t", "%3", "automatic-rename", "off",
     ]
     assert refresh == ["refresh-client", "-S"]
 
@@ -217,3 +219,13 @@ def test_runtime_path_with_spaces_survives_the_menu_quoting(adapter, monkeypatch
     # sh word splitting (POSIX rules; subprocess.run is stubbed here).
     assert shlex.split(runtime) == ["/home/a b/.venv/bin/python", "-m",
                                     "claude_org_runtime.cli"]
+
+
+def test_task_names_the_tab_and_pins_it(adapter) -> None:
+    """Issue #259: @task also renames the window and disables automatic-rename."""
+    adapter.set_agent_options("%2", role="worker", task="worker-1")
+    args = _args(adapter._fake.calls[0])
+    assert ["rename-window", "-t", "%2", "worker-1"] == args[args.index("rename-window"):][:4]
+    assert ["set-option", "-w", "-t", "%2", "automatic-rename", "off"] == args[-6:]
+    adapter.set_agent_options("%2", state="idle")
+    assert "rename-window" not in _args(adapter._fake.calls[2])
