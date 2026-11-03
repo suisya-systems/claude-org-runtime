@@ -1352,7 +1352,9 @@ class Broker(TokenMixin, StoreMixin):
                     (h, m.get("agent_state"), m.get("agent_ctx"), m.get("cwd"),
                      bool(m.get("logical")))
                     for h, m in self._pane_meta.items()
-                    if m.get("kind") == "claude"
+                    # The logical root (secretary) is registered by `org run` with
+                    # no kind; it is the human-driven Claude, so it counts.
+                    if m.get("kind") == "claude" or m.get("logical")
                 ]
             for handle, last, last_ctx, cwd, logical in targets:
                 if self._agent_state_stop.is_set():
