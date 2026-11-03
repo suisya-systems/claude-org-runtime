@@ -181,3 +181,16 @@ def test_secretary_pane_id_reads_the_marked_pane(tmp_path) -> None:
     assert a.secretary_pane_id() == "%4"
     R.stdout = "%1\t\n"
     assert a.secretary_pane_id() is None
+
+
+def test_root_pane_without_kind_still_gets_ctx_on_the_home_pane(tmp_path, monkeypatch) -> None:
+    # `org run` registers the root via issue_root_token, which sets no kind.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    a = SecretaryAdapter()
+    b = _broker(tmp_path, a)
+    tok = b.issue_token("manual-test", "manual-test", "secretary", cwd=CWD, auth_role="secretary")
+    b.register_logical_pane(tok)
+    _transcript(tmp_path / "home", CWD, _line(inp=20_000))
+    _poll_once(b)
+    assert _ctx_writes(a) == [("%9", "10%")]
