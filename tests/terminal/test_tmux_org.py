@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -203,3 +204,16 @@ def test_live_tmux_config_and_linked_window_options() -> None:
         assert len([p for p in a.list_panes() if p["pane_id"] == pane]) == 1
     finally:
         a.kill_server()  # this test's own socket only
+
+
+def test_runtime_path_with_spaces_survives_the_menu_quoting(adapter, monkeypatch) -> None:
+    # The tab menu runs '#{@org_runtime} org peek ...' inside tmux single
+    # quotes, then sh: backslash escapes survive both, nested quotes do not.
+    monkeypatch.setattr(tmux_mod.sys, "executable", "/home/a b/.venv/bin/python")
+    adapter.apply_org_config()
+    runtime = _args(adapter._fake.calls[0])[3]
+    assert runtime == "/home/a\\ b/.venv/bin/python -m claude_org_runtime.cli"
+    assert "'" not in runtime
+    # sh word splitting (POSIX rules; subprocess.run is stubbed here).
+    assert shlex.split(runtime) == ["/home/a b/.venv/bin/python", "-m",
+                                    "claude_org_runtime.cli"]

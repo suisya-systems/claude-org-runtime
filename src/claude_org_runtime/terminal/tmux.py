@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -275,7 +276,14 @@ class TmuxAdapter:
         can never orphan the pane that was just created.
         """
         # The tab menu's peek runs this runtime's own CLI, whatever PATH holds.
-        runtime = shlex.join([sys.executable, "-m", "claude_org_runtime.cli"])
+        # The menu wraps it in tmux single quotes, so shell-escape with
+        # backslashes (they pass through tmux single quotes to sh) rather
+        # than nesting quotes.
+        # ponytail: a path holding ' or # still breaks; quote per layer if one does.
+        runtime = " ".join(
+            re.sub(r"([^\w@%+=:,./-])", r"\\\1", part)
+            for part in (sys.executable, "-m", "claude_org_runtime.cli")
+        )
         with resources.as_file(resources.files(__package__) / ORG_CONF) as conf:
             self._tmux("set-option", "-g", "@org_runtime", runtime, ";",
                        "source-file", str(conf), check=False)
