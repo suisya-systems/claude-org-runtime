@@ -489,6 +489,8 @@ _CLAUDE_VALUE_FLAGS = {
     # ``server:org-broker-channel``。renga と同形の対話 flag (renga も
     # ``--dangerously-load-development-channels server:renga-peers`` を使う)。
     "--dangerously-load-development-channels",
+    # #76: broker が renga-peers のツールを止めるために注入する (予約。下記)。
+    "--disallowedTools",
 }
 _CLAUDE_BOOL_FLAGS = {
     "--strict-mcp-config", "--continue", "--verbose", "--debug", "--ide",
@@ -501,10 +503,10 @@ _CLAUDE_HEADLESS_BLACKLIST = {
 # caller の args[] に持たせてはいけない (broker 構造化フィールドと衝突)。
 # dev-channel flag は broker が channel sidecar 用に注入する唯一の出所なので、caller
 # が args[] で第二/別の dev-channel を持ち込むのを禁じる (§9.5/§9.7 単一注入経路)。
-# NOTE (#76): --strict-mcp-config は **broker が常に注入する** ようになったため
-# reserved から外す。caller が冪等に args[] へ付与しても reject せず (builder が
-# 重複を畳む)、bare check_messages の ambient renga-peers への誤ルートを防ぐ strict
-# 隔離を弱めない。
+# NOTE (#76): broker は --strict-mcp-config を注入しない (claude.ai コネクタ / プラグイン
+# / ユーザー設定の MCP まで落とすため)。代わりに ambient renga-peers のツールを
+# --disallowedTools で止める。caller がこれを足して防御を弱めないよう予約する。
+# --strict-mcp-config 自体は caller の明示指定として素通しにする。
 #
 # NOTE (#166): --resume は allowlist に**追加すると同時に**予約する。adopt を
 # 「秘密付きで新プロセスを起こす launcher」として定義した以上、resume は adopt の
@@ -516,7 +518,7 @@ _CLAUDE_HEADLESS_BLACKLIST = {
 _CLAUDE_RESERVED_IN_ARGS = {
     "--mcp-config", "--model", "--permission-mode",
     "--mcp-config-file", "--dangerously-load-development-channels",
-    "--resume",
+    "--resume", "--disallowedTools",
 }
 
 # --- Codex (interactive TUI) ---
@@ -533,34 +535,10 @@ def _basename(path: str) -> str:
     return os.path.basename(path.replace("\\", "/"))
 
 
-def _drop_redundant_strict(args: list[str]) -> list[str]:
-    """caller の **standalone** な --strict-mcp-config だけを畳む (broker が注入済み)。
-
-    値位置 (例 ``["--add-dir", "--strict-mcp-config"]``) に現れた --strict-mcp-config
-    は value-flag の引数なので落とすと arity が壊れる。value-flag (space 区切り形) の
-    次トークンは値として保持し、standalone の --strict-mcp-config のみ除去する。
-    ``--flag=value`` 結合形は自己完結なのでそのまま通す。
-    """
-    out: list[str] = []
-    i, n = 0, len(args)
-    while i < n:
-        tok = args[i]
-        if tok in _CLAUDE_VALUE_FLAGS and i + 1 < n:
-            out.extend((tok, args[i + 1]))  # 次は値: 解釈せず保持
-            i += 2
-            continue
-        if tok == "--strict-mcp-config":
-            i += 1  # broker 注入済みの重複: 畳む
-            continue
-        out.append(tok)
-        i += 1
-    return out
-
-
 def _has_standalone_flag(args: list[str], flag: str) -> bool:
     """``flag`` が **値位置ではない** token として args に現れるか。
 
-    ``_drop_redundant_strict`` と同じ arity 走査。素朴な ``flag in args`` だと
+    value-flag を飛ばす arity 走査。素朴な ``flag in args`` だと
     ``["--add-dir", "--continue"]`` のように値位置に来た同名文字列を flag と誤認する
     (``--add-dir`` の値がたまたま ``--continue`` という名前のディレクトリ、等)。
     """
@@ -624,6 +602,15 @@ def _guard_interactive_claude_argv(argv: list[str]) -> None:
         )
 
 
+# ambient renga-peers が公開する 14 ツール。公式 docs で per-server wildcard 形が
+# 確認できていないため完全修飾名で列挙する。renga 側にツールが増えたらここへ足す。
+RENGA_PEERS_TOOLS = tuple(f"mcp__renga-peers__{t}" for t in (
+    "set_summary", "list_peers", "send_message", "check_messages", "list_panes",
+    "spawn_pane", "close_pane", "focus_pane", "new_tab", "inspect_pane",
+    "poll_events", "send_keys", "spawn_claude_pane", "set_pane_identity",
+))
+
+
 def build_claude_argv(
     *,
     mcp_config_json: str,
@@ -647,12 +634,10 @@ def build_claude_argv(
     emit しない (§9.7 launcher argv の bit 等価)。caller の extra_args は構造化
     フィールドと衝突する予約 flag を持てない。最後に default-deny guard を通す。
 
-    ``--strict-mcp-config`` を**常に注入**する (#76): これにより spawn された pane は
-    ``--mcp-config`` で渡した broker MCP **のみ** を load し、ambient な .mcp.json
-    (renga<->broker 併存中に居る renga-peers 等) を無視する。bare 'check_messages'
-    が ambient renga-peers の同名ツールへ誤ルートして broker queue が silent drop
-    する事象 (#76) を、NUDGE_TEXT の FQ 化とは独立に防ぐ防御多重。caller が
-    extra_args に冪等で --strict-mcp-config を付けても重複は畳む。
+    ``--disallowedTools`` で ambient renga-peers の 14 ツールを完全修飾名で**常に
+    止める** (#76): bare 'check_messages' が renga-peers の同名ツールへ誤ルートして
+    broker queue が silent drop する事象を、NUDGE_TEXT の FQ 化とは独立に防ぐ防御多重。
+    ``--strict-mcp-config`` は注入しない (他の MCP を落とすため)。
 
     ``resume`` / ``continue_session`` は明示 adopt (#166) の **session selector**。
     adopt は「秘密付きで新しい claude プロセスを起こす」操作なので、引き継ぐ会話を
@@ -661,7 +646,7 @@ def build_claude_argv(
     (事前 Codex design review Major (c))。両者は **相互排他**: 同時指定は矛盾した
     session 指定で、claude 側の解決順に暗黙依存する argv を作ってしまう。
     ``continue_session`` は既に allowlist にある ``--continue`` を出すだけなので、
-    caller が args[] に冪等で付けていれば重複を畳む (``--strict-mcp-config`` と同型)。
+    caller が args[] に冪等で付けていれば重複を畳む 。
     """
     extra_args = list(extra_args or [])
     _reject_reserved_claude_args(extra_args)
@@ -678,7 +663,8 @@ def build_claude_argv(
             # 先頭 '-' の値は guard の値位置検査を通っても claude 側で flag として
             # 解釈されうる。builder の段で構造的に拒否する。
             raise ToolArgError(f"resume session id must not start with '-': {resume!r}")
-    argv = ["claude", "--mcp-config", mcp_config_json, "--strict-mcp-config"]
+    argv = ["claude", "--mcp-config", mcp_config_json,
+            "--disallowedTools", ",".join(RENGA_PEERS_TOOLS)]
     if resume is not None:
         argv += ["--resume", resume]
     if continue_session and not has_extra_continue:
@@ -689,8 +675,7 @@ def build_claude_argv(
         argv += ["--model", model]
     if channel_server:
         argv += ["--dangerously-load-development-channels", f"server:{channel_server}"]
-    # caller が冪等に付与した standalone --strict-mcp-config は畳む (上で注入済み)。
-    argv += _drop_redundant_strict(extra_args)
+    argv += extra_args
     _guard_interactive_claude_argv(argv)
     return argv
 

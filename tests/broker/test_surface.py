@@ -366,7 +366,8 @@ def test_build_claude_argv_without_selectors_is_byte_identical():
         permission_mode="acceptEdits", extra_args=["--add-dir", "/repo"],
     )
     assert argv == [
-        "claude", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
+        "claude", "--mcp-config", '{"mcpServers":{}}',
+        "--disallowedTools", ",".join(surface.RENGA_PEERS_TOOLS),
         "--permission-mode", "acceptEdits", "--model", "opus",
         "--add-dir", "/repo",
     ]

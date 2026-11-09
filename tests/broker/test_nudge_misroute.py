@@ -93,7 +93,11 @@ def _loaded_servers(argv, mcp_config_servers, ambient_servers):
     servers = dict(mcp_config_servers)
     if "--strict-mcp-config" not in argv:
         servers.update(ambient_servers)
-    return servers
+    # --disallowedTools はツールを context から外す: 全ツールが止まった server は無い扱い。
+    denied = set(argv[argv.index("--disallowedTools") + 1].split(",")) \
+        if "--disallowedTools" in argv else set()
+    return {n: t for n, t in servers.items()
+            if not t or any(f"mcp__{n}__{x}" not in denied for x in t)}
 
 
 # --------------------------------------------------------------------------- (a)
@@ -143,8 +147,8 @@ def test_nudge_text_uses_fully_qualified_broker_tool():
 
 # --------------------------------------------------------------------------- (b)
 def test_strict_mcp_config_isolates_broker_pane(broker):
-    """strict 注入 (b): bare 名 nudge でも、--strict-mcp-config で pane が broker MCP
-    のみ load するため ambient renga-peers が除外され、check_messages が broker へ一意
+    """denylist (b): bare 名 nudge でも、--disallowedTools で renga-peers のツールが
+    止まり pane の有効ツールが broker のみになるため ambient renga-peers が除外され、check_messages が broker へ一意
     解決する。fail-before: strict 無し -> renga-peers も load -> ambiguous -> silent
     drop。pass-after: strict 有り -> broker のみ -> drain 成立。"""
     sender = _bind(broker, "sender")
@@ -158,11 +162,11 @@ def test_strict_mcp_config_isolates_broker_pane(broker):
         channel_server="org-broker-channel",
     )
     # ambient .mcp.json は renga-peers を、--mcp-config は org-broker を寄与する。
-    ambient = {"renga-peers": {"check_messages"}}
+    ambient = {"renga-peers": {"check_messages"}}  # 全ツールが denylist 対象
     config_servers = {"org-broker": {"check_messages"}}
     loaded = _loaded_servers(argv, config_servers, ambient)
 
-    assert set(loaded) == {"org-broker"}  # strict -> renga-peers は load されない
+    assert set(loaded) == {"org-broker"}  # renga-peers のツールは止まる
 
     # bare 名 nudge (worst case) でも broker へ一意解決する。
     bare = "📨 新着あり。check_messages を実行"
@@ -172,31 +176,17 @@ def test_strict_mcp_config_isolates_broker_pane(broker):
     assert _pending(broker, "worker-b") == []
 
 
-def test_build_claude_argv_injects_strict_mcp_config():
-    """構造ガード (b): build_claude_argv は --strict-mcp-config を常に 1 本注入する。"""
-    assert build_claude_argv(mcp_config_json="{}").count("--strict-mcp-config") == 1
-    # channel (broker) 枝でも 1 本。
-    withch = build_claude_argv(mcp_config_json="{}", channel_server="org-broker-channel")
-    assert withch.count("--strict-mcp-config") == 1
+def test_build_claude_argv_denies_renga_peers_check_messages():
+    """構造ガード (b): argv は renga-peers の check_messages を止める (strict は使わない)。"""
+    argv = build_claude_argv(mcp_config_json="{}", channel_server="org-broker-channel")
+    assert "--strict-mcp-config" not in argv
+    assert "mcp__renga-peers__check_messages" in argv[argv.index("--disallowedTools") + 1]
 
 
-def test_build_claude_argv_accepts_idempotent_caller_strict_flag():
-    """caller の --strict-mcp-config 付与は reject されず (reserved から外した)、
-    重複は畳まれて 1 本に正規化される。"""
+def test_build_claude_argv_passes_through_explicit_caller_strict_flag():
+    """caller が明示した --strict-mcp-config は素通し (broker は注入も畳みもしない)。"""
     argv = build_claude_argv(mcp_config_json="{}", extra_args=["--strict-mcp-config"])
     assert argv.count("--strict-mcp-config") == 1
-
-
-def test_build_claude_argv_keeps_strict_token_in_value_position():
-    """dedup は **standalone** の --strict-mcp-config のみ畳み、value-flag の値位置に
-    現れた同名トークンは arity を壊さず保持する (Codex Minor 対応)。"""
-    argv = build_claude_argv(
-        mcp_config_json="{}", extra_args=["--add-dir", "--strict-mcp-config"],
-    )
-    # 注入分 (standalone) + --add-dir の値として 1 つ = 計 2。
-    assert argv.count("--strict-mcp-config") == 2
-    # value-flag と値の隣接が保たれている (arity 不変)。
-    assert argv[argv.index("--add-dir") + 1] == "--strict-mcp-config"
 
 
 def test_no_strict_would_load_ambient_renga_and_misroute():
