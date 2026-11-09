@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.58] - 2026-11-09
+
+### Fixed
+
+- broker: stop injecting `--strict-mcp-config` into every Claude it launches; block only the 14 renga-peers tools via `--disallowedTools` instead. claude.ai connectors, plugin MCP servers and user-configured MCP servers are usable in broker panes again. If renga adds tools, update `RENGA_PEERS_TOOLS` (#273).
+
 ## [0.1.57] - 2026-11-03
 
 ### Fixed
