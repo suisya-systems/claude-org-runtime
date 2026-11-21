@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.59] - 2026-11-21
+
 ### Fixed
 
 - broker: every pane the broker daemon spawns (Claude, Codex and generic) now gets `ORG_TRANSPORT=broker` in its environment instead of inheriting the tmux server's global value (for example `ORG_TRANSPORT=renga` from a login shell). The fixed value wins over any caller-supplied `env_extra`.
