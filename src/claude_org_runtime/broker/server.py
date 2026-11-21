@@ -1616,7 +1616,11 @@ class Broker(TokenMixin, StoreMixin):
         backend にのみ渡し、target pane を方向指定で split させる。持たない backend
         (tmux は #247 で降りた: 1 pane = 1 detached session) は adapter 既定の配置。
         """
+        # ORG_TRANSPORT: broker daemon が起こす pane は構造上 broker transport 上にいる。
+        # 明示しないと tmux サーバー global env (login shell の ORG_TRANSPORT=renga 等)
+        # を継承するため固定値で渡す。env_extra より後に載せるので上書き不可。
         env = {**(env_extra or {}),
+               "ORG_TRANSPORT": "broker",
                "ORG_BROKER_STATE_DIR": sidecar.absolutize(self.state_dir)}
         if getattr(self.adapter, "venv_path_via_pane_env", False):
             env.update(venv_pane_env(cwd, self.root_cwd))
